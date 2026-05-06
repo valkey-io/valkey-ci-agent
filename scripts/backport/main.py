@@ -519,43 +519,46 @@ def _apply_resolutions(
         else:
             raise ValueError(f"Cannot apply unresolved conflict for {result.path}")
 
-    if any_resolved or resolution_results:
-        # Complete the cherry-pick with resolved content.
-        # Set core.editor=true to prevent git from opening an editor
-        # in the non-interactive CI environment.
-        try:
-            continue_args = [
+    if not any_resolved:
+        # Nothing staged means nothing to commit; caller already verified the
+        # input, so this is a defensive check rather than an expected path.
+        return
+    # Complete the cherry-pick with resolved content.
+    # Set core.editor=true to prevent git from opening an editor
+    # in the non-interactive CI environment.
+    try:
+        continue_args = [
+            repo_dir,
+            "-c", f"user.name={signer.name or 'backport-agent'}",
+            "-c", (
+                f"user.email={signer.email or 'backport-agent@users.noreply.github.com'}"
+            ),
+            "-c", "core.editor=true",
+            "cherry-pick",
+            "--continue",
+        ]
+        _run_git(
+            *continue_args,
+        )
+        if require_dco_signoff:
+            _run_git(
                 repo_dir,
                 "-c", f"user.name={signer.name or 'backport-agent'}",
                 "-c", (
                     f"user.email={signer.email or 'backport-agent@users.noreply.github.com'}"
                 ),
-                "-c", "core.editor=true",
-                "cherry-pick",
-                "--continue",
-            ]
-            _run_git(
-                *continue_args,
+                "commit",
+                "--amend",
+                "--no-edit",
+                "--signoff",
             )
-            if require_dco_signoff:
-                _run_git(
-                    repo_dir,
-                    "-c", f"user.name={signer.name or 'backport-agent'}",
-                    "-c", (
-                        f"user.email={signer.email or 'backport-agent@users.noreply.github.com'}"
-                    ),
-                    "commit",
-                    "--amend",
-                    "--no-edit",
-                    "--signoff",
-                )
-        except Exception as exc:
-            # If cherry-pick --continue fails, something is wrong with the
-            # resolution (e.g., all files matched target-branch content so
-            # there's nothing to commit). Don't create a pointless empty
-            # commit — let the caller see the error and skip this candidate.
-            logger.warning("cherry-pick --continue failed: %s", exc)
-            raise
+    except Exception as exc:
+        # If cherry-pick --continue fails, something is wrong with the
+        # resolution (e.g., all files matched target-branch content so
+        # there's nothing to commit). Don't create a pointless empty
+        # commit — let the caller see the error and skip this candidate.
+        logger.warning("cherry-pick --continue failed: %s", exc)
+        raise
 
 
 

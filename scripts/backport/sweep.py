@@ -666,14 +666,27 @@ def _check_applied_commit_size(
     if upstream_additions <= 0:
         return None  # Can't compare; allow through
 
-    # Reject if either condition triggers:
-    #  - applied additions are >=3x upstream additions (ratio trips on small PRs)
-    #  - applied additions exceed upstream by >300 lines (absolute floor for
-    #    when the ratio is mild but the diff is still wrong)
-    if applied_additions >= upstream_additions * 3 or applied_additions - upstream_additions > 300:
+    # Reject only when both:
+    #  - applied additions are >= 3x upstream AND
+    #  - applied additions exceed upstream by more than 100 lines
+    # The 100-line floor prevents false positives on small PRs where a
+    # legitimate branch adaptation (e.g., 5 lines -> 15 lines) trips the
+    # 3x ratio. Over-application typically produces hundreds of extra
+    # lines (re-creating whole files), so the floor cleanly separates the
+    # two cases.
+    extra = applied_additions - upstream_additions
+    if applied_additions >= upstream_additions * 3 and extra > 100:
         return (
             f"applied +{applied_additions} vs upstream +{upstream_additions} "
-            f"(+{applied_additions - upstream_additions} extra lines, "
+            f"(+{extra} extra lines, "
+            f"{applied_additions / max(1, upstream_additions):.1f}x)"
+        )
+    # Absolute floor: a >300-line over-application is suspicious even when
+    # the ratio is mild (e.g., upstream +200, applied +500).
+    if extra > 300:
+        return (
+            f"applied +{applied_additions} vs upstream +{upstream_additions} "
+            f"(+{extra} extra lines, "
             f"{applied_additions / max(1, upstream_additions):.1f}x)"
         )
     return None

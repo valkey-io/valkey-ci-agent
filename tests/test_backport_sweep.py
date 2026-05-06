@@ -320,3 +320,71 @@ def test_apply_candidate_preserves_source_author_on_conflict_path(monkeypatch, t
     assert committer == "Local Committer <committer@local.invalid>"
     # Don't rely on the unused `candidate` local.
     assert candidate.source_pr_number == 42
+
+
+
+def _make_size_check_candidate() -> ProjectBackportCandidate:
+    return ProjectBackportCandidate(
+        source_pr_number=99,
+        source_pr_title="Test",
+        source_pr_url="https://example.invalid/pr/99",
+        target_branch="8.1",
+        merge_commit_sha="deadbeef",
+    )
+
+
+def _stub_size_check_subprocess(monkeypatch, upstream_add: int, applied_add: int) -> None:
+    """Stub subprocess.run so _check_applied_commit_size sees the given additions."""
+
+    def fake(cmd, **_kwargs):
+        if cmd[:3] == ["git", "fetch", "origin"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["git", "show"] and "HEAD" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout=f" 1 file changed, {applied_add} insertions(+)\n",
+                stderr="",
+            )
+        if cmd[:2] == ["git", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout=f" 1 file changed, {upstream_add} insertions(+)\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(backport_sweep.subprocess, "run", fake)
+
+
+def test_check_applied_commit_size_passes_small_pr_adaptation(monkeypatch):
+    """A 1-line upstream PR that becomes 5 lines after branch adaptation
+    must not be rejected (under old 3x rule, 3+ lines would trip)."""
+    _stub_size_check_subprocess(monkeypatch, upstream_add=1, applied_add=5)
+    assert backport_sweep._check_applied_commit_size("/fake", _make_size_check_candidate()) is None
+
+
+def test_check_applied_commit_size_passes_medium_pr_slight_growth(monkeypatch):
+    """Upstream 50 lines, applied 120 lines (70 extra) is fine under the new rule."""
+    _stub_size_check_subprocess(monkeypatch, upstream_add=50, applied_add=120)
+    assert backport_sweep._check_applied_commit_size("/fake", _make_size_check_candidate()) is None
+
+
+def test_check_applied_commit_size_rejects_ratio_and_floor(monkeypatch):
+    """Upstream 100 lines, applied 400 (300 extra, 4x) trips both guards."""
+    _stub_size_check_subprocess(monkeypatch, upstream_add=100, applied_add=400)
+    issue = backport_sweep._check_applied_commit_size("/fake", _make_size_check_candidate())
+    assert issue is not None
+    assert "+400" in issue and "+100" in issue
+
+
+def test_check_applied_commit_size_rejects_absolute_floor_only(monkeypatch):
+    """Upstream 200 lines, applied 600 (400 extra, 3x): absolute-floor branch."""
+    _stub_size_check_subprocess(monkeypatch, upstream_add=200, applied_add=600)
+    issue = backport_sweep._check_applied_commit_size("/fake", _make_size_check_candidate())
+    assert issue is not None
+
+
+def test_check_applied_commit_size_accepts_mild_ratio_under_floor(monkeypatch):
+    """Upstream 5 lines, applied 50 (10x ratio but only 45 extra): accept."""
+    _stub_size_check_subprocess(monkeypatch, upstream_add=5, applied_add=50)
+    assert backport_sweep._check_applied_commit_size("/fake", _make_size_check_candidate()) is None
