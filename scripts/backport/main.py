@@ -82,6 +82,8 @@ def run_backport(
     config: BackportConfig,
     github_token: str,
     push_repo: str | None = None,
+    language: str = "c",
+    build_commands: list[str] | None = None,
 ) -> BackportResult:
     """Execute the backport pipeline end-to-end.
 
@@ -258,6 +260,8 @@ def run_backport(
                         tmp_dir,
                         cherry_result.conflicting_files,
                         pr_context,
+                        language=language,
+                        build_commands=build_commands,
                     )
                     unresolved = [
                         r for r in resolution_results
@@ -308,17 +312,45 @@ def run_backport(
                         require_dco_signoff=require_dco_signoff,
                     )
 
+                # Run registry-configured build validation before pushing.
+                # Skipped if no commands are configured (build_commands empty).
+                if build_commands:
+                    from scripts.common.build_validator import run_build_commands
+                    ok, output = run_build_commands(tmp_dir, build_commands)
+                    if not ok:
+                        msg = f"Build validation failed: {output[:500]}"
+                        logger.error(msg)
+                        _post_comment(repo, source_pr_number, f"Backport skipped: {msg}")
+                        return BackportResult(
+                            outcome="error",
+                            commits_cherry_picked=len(cherry_result.applied_commits),
+                            files_conflicted=len(cherry_result.conflicting_files),
+                            error_message=msg,
+                        )
+
                 # Push the backport branch to the remote
                 if push_repo and push_repo != repo_full_name:
                     fork_url = github_https_url(push_repo)
                     _run_git(tmp_dir, "remote", "add", "fork", fork_url, env=git_env)
                     # Sync the fork's target branch to upstream so the PR
                     # doesn't show unrelated commits
+                    check_publish_allowed(
+                        target_repo=push_repo, action="git_push",
+                        context=f"sync {target_branch} to fork",
+                    )
                     logger.info("Syncing %s:%s to upstream.", push_repo, target_branch)
                     _run_git(tmp_dir, "push", "fork", f"{target_branch}:{target_branch}", env=git_env)
+                    check_publish_allowed(
+                        target_repo=push_repo, action="git_push",
+                        context=f"push backport branch {branch_name}",
+                    )
                     logger.info("Pushing branch %s to fork %s.", branch_name, push_repo)
                     _run_git(tmp_dir, "push", "--force", "fork", branch_name, env=git_env)
                 else:
+                    check_publish_allowed(
+                        target_repo=repo_full_name, action="git_push",
+                        context=f"push backport branch {branch_name}",
+                    )
                     logger.info("Pushing branch %s to origin.", branch_name)
                     _run_git(tmp_dir, "push", "--force", "origin", branch_name, env=git_env)
 
@@ -608,6 +640,8 @@ def main() -> None:
         ),
         github_token=github_token,
         push_repo=args.push_repo or repo_entry.push_repo,
+        language=repo_entry.language,
+        build_commands=list(repo_entry.build_commands) or None,
     )
 
     logger.info("Backport outcome: %s", result.outcome)

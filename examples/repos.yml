@@ -1,21 +1,36 @@
-# Example registry showing how to add a Valkey module.
+# Example registry showing how to onboard a Valkey module.
 # This file is for documentation only — the live registry is repos.yml at the repo root.
+#
+# Two supported deployment models:
+#
+# 1. Direct push (recommended): omit push_repo. The agent pushes branches
+#    directly to the upstream repo and opens a PR from that branch against
+#    the target release branch. Requires the GitHub App to have
+#    contents:write on the upstream repo. This is how OpenSearch's
+#    backport bot works. Branches are temporary and deleted after merge.
+#
+# 2. Fork push: set push_repo to a fork owned by a different user/org.
+#    The agent pushes to the fork and opens a cross-repo PR. Use this if
+#    maintainers don't want agent branches on the upstream repo.
+#    NOTE: GitHub's create-pull-request API may behave differently for
+#    same-org cross-repo PRs; prefer the direct-push model for org-owned
+#    staging repos.
 
 publish_guard:
   protected_repos:
     - valkey-io/valkey
     - valkey-io/valkey-bloom
+    - valkey-io/valkey-search
 
 repos:
   - repo: valkey-io/valkey
     project_owner: valkey-io
     project_owner_type: organization
     language: c
-    push_repo: valkey-io/valkey-backport-staging
     build_commands:
       - "make -j$(nproc)"
     backport_label: backport
-    llm_conflict_label: llm-resolved-conflicts
+    llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
     branches:
       - branch: "7.2"
@@ -33,7 +48,6 @@ repos:
     project_owner: valkey-io
     project_owner_type: organization
     language: c
-    push_repo: valkey-io/valkey-bloom-staging
     build_commands:
       - "make -j$(nproc)"
     branches:
@@ -44,7 +58,6 @@ repos:
     project_owner: valkey-io
     project_owner_type: organization
     language: c++
-    push_repo: valkey-io/valkey-search-staging
     build_commands:
       - "cmake --build build -j$(nproc)"
     branches:

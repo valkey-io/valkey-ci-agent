@@ -270,6 +270,8 @@ def run_backport_sweep(
         candidates=candidates, push_repo=push_repo,
         test_commands=test_commands,
         max_applied=max_candidates,
+        language=repo_entry.language,
+        build_commands=list(repo_entry.build_commands) or None,
     )
     emit_job_summary(_build_summary([result]))
     return result
@@ -280,6 +282,8 @@ def _process_branch(
     target_branch: str, candidates: list[ProjectBackportCandidate],
     push_repo: str, test_commands: list[str],
     max_applied: int = 0,
+    language: str = "c",
+    build_commands: list[str] | None = None,
 ) -> BranchSweepResult:
     result = BranchSweepResult(target_branch=target_branch, candidates_found=len(candidates))
     tmpdir = tempfile.mkdtemp(prefix=f"backport-{target_branch}-")
@@ -372,7 +376,11 @@ def _process_branch(
                     ))
                     continue
 
-                cr = _apply_candidate(tmpdir, candidate, signer, repo_full_name, git_env, require_dco_signoff=require_dco_signoff)
+                cr = _apply_candidate(
+                    tmpdir, candidate, signer, repo_full_name, git_env,
+                    require_dco_signoff=require_dco_signoff,
+                    language=language, build_commands=build_commands,
+                )
                 result.results.append(cr)
                 if cr.outcome == "applied":
                     applied_count += 1
@@ -416,6 +424,8 @@ def _apply_candidate(
     signer: object,
     repo_full_name: str, git_env: dict[str, str],
     require_dco_signoff: bool = False,
+    language: str = "c",
+    build_commands: list[str] | None = None,
 ) -> CandidateResult:
     sha = candidate.merge_commit_sha
     if not sha:
@@ -500,7 +510,10 @@ def _apply_candidate(
         commits=candidate.commit_shas,
     )
 
-    resolutions = resolve_conflicts_with_claude(repo_dir, conflicting_files, pr_context)
+    resolutions = resolve_conflicts_with_claude(
+        repo_dir, conflicting_files, pr_context,
+        language=language, build_commands=build_commands,
+    )
     unresolved = [r for r in resolutions if r.resolved_content is None]
     if unresolved:
         # Abort cherry-pick
@@ -694,25 +707,8 @@ def _read_index_stage(repo_dir: str, path: str, stage: int) -> str:
 
 
 def _run_test_commands(repo_dir: str, test_commands: list[str]) -> tuple[bool, str]:
-    if not test_commands:
-        return True, ""
-    for command in test_commands:
-        logger.info("Running backport validation command: %s", command)
-        result = subprocess.run(
-            command,
-            cwd=repo_dir,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-        )
-        if result.returncode != 0:
-            output = "\n".join(
-                part for part in [result.stdout[-2000:], result.stderr[-2000:]]
-                if part
-            ).strip()
-            return False, output or f"`{command}` failed with exit code {result.returncode}"
-    return True, ""
+    from scripts.common.build_validator import run_build_commands
+    return run_build_commands(repo_dir, test_commands)
 
 
 def _sync_target_branch_to_source(

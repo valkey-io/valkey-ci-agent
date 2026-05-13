@@ -11,6 +11,7 @@ scripts/
   ai/          AI layer: Claude Code subprocess orchestration
   backport/    Workflow 1: automated backports (active)
   common/      Shared infrastructure (git auth, GitHub client, safety guards)
+repos.yml      Central registry of repos, branches, project boards, build commands
 ```
 
 New workflows are added as sibling directories to `backport/`. Each workflow picks an agent profile (tools, timeout, effort) and writes its own prompt. The AI layer and shared infra stay unchanged.
@@ -27,94 +28,117 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 
 ## Backport Workflow
 
-The currently active workflow. Cherry-picks merged PRs from `unstable` onto release branches (7.2, 8.0, 8.1, 9.0, 9.1) with AI-powered conflict resolution.
+The currently active workflow. Cherry-picks merged PRs onto release branches with AI-powered conflict resolution. Works for any repo defined in `repos.yml` — Valkey core, Valkey modules (bloom, search, json), or anything else following the per-branch project-board pattern.
 
 ### How it works
 
-1. **Daily sweep** — every day at 09:00 UTC, queries GitHub Project v2 boards for PRs marked "To be backported"
-2. **Cherry-pick** — attempts `git cherry-pick` for each candidate onto the target release branch
-3. **AI conflict resolution** — when cherry-pick conflicts, Claude Code reads both sides, resolves the conflict, and runs `make -j$(nproc)` to verify compilation
-4. **PR creation** — pushes the branch and opens (or updates) a draft PR with a summary table of applied/skipped commits
+1. **Daily sweep** — every day at 09:00 UTC, the preflight job reads `repos.yml` and generates one matrix leg per `{repo, branch}` pair
+2. **Project discovery** — each leg queries the GitHub Project v2 board for PRs marked "To be backported"
+3. **Cherry-pick** — attempts `git cherry-pick` for each candidate onto the target release branch
+4. **AI conflict resolution** — when cherry-pick conflicts, Claude Code reads both sides, resolves the conflict, and (if configured) runs the repo's build commands to verify compilation
+5. **Build validation** — registry-configured build commands run deterministically after resolution; failure blocks the push
+6. **PR creation** — pushes the branch and opens (or updates) a draft PR with a summary table
 
 Manual single-PR backports are also supported via `workflow_dispatch`.
+
+### Registry (`repos.yml`)
+
+The registry is the single source of truth. To onboard a new repo, add an entry to `repos.yml`:
+
+```yaml
+publish_guard:
+  protected_repos:
+    - valkey-io/valkey
+
+repos:
+  - repo: valkey-io/valkey
+    project_owner: valkey-io
+    project_owner_type: organization
+    language: c                          # used in conflict resolver prompt
+    build_commands:
+      - "make -j$(nproc)"                # run after conflict resolution; empty = skip
+    backport_label: backport
+    llm_conflict_label: ai-resolved-conflicts
+    max_conflicting_files: 100
+    branches:
+      - branch: "8.1"
+        project_number: 14
+      - branch: "9.0"
+        project_number: 18
+```
+
+Optional `push_repo` field: if set to a different repo (e.g., a fork), branches are pushed there and PRs open cross-repo. If omitted, branches are pushed directly to the upstream repo (same model as OpenSearch's backport bot).
+
+See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
 ### Installation
 
 #### Prerequisites
 
-- A GitHub App (or PAT) with:
-  - `contents:write` on the push target (fork or same repo)
-  - `pull_requests:write` on the upstream repo (to open PRs)
-  - `projects:read` on the org (to query project boards)
+- A GitHub App with:
+  - `contents:write` on each repo in the registry (for pushing branches)
+  - `pull-requests:write` on each repo (for opening PRs)
+  - `organization_projects:read` on the org (for querying project boards)
 - An AWS account with Bedrock access to `us.anthropic.claude-opus-4-7`
 - An OIDC trust between GitHub Actions and your AWS account
 
-#### Step 1: Set up the push target
+#### Step 1: Configure secrets and variables
 
-Create a fork of `valkey-io/valkey` for the agent to push branches to (e.g., `valkey-io/valkey-ci-agent-fork`). Or use the same repo if the App has `contents:write` on upstream directly.
-
-#### Step 2: Configure secrets and variables
-
-On the repo hosting the agent workflows:
+On `valkey-io/valkey-ci-agent`:
 
 | Type | Name | Value |
 |------|------|-------|
 | Secret | `AWS_ROLE_ARN` | OIDC role ARN with Bedrock `InvokeModel` permission |
-| Secret | `VALKEY_GITHUB_TOKEN` | PAT or App installation token with `read:project` + `contents:write` + `pull_requests:write` |
-| Variable | `VALKEY_BACKPORT_PUSH_REPO` | e.g., `valkey-io/valkey-ci-agent-fork` |
+| Secret | `VALKEY_GITHUB_TOKEN` | App installation token or PAT |
+| Variable | `AWS_REGION` | e.g., `us-east-1` |
+| Variable | `CI_BOT_COMMIT_NAME` | e.g., `valkey-ci-agent` |
+| Variable | `CI_BOT_COMMIT_EMAIL` | e.g., `ci-agent@valkey.io` |
+| Variable | `CI_BOT_REQUIRE_DCO_SIGNOFF` | `true` |
+| Variable | `VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH` | `1` (to allow writes to protected repos) |
 
-#### Step 3: Copy the caller workflow
+#### Step 2: Edit `repos.yml`
 
-Copy [`examples/backport-caller-workflow.yml`](examples/backport-caller-workflow.yml) into your repo's `.github/workflows/` directory. It calls the reusable `backport-sweep.yml` from this repo.
+Add your repo(s) to the registry. No per-repo config files are needed — everything lives in `repos.yml`.
 
-#### Step 4: (Optional) Backport config
+#### Step 3: Enable the workflows
 
-Copy [`examples/backport-config.yml`](examples/backport-config.yml) to `.github/backport-agent.yml` in the target repo to customize labels and conflict limits.
+The scheduled sweep runs automatically. For event-driven single-PR backports, copy [`examples/backport-caller-workflow.yml`](examples/backport-caller-workflow.yml) into the consumer repo.
 
 ### Usage
 
 #### Daily sweep (automatic)
 
-Runs daily at 09:00 UTC via cron. Sweeps all 5 release-branch project boards in parallel:
-
-| Project | Branch |
-|---------|--------|
-| 1 | 7.2 |
-| 2 | 8.0 |
-| 14 | 8.1 |
-| 18 | 9.0 |
-| 41 | 9.1 |
-
-Each leg produces one PR (e.g., `[backport] Backport sweep for 8.1`) bundling all pending backports for that branch.
+Runs daily at 09:00 UTC via cron. The preflight job reads `repos.yml` and fans out one job per `{repo, branch}`. Each produces one PR bundling all pending backports for that branch.
 
 #### Manual backport (on-demand)
 
 ```bash
 gh workflow run manual-backport.yml \
-  --repo <agent-repo> \
+  --repo valkey-io/valkey-ci-agent \
   --field pr_url=https://github.com/valkey-io/valkey/pull/3601 \
-  --field target_branch=9.0 \
-  --field push_to_fork=<push-repo>
+  --field target_branch=9.0
 ```
 
-Creates one PR per source PR, named `[Backport 9.0] <original title>`.
+Creates one PR named `[Backport 9.0] <original title>`.
 
-### Configuration
+#### Filtering the sweep
 
-See [`examples/backport-config.yml`](examples/backport-config.yml) for all available fields.
+To run only for a specific repo or branch:
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `backport_label` | `backport` | Label applied to created PRs |
-| `llm_conflict_label` | `llm-resolved-conflicts` | Label when Claude resolved conflicts |
-| `max_conflicting_files` | 100 | Skip if more files conflict than this |
+```bash
+gh workflow run backport-sweep.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field repo=valkey-io/valkey \
+  --field project_number=14
+```
 
 ## Safety
 
-- **Publish guard** — blocks writes to `valkey-io/valkey` unless `VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH=1` is explicitly set
+- **Publish guard** — blocks writes to protected repos (configured in `repos.yml`) unless `VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH=1` is set. Fails closed if not configured at startup.
 - **Credential isolation** — all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
 - **Claude Code env isolation** — `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
-- **Fork sync** — before cherry-picking, the agent fast-forwards the fork's release branch to match upstream
+- **Deterministic build validation** — registry-configured build commands run after conflict resolution. A build failure blocks the push.
+- **Fork sync** — when using a fork push target, the agent fast-forwards the fork's release branch to match upstream before cherry-picking
 - **Stale branch pruning** — if a previous backport PR was closed without merging, the agent deletes the orphaned branch before starting fresh
 - **DCO** — all agent commits are signed off
 
