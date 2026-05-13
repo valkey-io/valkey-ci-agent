@@ -8,7 +8,10 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from scripts.backport.models import BackportPRContext, CherryPickResult, ResolutionResult
-from scripts.backport.pr_creator import BackportPRCreator
+from scripts.backport.pr_creator import (
+    BackportPRCreator,
+    build_pull_head_ref,
+)
 from scripts.backport.utils import build_branch_name
 
 # ── Shared strategies ─────────────────────────────────────────────────
@@ -230,6 +233,19 @@ def test_create_backport_pr_uses_configured_labels() -> None:
     mock_pr.add_to_labels.assert_called_once_with(
         "needs-backport-review",
         "ai-resolved-conflict",
+    )
+
+
+def test_pull_head_ref_for_different_owner_fork_escape_hatch() -> None:
+    branch = "agent/backport/weekly/8.1"
+
+    assert (
+        build_pull_head_ref(
+            "valkey-io/valkey",
+            "ci-bot/valkey",
+            branch,
+        )
+        == "ci-bot:agent/backport/weekly/8.1"
     )
 
 

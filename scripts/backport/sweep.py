@@ -27,6 +27,7 @@ from scripts.backport.main import (
     _run_git,
 )
 from scripts.backport.models import BackportPRContext
+from scripts.backport.pr_creator import build_pull_head_ref
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.github_client import retry_github_call
 from scripts.common.job_summary import emit_job_summary
@@ -798,11 +799,7 @@ def _find_existing_pr(gh: Any, base_repo: str, push_repo: str, branch: str) -> A
     active backport branch on a transient failure.
     """
     repo = retry_github_call(lambda: gh.get_repo(base_repo), retries=2, description=f"get {base_repo}")
-    # Cross-repo head ref: <push_owner>:<branch>; same-repo: just <branch>
-    if push_repo and push_repo != base_repo:
-        head_ref = f"{push_repo.split('/')[0]}:{branch}"
-    else:
-        head_ref = f"{base_repo.split('/')[0]}:{branch}"
+    head_ref = build_pull_head_ref(base_repo, push_repo, branch)
     pulls = retry_github_call(
         lambda: list(repo.get_pulls(state="open", head=head_ref)),
         retries=2, description="list PRs",
@@ -842,11 +839,7 @@ def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head
     body = _build_pr_body(result)
     title = f"[backport] Weekly backport sweep for {target_branch}"
 
-    # Build head ref: cross-repo uses <push_owner>:<branch>, same-repo uses <base_owner>:<branch>
-    if push_repo and push_repo != base_repo:
-        head_ref = f"{push_repo.split('/')[0]}:{head_branch}"
-    else:
-        head_ref = f"{base_repo.split('/')[0]}:{head_branch}"
+    head_ref = build_pull_head_ref(base_repo, push_repo, head_branch)
 
     if existing_pr:
         check_publish_allowed(target_repo=base_repo, action="edit_pull", context=f"PR #{existing_pr.number}")

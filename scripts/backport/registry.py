@@ -89,8 +89,14 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
     for i, repo_raw in enumerate(repos_raw):
         entries.append(_parse_repo_entry(repo_raw, i, seen_repos))
 
+    protected_repos = set(protected)
+    protected_repos.update(entry.repo for entry in entries)
+    protected_repos.update(
+        entry.push_repo for entry in entries if entry.push_repo is not None
+    )
+
     return Registry(
-        publish_guard_repos=frozenset(protected),
+        publish_guard_repos=frozenset(protected_repos),
         repos=tuple(entries),
     )
 
@@ -125,6 +131,11 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
     if push_repo is not None:
         if not isinstance(push_repo, str) or not _REPO_RE.match(push_repo):
             raise ValueError(f"repos[{index}].push_repo must be a valid 'owner/name' string")
+        if push_repo != repo and push_repo.split("/", 1)[0] == repo.split("/", 1)[0]:
+            raise ValueError(
+                f"repos[{index}].push_repo must be a different-owner fork; "
+                "omit push_repo for the standard direct-upstream model"
+            )
 
     build_commands = raw.get("build_commands", [])
     if not isinstance(build_commands, list):

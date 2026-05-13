@@ -47,8 +47,7 @@ The registry is the single source of truth. To onboard a new repo, add an entry 
 
 ```yaml
 publish_guard:
-  protected_repos:
-    - valkey-io/valkey
+  protected_repos: []                    # repos below are protected automatically
 
 repos:
   - repo: valkey-io/valkey
@@ -67,7 +66,7 @@ repos:
         project_number: 18
 ```
 
-Optional `push_repo` field: if set to a different repo (e.g., a fork), branches are pushed there and PRs open cross-repo. If omitted, branches are pushed directly to the upstream repo (same model as OpenSearch's backport bot).
+By default, branches are pushed directly to the upstream repo and the PR is opened in that same repo. That is the standard Valkey onboarding model because it avoids creating and maintaining one staging repo per module. `push_repo` remains available only as an emergency/testing escape hatch for a real fork.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
@@ -134,7 +133,7 @@ gh workflow run backport-sweep.yml \
 
 ## Safety
 
-- **Publish guard** — blocks writes to protected repos (configured in `repos.yml`) unless `VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH=1` is set. Fails closed if not configured at startup.
+- **Publish guard** — blocks writes to every repo listed in `repos.yml` unless `VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH=1` is set. Extra protected repos can also be listed under `publish_guard.protected_repos`. Fails closed if not configured at startup.
 - **Credential isolation** — all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
 - **Claude Code env isolation** — `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
 - **Deterministic build validation** — registry-configured build commands run after conflict resolution. A build failure blocks the push.

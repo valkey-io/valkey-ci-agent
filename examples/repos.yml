@@ -1,26 +1,25 @@
 # Example registry showing how to onboard a Valkey module.
 # This file is for documentation only — the live registry is repos.yml at the repo root.
 #
-# Two supported deployment models:
+# Standard deployment model:
 #
-# 1. Direct push (recommended): omit push_repo. The agent pushes branches
-#    directly to the upstream repo and opens a PR from that branch against
-#    the target release branch. Requires the GitHub App to have
-#    contents:write on the upstream repo. This is how OpenSearch's
-#    backport bot works. Branches are temporary and deleted after merge.
+# Direct push: omit push_repo. The agent pushes branches directly to the
+# upstream repo and opens a PR from that branch against the target release
+# branch. Requires the GitHub App to have contents:write on the upstream repo.
+# This scales cleanly across modules because onboarding a repo is only a
+# registry edit plus GitHub App installation permissions; no staging repo is
+# needed. Branches are temporary and deleted after merge.
 #
-# 2. Fork push: set push_repo to a fork owned by a different user/org.
-#    The agent pushes to the fork and opens a cross-repo PR. Use this if
-#    maintainers don't want agent branches on the upstream repo.
-#    NOTE: GitHub's create-pull-request API may behave differently for
-#    same-org cross-repo PRs; prefer the direct-push model for org-owned
-#    staging repos.
+# Emergency/testing escape hatch:
+#
+# Set push_repo only for a real fork when maintainers explicitly do not want
+# agent branches on the upstream repo. Do not create org-owned staging repos
+# for normal Valkey module onboarding.
 
 publish_guard:
-  protected_repos:
-    - valkey-io/valkey
-    - valkey-io/valkey-bloom
-    - valkey-io/valkey-search
+  # Repos listed below are protected automatically; use this only for extra
+  # write targets outside the registry.
+  protected_repos: []
 
 repos:
   - repo: valkey-io/valkey

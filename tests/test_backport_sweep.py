@@ -7,7 +7,11 @@ from unittest.mock import MagicMock
 
 from scripts.backport import sweep as backport_sweep
 from scripts.backport.models import ResolutionResult
-from scripts.backport.sweep import ProjectBackportCandidate
+from scripts.backport.sweep import (
+    BranchSweepResult,
+    CandidateResult,
+    ProjectBackportCandidate,
+)
 from scripts.common.git_auth import GitAuth
 
 
@@ -198,6 +202,45 @@ def test_run_test_commands_returns_failure_output(tmp_path):
     assert ok is False
     assert "stdout" in output
     assert "stderr" in output
+
+
+def test_upsert_pr_uses_direct_upstream_branch_by_default():
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_pr = MagicMock()
+    mock_pr.number = 555
+    mock_pr.html_url = "https://github.com/valkey-io/valkey/pull/555"
+    mock_repo.create_pull.return_value = mock_pr
+    result = BranchSweepResult(
+        target_branch="8.1",
+        candidates_found=1,
+        results=[
+            CandidateResult(
+                source_pr_number=10,
+                source_pr_title="Fix module API",
+                outcome="applied",
+                detail="",
+            )
+        ],
+    )
+
+    pr_url = backport_sweep._upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "8.1",
+        "agent/backport/weekly/8.1",
+        result,
+        existing_pr=None,
+    )
+
+    assert pr_url == "https://github.com/valkey-io/valkey/pull/555"
+    mock_repo.create_pull.assert_called_once()
+    _, kwargs = mock_repo.create_pull.call_args
+    assert kwargs["head"] == "valkey-io:agent/backport/weekly/8.1"
+    assert kwargs["base"] == "8.1"
+    assert kwargs["draft"] is True
 
 
 

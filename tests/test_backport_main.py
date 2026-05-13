@@ -104,6 +104,20 @@ def _make_mock_pr(
 _PATCH_PREFIX = "scripts.backport.main"
 
 
+def test_run_backport_rejects_same_owner_push_repo() -> None:
+    result = run_backport(
+        repo_full_name="valkey-io/valkey",
+        source_pr_number=100,
+        target_branch="8.1",
+        config=_default_config(),
+        github_token="fake-token",
+        push_repo="valkey-io/other-repo",
+    )
+
+    assert result.outcome == "error"
+    assert "direct-upstream" in (result.error_message or "")
+
+
 class TestRunBackportCleanCherryPick:
     """Test clean cherry-pick flow — no conflicts, PR created successfully."""
 

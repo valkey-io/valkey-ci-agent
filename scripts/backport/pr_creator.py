@@ -19,6 +19,13 @@ from scripts.common.publish_guard import check_publish_allowed
 logger = logging.getLogger(__name__)
 
 
+def build_pull_head_ref(base_repo: str, push_repo: str | None, branch_name: str) -> str:
+    """Return the GitHub pull-request head ref for a pushed branch."""
+    source_repo = push_repo or base_repo
+    owner = source_repo.split("/")[0]
+    return f"{owner}:{branch_name}"
+
+
 def _escape_table_cell(value: object) -> str:
     """Return markdown-table-safe text."""
     text = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -44,19 +51,6 @@ class BackportPRCreator:
         self._push_repo = push_repo
         self._backport_label = backport_label or "backport"
         self._llm_conflict_label = llm_conflict_label or "llm-resolved-conflicts"
-
-    def _head_ref(self, branch_name: str) -> str:
-        """Build the head ref for PR creation/search.
-
-        Cross-repo: ``<push_repo_owner>:<branch>``
-        Same-repo: ``<base_repo_owner>:<branch>``
-        """
-        if self._push_repo and self._push_repo != self._base_repo:
-            owner = self._push_repo.split("/")[0]
-        else:
-            owner = self._base_repo.split("/")[0]
-        return f"{owner}:{branch_name}"
-
 
     def create_backport_pr(
         self,
@@ -106,7 +100,7 @@ class BackportPRCreator:
             action="create_pull",
             context=f"backport {branch_name}->{context.target_branch}",
         )
-        head_ref = self._head_ref(branch_name)
+        head_ref = build_pull_head_ref(self._base_repo, self._push_repo, branch_name)
         pr = retry_github_call(
             lambda: repo.create_pull(
                 title=title,
@@ -276,7 +270,7 @@ class BackportPRCreator:
         )
 
         # Check open PRs with matching head branch.
-        head_ref = self._head_ref(branch_name)
+        head_ref = build_pull_head_ref(self._base_repo, self._push_repo, branch_name)
         logger.info(
             "Checking for duplicate backport PR with head ref %s",
             head_ref,

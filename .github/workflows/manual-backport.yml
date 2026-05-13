@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       push_to_fork:
-        description: "Push backport PR to this fork instead of the source repo (e.g. your-org/valkey)"
+        description: "Emergency/testing only: push the branch to a real fork instead of the source repo"
         required: false
         type: string
         default: ""

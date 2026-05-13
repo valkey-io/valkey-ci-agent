@@ -89,6 +89,19 @@ def run_backport(
 
     Returns a :class:`BackportResult` with outcome details.
     """
+    if (
+        push_repo
+        and push_repo != repo_full_name
+        and push_repo.split("/", 1)[0] == repo_full_name.split("/", 1)[0]
+    ):
+        return BackportResult(
+            outcome="error",
+            error_message=(
+                "push_repo must be a different-owner fork; omit push_repo for "
+                "the standard direct-upstream model"
+            ),
+        )
+
     gh = Github(auth=Auth.Token(github_token))
     try:
         try:

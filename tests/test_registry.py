@@ -59,6 +59,23 @@ class TestLoadRegistry:
         assert entry.llm_conflict_label == "llm-resolved-conflicts"
         assert entry.max_conflicting_files == 100
 
+    def test_publish_guard_includes_registry_repos_by_default(self, tmp_path):
+        data = _minimal_registry(publish_guard={"protected_repos": []})
+        path = _write_registry(tmp_path, data)
+        reg = load_registry(path)
+
+        assert reg.publish_guard_repos == frozenset({"org/repo"})
+
+    def test_publish_guard_includes_push_repo_escape_hatch(self, tmp_path):
+        data = _minimal_registry(
+            publish_guard={"protected_repos": []},
+            repos=[_minimal_repo(push_repo="fork/repo")],
+        )
+        path = _write_registry(tmp_path, data)
+        reg = load_registry(path)
+
+        assert reg.publish_guard_repos == frozenset({"org/repo", "fork/repo"})
+
     def test_full_entry(self, tmp_path):
         data = _minimal_registry(repos=[_minimal_repo(
             push_repo="fork/repo",
@@ -175,6 +192,12 @@ class TestValidation:
         data = _minimal_registry(repos=[_minimal_repo(push_repo="noslash")])
         path = _write_registry(tmp_path, data)
         with pytest.raises(ValueError, match="push_repo"):
+            load_registry(path)
+
+    def test_same_owner_push_repo_rejected(self, tmp_path):
+        data = _minimal_registry(repos=[_minimal_repo(push_repo="org/other-repo")])
+        path = _write_registry(tmp_path, data)
+        with pytest.raises(ValueError, match="direct-upstream"):
             load_registry(path)
 
     def test_build_commands_not_list(self, tmp_path):
