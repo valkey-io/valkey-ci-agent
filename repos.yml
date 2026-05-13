@@ -10,7 +10,7 @@ repos:
     build_commands:
       - "make -j$(nproc)"
     backport_label: backport
-    llm_conflict_label: llm-resolved-conflicts
+    llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
     branches:
       - branch: "7.2"
