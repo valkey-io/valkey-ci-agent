@@ -1,15 +1,16 @@
-"""Tests for scripts/publish_guard.py — the upstream-only kill-switch.
+"""Tests for scripts/publish_guard.py - the registry-backed write guard.
 
-The guard has a single job: block writes to valkey-io/valkey unless
-VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH=1. Writes to any other repo
-(including forks and valkey-io/valkey-fuzzer) pass through unconditionally.
+The guard blocks writes to configured protected repos unless
+VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH=1. Entry points configure this set from
+repos.yml and the guard fails closed if used before configuration.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from scripts.common.publish_guard import check_publish_allowed
+from scripts.common import publish_guard
+from scripts.common.publish_guard import check_publish_allowed, configure_publish_guard
 
 # All tests here opt out of the autouse fixture in conftest — the fixture
 # sets env vars that would otherwise mask the guard's default behavior.
@@ -46,6 +47,18 @@ def test_upstream_valkey_write_blocked_by_default(clean_env):
 def test_upstream_fuzzer_write_allowed_by_default(clean_env):
     """Fuzzer upstream is intentionally allowed without opt-in."""
     check_publish_allowed("valkey-io/valkey-fuzzer", action="create_issue")
+
+
+def test_configured_module_repo_blocked_by_default(clean_env):
+    configure_publish_guard({"valkey-io/valkey-bloom"})
+    with pytest.raises(RuntimeError, match="ALLOW_VALKEY_IO_PUBLISH"):
+        check_publish_allowed("valkey-io/valkey-bloom", action="create_pull")
+
+
+def test_unconfigured_guard_fails_closed(monkeypatch):
+    monkeypatch.setattr(publish_guard, "_configured", False)
+    with pytest.raises(RuntimeError, match="not configured"):
+        check_publish_allowed("some-org/some-repo", action="create_pull")
 
 
 
