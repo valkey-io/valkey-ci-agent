@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ _configured: bool = False
 _protected_repos: set[str] = set()
 
 
-def configure_publish_guard(protected_repos: set[str]) -> None:
+def configure_publish_guard(protected_repos: Iterable[str]) -> None:
     """Configure the publish guard with the set of protected repos.
 
     Must be called at startup before any check_publish_allowed() calls.

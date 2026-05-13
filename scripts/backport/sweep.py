@@ -14,7 +14,7 @@ import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -31,6 +31,9 @@ from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.github_client import retry_github_call
 from scripts.common.job_summary import emit_job_summary
 from scripts.common.publish_guard import check_publish_allowed
+
+if TYPE_CHECKING:
+    from scripts.backport.registry import BranchEntry, RepoEntry  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +226,6 @@ def run_backport_sweep(
 
     Returns a single BranchSweepResult.
     """
-    from scripts.backport.registry import BranchEntry, RepoEntry  # noqa: F811
-
     repo_full_name = repo_entry.repo
     push_repo = repo_entry.effective_push_repo
     target_branch = branch_entry.branch

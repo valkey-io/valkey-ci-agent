@@ -8,10 +8,7 @@ import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-try:
-    from typing import Literal
-except ImportError:
-    from typing_extensions import Literal
+from typing import Literal
 
 from scripts.ai.claude_code import (
     DEFAULT_CLAUDE_ENV_ALLOWLIST,

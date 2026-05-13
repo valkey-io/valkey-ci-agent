@@ -85,6 +85,7 @@ class BackportPRCreator:
             branch_name = build_branch_name(
                 context.source_pr_number, context.target_branch,
             )
+        assert branch_name is not None  # for mypy
         title = build_pr_title(context.source_pr_title, context.target_branch)
 
         had_conflicts = not cherry_pick_result.success
@@ -105,11 +106,12 @@ class BackportPRCreator:
             action="create_pull",
             context=f"backport {branch_name}->{context.target_branch}",
         )
+        head_ref = self._head_ref(branch_name)
         pr = retry_github_call(
             lambda: repo.create_pull(
                 title=title,
                 body=body,
-                head=self._head_ref(branch_name),
+                head=head_ref,
                 base=context.target_branch,
             ),
             retries=3,
