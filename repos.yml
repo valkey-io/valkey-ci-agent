@@ -1,7 +1,3 @@
-publish_guard:
-  # Repos listed below are protected automatically.
-  protected_repos: []
-
 repos:
   - repo: valkey-io/valkey
     push_repo: valkey-io/valkey-backport-staging

@@ -8,11 +8,6 @@
 # This keeps generated branches out of upstream repositories while retaining
 # one central registry for all modules.
 
-publish_guard:
-  # Repos listed below are protected automatically; use this only for extra
-  # write targets outside the registry.
-  protected_repos: []
-
 repos:
   - repo: valkey-io/valkey
     push_repo: valkey-io/valkey-backport-staging

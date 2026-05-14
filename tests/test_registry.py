@@ -35,7 +35,6 @@ def _minimal_repo(**overrides):
 
 def _minimal_registry(**overrides):
     base = {
-        "publish_guard": {"protected_repos": ["org/repo"]},
         "repos": [_minimal_repo()],
     }
     base.update(overrides)
@@ -47,10 +46,6 @@ class TestLoadRegistry:
         path = _write_registry(tmp_path, _minimal_registry())
         reg = load_registry(path)
         assert isinstance(reg, Registry)
-        assert reg.publish_guard_repos == frozenset({
-            "org/repo",
-            "org/repo-backport-staging",
-        })
         assert len(reg.repos) == 1
         entry = reg.repos[0]
         assert entry.repo == "org/repo"
@@ -64,26 +59,6 @@ class TestLoadRegistry:
         assert entry.backport_label == "backport"
         assert entry.llm_conflict_label == "llm-resolved-conflicts"
         assert entry.max_conflicting_files == 100
-
-    def test_publish_guard_includes_registry_repos_by_default(self, tmp_path):
-        data = _minimal_registry(publish_guard={"protected_repos": []})
-        path = _write_registry(tmp_path, data)
-        reg = load_registry(path)
-
-        assert reg.publish_guard_repos == frozenset({
-            "org/repo",
-            "org/repo-backport-staging",
-        })
-
-    def test_publish_guard_includes_push_repo(self, tmp_path):
-        data = _minimal_registry(
-            publish_guard={"protected_repos": []},
-            repos=[_minimal_repo(push_repo="fork/repo")],
-        )
-        path = _write_registry(tmp_path, data)
-        reg = load_registry(path)
-
-        assert reg.publish_guard_repos == frozenset({"org/repo", "fork/repo"})
 
     def test_full_entry(self, tmp_path):
         data = _minimal_registry(repos=[_minimal_repo(
@@ -153,7 +128,7 @@ class TestValidation:
             load_registry(str(path))
 
     def test_repos_empty(self, tmp_path):
-        path = _write_registry(tmp_path, {"publish_guard": {"protected_repos": []}, "repos": []})
+        path = _write_registry(tmp_path, {"repos": []})
         with pytest.raises(ValueError, match="non-empty list"):
             load_registry(path)
 
@@ -271,9 +246,3 @@ class TestValidation:
         with pytest.raises(ValueError, match="non-empty list"):
             load_registry(path)
 
-    def test_invalid_protected_repo(self, tmp_path):
-        data = _minimal_registry()
-        data["publish_guard"]["protected_repos"] = ["noslash"]
-        path = _write_registry(tmp_path, data)
-        with pytest.raises(ValueError, match="publish_guard.protected_repos"):
-            load_registry(path)

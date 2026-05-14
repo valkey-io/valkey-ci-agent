@@ -34,7 +34,6 @@ from scripts.backport.validation import (
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.github_client import retry_github_call
 from scripts.common.job_summary import emit_job_summary
-from scripts.common.publish_guard import check_publish_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -336,16 +335,8 @@ def run_backport(
                     _run_git(tmp_dir, "remote", "add", "staging", staging_url, env=git_env)
                     # Sync the staging fork's target branch to upstream so the PR
                     # doesn't show unrelated commits
-                    check_publish_allowed(
-                        target_repo=push_repo, action="git_push",
-                        context=f"sync {target_branch} to staging fork",
-                    )
                     logger.info("Syncing %s:%s to upstream.", push_repo, target_branch)
                     _run_git(tmp_dir, "push", "staging", f"{target_branch}:{target_branch}", env=git_env)
-                    check_publish_allowed(
-                        target_repo=push_repo, action="git_push",
-                        context=f"push backport branch {branch_name}",
-                    )
                     logger.info("Pushing branch %s to staging repo %s.", branch_name, push_repo)
                     _run_git(tmp_dir, "push", "--force-with-lease", "staging", branch_name, env=git_env)
         logger.info("Creating backport PR.")
@@ -414,11 +405,6 @@ def _post_comment(repo: object, pr_number: int, body: str) -> None:
             retries=3,
             description=f"get PR #{pr_number} for comment",
         )
-        check_publish_allowed(
-            target_repo=str(getattr(repo, "full_name", "") or ""),
-            action="create_issue_comment",
-            context=f"backport PR #{pr_number}",
-        )
         retry_github_call(
             lambda: pr.create_issue_comment(body),
             retries=3,
@@ -455,11 +441,11 @@ def _clone_repo(
     )
     # Configure git identity for cherry-pick commits
     subprocess.run(
-        ["git", "config", "user.name", "valkey-ci-agent"],
+        ["git", "config", "user.name", "valkey-ci-agent[bot]"],
         cwd=dest_dir, check=True, capture_output=True, text=True,
     )
     subprocess.run(
-        ["git", "config", "user.email", "valkey-ci-agent@users.noreply.github.com"],
+        ["git", "config", "user.email", "valkey-ci-agent[bot]@users.noreply.github.com"],
         cwd=dest_dir, check=True, capture_output=True, text=True,
     )
     # Fetch all branches so cherry-pick can reference any commit
@@ -586,9 +572,6 @@ def main() -> None:
         repo_entry, _branch_entry = registry.get_branch(args.repo, args.target_branch)
     except KeyError as exc:
         parser.error(str(exc))
-
-    from scripts.common.publish_guard import configure_publish_guard
-    configure_publish_guard(registry.publish_guard_repos)
 
     result = run_backport(
         repo_full_name=args.repo,

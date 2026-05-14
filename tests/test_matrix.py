@@ -9,8 +9,6 @@ def _write_registry(tmp_path) -> str:
     path = tmp_path / "repos.yml"
     path.write_text(
         """
-publish_guard:
-  protected_repos: []
 repos:
   - repo: org/core
     push_repo: org/core-backport-staging

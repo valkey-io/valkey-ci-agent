@@ -46,7 +46,6 @@ class RepoEntry:
 
 @dataclass(frozen=True)
 class Registry:
-    publish_guard_repos: frozenset[str]
     repos: tuple[RepoEntry, ...]
 
     def get_repo(self, repo_full_name: str) -> RepoEntry:
@@ -75,17 +74,6 @@ def load_registry(path: str) -> Registry:
 
 
 def _parse_registry(raw: dict[str, Any]) -> Registry:
-    # publish_guard
-    pg = raw.get("publish_guard", {})
-    if not isinstance(pg, dict):
-        raise ValueError("publish_guard must be a mapping")
-    protected = pg.get("protected_repos", [])
-    if not isinstance(protected, list):
-        raise ValueError("publish_guard.protected_repos must be a list")
-    for r in protected:
-        if not isinstance(r, str) or not _REPO_RE.match(r):
-            raise ValueError(f"Invalid repo in publish_guard.protected_repos: {r!r}")
-
     # repos
     repos_raw = raw.get("repos", [])
     if not isinstance(repos_raw, list) or not repos_raw:
@@ -96,12 +84,7 @@ def _parse_registry(raw: dict[str, Any]) -> Registry:
     for i, repo_raw in enumerate(repos_raw):
         entries.append(_parse_repo_entry(repo_raw, i, seen_repos))
 
-    protected_repos = set(protected)
-    protected_repos.update(entry.repo for entry in entries)
-    protected_repos.update(entry.push_repo for entry in entries)
-
     return Registry(
-        publish_guard_repos=frozenset(protected_repos),
         repos=tuple(entries),
     )
 

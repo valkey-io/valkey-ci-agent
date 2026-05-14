@@ -46,9 +46,6 @@ Manual single-PR backports are also supported via `workflow_dispatch`.
 The registry is the single source of truth. To onboard a new repo, add an entry to `repos.yml`:
 
 ```yaml
-publish_guard:
-  protected_repos: []                    # repos below are protected automatically
-
 repos:
   - repo: valkey-io/valkey
     push_repo: valkey-io/valkey-backport-staging  # staging fork that receives agent branches
@@ -98,7 +95,6 @@ On `valkey-io/valkey-ci-agent`:
 | Secret | `AWS_ROLE_ARN` | OIDC role ARN with Bedrock `InvokeModel` permission |
 | Secret | `VALKEY_GITHUB_TOKEN` | App installation token or PAT |
 | Variable | `AWS_REGION` | e.g., `us-east-1` |
-| Variable | `VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH` | `1` (to allow writes to protected repos) |
 
 #### Step 2: Edit `repos.yml`
 
@@ -106,7 +102,7 @@ Add your repo(s) to the registry. No per-repo config files are needed — everyt
 
 #### Step 3: Enable the workflows
 
-The scheduled sweep runs automatically. For event-driven single-PR backports, copy [`examples/backport-caller-workflow.yml`](examples/backport-caller-workflow.yml) into the consumer repo.
+The scheduled sweep runs automatically.
 
 ### Usage
 
@@ -138,7 +134,7 @@ gh workflow run backport-sweep.yml \
 
 ## Safety
 
-- **Publish guard** — blocks writes to every repo listed in `repos.yml` unless `VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH=1` is set. Extra protected repos can also be listed under `publish_guard.protected_repos`. Fails closed if not configured at startup.
+- **Write boundary** — the agent only has push access to staging forks (e.g., `valkey-io/valkey-backport-staging`). It cannot push to upstream repositories. Reviewers merge backport PRs from the staging fork into upstream.
 - **Credential isolation** — all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
 - **Claude Code env isolation** — `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
 - **Deterministic validation** — registry-configured build commands and matching path-based tests run before push. A validation failure blocks the push.

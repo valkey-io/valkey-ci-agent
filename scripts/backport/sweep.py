@@ -41,7 +41,6 @@ from scripts.backport.validation import (
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.github_client import retry_github_call
 from scripts.common.job_summary import emit_job_summary
-from scripts.common.publish_guard import check_publish_allowed
 
 if TYPE_CHECKING:
     from scripts.backport.registry import BranchEntry, RepoEntry  # noqa: F401
@@ -306,10 +305,9 @@ def _process_branch(
     try:
         with GitAuth(github_token, prefix="backport-sweep-git-askpass-") as git_auth:
             git_env = git_auth.env()
-            check_publish_allowed(target_repo=push_repo, action="git_push", context=f"{_BRANCH_PREFIX}/{target_branch}")
             _clone_target_branch(repo_full_name, target_branch, tmpdir, git_env)
-            _run_git(tmpdir, "config", "user.name", "valkey-ci-agent")
-            _run_git(tmpdir, "config", "user.email", "ci-agent@valkey.io")
+            _run_git(tmpdir, "config", "user.name", "valkey-ci-agent[bot]")
+            _run_git(tmpdir, "config", "user.email", "valkey-ci-agent[bot]@users.noreply.github.com")
 
             # Sync push_repo's copy of target_branch to match source before
             # we start cherry-picking. Without this, if the fork's release
@@ -411,7 +409,6 @@ def _process_branch(
                         item.detail = output[:500]
                     logger.warning("Validation failed for %s; not pushing branch.", target_branch)
                     return result
-                check_publish_allowed(target_repo=push_repo, action="git_push", context=backport_branch)
                 _push_backport_branch(
                     tmpdir,
                     backport_branch,
@@ -809,11 +806,6 @@ def _sync_target_branch_to_source(
             "Creating missing staging branch %s:%s at %s",
             push_repo, target_branch, source_sha[:8],
         )
-        check_publish_allowed(
-            target_repo=push_repo,
-            action="create_ref",
-            context=f"create {target_branch} from source head",
-        )
         try:
             retry_github_call(
                 lambda: push_repo_obj.create_git_ref(
@@ -855,10 +847,6 @@ def _sync_target_branch_to_source(
         logger.info(
             "Fast-forwarding %s:%s from %s to %s (behind by %d)",
             push_repo, target_branch, push_sha[:8], source_sha[:8], compare.ahead_by,
-        )
-        check_publish_allowed(
-            target_repo=push_repo, action="update_ref",
-            context=f"fast-forward {target_branch} to source head",
         )
         try:
             ref = retry_github_call(
@@ -917,7 +905,6 @@ def _delete_stale_backport_branch(gh: Any, push_repo: str, branch: str) -> None:
         if ref is None:
             return
         logger.info("Deleting stale backport branch %s on %s (no open PR)", branch, push_repo)
-        check_publish_allowed(target_repo=push_repo, action="delete_branch", context=branch)
         retry_github_call(lambda: ref.delete(), retries=2, description=f"delete ref {branch}")
     except Exception as exc:
         # Branch not found is fine — nothing to prune. Any other error
@@ -936,12 +923,10 @@ def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head
     title = f"[backport] Backport sweep for {target_branch}"
 
     if existing_pr:
-        check_publish_allowed(target_repo=base_repo, action="edit_pull", context=f"PR #{existing_pr.number}")
         retry_github_call(lambda: existing_pr.edit(title=title, body=body), retries=2, description="update PR")
         logger.info("Updated PR #%d on %s", existing_pr.number, base_repo)
         return existing_pr.html_url
 
-    check_publish_allowed(target_repo=base_repo, action="create_pull", context=head_branch)
     pr = retry_github_call(
         lambda: create_pull_from_push_repo(
             repo,
@@ -1131,9 +1116,6 @@ def main() -> None:
     from scripts.backport.registry import load_registry
     registry = load_registry(args.registry)
     repo_entry, branch_entry = registry.get_branch(args.repo, args.branch)
-
-    from scripts.common.publish_guard import configure_publish_guard
-    configure_publish_guard(registry.publish_guard_repos)
 
     test_commands_override = None
     if args.test_commands:

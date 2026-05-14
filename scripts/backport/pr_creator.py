@@ -15,7 +15,6 @@ from scripts.backport.models import (
 )
 from scripts.backport.utils import build_branch_name, build_pr_title
 from scripts.common.github_client import retry_github_call
-from scripts.common.publish_guard import check_publish_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -167,11 +166,6 @@ class BackportPRCreator:
         # Open the pull request (branch already exists on remote).
         logger.info(
             "Opening backport PR: %s -> %s", branch_name, context.target_branch,
-        )
-        check_publish_allowed(
-            target_repo=self._base_repo,
-            action="create_pull",
-            context=f"backport {branch_name}->{context.target_branch}",
         )
         pr = retry_github_call(
             lambda: create_pull_from_push_repo(

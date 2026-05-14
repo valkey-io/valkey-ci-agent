@@ -93,7 +93,6 @@ jobs:
       CI_AGENT_EVIDENCE_DIR: agent-evidence
       MAX_CANDIDATES: ${{ inputs.max_candidates || '0' }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
-      VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH: ${{ vars.VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH || '' }}
     steps:
       - name: Check out agent repository
         uses: actions/checkout@v6

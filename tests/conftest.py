@@ -2,18 +2,14 @@
 
 import pytest
 
-from scripts.common.publish_guard import configure_publish_guard
-
 
 @pytest.fixture(autouse=True)
-def allow_upstream_publish_in_tests(
-    monkeypatch: pytest.MonkeyPatch, request
-) -> None:
-    """Set VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH=1 unless test opts out.
+def allow_upstream_publish_in_tests(request: pytest.FixtureRequest) -> None:
+    """No-op fixture kept for the ``disable_publish_autouse`` marker.
 
-    Also configures publish_guard with the standard protected repos.
+    The legacy publish guard has been removed; this fixture is retained so
+    tests that explicitly opt out via the marker continue to work without
+    requiring per-test changes.
     """
-    configure_publish_guard({"valkey-io/valkey"})
     if "disable_publish_autouse" in request.keywords:
         return
-    monkeypatch.setenv("VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH", "1")

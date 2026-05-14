@@ -86,8 +86,6 @@ def test_cli_rejects_target_branch_missing_from_registry(
     registry = tmp_path / "repos.yml"
     registry.write_text(
         """
-publish_guard:
-  protected_repos: []
 repos:
   - repo: valkey-io/valkey
     push_repo: valkey-io/valkey-backport-staging

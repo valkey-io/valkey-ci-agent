@@ -49,8 +49,6 @@ jobs:
       issues: write
       actions: read
       id-token: write
-    env:
-      VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH: ${{ vars.VALKEY_CI_AGENT_ALLOW_VALKEY_IO_PUBLISH || '' }}
     steps:
       - name: Resolve called workflow ref
         id: called-workflow
