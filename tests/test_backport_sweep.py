@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from github.GithubException import GithubException
+
 from scripts.backport import sweep as backport_sweep
 from scripts.backport.models import ResolutionResult
 from scripts.backport.sweep import (
@@ -563,6 +565,33 @@ def test_check_applied_commit_size_accepts_mild_ratio_under_floor(monkeypatch):
     _stub_size_check_subprocess(monkeypatch, upstream_add=5, applied_add=50)
     assert backport_sweep._check_applied_commit_size("/fake", _make_size_check_candidate()) is None
 
+
+def test_sync_target_branch_creates_missing_staging_branch():
+    gh = MagicMock()
+    source_repo = MagicMock()
+    staging_repo = MagicMock()
+    source_repo.get_branch.return_value.commit.sha = "abc123def"
+    staging_repo.get_branch.side_effect = GithubException(
+        status=404,
+        data={"message": "Branch not found"},
+        headers={},
+    )
+    gh.get_repo.side_effect = lambda name: {
+        "valkey-io/valkey": source_repo,
+        "valkey-io/valkey-backport-staging": staging_repo,
+    }[name]
+
+    backport_sweep._sync_target_branch_to_source(
+        gh,
+        "valkey-io/valkey-backport-staging",
+        "valkey-io/valkey",
+        "8.1",
+    )
+
+    staging_repo.create_git_ref.assert_called_once_with(
+        ref="refs/heads/8.1",
+        sha="abc123def",
+    )
 
 
 def test_graphql_client_retry_exhaustion_raises_clear_error(monkeypatch):

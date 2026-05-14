@@ -89,6 +89,11 @@ def run_backport(
 
     Returns a :class:`BackportResult` with outcome details.
     """
+    if not push_repo:
+        return BackportResult(
+            outcome="error",
+            error_message="push_repo is required for the staging-repo backport model",
+        )
     if push_repo == repo_full_name:
         return BackportResult(
             outcome="error",
@@ -365,14 +370,6 @@ def run_backport(
                     )
                     logger.info("Pushing branch %s to staging repo %s.", branch_name, push_repo)
                     _run_git(tmp_dir, "push", "--force-with-lease", "staging", branch_name, env=git_env)
-                else:
-                    check_publish_allowed(
-                        target_repo=repo_full_name, action="git_push",
-                        context=f"push backport branch {branch_name}",
-                    )
-                    logger.info("Pushing branch %s to origin.", branch_name)
-                    _run_git(tmp_dir, "push", "--force", "origin", branch_name, env=git_env)
-
         logger.info("Creating backport PR.")
         risk = assess_backport_risk(
             pr_context,

@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from github import Auth, Github
+from github.GithubException import GithubException
 
 from scripts.backport.cherry_pick import is_non_merge_mainline_error
 from scripts.backport.conflict_resolver import resolve_conflicts_with_claude
@@ -776,18 +777,63 @@ def _sync_target_branch_to_source(
     sweep before cherry-picking on top of a potentially wrong base.
     """
     try:
-        source_sha = retry_github_call(
-            lambda: gh.get_repo(source_repo).get_branch(target_branch).commit.sha,
-            retries=2, description=f"get {source_repo}:{target_branch} head",
+        source_repo_obj = retry_github_call(
+            lambda: gh.get_repo(source_repo),
+            retries=2, description=f"get {source_repo}",
         )
-        push_sha = retry_github_call(
-            lambda: gh.get_repo(push_repo).get_branch(target_branch).commit.sha,
-            retries=2, description=f"get {push_repo}:{target_branch} head",
+        push_repo_obj = retry_github_call(
+            lambda: gh.get_repo(push_repo),
+            retries=2, description=f"get {push_repo}",
+        )
+        source_sha = retry_github_call(
+            lambda: source_repo_obj.get_branch(target_branch).commit.sha,
+            retries=2, description=f"get {source_repo}:{target_branch} head",
         )
     except Exception as exc:
         raise RuntimeError(
             f"Could not resolve branch heads for sync of {push_repo}:{target_branch} "
             f"against {source_repo}: {exc}"
+        ) from exc
+
+    try:
+        push_sha = retry_github_call(
+            lambda: push_repo_obj.get_branch(target_branch).commit.sha,
+            retries=2, description=f"get {push_repo}:{target_branch} head",
+        )
+    except GithubException as exc:
+        if exc.status != 404:
+            raise RuntimeError(
+                f"Could not resolve branch heads for sync of "
+                f"{push_repo}:{target_branch} against {source_repo}: {exc}"
+            ) from exc
+        logger.info(
+            "Creating missing staging branch %s:%s at %s",
+            push_repo, target_branch, source_sha[:8],
+        )
+        check_publish_allowed(
+            target_repo=push_repo,
+            action="create_ref",
+            context=f"create {target_branch} from source head",
+        )
+        try:
+            retry_github_call(
+                lambda: push_repo_obj.create_git_ref(
+                    ref=f"refs/heads/{target_branch}",
+                    sha=source_sha,
+                ),
+                retries=2,
+                description=f"create {push_repo}:{target_branch}",
+            )
+        except Exception as create_exc:
+            raise RuntimeError(
+                f"Could not create missing staging branch "
+                f"{push_repo}:{target_branch}: {create_exc}"
+            ) from create_exc
+        return
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not resolve branch heads for sync of "
+            f"{push_repo}:{target_branch} against {source_repo}: {exc}"
         ) from exc
 
     if push_sha == source_sha:

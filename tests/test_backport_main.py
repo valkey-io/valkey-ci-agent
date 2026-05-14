@@ -150,6 +150,7 @@ def _make_mock_pr(
 
 # Shared patch targets
 _PATCH_PREFIX = "scripts.backport.main"
+_DEFAULT_PUSH_REPO = "valkey-io/valkey-backport-staging"
 
 
 @patch(f"{_PATCH_PREFIX}.Github")
@@ -184,14 +185,14 @@ def test_run_backport_allows_same_owner_staging_push_repo(mock_github) -> None:
             target_branch="8.1",
             config=_default_config(),
             github_token="fake-token",
-            push_repo="valkey-io/valkey-backport-staging",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
     assert result.outcome == "success"
     mock_creator_cls.assert_called_once()
     _, kwargs = mock_creator_cls.call_args
     assert kwargs["base_repo"] == "valkey-io/valkey"
-    assert kwargs["push_repo"] == "valkey-io/valkey-backport-staging"
+    assert kwargs["push_repo"] == _DEFAULT_PUSH_REPO
 
 
 def test_run_backport_rejects_redundant_same_repo_push_repo() -> None:
@@ -206,6 +207,19 @@ def test_run_backport_rejects_redundant_same_repo_push_repo() -> None:
 
     assert result.outcome == "error"
     assert "staging fork" in (result.error_message or "")
+
+
+def test_run_backport_requires_push_repo() -> None:
+    result = run_backport(
+        repo_full_name="valkey-io/valkey",
+        source_pr_number=100,
+        target_branch="8.1",
+        config=_default_config(),
+        github_token="fake-token",
+    )
+
+    assert result.outcome == "error"
+    assert "push_repo is required" in (result.error_message or "")
 
 
 class TestRunBackportCleanCherryPick:
@@ -262,6 +276,7 @@ class TestRunBackportCleanCherryPick:
             target_branch="8.1",
             config=_default_config(),
             github_token="fake-token",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "success"
@@ -274,7 +289,7 @@ class TestRunBackportCleanCherryPick:
         mock_pr_creator_cls.assert_called_once_with(
             mock_gh,
             base_repo="valkey-io/valkey",
-            push_repo=None,
+            push_repo=_DEFAULT_PUSH_REPO,
             backport_label="backport",
             llm_conflict_label="llm-resolved-conflicts",
         )
@@ -319,6 +334,7 @@ class TestRunBackportCleanCherryPick:
             config=_default_config(),
             github_token="fake-token",
             build_commands=["make"],
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "error"
@@ -397,6 +413,7 @@ class TestRunBackportConflictedCherryPick:
             target_branch="8.1",
             config=_default_config(),
             github_token="fake-token",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "success"
@@ -438,6 +455,7 @@ class TestRunBackportDuplicateDetection:
             target_branch="8.1",
             config=_default_config(),
             github_token="fake-token",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "duplicate"
@@ -479,6 +497,7 @@ class TestRunBackportMergedPrValidation:
             target_branch="8.1",
             config=_default_config(),
             github_token="fake-token",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "pr-not-merged"
@@ -520,6 +539,7 @@ class TestRunBackportMissingBranch:
             target_branch="nonexistent",
             config=_default_config(),
             github_token="fake-token",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "branch-missing"
@@ -575,6 +595,7 @@ class TestRunBackportGitHubAPIError:
             target_branch="8.1",
             config=_default_config(),
             github_token="fake-token",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "error"
@@ -621,6 +642,7 @@ class TestRunBackportCherryPickFailure:
             target_branch="8.1",
             config=_default_config(),
             github_token="fake-token",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "error"
@@ -671,6 +693,7 @@ class TestRunBackportAlreadyApplied:
             target_branch="8.1",
             config=_default_config(),
             github_token="fake-token",
+            push_repo=_DEFAULT_PUSH_REPO,
         )
 
         assert result.outcome == "already-applied"
@@ -690,11 +713,12 @@ def test_run_backport_requires_commit_identity_when_dco_is_enabled(
     monkeypatch.delenv("CI_BOT_COMMIT_EMAIL", raising=False)
 
     result = run_backport(
-            repo_full_name="valkey-io/valkey",
+        repo_full_name="valkey-io/valkey",
         source_pr_number=100,
         target_branch="8.1",
         config=_default_config(),
         github_token="fake-token",
+        push_repo=_DEFAULT_PUSH_REPO,
     )
 
     assert result.outcome == "error"
