@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, PropertyMock
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -129,7 +129,7 @@ class TestPRBodyCompletenessProperty:
         assert "conflict" in body.lower()
 
         # No human review disclaimer when no LLM resolution
-        assert "human review" not in body.lower() or "no" in body.lower()
+        assert "Human Review Required" not in body
 
     @given(
         context=_pr_context_strategy,
@@ -318,7 +318,7 @@ def test_pull_create_head_ref_uses_plain_branch_for_direct_upstream() -> None:
     )
 
 
-def test_pull_head_refs_for_different_owner_staging_fork() -> None:
+def test_pull_head_refs_for_different_owner_fork() -> None:
     branch = "agent/backport/sweep/8.1"
 
     assert (
@@ -339,72 +339,17 @@ def test_pull_head_refs_for_different_owner_staging_fork() -> None:
     )
 
 
-def test_pull_head_refs_for_same_owner_staging_fork() -> None:
-    branch = "agent/backport/sweep/8.1"
-
-    assert (
-        build_pull_create_head_ref(
-            "valkey-io/valkey",
-            "valkey-io/valkey-backport-staging",
-            branch,
-        )
-        == "valkey-io:agent/backport/sweep/8.1"
-    )
-    assert (
-        build_pull_search_head_ref(
-            "valkey-io/valkey",
-            "valkey-io/valkey-backport-staging",
-            branch,
-        )
-        == "valkey-io:agent/backport/sweep/8.1"
-    )
-
-
-def test_same_owner_staging_pr_creation_sets_head_repo() -> None:
-    repo = MagicMock()
-    repo.url = "https://api.github.com/repos/valkey-io/valkey"
-    repo._requester.requestJsonAndCheck.return_value = (  # noqa: SLF001
-        {},
-        {"html_url": "https://github.com/valkey-io/valkey/pull/1"},
-    )
-
-    with patch("scripts.backport.pr_creator.PullRequest", return_value="pull") as pull_cls:
-        created = create_pull_from_push_repo(
-            repo,
-            base_repo="valkey-io/valkey",
-            push_repo="valkey-io/valkey-backport-staging",
-            title="Backport",
-            body="Body",
-            head_branch="agent/backport/sweep/8.1",
-            base_branch="8.1",
-            draft=True,
-        )
-
-    assert created == "pull"
-    repo.create_pull.assert_not_called()
-    method, url = repo._requester.requestJsonAndCheck.call_args.args  # noqa: SLF001
-    kwargs = repo._requester.requestJsonAndCheck.call_args.kwargs  # noqa: SLF001
-    assert method == "POST"
-    assert url == "https://api.github.com/repos/valkey-io/valkey/pulls"
-    assert kwargs["input"] == {
-        "title": "Backport",
-        "body": "Body",
-        "head": "valkey-io:agent/backport/sweep/8.1",
-        "head_repo": "valkey-backport-staging",
-        "base": "8.1",
-        "draft": True,
-    }
-    pull_cls.assert_called_once()
-
-
-def test_pull_matches_push_repo_filters_ambiguous_same_owner_heads() -> None:
+def test_pull_matches_push_repo_filters_unexpected_head_repo() -> None:
     matching = MagicMock()
-    matching.head.repo.full_name = "valkey-io/valkey-backport-staging"
+    matching.head.repo.full_name = "ci-bot/valkey"
     wrong = MagicMock()
     wrong.head.repo.full_name = "valkey-io/valkey"
+    unknown = MagicMock()
+    unknown.head.repo.full_name = None
 
-    assert pull_matches_push_repo(matching, "valkey-io/valkey-backport-staging")
-    assert not pull_matches_push_repo(wrong, "valkey-io/valkey-backport-staging")
+    assert pull_matches_push_repo(matching, "ci-bot/valkey")
+    assert not pull_matches_push_repo(wrong, "ci-bot/valkey")
+    assert not pull_matches_push_repo(unknown, "ci-bot/valkey")
 
 
 
@@ -450,6 +395,7 @@ class TestDuplicateDetectionProperty:
         # Mock an open PR with matching head branch
         mock_pr = MagicMock()
         mock_pr.html_url = "https://github.com/valkey-io/valkey/pull/999"
+        mock_pr.head.repo.full_name = "valkey-io/valkey"
 
         mock_repo.get_pulls.return_value = [mock_pr]
 
@@ -536,6 +482,7 @@ class TestDuplicateDetectionProperty:
         mock_closed_pr = MagicMock()
         mock_closed_pr.html_url = "https://github.com/valkey-io/valkey/pull/888"
         mock_closed_pr.merged_at = "2026-01-01T00:00:00Z"  # merged → duplicate
+        mock_closed_pr.head.repo.full_name = "valkey-io/valkey"
 
         # No open PRs, but a merged closed one matches
         mock_repo.get_pulls.side_effect = [
@@ -582,6 +529,7 @@ class TestDuplicateDetectionProperty:
         mock_closed_pr = MagicMock()
         mock_closed_pr.html_url = "https://github.com/valkey-io/valkey/pull/888"
         mock_closed_pr.merged_at = None  # closed but not merged
+        mock_closed_pr.head.repo.full_name = "valkey-io/valkey"
 
         mock_repo.get_pulls.side_effect = [
             [],  # no open PRs

@@ -77,4 +77,3 @@ class BackportConfig:
     backport_label: str = "backport"
     llm_conflict_label: str = "llm-resolved-conflicts"
     max_conflicting_files: int = 100
-    require_staging_fork: bool = True

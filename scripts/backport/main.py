@@ -73,18 +73,15 @@ def run_backport(
 
     Returns a :class:`BackportResult` with outcome details.
     """
-    if not push_repo:
-        return BackportResult(
-            outcome="error",
-            error_message="push_repo is required for the staging-repo backport model",
-        )
-    if config.require_staging_fork and push_repo == repo_full_name:
+    if push_repo and push_repo.split("/", 1)[0] == repo_full_name.split("/", 1)[0]:
         return BackportResult(
             outcome="error",
             error_message=(
-                "push_repo must be a staging fork, not the upstream repo"
+                "push_repo must be a different-owner fork; omit push_repo "
+                "for direct upstream pushes"
             ),
         )
+    effective_push_repo = push_repo or repo_full_name
 
     gh = Github(auth=Auth.Token(github_token))
     try:
@@ -113,7 +110,7 @@ def run_backport(
         pr_creator = BackportPRCreator(
             gh,
             base_repo=repo_full_name,
-            push_repo=push_repo,
+            push_repo=effective_push_repo,
             backport_label=config.backport_label,
             llm_conflict_label=config.llm_conflict_label,
         )
@@ -331,19 +328,17 @@ def run_backport(
                         )
 
                 # Push the backport branch to the remote
-                if push_repo:
-                    push_remote = "origin"
-                    if push_repo != repo_full_name:
-                        push_remote = "staging"
-                        staging_url = github_https_url(push_repo)
-                        _run_git(tmp_dir, "remote", "add", push_remote, staging_url, env=git_env)
-                    # Sync the staging fork's target branch to upstream so the PR
-                    # doesn't show unrelated commits
-                    if push_repo != repo_full_name:
-                        logger.info("Syncing %s:%s to upstream.", push_repo, target_branch)
-                        _run_git(tmp_dir, "push", push_remote, f"{target_branch}:{target_branch}", env=git_env)
-                    logger.info("Pushing branch %s to %s.", branch_name, push_repo)
-                    _run_git(tmp_dir, "push", "--force-with-lease", push_remote, branch_name, env=git_env)
+                push_remote = "origin"
+                if effective_push_repo != repo_full_name:
+                    push_remote = "push_target"
+                    push_url = github_https_url(effective_push_repo)
+                    _run_git(tmp_dir, "remote", "add", push_remote, push_url, env=git_env)
+                    # Sync the fork's target branch to upstream so the PR
+                    # doesn't show unrelated commits.
+                    logger.info("Syncing %s:%s to upstream.", effective_push_repo, target_branch)
+                    _run_git(tmp_dir, "push", push_remote, f"{target_branch}:{target_branch}", env=git_env)
+                logger.info("Pushing branch %s to %s.", branch_name, effective_push_repo)
+                _run_git(tmp_dir, "push", "--force-with-lease", push_remote, branch_name, env=git_env)
         logger.info("Creating backport PR.")
         try:
             backport_pr_url = pr_creator.create_backport_pr(
@@ -554,7 +549,7 @@ def main() -> None:
     parser.add_argument(
         "--push-repo",
         default="",
-        help="Override push_repo from registry (emergency/testing use only)",
+        help="Override push_repo with a different-owner fork (emergency/testing use only)",
     )
     args = parser.parse_args()
 
@@ -588,7 +583,6 @@ def main() -> None:
             backport_label=repo_entry.backport_label,
             llm_conflict_label=repo_entry.llm_conflict_label,
             max_conflicting_files=repo_entry.max_conflicting_files,
-            require_staging_fork=repo_entry.require_staging_fork,
         ),
         github_token=github_token,
         push_repo=args.push_repo or repo_entry.push_repo,

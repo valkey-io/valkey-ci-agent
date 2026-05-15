@@ -21,15 +21,17 @@ on:
         type: string
         default: "us-east-1"
       push_repo:
-        description: "Override staging repository for the backport branch"
+        description: "Override different-owner fork for the backport branch"
         required: false
         type: string
         default: ""
     secrets:
       AWS_ROLE_ARN:
         required: true
-      VALKEY_GITHUB_TOKEN:
-        required: false
+      VALKEYRIE_BOT_APP_ID:
+        required: true
+      VALKEYRIE_BOT_PRIVATE_KEY:
+        required: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -44,10 +46,7 @@ jobs:
       group: backport-${{ inputs.repo_full_name }}-${{ inputs.source_pr_number }}-${{ inputs.target_branch }}
       cancel-in-progress: false
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      actions: read
+      contents: read
       id-token: write
     steps:
       - name: Resolve called workflow ref
@@ -87,6 +86,14 @@ jobs:
           pip install -r requirements.txt
           npm install -g @anthropic-ai/claude-code
 
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+
       - name: Configure AWS credentials from OIDC role
         uses: aws-actions/configure-aws-credentials@v5
         with:
@@ -97,7 +104,7 @@ jobs:
       - name: Run backport pipeline
         env:
           AWS_DEFAULT_REGION: ${{ inputs.aws_region }}
-          BACKPORT_GITHUB_TOKEN: ${{ secrets.VALKEY_GITHUB_TOKEN || github.token }}
+          BACKPORT_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
           REPO_FULL_NAME: ${{ inputs.repo_full_name }}
           SOURCE_PR_NUMBER: ${{ inputs.source_pr_number }}
           TARGET_BRANCH: ${{ inputs.target_branch }}

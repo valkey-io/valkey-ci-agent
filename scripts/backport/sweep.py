@@ -230,7 +230,7 @@ def run_backport_sweep(
     branch_fields: list[str] | None = None,
     test_commands_override: list[str] | None = None,
     discover_only: bool = False,
-    max_candidates: int = 0,
+    max_candidates: int = 5,
 ) -> BranchSweepResult:
     """Run backport sweep for a single repo+branch from the registry.
 
@@ -260,7 +260,10 @@ def run_backport_sweep(
     candidates = candidates_by_branch.get(target_branch, [])
 
     if max_candidates > 0:
-        logger.info("Branch %s: %d candidate(s) found, will apply up to %d", target_branch, len(candidates), max_candidates)
+        logger.info(
+            "Branch %s: %d candidate(s) found, will apply up to %d successful cherry-pick(s)",
+            target_branch, len(candidates), max_candidates,
+        )
     else:
         logger.info("Branch %s: %d candidate(s)", target_branch, len(candidates))
 
@@ -812,7 +815,7 @@ def _sync_target_branch_to_source(
                 f"{push_repo}:{target_branch} against {source_repo}: {exc}"
             ) from exc
         logger.info(
-            "Creating missing staging branch %s:%s at %s",
+                "Creating missing fork branch %s:%s at %s",
             push_repo, target_branch, source_sha[:8],
         )
         try:
@@ -826,7 +829,7 @@ def _sync_target_branch_to_source(
             )
         except Exception as create_exc:
             raise RuntimeError(
-                f"Could not create missing staging branch "
+                f"Could not create missing fork branch "
                 f"{push_repo}:{target_branch}: {create_exc}"
             ) from create_exc
         return
@@ -1148,8 +1151,8 @@ def main() -> None:
     parser.add_argument("--branch-fields", default=",".join(_DEFAULT_BRANCH_FIELDS))
     parser.add_argument("--test-commands", default="",
                         help="Override test commands (newline-separated). Empty = use registry.")
-    parser.add_argument("--max-candidates", type=int, default=0,
-                        help="Cap the number of candidates per branch (0 = unlimited)")
+    parser.add_argument("--max-candidates", type=int, default=5,
+                        help="Cap the number of applied cherry-picks per branch (0 = unlimited)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--discover-only", action="store_true")
     parser.add_argument("--verbose", action="store_true")

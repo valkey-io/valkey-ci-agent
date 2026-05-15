@@ -60,14 +60,14 @@ changes, and lets modules add their own smoke tests without changing agent code.
 
 ## Repository Model
 
-The standard model is staging forks: the agent pushes `agent/backport/...`
-branches to each repo's configured `push_repo` and opens PRs against the
-upstream `repo`. This keeps generated branches out of upstream repositories
-while preserving normal review and merge flow on the upstream release branches.
+The standard model is direct upstream branches: the agent pushes
+`agent/backport/...` branches to `repo` and opens draft PRs in that same
+repository. This keeps the registry small and matches the GitHub App
+permissions used by the workflows.
 
-`push_repo` is required for every registry entry. Same-owner staging forks are
-valid. By default `push_repo` must not be identical to `repo`; direct upstream
-pushes require an explicit `require_staging_fork: false` registry opt-out.
+`push_repo` is optional and exists only as a different-owner fork escape hatch.
+Same-owner `push_repo` values are rejected so staging repositories do not become
+the normal deployment model.
 
 ## Planned Workflows
 

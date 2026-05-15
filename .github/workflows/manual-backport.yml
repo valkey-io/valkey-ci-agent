@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       push_repo:
-        description: "Override staging repository for the backport branch"
+        description: "Override different-owner fork for the backport branch"
         required: false
         type: string
         default: ""
@@ -25,9 +25,7 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-permissions:
-  contents: read
-  actions: read
+permissions: {}
 
 jobs:
   parse-inputs:
@@ -65,10 +63,7 @@ jobs:
   backport:
     needs: parse-inputs
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      actions: read
+      contents: read
       id-token: write
     uses: ./.github/workflows/backport.yml
     with:
@@ -78,4 +73,5 @@ jobs:
       push_repo: ${{ inputs.push_repo }}
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-      VALKEY_GITHUB_TOKEN: ${{ secrets.VALKEY_GITHUB_TOKEN }}
+      VALKEYRIE_BOT_APP_ID: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      VALKEYRIE_BOT_PRIVATE_KEY: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}

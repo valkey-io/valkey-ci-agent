@@ -3,14 +3,12 @@
 #
 # Standard deployment model:
 #
-# Each upstream repo has a configured staging fork. The agent pushes
-# `agent/backport/...` branches to push_repo and opens PRs against repo.
-# This keeps generated branches out of upstream repositories while retaining
-# one central registry for all modules.
+# The agent pushes `agent/backport/...` branches directly to repo and opens
+# draft PRs in that same upstream repository. `push_repo` is optional and only
+# for a different-owner fork escape hatch.
 
 repos:
   - repo: valkey-io/valkey
-    push_repo: valkey-io/valkey-backport-staging
     project_owner: valkey-io
     project_owner_type: organization
     language: c
@@ -43,7 +41,6 @@ repos:
         project_number: 41
 
   - repo: valkey-io/valkey-bloom
-    push_repo: valkey-io/valkey-bloom-backport-staging
     project_owner: valkey-io
     project_owner_type: organization
     language: c
@@ -54,7 +51,6 @@ repos:
         project_number: 5
 
   - repo: valkey-io/valkey-search
-    push_repo: valkey-io/valkey-search-backport-staging
     project_owner: valkey-io
     project_owner_type: organization
     language: c++

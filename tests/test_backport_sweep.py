@@ -372,6 +372,77 @@ def test_push_backport_branch_uses_force_with_lease_after_rebase(monkeypatch):
     ]
 
 
+def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
+    candidates = [
+        ProjectBackportCandidate(
+            source_pr_number=i,
+            source_pr_title=f"PR {i}",
+            source_pr_url=f"https://github.com/valkey-io/valkey/pull/{i}",
+            target_branch="8.1",
+            merge_commit_sha=f"sha{i}",
+        )
+        for i in range(1, 10)
+    ]
+    applied_by_pr = {3, 4, 6, 7, 8, 9}
+    attempted: list[int] = []
+
+    monkeypatch.setattr(backport_sweep, "_clone_target_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "_run_git", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "_find_existing_pr", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "_delete_stale_backport_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "_list_already_applied", lambda *_args, **_kwargs: {"2"})
+    monkeypatch.setattr(backport_sweep, "changed_paths_since_base", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(backport_sweep, "_run_test_commands", lambda *_args, **_kwargs: (True, ""))
+
+    pushed: list[str] = []
+    monkeypatch.setattr(
+        backport_sweep,
+        "_push_backport_branch",
+        lambda _repo_dir, branch, *_args, **_kwargs: pushed.append(branch),
+    )
+    monkeypatch.setattr(
+        backport_sweep,
+        "_upsert_pr",
+        lambda *_args, **_kwargs: "https://github.com/valkey-io/valkey/pull/100",
+    )
+
+    def fake_apply(_repo_dir, candidate, *_args, **_kwargs):
+        attempted.append(candidate.source_pr_number)
+        if candidate.source_pr_number in applied_by_pr:
+            return CandidateResult(
+                source_pr_number=candidate.source_pr_number,
+                source_pr_title=candidate.source_pr_title,
+                outcome="applied",
+            )
+        return CandidateResult(
+            source_pr_number=candidate.source_pr_number,
+            source_pr_title=candidate.source_pr_title,
+            outcome="skipped-conflict",
+            detail="conflict",
+        )
+
+    monkeypatch.setattr(backport_sweep, "_apply_candidate", fake_apply)
+
+    result = backport_sweep._process_branch(
+        gh=MagicMock(),
+        repo=MagicMock(),
+        repo_full_name="valkey-io/valkey",
+        github_token="token",
+        target_branch="8.1",
+        candidates=candidates,
+        push_repo="valkey-io/valkey",
+        test_commands=[],
+        max_applied=5,
+    )
+
+    assert attempted == [1, 3, 4, 5, 6, 7, 8]
+    assert [r.source_pr_number for r in result.results] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert sum(1 for r in result.results if r.outcome == "applied") == 5
+    assert result.results[1].outcome == "skipped-existing"
+    assert result.results[4].outcome == "skipped-conflict"
+    assert pushed == ["agent/backport/sweep/8.1"]
+    assert result.pr_url == "https://github.com/valkey-io/valkey/pull/100"
+
 
 def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     full_env = dict(os.environ)
@@ -562,29 +633,29 @@ def test_check_applied_commit_size_accepts_mild_ratio_under_floor(monkeypatch):
     assert backport_sweep._check_applied_commit_size("/fake", _make_size_check_candidate()) is None
 
 
-def test_sync_target_branch_creates_missing_staging_branch():
+def test_sync_target_branch_creates_missing_fork_branch():
     gh = MagicMock()
     source_repo = MagicMock()
-    staging_repo = MagicMock()
+    fork_repo = MagicMock()
     source_repo.get_branch.return_value.commit.sha = "abc123def"
-    staging_repo.get_branch.side_effect = GithubException(
+    fork_repo.get_branch.side_effect = GithubException(
         status=404,
         data={"message": "Branch not found"},
         headers={},
     )
     gh.get_repo.side_effect = lambda name: {
         "valkey-io/valkey": source_repo,
-        "valkey-io/valkey-backport-staging": staging_repo,
+        "ci-bot/valkey": fork_repo,
     }[name]
 
     backport_sweep._sync_target_branch_to_source(
         gh,
-        "valkey-io/valkey-backport-staging",
+        "ci-bot/valkey",
         "valkey-io/valkey",
         "8.1",
     )
 
-    staging_repo.create_git_ref.assert_called_once_with(
+    fork_repo.create_git_ref.assert_called_once_with(
         ref="refs/heads/8.1",
         sha="abc123def",
     )

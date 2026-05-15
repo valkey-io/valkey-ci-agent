@@ -32,17 +32,16 @@ class RepoEntry:
     project_owner_type: str
     language: str
     branches: tuple[BranchEntry, ...]
-    push_repo: str
+    push_repo: str | None = None
     build_commands: tuple[str, ...] = ()
     validation_rules: tuple[ValidationRule, ...] = ()
     backport_label: str = "backport"
     llm_conflict_label: str = "llm-resolved-conflicts"
     max_conflicting_files: int = 100
-    require_staging_fork: bool = True
 
     @property
     def effective_push_repo(self) -> str:
-        return self.push_repo
+        return self.push_repo or self.repo
 
 
 @dataclass(frozen=True)
@@ -117,29 +116,34 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
         raise ValueError(f"repos[{index}].language is required")
 
     push_repo = raw.get("push_repo")
-    if not isinstance(push_repo, str) or not _REPO_RE.match(push_repo):
-        raise ValueError(
-            f"repos[{index}].push_repo is required and must be a valid 'owner/name' string"
-        )
-    require_staging_fork = raw.get("require_staging_fork", True)
-    if not isinstance(require_staging_fork, bool):
-        raise ValueError(f"repos[{index}].require_staging_fork must be a boolean")
-    if require_staging_fork and push_repo == repo:
-        raise ValueError(
-            f"repos[{index}].push_repo must be a staging fork, not the upstream repo"
-        )
+    if push_repo is not None:
+        if not isinstance(push_repo, str) or not _REPO_RE.match(push_repo):
+            raise ValueError(
+                f"repos[{index}].push_repo must be a valid 'owner/name' string"
+            )
+        if push_repo.split("/", 1)[0] == repo.split("/", 1)[0]:
+            raise ValueError(
+                f"repos[{index}].push_repo must be a different-owner fork; "
+                "omit push_repo for direct upstream pushes"
+            )
 
     build_commands = raw.get("build_commands", [])
     if not isinstance(build_commands, list):
         raise ValueError(f"repos[{index}].build_commands must be a list")
     for j, cmd in enumerate(build_commands):
-        if not isinstance(cmd, str):
-            raise ValueError(f"repos[{index}].build_commands[{j}] must be a string")
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise ValueError(
+                f"repos[{index}].build_commands[{j}] must be a non-empty string"
+            )
 
     validation_rules = _parse_validation_rules(raw.get("validation_rules", []), index)
 
     backport_label = raw.get("backport_label", "backport")
+    if not isinstance(backport_label, str) or not backport_label.strip():
+        raise ValueError(f"repos[{index}].backport_label must be a non-empty string")
     llm_conflict_label = raw.get("llm_conflict_label", "llm-resolved-conflicts")
+    if not isinstance(llm_conflict_label, str) or not llm_conflict_label.strip():
+        raise ValueError(f"repos[{index}].llm_conflict_label must be a non-empty string")
     max_conflicting_files = raw.get("max_conflicting_files", 100)
     if not isinstance(max_conflicting_files, int) or max_conflicting_files < 1:
         raise ValueError(f"repos[{index}].max_conflicting_files must be a positive integer")
@@ -162,10 +166,9 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
         push_repo=push_repo,
         build_commands=tuple(build_commands),
         validation_rules=tuple(validation_rules),
-        backport_label=str(backport_label),
-        llm_conflict_label=str(llm_conflict_label),
+        backport_label=backport_label,
+        llm_conflict_label=llm_conflict_label,
         max_conflicting_files=max_conflicting_files,
-        require_staging_fork=require_staging_fork,
         branches=tuple(branches),
     )
 
@@ -189,7 +192,7 @@ def _parse_validation_rules(raw: Any, repo_idx: int) -> list[ValidationRule]:
                 "must be a non-empty list"
             )
         for path_idx, pattern in enumerate(paths):
-            if not isinstance(pattern, str) or not pattern:
+            if not isinstance(pattern, str) or not pattern.strip():
                 raise ValueError(
                     f"repos[{repo_idx}].validation_rules[{rule_idx}]"
                     f".paths[{path_idx}] must be a non-empty string"
@@ -202,7 +205,7 @@ def _parse_validation_rules(raw: Any, repo_idx: int) -> list[ValidationRule]:
                 "must be a non-empty list"
             )
         for cmd_idx, command in enumerate(commands):
-            if not isinstance(command, str) or not command:
+            if not isinstance(command, str) or not command.strip():
                 raise ValueError(
                     f"repos[{repo_idx}].validation_rules[{rule_idx}]"
                     f".commands[{cmd_idx}] must be a non-empty string"

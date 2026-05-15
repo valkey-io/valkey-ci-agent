@@ -16,10 +16,10 @@ on:
         type: string
         default: ""
       max_candidates:
-        description: "Cap candidates per branch (0 = unlimited)"
+        description: "Cap successfully applied cherry-picks per branch (0 = unlimited)"
         required: false
         type: string
-        default: "0"
+        default: "5"
       dry_run:
         description: "Discovery only — don't cherry-pick or push"
         required: false
@@ -29,9 +29,7 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 jobs:
   preflight:
@@ -39,6 +37,8 @@ jobs:
     if: github.repository == 'valkey-io/valkey-ci-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       has_entries: ${{ steps.matrix.outputs.has_entries }}
@@ -91,8 +91,11 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       CLAUDE_CODE_USE_BEDROCK: "1"
       CI_AGENT_EVIDENCE_DIR: agent-evidence
-      MAX_CANDIDATES: ${{ inputs.max_candidates || '0' }}
+      MAX_CANDIDATES: ${{ inputs.max_candidates || '5' }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Check out agent repository
         uses: actions/checkout@v6
@@ -111,18 +114,13 @@ jobs:
           pip install -r requirements.txt
           npm install -g @anthropic-ai/claude-code
 
-      - name: Resolve target repository token
-        id: token
-        shell: bash
-        env:
-          VALKEY_GITHUB_TOKEN: ${{ secrets.VALKEY_GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${VALKEY_GITHUB_TOKEN}" ]]; then
-            echo "VALKEY_GITHUB_TOKEN secret is required (needs read:project scope)" >&2
-            exit 1
-          fi
-          echo "token=${VALKEY_GITHUB_TOKEN}" >> "$GITHUB_OUTPUT"
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -134,7 +132,7 @@ jobs:
       - name: Run backport sweep
         shell: bash
         env:
-          TARGET_TOKEN: ${{ steps.token.outputs.token }}
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
         run: |
           set -euo pipefail
           args=(
@@ -160,7 +158,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backport-sweep-result-${{ github.run_id }}-${{ matrix.branch }}
+          name: backport-sweep-result-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
           path: backport-sweep-result.json
           retention-days: 30
 
@@ -168,7 +166,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backport-sweep-agent-evidence-${{ github.run_id }}-${{ matrix.branch }}
+          name: backport-sweep-agent-evidence-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
           path: agent-evidence
           if-no-files-found: ignore
           retention-days: 30

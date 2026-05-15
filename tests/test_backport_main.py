@@ -88,7 +88,6 @@ def test_cli_rejects_target_branch_missing_from_registry(
         """
 repos:
   - repo: valkey-io/valkey
-    push_repo: valkey-io/valkey-backport-staging
     project_owner: valkey-io
     project_owner_type: organization
     language: c
@@ -149,11 +148,11 @@ def _make_mock_pr(
 
 # Shared patch targets
 _PATCH_PREFIX = "scripts.backport.main"
-_DEFAULT_PUSH_REPO = "valkey-io/valkey-backport-staging"
+_DEFAULT_PUSH_REPO = "ci-bot/valkey"
 
 
 @patch(f"{_PATCH_PREFIX}.Github")
-def test_run_backport_allows_same_owner_staging_push_repo(mock_github) -> None:
+def test_run_backport_allows_different_owner_push_repo(mock_github) -> None:
     mock_repo = MagicMock()
     mock_repo.get_branch.return_value = MagicMock()
     mock_pr = _make_mock_pr()
@@ -203,11 +202,25 @@ def test_run_backport_rejects_redundant_same_repo_push_repo() -> None:
     )
 
     assert result.outcome == "error"
-    assert "staging fork" in (result.error_message or "")
+    assert "different-owner fork" in (result.error_message or "")
+
+
+def test_run_backport_rejects_same_owner_push_repo() -> None:
+    result = run_backport(
+        repo_full_name="valkey-io/valkey",
+        source_pr_number=100,
+        target_branch="8.1",
+        config=_default_config(),
+        github_token="fake-token",
+        push_repo="valkey-io/valkey-backport-staging",
+    )
+
+    assert result.outcome == "error"
+    assert "different-owner fork" in (result.error_message or "")
 
 
 @patch(f"{_PATCH_PREFIX}.Github")
-def test_run_backport_allows_direct_push_when_configured(mock_github) -> None:
+def test_run_backport_defaults_to_direct_upstream_push(mock_github) -> None:
     mock_repo = MagicMock()
     mock_repo.get_branch.return_value = MagicMock()
     mock_repo.get_pull.return_value = _make_mock_pr()
@@ -233,30 +246,19 @@ def test_run_backport_allows_direct_push_when_configured(mock_github) -> None:
             repo_full_name="valkey-io/valkey",
             source_pr_number=100,
             target_branch="8.1",
-            config=BackportConfig(require_staging_fork=False),
+            config=_default_config(),
             github_token="fake-token",
-            push_repo="valkey-io/valkey",
         )
 
     assert result.outcome == "success"
+    mock_creator_cls.assert_called_once()
+    _, kwargs = mock_creator_cls.call_args
+    assert kwargs["push_repo"] == "valkey-io/valkey"
     assert any(
         call.args[1:4] == ("push", "--force-with-lease", "origin")
         for call in mock_run_git.call_args_list
     )
     assert not any(call.args[1:3] == ("remote", "add") for call in mock_run_git.call_args_list)
-
-
-def test_run_backport_requires_push_repo() -> None:
-    result = run_backport(
-        repo_full_name="valkey-io/valkey",
-        source_pr_number=100,
-        target_branch="8.1",
-        config=_default_config(),
-        github_token="fake-token",
-    )
-
-    assert result.outcome == "error"
-    assert "push_repo is required" in (result.error_message or "")
 
 
 class TestRunBackportCleanCherryPick:

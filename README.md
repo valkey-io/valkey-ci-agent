@@ -48,10 +48,8 @@ The registry is the single source of truth. To onboard a new repo, add an entry 
 ```yaml
 repos:
   - repo: valkey-io/valkey
-    push_repo: valkey-io/valkey-backport-staging  # staging fork that receives agent branches
     project_owner: valkey-io
     project_owner_type: organization
-    require_staging_fork: true          # default; set false only for direct upstream pushes
     language: c                          # used in conflict resolver prompt
     build_commands:
       - "make -j$(nproc)"                # run before push; empty = skip
@@ -70,7 +68,7 @@ repos:
         project_number: 18
 ```
 
-Agent branches are pushed to the repo's configured `push_repo` staging fork, while PRs are opened against `repo` upstream. This keeps generated branches out of the upstream repositories while still giving reviewers normal PRs against the release branches. `push_repo` is required for every onboarded repository. Direct upstream pushes are only allowed when `require_staging_fork: false` is explicitly configured.
+By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
 
 `validation_rules` are optional. Each rule matches changed paths with shell-style globs and appends the listed commands after `build_commands`. Use them for high-signal tests that catch branch-specific adaptation mistakes without running a full CI matrix locally.
 
@@ -83,6 +81,7 @@ See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 - A GitHub App with:
   - `contents:write` on each repo in the registry (for pushing branches)
   - `pull-requests:write` on each repo (for opening PRs)
+  - `issues:write` on each repo (for backport status comments)
   - `organization_projects:read` on the org (for querying project boards)
 - An AWS account with Bedrock access to `us.anthropic.claude-opus-4-7`
 - An OIDC trust between GitHub Actions and your AWS account
@@ -94,8 +93,11 @@ On `valkey-io/valkey-ci-agent`:
 | Type | Name | Value |
 |------|------|-------|
 | Secret | `AWS_ROLE_ARN` | OIDC role ARN with Bedrock `InvokeModel` permission |
-| Secret | `VALKEY_GITHUB_TOKEN` | App installation token or PAT |
+| Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie GitHub App ID |
+| Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | Valkeyrie GitHub App private key |
 | Variable | `AWS_REGION` | e.g., `us-east-1` |
+
+The workflows mint a short-lived installation token with `actions/create-github-app-token` and use that token for registry repository reads, branch pushes, PR creation, status comments, and project-board queries.
 
 #### Step 2: Edit `repos.yml`
 
@@ -109,7 +111,7 @@ The scheduled sweep runs automatically.
 
 #### Daily sweep (automatic)
 
-Runs daily at 09:00 UTC via cron. The preflight job reads `repos.yml` and fans out one job per `{repo, branch}`. Each produces one PR bundling all pending backports for that branch.
+Runs daily at 09:00 UTC via cron. The preflight job reads `repos.yml` and fans out one job per `{repo, branch}`. Each produces one PR with up to five successfully applied backports for that branch; skipped or unresolved candidates do not count against that cap.
 
 #### Manual backport (on-demand)
 
@@ -135,11 +137,11 @@ gh workflow run backport-sweep.yml \
 
 ## Safety
 
-- **Write boundary** — the agent only has push access to staging forks (e.g., `valkey-io/valkey-backport-staging`). It cannot push to upstream repositories. Reviewers merge backport PRs from the staging fork into upstream.
+- **Branch namespace** — the agent writes only `agent/backport/...` branches and opens draft PRs for maintainer review.
 - **Credential isolation** — all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
 - **Claude Code env isolation** — `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
 - **Deterministic validation** — registry-configured build commands and matching path-based tests run before push. A validation failure blocks the push.
-- **Staging fork sync** — the agent fast-forwards the staging fork's release branch to match upstream before cherry-picking
+- **Fork sync** — when a different-owner `push_repo` is configured, the agent fast-forwards that fork's release branch to match upstream before cherry-picking
 - **Stale branch pruning** — if a previous backport PR was closed without merging, the agent deletes the orphaned branch before starting fresh
 - **DCO** — all agent commits are signed off
 
