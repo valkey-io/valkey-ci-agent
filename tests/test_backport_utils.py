@@ -169,7 +169,9 @@ class TestBuildPrTitleProperty:
 class TestHasConflictMarkersProperty:
 
 
-    MARKERS = ["<<<<<<<", "=======", ">>>>>>>"]
+    # Real-world git conflict markers are line-anchored: <<<<<<< and >>>>>>> are
+    # followed by a ref name (or appear alone), and ======= is on its own line.
+    MARKERS = ["<<<<<<< HEAD", "=======", ">>>>>>> source"]
 
     @given(
         base=st.text(max_size=200),
@@ -180,12 +182,13 @@ class TestHasConflictMarkersProperty:
     def test_detects_injected_markers(
         self, base: str, marker: str, suffix: str
     ) -> None:
-        """Strings with an injected conflict marker are always detected."""
-        # Filter out base strings that already contain a marker
+        """Strings with an injected line-anchored conflict marker are detected."""
         from hypothesis import assume
 
-        assume(not any(m in base for m in self.MARKERS))
-        content = base + marker + suffix
+        # Filter out base strings that already contain a marker
+        assume(not any(m.split()[0] in base for m in self.MARKERS))
+        # Inject the marker on its own line as it appears in real conflicts
+        content = base + "\n" + marker + "\n" + suffix
         assert has_conflict_markers(content) is True
 
     @given(
