@@ -9,7 +9,10 @@ from pathlib import PurePosixPath
 
 import yaml  # type: ignore[import-untyped]
 
-_CONFLICT_MARKERS = re.compile(r"<{7}|={7}|>{7}")
+_CONFLICT_MARKERS = re.compile(
+    r"^(<{7} \S|={7}$|>{7} \S|<{7}$|>{7}$)",
+    re.MULTILINE,
+)
 
 
 def build_branch_name(source_pr_number: int, target_branch: str) -> str:
