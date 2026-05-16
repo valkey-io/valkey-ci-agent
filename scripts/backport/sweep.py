@@ -309,8 +309,8 @@ def _process_branch(
         with GitAuth(github_token, prefix="backport-sweep-git-askpass-") as git_auth:
             git_env = git_auth.env()
             _clone_target_branch(repo_full_name, target_branch, tmpdir, git_env)
-            _run_git(tmpdir, "config", "user.name", "valkey-ci-agent[bot]")
-            _run_git(tmpdir, "config", "user.email", "valkey-ci-agent[bot]@users.noreply.github.com")
+            _run_git(tmpdir, "config", "user.name", "valkeyrie[bot]")
+            _run_git(tmpdir, "config", "user.email", "valkeyrie[bot]@users.noreply.github.com")
 
             # Sync push_repo's copy of target_branch to match source before
             # we start cherry-picking. Without this, if the fork's release
