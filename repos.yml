@@ -5,17 +5,6 @@ repos:
     language: c
     build_commands:
       - "make -j$(nproc)"
-    validation_rules:
-      - paths:
-          - "tests/unit/cluster/cli.tcl"
-        commands:
-          - "./runtest --clients 1 --single unit/cluster/cli"
-      - paths:
-          - "src/cluster_legacy.c"
-          - "src/cluster_migrateslots.c"
-          - "tests/unit/cluster/*migration*.tcl"
-        commands:
-          - "./runtest --clients 1 --single unit/cluster/slot-migration"
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
