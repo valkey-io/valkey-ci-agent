@@ -285,7 +285,92 @@ def test_upsert_pr_uses_direct_upstream_branch_by_default():
     _, kwargs = mock_repo.create_pull.call_args
     assert kwargs["head"] == "agent/backport/sweep/8.1"
     assert kwargs["base"] == "8.1"
-    assert kwargs["draft"] is True
+    # Sweep PRs are opened directly (not as drafts) so maintainers see
+    # them in the active queue alongside other PRs.
+    assert kwargs["draft"] is False
+
+
+def test_upsert_pr_promotes_existing_draft_to_ready():
+    """An existing draft sweep PR should be marked ready-for-review on update.
+
+    Earlier versions of this script created sweep PRs as drafts. To roll
+    that change forward without touching every PR by hand, _upsert_pr
+    should promote any existing draft to ready-for-review whenever it
+    edits the PR.
+    """
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    existing_pr = MagicMock()
+    existing_pr.number = 999
+    existing_pr.html_url = "https://github.com/valkey-io/valkey/pull/999"
+    existing_pr.draft = True
+    existing_pr.node_id = "PR_kwDO_node_id_999"
+
+    mock_gql = MagicMock()
+
+    result = BranchSweepResult(
+        target_branch="9.1",
+        candidates_found=1,
+        results=[CandidateResult(10, "Some PR", "applied", "")],
+    )
+
+    backport_sweep._upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "9.1",
+        "agent/backport/sweep/9.1",
+        result,
+        existing_pr=existing_pr,
+        gql=mock_gql,
+    )
+
+    # PR body/title were edited as before.
+    existing_pr.edit.assert_called_once()
+    # And the GraphQL ready-for-review mutation ran with the PR's node_id.
+    mock_gql.execute.assert_called_once()
+    args, _ = mock_gql.execute.call_args
+    query, variables = args
+    assert "markPullRequestReadyForReview" in query
+    assert variables == {"id": "PR_kwDO_node_id_999"}
+
+
+def test_upsert_pr_skips_ready_promotion_when_already_open():
+    """If the existing PR is not a draft, no GraphQL mutation should run."""
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    existing_pr = MagicMock()
+    existing_pr.number = 1000
+    existing_pr.html_url = "https://github.com/valkey-io/valkey/pull/1000"
+    existing_pr.draft = False
+    existing_pr.node_id = "PR_kwDO_node_id_1000"
+
+    mock_gql = MagicMock()
+
+    result = BranchSweepResult(
+        target_branch="9.1",
+        candidates_found=1,
+        results=[CandidateResult(11, "Another PR", "applied", "")],
+    )
+
+    backport_sweep._upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "9.1",
+        "agent/backport/sweep/9.1",
+        result,
+        existing_pr=existing_pr,
+        gql=mock_gql,
+    )
+
+    existing_pr.edit.assert_called_once()
+    # No promotion mutation when the PR is already open.
+    mock_gql.execute.assert_not_called()
 
 
 def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
@@ -701,3 +786,75 @@ def test_graphql_client_retry_exhaustion_raises_clear_error(monkeypatch):
 def test_safe_tmp_component_removes_branch_separators():
     assert backport_sweep._safe_tmp_component("release/8.1") == "release-8.1"
     assert backport_sweep._safe_tmp_component("///") == "branch"
+
+
+def test_build_pr_body_lists_already_on_branch_under_applied():
+    """Applied table reflects cumulative state of the backport branch.
+
+    `skipped-existing` with detail "already on backport branch" means the
+    PR was cherry-picked by a prior sweep run -> appears in Applied.
+
+    `skipped-existing` with any other detail means the change is already
+    on the *release* branch (empty cherry-pick or no-op resolution) -> it
+    is NOT on the backport branch and must not appear in Applied.
+    """
+    result = BranchSweepResult(
+        target_branch="9.1",
+        candidates_found=5,
+        results=[
+            # Fresh cherry-pick this run.
+            CandidateResult(
+                source_pr_number=3654,
+                source_pr_title="Use full hash-seed bytes when deriving SipHash seed",
+                outcome="applied",
+                detail="conflicts resolved by Claude Code",
+            ),
+            # Already on the sweep branch from a prior run -> in Applied.
+            CandidateResult(
+                source_pr_number=3380,
+                source_pr_title="CLUSTERSCAN MATCH pattern maps to a specific slot optimizations",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+            CandidateResult(
+                source_pr_number=3619,
+                source_pr_title="Fix invalid memory access in RESTORE with malformed zipmap",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+            # Already merged into the release branch (empty cherry-pick)
+            # -> NOT on the sweep branch, must not appear in Applied.
+            CandidateResult(
+                source_pr_number=4001,
+                source_pr_title="Already-merged release-branch commit",
+                outcome="skipped-existing",
+                detail="already applied or empty cherry-pick",
+            ),
+            # Conflict resolution collapsed to a no-op -> NOT in Applied.
+            CandidateResult(
+                source_pr_number=4002,
+                source_pr_title="No-op resolution",
+                outcome="skipped-existing",
+                detail="resolution was already satisfied on target branch",
+            ),
+        ],
+    )
+
+    body = backport_sweep._build_pr_body(result)
+
+    assert "## Applied" in body
+    # The Applied section is the only commit-listing section in the body
+    # (no Needs attention because there are no failures, and the legacy
+    # "Already on branch" section is removed). Asserting against the full
+    # body therefore only checks the Applied table.
+    assert "## Needs attention" not in body
+    assert "Already on branch" not in body
+    # Newly applied + on-sweep-branch carry-overs are listed.
+    assert "`#3654`" in body
+    assert "`#3380`" in body
+    assert "`#3619`" in body
+    # Already-on-release-branch and no-op resolutions must NOT be listed:
+    # those changes are not on the sweep branch, so listing them under
+    # Applied would misrepresent the PR's commit set.
+    assert "`#4001`" not in body
+    assert "`#4002`" not in body

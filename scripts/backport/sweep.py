@@ -75,6 +75,16 @@ class CandidateResult:
     detail: str = ""
 
 
+# Detail string used when a candidate PR is already cherry-picked onto the
+# backport sweep branch (detected by _list_already_applied scanning the
+# branch's commit log for the (#NNNN) marker). The PR-body builder treats
+# this case as "on the branch" and lists it under Applied, distinct from
+# other "skipped-existing" detail strings (e.g. "already applied or empty
+# cherry-pick") which mean the change is on the *release* branch and not
+# committed to the sweep branch.
+DETAIL_ALREADY_ON_SWEEP_BRANCH = "already on backport branch"
+
+
 @dataclass
 class BranchSweepResult:
     target_branch: str
@@ -384,7 +394,7 @@ def _process_branch(
                         source_pr_number=candidate.source_pr_number,
                         source_pr_title=candidate.source_pr_title,
                         outcome="skipped-existing",
-                        detail="already on backport branch",
+                        detail=DETAIL_ALREADY_ON_SWEEP_BRANCH,
                     ))
                     continue
 
@@ -421,7 +431,11 @@ def _process_branch(
                 logger.info("Pushed %d commit(s) to %s/%s", len(applied), push_repo, backport_branch)
 
                 # Upsert PR
-                pr_url = _upsert_pr(gh, repo_full_name, push_repo, target_branch, backport_branch, result, existing_pr)
+                pr_url = _upsert_pr(
+                    gh, repo_full_name, push_repo, target_branch,
+                    backport_branch, result, existing_pr,
+                    gql=GitHubGraphQLClient(github_token),
+                )
                 result.pr_url = pr_url
 
     except Exception as exc:
@@ -940,13 +954,28 @@ def _delete_stale_backport_branch(gh: Any, push_repo: str, branch: str) -> None:
 
 
 def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head_branch: str,
-               result: BranchSweepResult, existing_pr: Any | None) -> str:
+               result: BranchSweepResult, existing_pr: Any | None,
+               gql: GitHubGraphQLClient | None = None) -> str:
     repo = retry_github_call(lambda: gh.get_repo(base_repo), retries=2, description=f"get {base_repo}")
     body = _build_pr_body(result)
     title = f"[backport] Backport sweep for {target_branch}"
 
     if existing_pr:
         retry_github_call(lambda: existing_pr.edit(title=title, body=body), retries=2, description="update PR")
+        # Promote existing draft sweep PRs to "ready for review". Earlier
+        # versions of this script created PRs as drafts; we now want them
+        # open by default, and want any leftover drafts to be promoted on
+        # the next sweep run so maintainers see them in the active queue.
+        # The GitHub REST API has no endpoint for this transition, so use
+        # the GraphQL markPullRequestReadyForReview mutation.
+        if getattr(existing_pr, "draft", False) and gql is not None:
+            node_id = getattr(existing_pr, "node_id", None)
+            if node_id:
+                _mark_pr_ready_for_review(gql, node_id)
+                logger.info(
+                    "Marked PR #%d on %s ready for review",
+                    existing_pr.number, base_repo,
+                )
         logger.info("Updated PR #%d on %s", existing_pr.number, base_repo)
         return existing_pr.html_url
 
@@ -959,12 +988,30 @@ def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head
             body=body,
             head_branch=head_branch,
             base_branch=target_branch,
-            draft=True,
+            draft=False,
         ),
         retries=2, description="create PR",
     )
     logger.info("Created PR #%d on %s", pr.number, base_repo)
     return pr.html_url
+
+
+def _mark_pr_ready_for_review(gql: GitHubGraphQLClient, pr_node_id: str) -> None:
+    """Convert a draft pull request to ready-for-review via GraphQL.
+
+    The REST API does not expose this transition, so we use the
+    markPullRequestReadyForReview mutation. Errors surface to the caller
+    so a sweep run that can't promote a PR fails loudly rather than
+    silently leaving the PR in draft.
+    """
+    mutation = """
+    mutation($id: ID!) {
+      markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+        pullRequest { isDraft }
+      }
+    }
+    """
+    gql.execute(mutation, {"id": pr_node_id})
 
 
 def _list_already_applied(repo_dir: str, base_branch: str, backport_branch: str) -> set[str]:
@@ -996,11 +1043,31 @@ def _build_pr_body(result: BranchSweepResult) -> str:
         "Automated cherry-picks from PRs marked \"To be backported\".",
         "",
     ]
-    # Categorize candidates by outcome so the PR body separates
-    # "informational" rows (already on branch) from "actionable" rows
-    # (conflicts, build failures, errors that a maintainer needs to look at).
-    applied = [r for r in result.results if r.outcome == "applied"]
-    already = [r for r in result.results if r.outcome == "skipped-existing"]
+    # The Applied table reflects the cumulative state of the backport
+    # branch: PRs cherry-picked in this run AND PRs already on the branch
+    # from prior sweeps. This way the PR description always matches the
+    # commits in the PR, regardless of how many sweep runs contributed.
+    #
+    # `skipped-existing` is emitted in three different situations and
+    # only the first means "the commit is on the backport branch":
+    #   1. _list_already_applied found the source PR # in the branch's
+    #      commit log -> detail == DETAIL_ALREADY_ON_SWEEP_BRANCH.
+    #   2. git cherry-pick produced an empty commit -> detail starts
+    #      with "already applied" (the change is already in the *release*
+    #      branch, so nothing was committed onto the sweep branch).
+    #   3. Conflict resolution collapsed to a no-op -> detail mentions
+    #      "already satisfied on target branch".
+    # Only #1 belongs in the Applied table; the others would mislead a
+    # maintainer into thinking those commits ride on the backport branch.
+    # `Needs attention` continues to surface only this run's failures.
+    applied = [
+        r for r in result.results
+        if r.outcome == "applied"
+        or (
+            r.outcome == "skipped-existing"
+            and r.detail == DETAIL_ALREADY_ON_SWEEP_BRANCH
+        )
+    ]
     failed = [
         r for r in result.results
         if r.outcome not in {"applied", "skipped-existing"}
@@ -1029,21 +1096,6 @@ def _build_pr_body(result: BranchSweepResult) -> str:
             lines.append(
                 f"| `#{r.source_pr_number}` | {_esc(r.source_pr_title)} | "
                 f"{r.outcome} | {_esc(r.detail)} |",
-            )
-        lines.extend(["", "</details>", ""])
-
-    if already:
-        lines.extend([
-            f"<details><summary>Already on branch ({len(already)})</summary>",
-            "",
-            "Source PRs whose changes already exist on the target branch — no action needed.",
-            "",
-            "| Source PR | Title | Detail |",
-            "|---|---|---|",
-        ])
-        for r in already:
-            lines.append(
-                f"| `#{r.source_pr_number}` | {_esc(r.source_pr_title)} | {_esc(r.detail)} |",
             )
         lines.extend(["", "</details>", ""])
 
