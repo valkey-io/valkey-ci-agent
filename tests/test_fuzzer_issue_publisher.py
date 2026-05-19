@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from scripts.fuzzer.issue_publisher import (
     FuzzerIssuePublisher,
     _build_title,
@@ -97,3 +99,20 @@ def test_updates_existing_reinjects_missing_marker():
     edited_body = loaded.edit.call_args.kwargs["body"]
     assert marker in edited_body
     assert "<!-- valkey-ci-agent:occurrences:2 -->" in edited_body
+
+
+def test_search_failure_propagates_no_duplicate_issue():
+    """A transient GitHub search failure must NOT silently fall through to
+    create_issue — that would generate duplicate issues on every cron run
+    until the search recovered. The error propagates and the surrounding
+    main.py loop records this run as 'error' instead."""
+    mock_repo = MagicMock()
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.side_effect = RuntimeError("rate limited")
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        FuzzerIssuePublisher(mock_gh).upsert_issue(
+            "valkey-io/valkey-fuzzer", _analysis(),
+        )
+    mock_repo.create_issue.assert_not_called()

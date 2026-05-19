@@ -61,3 +61,22 @@ def test_analysis_error_recorded(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["runs"][0]["action"] == "error"
     assert "boom" in payload["runs"][0]["error"]
+
+
+def _analysis_obj(*, status: str, verdict: str) -> MagicMock:
+    a = MagicMock()
+    a.overall_status = status
+    a.triage_verdict = verdict
+    return a
+
+
+@pytest.mark.parametrize("status,verdict,expected", [
+    ("anomalous", "likely-core-valkey-bug", True),
+    ("warning", "possible-core-valkey-bug", True),     # the bug this guards
+    ("warning", "needs-human-triage", True),
+    ("normal", "expected-chaos-noise", False),
+    ("warning", "expected-chaos-noise", False),
+    ("warning", "environmental-or-infra", False),
+])
+def test_should_publish_gate(status, verdict, expected):
+    assert fuzzer_main_mod._should_publish(_analysis_obj(status=status, verdict=verdict)) is expected

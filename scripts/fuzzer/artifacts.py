@@ -108,12 +108,25 @@ class ArtifactClient:
         raise AssertionError("unreachable: retry loop must return or raise")
 
 
+# Defends against a buggy fuzzer producing a runaway log dump that would
+# exhaust the runner. Real fuzzer artifacts are typically <50 MB.
+_MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024
+
+
 def _extract_zip(blob: bytes) -> dict[str, bytes]:
     if not blob:
         return {}
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-            return {m.filename: zf.read(m) for m in zf.infolist() if not m.is_dir()}
+            members = [m for m in zf.infolist() if not m.is_dir()]
+            total = sum(m.file_size for m in members)
+            if total > _MAX_UNCOMPRESSED_BYTES:
+                logger.warning(
+                    "Artifact uncompressed size %d exceeds cap %d; refusing to extract",
+                    total, _MAX_UNCOMPRESSED_BYTES,
+                )
+                return {}
+            return {m.filename: zf.read(m) for m in members}
     except zipfile.BadZipFile:
         logger.warning("Artifact zip is corrupt; returning empty")
         return {}

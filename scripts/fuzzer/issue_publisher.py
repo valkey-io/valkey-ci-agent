@@ -59,15 +59,17 @@ class FuzzerIssuePublisher:
         return "updated", existing.html_url
 
     def _find_existing(self, repo_name: str, marker: str) -> Any:
-        """Find an open issue containing the dedup marker, or None."""
+        """Find an open issue containing the dedup marker, or None.
+
+        Search failures are propagated so the caller does not silently treat
+        them as "no existing issue" (which would cause duplicate issue
+        creation). The next cron run will retry against the same fingerprint.
+        """
         query = f'"{marker}" in:body repo:{repo_name} is:issue is:open'
-        try:
-            for issue in self._gh.search_issues(query):
-                if marker in (issue.body or ""):
-                    # Reload via the actual repo so we get a mutable issue handle.
-                    return self._gh.get_repo(repo_name).get_issue(issue.number)
-        except Exception as exc:
-            logger.warning("Issue search failed, skipping dedup check: %s", exc)
+        for issue in self._gh.search_issues(query):
+            if marker in (issue.body or ""):
+                # Reload via the actual repo so we get a mutable issue handle.
+                return self._gh.get_repo(repo_name).get_issue(issue.number)
         return None
 
 

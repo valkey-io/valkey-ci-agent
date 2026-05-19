@@ -226,7 +226,12 @@ class FuzzerRunAnalyzer:
         )
         if bundle is None:
             return _build_error_analysis(context, "no fuzzer artifact bundle found")
-        _load_artifacts(context, self._client.download_artifact(repo, bundle.artifact_id))
+        files = self._client.download_artifact(repo, bundle.artifact_id)
+        if not files:
+            return _build_error_analysis(
+                context, "fuzzer artifact bundle was empty or unreadable",
+            )
+        _load_artifacts(context, files)
 
         anomalies, normals = _scan_logs(context)
 

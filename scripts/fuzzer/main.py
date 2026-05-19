@@ -22,7 +22,18 @@ from scripts.fuzzer.issue_publisher import FuzzerIssuePublisher
 TARGET_REPO = "valkey-io/valkey-fuzzer"
 WORKFLOW_FILE = "fuzzer-run.yml"
 
+# Verdicts that should NOT produce an issue. Everything else does — including
+# `needs-human-triage` (Claude failed and there are unresolved signals).
+_NO_PUBLISH_VERDICTS = frozenset({"expected-chaos-noise", "environmental-or-infra"})
+
 logger = logging.getLogger(__name__)
+
+
+def _should_publish(analysis: Any) -> bool:
+    """Publish on anomalous status OR any bug-candidate triage verdict."""
+    if analysis.overall_status == "anomalous":
+        return True
+    return analysis.triage_verdict not in _NO_PUBLISH_VERDICTS
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             entry["status"] = analysis.overall_status
             entry["verdict"] = analysis.triage_verdict
             entry["summary"] = analysis.summary
-            if analysis.overall_status == "anomalous":
+            if _should_publish(analysis):
                 action, url = publisher.upsert_issue(TARGET_REPO, analysis)
                 entry["issue_action"] = action
                 entry["issue_url"] = url

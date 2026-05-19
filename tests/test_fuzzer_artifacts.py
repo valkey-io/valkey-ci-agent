@@ -22,6 +22,16 @@ def test_extract_zip_returns_empty_on_bad_input(blob):
     assert _extract_zip(blob) == {}
 
 
+def test_extract_zip_refuses_oversized_archive(monkeypatch):
+    """A buggy fuzzer dumping a multi-GB log shouldn't OOM the monitor."""
+    from scripts.fuzzer import artifacts as artifacts_mod
+    monkeypatch.setattr(artifacts_mod, "_MAX_UNCOMPRESSED_BYTES", 512)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("big.bin", b"a" * 1024)
+    assert _extract_zip(buf.getvalue()) == {}
+
+
 def test_client_requires_token():
     with pytest.raises(ValueError, match="token is required"):
         ArtifactClient(MagicMock(), token="")
