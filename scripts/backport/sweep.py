@@ -1077,7 +1077,7 @@ def _build_pr_body(result: BranchSweepResult) -> str:
         lines.extend(["## Applied", "", "| Source PR | Title | Detail |", "|---|---|---|"])
         for r in applied:
             lines.append(
-                f"| `#{r.source_pr_number}` | {_esc(r.source_pr_title)} | {_esc(r.detail)} |",
+                f"| #{r.source_pr_number} | {_esc(r.source_pr_title)} | {_esc(r.detail)} |",
             )
         lines.append("")
 
@@ -1094,7 +1094,7 @@ def _build_pr_body(result: BranchSweepResult) -> str:
         ])
         for r in failed:
             lines.append(
-                f"| `#{r.source_pr_number}` | {_esc(r.source_pr_title)} | "
+                f"| #{r.source_pr_number} | {_esc(r.source_pr_title)} | "
                 f"{r.outcome} | {_esc(r.detail)} |",
             )
         lines.extend(["", "</details>", ""])

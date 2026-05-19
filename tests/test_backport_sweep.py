@@ -850,11 +850,11 @@ def test_build_pr_body_lists_already_on_branch_under_applied():
     assert "## Needs attention" not in body
     assert "Already on branch" not in body
     # Newly applied + on-sweep-branch carry-overs are listed.
-    assert "`#3654`" in body
-    assert "`#3380`" in body
-    assert "`#3619`" in body
+    assert "#3654" in body
+    assert "#3380" in body
+    assert "#3619" in body
     # Already-on-release-branch and no-op resolutions must NOT be listed:
     # those changes are not on the sweep branch, so listing them under
     # Applied would misrepresent the PR's commit set.
-    assert "`#4001`" not in body
-    assert "`#4002`" not in body
+    assert "#4001" not in body
+    assert "#4002" not in body
