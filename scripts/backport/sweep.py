@@ -160,7 +160,8 @@ class GitHubGraphQLClient:
 
 class ProjectBackportDiscovery:
     def __init__(self, gql: GitHubGraphQLClient, *, project_owner: str,
-                 project_number: int, project_owner_type: str = "organization",
+                 project_number: int, source_repo: str,
+                 project_owner_type: str = "organization",
                  status_field: str = _DEFAULT_STATUS_FIELD,
                  status_value: str = _DEFAULT_STATUS_VALUE,
                  branch_fields: list[str] | None = None,
@@ -169,6 +170,7 @@ class ProjectBackportDiscovery:
         self._owner = project_owner
         self._number = project_number
         self._owner_type = project_owner_type
+        self._source_repo = source_repo
         self._status_field = status_field
         self._status_value = status_value
         self._branch_fields = branch_fields or list(_DEFAULT_BRANCH_FIELDS)
@@ -204,6 +206,17 @@ class ProjectBackportDiscovery:
     def _candidate_from_item(self, item: dict[str, Any], branches: list[str]) -> ProjectBackportCandidate | None:
         content = item.get("content") or {}
         if content.get("__typename") != "PullRequest" or not content.get("merged"):
+            return None
+        # Project boards aggregate PRs across the whole org. Drop anything
+        # that didn't originate in the repo we're sweeping into — otherwise
+        # we'd try to cherry-pick e.g. a valkey-io.github.io blog-post merge
+        # commit into valkey-io/valkey, which fails at `git fetch <sha>`.
+        item_repo = (content.get("repository") or {}).get("nameWithOwner")
+        if item_repo and item_repo != self._source_repo:
+            logger.debug(
+                "Skipping project item PR #%s from %s (sweep target is %s)",
+                content.get("number"), item_repo, self._source_repo,
+            )
             return None
         fields = _extract_field_values(item)
         if not _field_has_value(fields, self._status_field, self._status_value):
@@ -260,6 +273,7 @@ def run_backport_sweep(
         GitHubGraphQLClient(github_token),
         project_owner=repo_entry.project_owner,
         project_number=project_number,
+        source_repo=repo_full_name,
         project_owner_type=repo_entry.project_owner_type,
         status_field=status_field,
         status_value=status_value,
@@ -1141,6 +1155,7 @@ query($owner: String!, $number: Int!, $cursor: String) {{
             __typename
             ... on PullRequest {{
               number title url merged
+              repository {{ nameWithOwner }}
               mergeCommit {{ oid }}
               commits(first: 100) {{ nodes {{ commit {{ oid }} }} }}
             }}

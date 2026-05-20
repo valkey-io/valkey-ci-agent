@@ -858,3 +858,106 @@ def test_build_pr_body_lists_already_on_branch_under_applied():
     # Applied would misrepresent the PR's commit set.
     assert "#4001" not in body
     assert "#4002" not in body
+
+
+
+# ---------------------------------------------------------------------------
+# ProjectBackportDiscovery — cross-repo filter
+# ---------------------------------------------------------------------------
+
+
+def _project_item(*, number: int, repo: str, status: str = "To be backported",
+                  merge_sha: str = "abc1234567890abcdef") -> dict:
+    """Build a fake project-item payload shaped like the GraphQL response."""
+    return {
+        "content": {
+            "__typename": "PullRequest",
+            "number": number,
+            "title": f"PR {number}",
+            "url": f"https://github.com/{repo}/pull/{number}",
+            "merged": True,
+            "repository": {"nameWithOwner": repo},
+            "mergeCommit": {"oid": merge_sha},
+            "commits": {"nodes": [{"commit": {"oid": merge_sha}}]},
+        },
+        "fieldValues": {
+            "nodes": [
+                {
+                    "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                    "name": status,
+                    "field": {"name": "Status"},
+                },
+            ],
+        },
+    }
+
+
+def _make_discovery(items: list[dict], *, source_repo: str = "valkey-io/valkey"):
+    """Build a discovery instance whose GraphQL client returns `items`."""
+    gql = MagicMock()
+    discovery = backport_sweep.ProjectBackportDiscovery(
+        gql,
+        project_owner="valkey-io",
+        project_number=1,
+        source_repo=source_repo,
+        implicit_target_branch="9.1",
+    )
+    # Bypass the GraphQL fetch — return our fake items directly.
+    discovery._iter_items = lambda: items  # type: ignore[method-assign]
+    return discovery
+
+
+def test_discovery_filters_out_pr_from_other_repo():
+    """A blog-post PR on valkey-io.github.io (added to the same project
+    board) must NOT become a backport candidate for valkey-io/valkey.
+    """
+    items = [
+        _project_item(number=3654, repo="valkey-io/valkey"),
+        _project_item(number=553, repo="valkey-io/valkey-io.github.io"),
+    ]
+    by_branch = _make_discovery(items).discover(["9.1"])
+    nums = [c.source_pr_number for c in by_branch["9.1"]]
+    assert nums == [3654]
+
+
+def test_discovery_keeps_matching_repo_pr():
+    """Sanity check: a PR from the configured repo flows through."""
+    items = [_project_item(number=3654, repo="valkey-io/valkey")]
+    by_branch = _make_discovery(items).discover(["9.1"])
+    assert len(by_branch["9.1"]) == 1
+    assert by_branch["9.1"][0].source_pr_number == 3654
+
+
+def test_discovery_drops_unmerged_pr_regardless_of_repo():
+    """The merged-only filter is applied before the repo filter."""
+    item = _project_item(number=999, repo="valkey-io/valkey")
+    item["content"]["merged"] = False
+    by_branch = _make_discovery([item]).discover(["9.1"])
+    assert by_branch["9.1"] == []
+
+
+def test_discovery_drops_pr_with_wrong_status_regardless_of_repo():
+    item = _project_item(number=42, repo="valkey-io/valkey", status="Done")
+    by_branch = _make_discovery([item]).discover(["9.1"])
+    assert by_branch["9.1"] == []
+
+
+def test_discovery_keeps_pr_when_repository_field_missing():
+    """If the GraphQL payload lacks repository (older cached response, schema
+    quirk, etc.), don't refuse to sweep — the field is the new filter, not a
+    hard requirement.
+    """
+    item = _project_item(number=3654, repo="valkey-io/valkey")
+    item["content"].pop("repository")
+    by_branch = _make_discovery([item]).discover(["9.1"])
+    assert len(by_branch["9.1"]) == 1
+
+
+def test_project_items_query_selects_repository_name_with_owner():
+    """Regression guard: the query must request the repo field, otherwise
+    the runtime filter sees None for every item and lets cross-repo PRs
+    through.
+    """
+    query = backport_sweep._project_items_query("organization")
+    assert "repository {" in query
+    assert "nameWithOwner" in query
