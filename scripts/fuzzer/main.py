@@ -79,13 +79,23 @@ def main(argv: list[str] | None = None) -> int:
             entry["verdict"] = analysis.triage_verdict
             entry["summary"] = analysis.summary
             if _should_publish(analysis):
-                action, url = publisher.upsert(
-                    TARGET_REPO,
-                    fingerprint=analysis.incident_fingerprint or "unknown",
-                    render=issue_renderer.render_for(analysis),
-                )
-                entry["issue_action"] = action
-                entry["issue_url"] = url
+                if not analysis.incident_fingerprint:
+                    # Refuse to publish without a fingerprint — otherwise
+                    # unrelated runs would collide on a single issue.
+                    logger.error(
+                        "Run %s passed publish gate but has no fingerprint; skipping",
+                        run.id,
+                    )
+                    entry["issue_action"] = "skipped-no-fingerprint"
+                else:
+                    action, url = publisher.upsert(
+                        TARGET_REPO,
+                        fingerprint=analysis.incident_fingerprint,
+                        render=issue_renderer.render_for(analysis),
+                        idempotency_key=str(run.id),
+                    )
+                    entry["issue_action"] = action
+                    entry["issue_url"] = url
         except Exception as exc:
             entry["action"] = "error"
             entry["error"] = str(exc)
@@ -99,7 +109,9 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.output).write_text(rendered, encoding="utf-8")
     else:
         print(rendered)
-    return 0
+    # Surface monitor errors via the workflow's exit code so a failed run
+    # shows ❌ in the Actions tab instead of being hidden in the JSON artifact.
+    return 1 if any(r.get("action") == "error" for r in results) else 0
 
 
 if __name__ == "__main__":

@@ -167,13 +167,15 @@ def _invoke_claude(context: FuzzerRunContext, anomalies: list[FuzzerSignal],
     for name, text in context.node_logs.items():
         (art_dir / name).write_text(text)
 
-    # Clone valkey at the tested commit and the fuzzer at the run's HEAD so
-    # Claude can grep for assertion text, crash handlers, validation logic.
-    # If a clone fails, tell Claude so it doesn't cite source line numbers
-    # with false confidence.
-    valkey_ok = shallow_clone_at_sha(
-        "valkey-io/valkey", workdir / "valkey", context.tested_valkey_sha,
-    )
+    # Clone valkey at the tested commit (skipping if the manifest didn't record
+    # one — cloning the default branch would have Claude triage a different
+    # tree than the one that crashed). Clone the fuzzer at the run's HEAD too.
+    if context.tested_valkey_sha:
+        valkey_ok = shallow_clone_at_sha(
+            "valkey-io/valkey", workdir / "valkey", context.tested_valkey_sha,
+        )
+    else:
+        valkey_ok = False
     fuzzer_ok = shallow_clone_at_sha(
         context.repo, workdir / "valkey-fuzzer", context.head_sha or None,
     )
@@ -200,8 +202,13 @@ def _format_source_note(context: FuzzerRunContext, *, valkey_ok: bool, fuzzer_ok
     lines = ["- _artifacts/ — results.json and per-node Valkey server logs."]
     if valkey_ok:
         lines.append(
-            f"- valkey/ — Valkey source at commit {context.tested_valkey_sha or 'default branch'}. "
+            f"- valkey/ — Valkey source at commit {context.tested_valkey_sha}. "
             "Grep for assertion text, crash handlers, BUG REPORT lines."
+        )
+    elif not context.tested_valkey_sha:
+        lines.append(
+            "- valkey/ — NOT AVAILABLE (the fuzzer manifest did not record the "
+            "tested commit). Do not cite source line numbers."
         )
     else:
         lines.append(
@@ -335,10 +342,19 @@ class FuzzerRunAnalyzer:
 
 
 def _build_error_analysis(context: FuzzerRunContext, reason: str) -> FuzzerRunAnalysis:
-    """Surface infrastructure failures (e.g. missing artifacts) for human triage."""
+    """Surface infrastructure failures (e.g. missing artifacts) for human triage.
+
+    Computes an explicit fingerprint from `(repo, workflow_file, "error")` and
+    the reason so different error classes (missing artifacts vs. Claude crash)
+    each get their own dedup bucket instead of all collapsing into one issue.
+    """
     return FuzzerRunAnalysis(
         repo=context.repo, workflow_file=context.workflow_file, run_id=context.run_id,
         run_url=context.run_url, conclusion=context.conclusion, head_sha=context.head_sha,
         overall_status="warning", triage_verdict="needs-human-triage",
         summary=f"Run {context.run_id}: {reason}",
+        incident_fingerprint=compute_fingerprint(
+            namespace=(context.repo, context.workflow_file, "error"),
+            shapes=[reason],
+        ),
     )

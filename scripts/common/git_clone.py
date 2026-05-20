@@ -1,8 +1,9 @@
-"""Shallow git-clone helpers for workflows that need source access.
+"""Shallow git-clone helpers.
 
-Workflow-agnostic. Used today by the fuzzer monitor (clones valkey + the
-fuzzer repo at the tested SHA so Claude Code can grep through source while
-triaging); other analysis workflows can reuse the same pattern.
+``shallow_clone_at_sha(repo, dest, sha)`` clones the given ``owner/name``
+into ``dest`` at depth 1, optionally fetching and checking out a specific
+commit. Validates ``repo`` and ``sha`` shapes to defend against argument
+injection. Returns ``True`` on success, ``False`` on any failure.
 """
 
 from __future__ import annotations

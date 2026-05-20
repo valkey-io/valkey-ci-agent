@@ -1,14 +1,9 @@
 """Stable fingerprints for incident deduplication.
 
-Workflow-agnostic. Each caller passes:
-- a `namespace` tuple of identity strings (e.g. repo + workflow file + root
-  cause) that disambiguate one workflow's findings from another's.
-- a list of raw `shapes` describing each finding. Volatile substrings
-  (memory addresses, hex SHAs, node IDs, run-specific numbers) are
-  normalized so two runs of the same underlying failure with different
-  node IDs produce the same fingerprint.
-
-Fingerprints are stable across processes — never tied to PID, time, or run ID.
+``compute_fingerprint(namespace, shapes)`` hashes an identity tuple plus
+finding shapes. Volatile substrings (memory addresses, hex SHAs, node
+ids, run-specific numbers) are normalized so two runs of the same
+underlying failure produce the same fingerprint.
 """
 
 from __future__ import annotations

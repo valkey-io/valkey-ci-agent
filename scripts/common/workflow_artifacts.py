@@ -1,8 +1,7 @@
 """GitHub Actions workflow run and artifact retrieval.
 
-Workflow-agnostic helpers for analysis pipelines (fuzzer, daily CI, PR
-reviewer, etc.) that need to enumerate recent runs of a target workflow
-and pull their uploaded artifacts.
+Lists recent runs of a target workflow file and downloads their uploaded
+artifact bundles into an in-memory ``{path: bytes}`` map.
 """
 
 from __future__ import annotations

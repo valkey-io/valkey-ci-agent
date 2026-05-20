@@ -103,3 +103,69 @@ def test_search_failure_propagates_no_duplicate_issue():
     with pytest.raises(RuntimeError, match="rate limited"):
         publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
     mock_repo.create_issue.assert_not_called()
+
+
+def test_idempotency_key_recorded_on_create():
+    """When idempotency_key is supplied, the new issue body records it."""
+    mock_repo = MagicMock()
+    mock_issue = MagicMock(number=1, html_url="https://x/issues/1")
+    mock_repo.create_issue.return_value = mock_issue
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.return_value = iter([])
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    publisher.upsert("o/r", fingerprint="fp1",
+                     render=_render_static(), idempotency_key="run-42")
+    body = mock_repo.create_issue.call_args.kwargs["body"]
+    assert f"<!-- {NAMESPACE}:last-key:run-42 -->" in body
+
+
+def test_idempotency_key_skips_duplicate_update():
+    """A second upsert with the same idempotency_key must NOT bump the
+    counter or comment — same source event firing twice is a no-op.
+    """
+    marker = f"<!-- {NAMESPACE}:fp1 -->"
+    body = (
+        f"{marker}\n<!-- {NAMESPACE}:occurrences:1 -->\n"
+        f"<!-- {NAMESPACE}:last-key:run-42 -->"
+    )
+    existing = MagicMock(number=5, html_url="https://x/issues/5", body=body, title="old")
+    mock_repo = MagicMock()
+    mock_repo.get_issue.return_value = existing
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.return_value = [existing]
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, _ = publisher.upsert("o/r", fingerprint="fp1",
+                                 render=_render_static(), idempotency_key="run-42")
+    assert action == "skipped-duplicate"
+    existing.edit.assert_not_called()
+    existing.create_comment.assert_not_called()
+
+
+def test_idempotency_key_different_value_still_updates():
+    """A different idempotency_key (different source event) bumps as usual,
+    and the new key replaces the old one in the body.
+    """
+    marker = f"<!-- {NAMESPACE}:fp1 -->"
+    body = (
+        f"{marker}\n<!-- {NAMESPACE}:occurrences:1 -->\n"
+        f"<!-- {NAMESPACE}:last-key:run-42 -->"
+    )
+    existing = MagicMock(number=5, html_url="https://x/issues/5", body=body, title="old")
+    mock_repo = MagicMock()
+    mock_repo.get_issue.return_value = existing
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.return_value = [existing]
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, _ = publisher.upsert("o/r", fingerprint="fp1",
+                                 render=_render_static(), idempotency_key="run-99")
+    assert action == "updated"
+    edited = existing.edit.call_args.kwargs["body"]
+    assert f"<!-- {NAMESPACE}:occurrences:2 -->" in edited
+    assert f"<!-- {NAMESPACE}:last-key:run-99 -->" in edited
+    assert f"<!-- {NAMESPACE}:last-key:run-42 -->" not in edited

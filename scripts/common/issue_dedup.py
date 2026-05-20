@@ -1,20 +1,18 @@
 """Marker-based create-or-update for GitHub issues.
 
-A workflow-agnostic helper that:
+Embeds an HTML-comment marker (``<!-- <namespace>:<fingerprint> -->``) in
+the first issue created for a finding. On subsequent calls with the same
+fingerprint, edits the existing issue's body to bump an occurrence counter
+and appends a comment.
 
-1. Embeds an HTML comment "marker" containing a stable fingerprint into the
-   first issue created for a given finding.
-2. On subsequent runs, searches the target repo for an open issue containing
-   the marker. If found, edits its body to bump an occurrence counter and
-   appends a comment; if not found, creates a fresh issue.
+Optional ``idempotency_key`` records the source event (e.g. a workflow run
+id) and skips the update if the same key has already been seen, so a
+re-triggered cron does not inflate the counter.
 
-Callers supply the rendered title, body, and comment — this module owns only
-the dedup machinery, not the presentation.
-
-Search failures are propagated. The caller is expected to wrap upsert in a
-per-run try/except so a transient outage records as an error and the next
-scheduled run retries against the same fingerprint instead of silently
-creating a duplicate issue.
+Callers supply rendered title, body, and comment via a render callback;
+this module owns only the dedup machinery. Search failures are propagated
+so a transient outage records as an error rather than silently creating a
+duplicate issue on the next cron tick.
 """
 
 from __future__ import annotations
@@ -54,13 +52,22 @@ class IssueDedupPublisher:
         *,
         fingerprint: str,
         render: Callable[[str, int], IssueContent],
+        idempotency_key: str | None = None,
     ) -> tuple[str, str]:
         """Create or update the issue for ``fingerprint``.
 
         ``render(marker, occurrences)`` is called with the dedup marker and
         the occurrence count (1 for new issues, >=2 for updates) and must
         return a fully rendered :class:`IssueContent`. Returns
-        ``(action, html_url)`` where action is ``"created"`` or ``"updated"``.
+        ``(action, html_url)`` where action is ``"created"``, ``"updated"``,
+        or ``"skipped-duplicate"`` (when ``idempotency_key`` matches the last
+        recorded key on an existing issue).
+
+        If ``idempotency_key`` is set, the publisher records it in the issue
+        body as ``<!-- <ns>:last-key:<value> -->`` and refuses to bump the
+        occurrence counter when the same key is seen again. Use this to
+        guard against re-runs of the same source event (e.g. the same
+        workflow run id) inflating the count.
         """
         repo = self._gh.get_repo(repo_name)
         marker = f"<!-- {self._ns}:{fingerprint} -->"
@@ -68,7 +75,10 @@ class IssueDedupPublisher:
 
         if existing is None:
             content = render(marker, 1)
-            issue = repo.create_issue(title=content.title, body=content.body)
+            body = content.body
+            if idempotency_key is not None:
+                body = f"{body}\n{_last_key_marker(self._ns, idempotency_key)}"
+            issue = repo.create_issue(title=content.title, body=body)
             if content.labels:
                 try:
                     issue.add_to_labels(*content.labels)
@@ -78,6 +88,16 @@ class IssueDedupPublisher:
             return "created", issue.html_url
 
         body = existing.body or ""
+
+        if idempotency_key is not None:
+            last = _last_key_re(self._ns).search(body)
+            if last and last.group(1) == idempotency_key:
+                logger.info(
+                    "Issue #%s already records key %s; skipping update",
+                    existing.number, idempotency_key,
+                )
+                return "skipped-duplicate", existing.html_url
+
         # Re-inject the marker if the body lost it (e.g. an editor stripped
         # HTML comments) so future runs continue to dedupe against this issue.
         if marker not in body:
@@ -89,6 +109,12 @@ class IssueDedupPublisher:
             _occurrence_re(self._ns).sub(marker_occurrences, body)
             if m else f"{body}\n{marker_occurrences}"
         )
+        if idempotency_key is not None:
+            replacement = _last_key_marker(self._ns, idempotency_key)
+            if _last_key_re(self._ns).search(new_body):
+                new_body = _last_key_re(self._ns).sub(replacement, new_body)
+            else:
+                new_body = f"{new_body}\n{replacement}"
         content = render(marker, count)
         existing.edit(body=new_body, title=content.title)
         existing.create_comment(body=content.comment)
@@ -108,3 +134,11 @@ class IssueDedupPublisher:
 def _occurrence_re(namespace: str) -> re.Pattern[str]:
     """A namespaced occurrence-counter regex: ``<!-- <ns>:occurrences:<n> -->``."""
     return re.compile(rf"<!-- {re.escape(namespace)}:occurrences:(\d+) -->")
+
+
+def _last_key_marker(namespace: str, key: str) -> str:
+    return f"<!-- {namespace}:last-key:{key} -->"
+
+
+def _last_key_re(namespace: str) -> re.Pattern[str]:
+    return re.compile(rf"<!-- {re.escape(namespace)}:last-key:([^\s>]+) -->")

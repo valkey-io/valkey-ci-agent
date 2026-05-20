@@ -1,6 +1,8 @@
 """Tests for fuzzer analyzer."""
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from scripts.fuzzer.analyzer import (
@@ -117,3 +119,56 @@ def test_format_source_note_when_clones_fail():
     note = _format_source_note(_ctx(), valkey_ok=False, fuzzer_ok=False)
     assert "NOT AVAILABLE" in note
     assert "Do not cite source line numbers" in note
+
+
+def test_format_source_note_when_sha_unrecorded():
+    """Missing SHA must produce a different note than a failed clone — we
+    never want to silently fall back to the default branch.
+    """
+    from scripts.fuzzer.analyzer import _format_source_note
+    note = _format_source_note(_ctx(), valkey_ok=False, fuzzer_ok=True)
+    assert "NOT AVAILABLE" in note
+    assert "manifest did not record the tested commit" in note
+    assert "Do not cite source line numbers" in note
+
+
+def test_invoke_claude_skips_valkey_clone_when_sha_missing(monkeypatch, tmp_path):
+    """If the manifest didn't record valkey_sha, the analyzer must NOT clone
+    the default branch — that would have Claude triage a different tree.
+    """
+    from scripts.fuzzer import analyzer as analyzer_mod
+
+    clone_calls: list[tuple] = []
+
+    def fake_clone(repo, dest, sha=None):
+        clone_calls.append((repo, sha))
+        return True
+
+    fake_result = MagicMock(returncode=0, stdout='{"overall_status": "normal"}', stderr="")
+    monkeypatch.setattr(analyzer_mod, "shallow_clone_at_sha", fake_clone)
+    monkeypatch.setattr(analyzer_mod, "run_agent", lambda *a, **kw: fake_result)
+
+    ctx = _ctx(head_sha="abc123")  # tested_valkey_sha left as None
+    analyzer_mod._invoke_claude(ctx, [], tmp_path)
+
+    cloned_repos = [r for r, _ in clone_calls]
+    assert "valkey-io/valkey" not in cloned_repos
+    assert "r" in cloned_repos  # fuzzer repo (the test ctx repo) still cloned
+
+
+def test_build_error_analysis_has_distinct_fingerprint_per_reason():
+    """Different infra-failure reasons must NOT collide on a single issue."""
+    from scripts.fuzzer.analyzer import _build_error_analysis
+    a = _build_error_analysis(_ctx(), "no fuzzer artifact bundle found")
+    b = _build_error_analysis(_ctx(), "fuzzer artifact bundle was empty or unreadable")
+    assert a.incident_fingerprint
+    assert b.incident_fingerprint
+    assert a.incident_fingerprint != b.incident_fingerprint
+
+
+def test_build_error_analysis_fingerprint_is_stable():
+    """Same context + reason produces the same fingerprint across calls."""
+    from scripts.fuzzer.analyzer import _build_error_analysis
+    a = _build_error_analysis(_ctx(), "no fuzzer artifact bundle found")
+    b = _build_error_analysis(_ctx(), "no fuzzer artifact bundle found")
+    assert a.incident_fingerprint == b.incident_fingerprint
