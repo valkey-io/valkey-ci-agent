@@ -56,7 +56,7 @@ class TestLoadRegistry:
         assert entry.build_commands == ()
         assert entry.validation_rules == ()
         assert entry.backport_label == "backport"
-        assert entry.llm_conflict_label == "llm-resolved-conflicts"
+        assert entry.llm_conflict_label == "ai-resolved-conflicts"
         assert entry.max_conflicting_files == 100
 
     def test_full_entry(self, tmp_path):

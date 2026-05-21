@@ -308,6 +308,155 @@ def test_create_backport_pr_does_not_apply_llm_label_for_automatic_resolution() 
     mock_pr.add_to_labels.assert_called_once_with("needs-backport-review")
 
 
+def _make_creator_with_repo(
+    backport_label: str = "backport",
+    llm_conflict_label: str = "ai-resolved-conflicts",
+):
+    """Build a BackportPRCreator wired to mock github/repo/pr objects."""
+    mock_github = MagicMock()
+    mock_repo = MagicMock()
+    mock_github.get_repo.return_value = mock_repo
+
+    mock_pr = MagicMock()
+    mock_pr.number = 999
+    mock_pr.html_url = "https://github.com/owner/repo/pull/999"
+    mock_repo.create_pull.return_value = mock_pr
+
+    creator = BackportPRCreator(
+        mock_github,
+        "owner/repo",
+        backport_label=backport_label,
+        llm_conflict_label=llm_conflict_label,
+    )
+    return creator, mock_repo, mock_pr
+
+
+def _basic_context() -> BackportPRContext:
+    return BackportPRContext(
+        source_pr_number=123,
+        source_pr_title="Fix something",
+        source_pr_url="https://github.com/owner/repo/pull/123",
+        source_pr_diff="diff",
+        target_branch="8.1",
+        commits=["abc1234"],
+    )
+
+
+def test_ensure_label_exists_creates_missing_backport_label() -> None:
+    """When the configured backport label is missing on the repo, the
+    creator should create it before applying."""
+    from github.GithubException import GithubException
+
+    creator, mock_repo, mock_pr = _make_creator_with_repo()
+    mock_repo.get_label.side_effect = GithubException(404, {"message": "Not Found"})
+
+    creator.create_backport_pr(
+        _basic_context(),
+        CherryPickResult(success=True, conflicting_files=[], applied_commits=["abc1234"]),
+        None,
+        branch_name="backport/123-to-8.1",
+    )
+
+    mock_repo.get_label.assert_called_once_with("backport")
+    mock_repo.create_label.assert_called_once()
+    create_kwargs = mock_repo.create_label.call_args.kwargs
+    assert create_kwargs["name"] == "backport"
+    assert create_kwargs["color"] == "0e8a16"
+    assert "valkey-ci-agent" in create_kwargs["description"]
+    mock_pr.add_to_labels.assert_called_once_with("backport")
+
+
+def test_ensure_label_exists_creates_both_labels_when_llm_resolved() -> None:
+    """Both labels must be created when both are missing and LLM resolved a conflict."""
+    from github.GithubException import GithubException
+
+    creator, mock_repo, mock_pr = _make_creator_with_repo()
+    mock_repo.get_label.side_effect = GithubException(404, {"message": "Not Found"})
+
+    result = ResolutionResult(
+        path="src/server.c",
+        resolved_content="resolved",
+        resolution_summary="LLM resolved conflict",
+    )
+    creator.create_backport_pr(
+        _basic_context(),
+        CherryPickResult(success=False, conflicting_files=[], applied_commits=["abc1234"]),
+        [result],
+        branch_name="backport/123-to-8.1",
+    )
+
+    assert mock_repo.get_label.call_count == 2
+    assert mock_repo.create_label.call_count == 2
+    created_names = {
+        call.kwargs["name"] for call in mock_repo.create_label.call_args_list
+    }
+    assert created_names == {"backport", "ai-resolved-conflicts"}
+    mock_pr.add_to_labels.assert_called_once_with(
+        "backport", "ai-resolved-conflicts",
+    )
+
+
+def test_ensure_label_skips_create_when_label_exists() -> None:
+    """When get_label succeeds, create_label must not be called."""
+    creator, mock_repo, mock_pr = _make_creator_with_repo()
+    mock_repo.get_label.return_value = MagicMock()  # label found
+
+    creator.create_backport_pr(
+        _basic_context(),
+        CherryPickResult(success=True, conflicting_files=[], applied_commits=["abc1234"]),
+        None,
+        branch_name="backport/123-to-8.1",
+    )
+
+    mock_repo.get_label.assert_called_once_with("backport")
+    mock_repo.create_label.assert_not_called()
+    mock_pr.add_to_labels.assert_called_once_with("backport")
+
+
+def test_ensure_label_swallows_create_failure_and_still_attempts_apply() -> None:
+    """If label creation fails (e.g. permission error), the PR flow continues
+    and add_to_labels is still attempted."""
+    from github.GithubException import GithubException
+
+    creator, mock_repo, mock_pr = _make_creator_with_repo()
+    mock_repo.get_label.side_effect = GithubException(404, {"message": "Not Found"})
+    mock_repo.create_label.side_effect = GithubException(
+        403, {"message": "Resource not accessible by integration"},
+    )
+
+    pr_url = creator.create_backport_pr(
+        _basic_context(),
+        CherryPickResult(success=True, conflicting_files=[], applied_commits=["abc1234"]),
+        None,
+        branch_name="backport/123-to-8.1",
+    )
+
+    assert pr_url == mock_pr.html_url
+    mock_repo.create_label.assert_called_once()
+    mock_pr.add_to_labels.assert_called_once_with("backport")
+
+
+def test_ensure_label_treats_422_as_already_exists() -> None:
+    """A 422 from create_label (concurrent creation) should be silently ignored."""
+    from github.GithubException import GithubException
+
+    creator, mock_repo, mock_pr = _make_creator_with_repo()
+    mock_repo.get_label.side_effect = GithubException(404, {"message": "Not Found"})
+    mock_repo.create_label.side_effect = GithubException(
+        422, {"message": "Validation Failed"},
+    )
+
+    pr_url = creator.create_backport_pr(
+        _basic_context(),
+        CherryPickResult(success=True, conflicting_files=[], applied_commits=["abc1234"]),
+        None,
+        branch_name="backport/123-to-8.1",
+    )
+
+    assert pr_url == mock_pr.html_url
+    mock_pr.add_to_labels.assert_called_once_with("backport")
+
+
 def test_pull_create_head_ref_uses_plain_branch_for_direct_upstream() -> None:
     branch = "agent/backport/sweep/8.1"
 

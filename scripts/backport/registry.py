@@ -36,7 +36,7 @@ class RepoEntry:
     build_commands: tuple[str, ...] = ()
     validation_rules: tuple[ValidationRule, ...] = ()
     backport_label: str = "backport"
-    llm_conflict_label: str = "llm-resolved-conflicts"
+    llm_conflict_label: str = "ai-resolved-conflicts"
     max_conflicting_files: int = 100
 
     @property
@@ -141,7 +141,7 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
     backport_label = raw.get("backport_label", "backport")
     if not isinstance(backport_label, str) or not backport_label.strip():
         raise ValueError(f"repos[{index}].backport_label must be a non-empty string")
-    llm_conflict_label = raw.get("llm_conflict_label", "llm-resolved-conflicts")
+    llm_conflict_label = raw.get("llm_conflict_label", "ai-resolved-conflicts")
     if not isinstance(llm_conflict_label, str) or not llm_conflict_label.strip():
         raise ValueError(f"repos[{index}].llm_conflict_label must be a non-empty string")
     max_conflicting_files = raw.get("max_conflicting_files", 100)

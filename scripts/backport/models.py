@@ -75,5 +75,5 @@ class BackportConfig:
     """Configuration for the backport agent, derived from the registry."""
 
     backport_label: str = "backport"
-    llm_conflict_label: str = "llm-resolved-conflicts"
+    llm_conflict_label: str = "ai-resolved-conflicts"
     max_conflicting_files: int = 100

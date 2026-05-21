@@ -330,7 +330,7 @@ class TestRunBackportCleanCherryPick:
             base_repo="valkey-io/valkey",
             push_repo=_DEFAULT_PUSH_REPO,
             backport_label="backport",
-            llm_conflict_label="llm-resolved-conflicts",
+            llm_conflict_label="ai-resolved-conflicts",
         )
 
     @patch("scripts.common.build_validator.run_build_commands")
