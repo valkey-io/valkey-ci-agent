@@ -19,3 +19,20 @@ repos:
         project_number: 18
       - branch: "9.1"
         project_number: 41
+
+  - repo: valkey-io/valkey-search
+    project_owner: valkey-io
+    project_owner_type: organization
+    language: c++
+    build_commands:
+      - "./build.sh"
+    backport_label: backport
+    llm_conflict_label: ai-resolved-conflicts
+    max_conflicting_files: 100
+    branches:
+      - branch: "1.0"
+        project_number: 36
+      - branch: "1.1"
+        project_number: 34
+      - branch: "1.2"
+        project_number: 58
