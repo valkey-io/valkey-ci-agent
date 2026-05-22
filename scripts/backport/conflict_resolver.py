@@ -159,6 +159,13 @@ def _validate_file(
         ), None
 
     if hashlib.sha256(content.encode("utf-8")).hexdigest() == pre_hashes.get(cf.path):
+        # File unchanged — but if it has no conflict markers, git's auto-merge
+        # already produced a clean result. Treat it as resolved so it gets staged.
+        if not has_conflict_markers(content):
+            return ResolutionResult(
+                path=cf.path, resolved_content=content,
+                resolution_summary="auto-merged cleanly (no conflict markers, no edits needed)",
+            ), None
         return ResolutionResult(
             path=cf.path, resolved_content=None,
             resolution_summary="file unchanged after Claude Code (no resolution attempted)",

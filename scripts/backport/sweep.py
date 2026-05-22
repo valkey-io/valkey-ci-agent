@@ -65,6 +65,7 @@ class ProjectBackportCandidate:
     target_branch: str
     merge_commit_sha: str | None = None
     commit_shas: list[str] = field(default_factory=list)
+    merged_at: str = ""  # ISO timestamp for ordering
 
 
 @dataclass
@@ -238,6 +239,7 @@ class ProjectBackportDiscovery:
             target_branch=target,
             merge_commit_sha=merge_sha,
             commit_shas=[s for s in commits if s],
+            merged_at=str(content.get("mergedAt") or ""),
         )
 
 
@@ -282,6 +284,10 @@ def run_backport_sweep(
     )
     candidates_by_branch = discovery.discover([target_branch])
     candidates = candidates_by_branch.get(target_branch, [])
+
+    # Sort by merge date so dependent PRs are cherry-picked in the order
+    # they were merged to the source branch.
+    candidates.sort(key=lambda c: c.merged_at or "")
 
     if max_candidates > 0:
         logger.info(
@@ -1154,7 +1160,7 @@ query($owner: String!, $number: Int!, $cursor: String) {{
           content {{
             __typename
             ... on PullRequest {{
-              number title url merged
+              number title url merged mergedAt
               repository {{ nameWithOwner }}
               mergeCommit {{ oid }}
               commits(first: 100) {{ nodes {{ commit {{ oid }} }} }}
