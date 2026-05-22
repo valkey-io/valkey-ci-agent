@@ -146,6 +146,7 @@ def test_claude_nonzero_exit_returns_unresolved(tmp_path: Path) -> None:
 
 
 def test_validation_failure_retries_claude_once(tmp_path: Path) -> None:
+    """If Claude leaves conflict markers in the file, the resolver retries once."""
     src = tmp_path / "tests" / "unit"
     src.mkdir(parents=True)
     conflicted = src / "cluster.tcl"
@@ -161,8 +162,12 @@ def test_validation_failure_retries_claude_once(tmp_path: Path) -> None:
     def mock_agent(_profile, prompt, **kw):
         prompts.append(prompt)
         if len(prompts) == 1:
-            conflicted.write_text("proc f {} { return ok\n")
+            # Pass 1: leave conflict markers in the file → triggers retry.
+            conflicted.write_text(
+                "<<<<<<< HEAD\nold\n=======\nproc f {} { return ok }\n>>>>>>> abc\n"
+            )
         else:
+            # Pass 2: actually resolve.
             conflicted.write_text("proc f {} { return ok }\n")
         return _agent_result('{"type":"result","result":"Resolved"}')
 
