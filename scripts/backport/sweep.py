@@ -434,7 +434,7 @@ def _process_branch(
                     for item in applied:
                         item.outcome = "skipped-test"
                         item.detail = output[:500]
-                    logger.warning("Validation failed for %s; not pushing branch.", target_branch)
+                    logger.warning("Validation failed for %s; not pushing branch.\nOutput (last 4000 chars):\n%s", target_branch, output[-4000:])
                     return result
                 _push_backport_branch(
                     tmpdir,

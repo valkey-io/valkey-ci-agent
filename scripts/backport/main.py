@@ -482,7 +482,13 @@ def _run_git(repo_dir: str, *args: str, env: dict[str, str] | None = None) -> No
     """Run a git command in *repo_dir*, raising on failure."""
     cmd = ["git", *args]
     logger.debug("Running: %s (cwd=%s)", " ".join(cmd), repo_dir)
-    subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True, text=True, env=env)
+    result = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        logger.error("git %s failed (rc=%d)\nstdout: %s\nstderr: %s",
+                     args[0], result.returncode,
+                     result.stdout.strip()[-500:] if result.stdout else "",
+                     result.stderr.strip()[-500:] if result.stderr else "")
+        result.check_returncode()
 
 
 def _apply_resolutions(
