@@ -213,11 +213,10 @@ def test_mixed_whitespace_and_real_conflicts(tmp_path: Path) -> None:
 
 def test_unchanged_file_without_markers_detected(tmp_path: Path) -> None:
     """If Claude doesn't edit the file and it has no conflict markers
-    (e.g., add/add conflict where git leaves one side), the pre-hash
-    check catches it as unresolved."""
+    (e.g., git auto-merged cleanly), treat it as resolved so it gets staged."""
     src = tmp_path / "src"
     src.mkdir()
-    # File without conflict markers (git left target side)
+    # File without conflict markers (git auto-merged cleanly)
     target_file = src / "server.c"
     target_file.write_text("int main() { return 0; }\n")
 
@@ -235,8 +234,8 @@ def test_unchanged_file_without_markers_detected(tmp_path: Path) -> None:
         results = resolve_conflicts_with_claude(str(tmp_path), [cf], _pr_context())
 
     assert len(results) == 1
-    assert results[0].resolved_content is None
-    assert "file unchanged" in results[0].resolution_summary
+    assert results[0].resolved_content == "int main() { return 0; }\n"
+    assert "auto-merged cleanly" in results[0].resolution_summary
 
 
 def test_claude_editing_unlisted_file_is_rejected(tmp_path: Path) -> None:
