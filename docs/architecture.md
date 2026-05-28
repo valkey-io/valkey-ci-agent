@@ -47,9 +47,13 @@ Claude gets the repo checkout with conflict markers, reads both sides, and edits
 only the conflicted files in place. The prompt is parameterized by the repo
 language from `repos.yml`.
 
-Validation runs the registry's `build_commands` for every generated branch
-before push. A non-zero exit blocks the push. Repos with no `build_commands`
-configured rely on upstream CI for verification.
+Validation first runs the registry's optional `validation_setup_commands`,
+then runs `build_commands` before push. Repos can opt into
+`validate_each_candidate` to validate after each cherry-pick and isolate the
+candidate that broke the branch. When validation fails but the branch has
+reviewable changes, the sweep opens or updates a draft PR with failure details
+instead of discarding the work. Repos with no `build_commands` configured rely
+on upstream CI for verification.
 
 ### Common Infrastructure
 

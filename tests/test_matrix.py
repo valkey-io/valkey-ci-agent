@@ -48,6 +48,8 @@ def test_build_matrix_emits_one_leg_per_registered_branch(tmp_path) -> None:
     assert matrix["include"][0]["push_repo"] == "org/core"
     assert matrix["include"][0]["language"] == "c"
     assert json.loads(matrix["include"][0]["build_commands_json"]) == ["make test"]
+    assert json.loads(matrix["include"][0]["validation_setup_commands_json"]) == []
+    assert matrix["include"][0]["validate_each_candidate"] is False
 
 
 def test_build_matrix_filters_by_repo_and_project_number(tmp_path) -> None:
@@ -69,6 +71,8 @@ def test_build_matrix_filters_by_repo_and_project_number(tmp_path) -> None:
                 "push_repo": "org/core",
                 "language": "c",
                 "build_commands_json": json.dumps(["make test"]),
+                "validation_setup_commands_json": json.dumps([]),
+                "validate_each_candidate": False,
             }
         ]
     }

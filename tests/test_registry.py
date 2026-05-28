@@ -54,7 +54,9 @@ class TestLoadRegistry:
         assert entry.push_repo is None
         assert entry.effective_push_repo == "org/repo"
         assert entry.build_commands == ()
+        assert entry.validation_setup_commands == ()
         assert entry.validation_rules == ()
+        assert entry.validate_each_candidate is False
         assert entry.backport_label == "backport"
         assert entry.llm_conflict_label == "ai-resolved-conflicts"
         assert entry.max_conflicting_files == 100
@@ -63,12 +65,14 @@ class TestLoadRegistry:
         data = _minimal_registry(repos=[_minimal_repo(
             push_repo="fork/repo",
             build_commands=["make -j4"],
+            validation_setup_commands=["./ci/setup.sh"],
             validation_rules=[
                 {
                     "paths": ["src/cluster_legacy.c", "tests/unit/cluster/*.tcl"],
                     "commands": ["./runtest --single unit/cluster/slot-migration"],
                 }
             ],
+            validate_each_candidate=True,
             backport_label="bp",
             llm_conflict_label="ai",
             max_conflicting_files=50,
@@ -83,12 +87,14 @@ class TestLoadRegistry:
         assert entry.push_repo == "fork/repo"
         assert entry.effective_push_repo == "fork/repo"
         assert entry.build_commands == ("make -j4",)
+        assert entry.validation_setup_commands == ("./ci/setup.sh",)
         assert entry.validation_rules == (
             ValidationRule(
                 paths=("src/cluster_legacy.c", "tests/unit/cluster/*.tcl"),
                 commands=("./runtest --single unit/cluster/slot-migration",),
             ),
         )
+        assert entry.validate_each_candidate is True
         assert entry.backport_label == "bp"
         assert entry.llm_conflict_label == "ai"
         assert entry.max_conflicting_files == 50
@@ -219,6 +225,27 @@ class TestValidation:
         data = _minimal_registry(repos=[_minimal_repo(build_commands=["make", "  "])])
         path = _write_registry(tmp_path, data)
         with pytest.raises(ValueError, match=r"build_commands\[1\] must be a non-empty string"):
+            load_registry(path)
+
+    def test_validation_setup_commands_not_list(self, tmp_path):
+        data = _minimal_registry(repos=[_minimal_repo(validation_setup_commands="make")])
+        path = _write_registry(tmp_path, data)
+        with pytest.raises(ValueError, match="validation_setup_commands must be a list"):
+            load_registry(path)
+
+    def test_validation_setup_commands_rejects_empty_command(self, tmp_path):
+        data = _minimal_registry(repos=[_minimal_repo(validation_setup_commands=["setup", "  "])])
+        path = _write_registry(tmp_path, data)
+        with pytest.raises(
+            ValueError,
+            match=r"validation_setup_commands\[1\] must be a non-empty string",
+        ):
+            load_registry(path)
+
+    def test_validate_each_candidate_must_be_boolean(self, tmp_path):
+        data = _minimal_registry(repos=[_minimal_repo(validate_each_candidate="yes")])
+        path = _write_registry(tmp_path, data)
+        with pytest.raises(ValueError, match="validate_each_candidate must be a boolean"):
             load_registry(path)
 
     def test_backport_label_must_be_non_empty_string(self, tmp_path):

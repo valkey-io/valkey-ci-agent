@@ -24,8 +24,11 @@ repos:
     project_owner: valkey-io
     project_owner_type: organization
     language: c++
+    validation_setup_commands:
+      - "docker build -t valkey-search-backport -f .devcontainer/Dockerfile ."
     build_commands:
-      - "./build.sh"
+      - "mkdir -p test-results && docker run --privileged --rm --mount type=bind,source=\"$(pwd)/test-results\",target=/workspace/test-results -v \"$(pwd):/workspace\" --user \"ubuntu:ubuntu\" valkey-search-backport sudo ci/build_ubuntu.sh --unittest-output=/workspace/test-results"
+    validate_each_candidate: true
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100

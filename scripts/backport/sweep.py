@@ -264,6 +264,10 @@ def run_backport_sweep(
     target_branch = branch_entry.branch
     project_number = branch_entry.project_number
     test_commands = test_commands_override if test_commands_override is not None else list(repo_entry.build_commands)
+    validation_setup_commands = (
+        [] if test_commands_override is not None
+        else list(repo_entry.validation_setup_commands)
+    )
     validation_rules = [] if test_commands_override is not None else list(repo_entry.validation_rules)
 
     gh = Github(auth=Auth.Token(github_token))
@@ -308,10 +312,12 @@ def run_backport_sweep(
         github_token=github_token, target_branch=target_branch,
         candidates=candidates, push_repo=push_repo,
         test_commands=test_commands,
+        validation_setup_commands=validation_setup_commands,
         max_applied=max_candidates,
         language=repo_entry.language,
         build_commands=list(repo_entry.build_commands) or None,
         validation_rules=validation_rules,
+        validate_each_candidate=repo_entry.validate_each_candidate,
     )
     emit_job_summary(_build_summary([result]))
     return result
@@ -321,10 +327,12 @@ def _process_branch(
     *, gh: Any, repo: Any, repo_full_name: str, github_token: str,
     target_branch: str, candidates: list[ProjectBackportCandidate],
     push_repo: str, test_commands: list[str],
+    validation_setup_commands: list[str] | None = None,
     max_applied: int = 0,
     language: str = "c",
     build_commands: list[str] | None = None,
     validation_rules: list[Any] | None = None,
+    validate_each_candidate: bool = False,
 ) -> BranchSweepResult:
     result = BranchSweepResult(target_branch=target_branch, candidates_found=len(candidates))
     tmpdir = tempfile.mkdtemp(prefix=f"backport-{_safe_tmp_component(target_branch)}-")
@@ -335,6 +343,14 @@ def _process_branch(
             _clone_target_branch(repo_full_name, target_branch, tmpdir, git_env)
             _run_git(tmpdir, "config", "user.name", "valkeyrie-bot[bot]")
             _run_git(tmpdir, "config", "user.email", "3692572+valkeyrie-bot[bot]@users.noreply.github.com")
+            setup_ok, setup_output = _run_test_commands(
+                tmpdir, validation_setup_commands or [],
+            )
+            if not setup_ok:
+                raise RuntimeError(
+                    "validation setup failed: "
+                    + (setup_output[:500] or "setup command failed")
+                )
 
             # Sync push_repo's copy of target_branch to match source before
             # we start cherry-picking. Without this, if the fork's release
@@ -396,6 +412,7 @@ def _process_branch(
             logger.info("Already applied on %s: %s", backport_branch, already_applied)
 
             applied_count = 0
+            retained_validation_failure = False
             for candidate in candidates:
                 if max_applied > 0 and applied_count >= max_applied:
                     logger.info(
@@ -419,23 +436,65 @@ def _process_branch(
                 )
                 result.results.append(cr)
                 if cr.outcome == "applied":
+                    if validate_each_candidate:
+                        ok, output = _validate_backport_branch(
+                            tmpdir,
+                            target_branch,
+                            test_commands,
+                            validation_rules or [],
+                        )
+                        if not ok:
+                            cr.outcome = "skipped-test"
+                            cr.detail = output[:500]
+                            if applied_count == 0:
+                                retained_validation_failure = True
+                                logger.warning(
+                                    "Validation failed for first retained "
+                                    "candidate #%d on %s; preserving branch "
+                                    "for draft PR review.",
+                                    candidate.source_pr_number,
+                                    target_branch,
+                                )
+                                break
+                            subprocess.run(
+                                ["git", "reset", "--hard", "HEAD^"],
+                                cwd=tmpdir,
+                                capture_output=True,
+                                text=True,
+                            )
+                            logger.warning(
+                                "Validation failed for candidate #%d on %s; "
+                                "removed candidate and continuing.",
+                                candidate.source_pr_number,
+                                target_branch,
+                            )
+                            continue
                     applied_count += 1
 
             # Push if we applied anything and validation passes.
             applied = [r for r in result.results if r.outcome == "applied"]
-            if applied:
-                commands = select_validation_commands(
-                    test_commands,
-                    validation_rules or [],
-                    changed_paths_since_base(tmpdir, f"origin/{target_branch}"),
-                )
-                ok, output = _run_test_commands(tmpdir, commands)
+            branch_has_changes = _branch_has_changes(tmpdir, target_branch)
+            validation_failed = retained_validation_failure
+            if branch_has_changes:
+                if applied and not retained_validation_failure:
+                    ok, output = _validate_backport_branch(
+                        tmpdir,
+                        target_branch,
+                        test_commands,
+                        validation_rules or [],
+                    )
+                else:
+                    ok, output = (not retained_validation_failure, "")
                 if not ok:
+                    validation_failed = True
                     for item in applied:
                         item.outcome = "skipped-test"
                         item.detail = output[:500]
-                    logger.warning("Validation failed for %s; not pushing branch.", target_branch)
-                    return result
+                    logger.warning(
+                        "Validation failed for %s; pushing draft PR with "
+                        "failure details.",
+                        target_branch,
+                    )
                 _push_backport_branch(
                     tmpdir,
                     backport_branch,
@@ -449,6 +508,7 @@ def _process_branch(
                     gh, repo_full_name, push_repo, target_branch,
                     backport_branch, result, existing_pr,
                     gql=GitHubGraphQLClient(github_token),
+                    draft=validation_failed,
                 )
                 result.pr_url = pr_url
 
@@ -809,6 +869,30 @@ def _run_test_commands(repo_dir: str, test_commands: list[str]) -> tuple[bool, s
     return run_build_commands(repo_dir, test_commands)
 
 
+def _validate_backport_branch(
+    repo_dir: str,
+    target_branch: str,
+    test_commands: list[str],
+    validation_rules: list[Any],
+) -> tuple[bool, str]:
+    commands = select_validation_commands(
+        test_commands,
+        validation_rules,
+        changed_paths_since_base(repo_dir, f"origin/{target_branch}"),
+    )
+    return _run_test_commands(repo_dir, commands)
+
+
+def _branch_has_changes(repo_dir: str, target_branch: str) -> bool:
+    result = subprocess.run(
+        ["git", "diff", "--quiet", f"origin/{target_branch}...HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 1
+
+
 def _sync_target_branch_to_source(
     gh: Any, push_repo: str, source_repo: str, target_branch: str,
 ) -> None:
@@ -969,10 +1053,12 @@ def _delete_stale_backport_branch(gh: Any, push_repo: str, branch: str) -> None:
 
 def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head_branch: str,
                result: BranchSweepResult, existing_pr: Any | None,
-               gql: GitHubGraphQLClient | None = None) -> str:
+               gql: GitHubGraphQLClient | None = None,
+               draft: bool = False) -> str:
     repo = retry_github_call(lambda: gh.get_repo(base_repo), retries=2, description=f"get {base_repo}")
-    body = _build_pr_body(result)
-    title = f"[backport] Backport sweep for {target_branch}"
+    body = _build_pr_body(result, validation_failed=draft)
+    title_prefix = "[backport][validation failed]" if draft else "[backport]"
+    title = f"{title_prefix} Backport sweep for {target_branch}"
 
     if existing_pr:
         retry_github_call(lambda: existing_pr.edit(title=title, body=body), retries=2, description="update PR")
@@ -982,7 +1068,15 @@ def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head
         # the next sweep run so maintainers see them in the active queue.
         # The GitHub REST API has no endpoint for this transition, so use
         # the GraphQL markPullRequestReadyForReview mutation.
-        if getattr(existing_pr, "draft", False) and gql is not None:
+        if draft and not getattr(existing_pr, "draft", False) and gql is not None:
+            node_id = getattr(existing_pr, "node_id", None)
+            if node_id:
+                _mark_pr_draft(gql, node_id)
+                logger.info(
+                    "Converted PR #%d on %s back to draft after validation failure",
+                    existing_pr.number, base_repo,
+                )
+        elif not draft and getattr(existing_pr, "draft", False) and gql is not None:
             node_id = getattr(existing_pr, "node_id", None)
             if node_id:
                 _mark_pr_ready_for_review(gql, node_id)
@@ -1002,7 +1096,7 @@ def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head
             body=body,
             head_branch=head_branch,
             base_branch=target_branch,
-            draft=False,
+            draft=draft,
         ),
         retries=2, description="create PR",
     )
@@ -1021,6 +1115,18 @@ def _mark_pr_ready_for_review(gql: GitHubGraphQLClient, pr_node_id: str) -> None
     mutation = """
     mutation($id: ID!) {
       markPullRequestReadyForReview(input: {pullRequestId: $id}) {
+        pullRequest { isDraft }
+      }
+    }
+    """
+    gql.execute(mutation, {"id": pr_node_id})
+
+
+def _mark_pr_draft(gql: GitHubGraphQLClient, pr_node_id: str) -> None:
+    """Convert a pull request to draft via GraphQL."""
+    mutation = """
+    mutation($id: ID!) {
+      convertPullRequestToDraft(input: {pullRequestId: $id}) {
         pullRequest { isDraft }
       }
     }
@@ -1050,13 +1156,26 @@ def _list_already_applied(repo_dir: str, base_branch: str, backport_branch: str)
 
 
 
-def _build_pr_body(result: BranchSweepResult) -> str:
+def _build_pr_body(
+    result: BranchSweepResult,
+    *,
+    validation_failed: bool = False,
+) -> str:
     lines = [
         f"# Backport sweep for {result.target_branch}",
         "",
         "Automated cherry-picks from PRs marked \"To be backported\".",
         "",
     ]
+    if validation_failed:
+        lines.extend([
+            "## Validation failed",
+            "",
+            "This draft PR preserves the attempted backport branch so "
+            "maintainers can inspect and fix the validation failure instead "
+            "of losing the work in scheduled-run logs.",
+            "",
+        ])
     # The Applied table reflects the cumulative state of the backport
     # branch: PRs cherry-picked in this run AND PRs already on the branch
     # from prior sweeps. This way the PR description always matches the

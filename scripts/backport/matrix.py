@@ -48,6 +48,10 @@ def build_matrix(
                 "push_repo": repo_entry.effective_push_repo,
                 "language": repo_entry.language,
                 "build_commands_json": json.dumps(list(repo_entry.build_commands)),
+                "validation_setup_commands_json": json.dumps(
+                    list(repo_entry.validation_setup_commands)
+                ),
+                "validate_each_candidate": repo_entry.validate_each_candidate,
             })
 
     return {"include": entries}

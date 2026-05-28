@@ -50,8 +50,11 @@ repos:
     project_owner: valkey-io
     project_owner_type: organization
     language: c                          # used in conflict resolver prompt
+    validation_setup_commands:
+      - "./ci/setup-backport-validation.sh" # optional; run once in clone
     build_commands:
       - "make -j$(nproc)"                # run before push; empty = skip
+    validate_each_candidate: false       # optional; validate after each pick
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
@@ -63,6 +66,8 @@ repos:
 ```
 
 By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
+
+If validation fails after the sweep has reviewable commits, the agent pushes a draft PR with failure details instead of dropping the branch. Repos with expensive or fragile validation can opt into `validate_each_candidate` so the sweep isolates the failing cherry-pick and keeps later candidates moving.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 

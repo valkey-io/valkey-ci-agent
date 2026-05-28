@@ -43,8 +43,11 @@ repos:
     project_owner: valkey-io
     project_owner_type: organization
     language: c++
+    validation_setup_commands:
+      - "docker build -t valkey-search-backport -f .devcontainer/Dockerfile ."
     build_commands:
-      - "cmake --build build -j$(nproc)"
+      - "docker run --privileged --rm -v \"$(pwd):/workspace\" --user \"ubuntu:ubuntu\" valkey-search-backport sudo ci/build_ubuntu.sh"
+    validate_each_candidate: true
     branches:
       - branch: "1.0"
         project_number: 8
