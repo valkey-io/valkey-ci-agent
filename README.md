@@ -67,7 +67,7 @@ repos:
 
 By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
 
-If validation fails after the sweep has reviewable commits, the agent pushes a draft PR with failure details instead of dropping the branch. Repos with expensive or fragile validation can opt into `validate_each_candidate` so the sweep isolates the failing cherry-pick and keeps later candidates moving.
+If validation fails after the sweep has reviewable commits, the agent pushes a draft PR with failure details instead of dropping the branch. Repos with expensive or fragile validation can opt into `validate_each_candidate`: a failure after an already-retained commit is reset so later candidates can continue, while a failure on the first retained candidate is preserved as a draft PR for review.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 

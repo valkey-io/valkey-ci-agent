@@ -49,11 +49,11 @@ language from `repos.yml`.
 
 Validation first runs the registry's optional `validation_setup_commands`,
 then runs `build_commands` before push. Repos can opt into
-`validate_each_candidate` to validate after each cherry-pick and isolate the
-candidate that broke the branch. When validation fails but the branch has
-reviewable changes, the sweep opens or updates a draft PR with failure details
-instead of discarding the work. Repos with no `build_commands` configured rely
-on upstream CI for verification.
+`validate_each_candidate` to validate after each cherry-pick. After one
+candidate has been retained, later validation failures are reset so the sweep
+can keep moving; when the first retained candidate fails, the broken branch is
+preserved as a draft PR for review. Repos with no `build_commands` configured
+rely on upstream CI for verification.
 
 ### Common Infrastructure
 

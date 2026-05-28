@@ -72,7 +72,9 @@ class ProjectBackportCandidate:
 class CandidateResult:
     source_pr_number: int
     source_pr_title: str
-    outcome: str  # applied, skipped-existing, skipped-conflict, skipped-test, error
+    # applied-validation-failed means the commit is present on the pushed
+    # backport branch, but branch validation failed and the PR stays draft.
+    outcome: str  # applied, applied-validation-failed, skipped-*, error
     detail: str = ""
 
 
@@ -419,6 +421,7 @@ def _process_branch(
 
             applied_count = 0
             retained_validation_failure = False
+            retained_validation_output = ""
             for candidate in candidates:
                 if max_applied > 0 and applied_count >= max_applied:
                     logger.info(
@@ -465,10 +468,11 @@ def _process_branch(
                             validation_rules or [],
                         )
                         if not ok:
-                            cr.outcome = "skipped-test"
+                            cr.outcome = "applied-validation-failed"
                             cr.detail = output[:500]
                             if applied_count == 0:
                                 retained_validation_failure = True
+                                retained_validation_output = output
                                 logger.warning(
                                     "Validation failed for first retained "
                                     "candidate #%d on %s; preserving branch "
@@ -477,12 +481,8 @@ def _process_branch(
                                     target_branch,
                                 )
                                 break
-                            subprocess.run(
-                                ["git", "reset", "--hard", "HEAD^"],
-                                cwd=tmpdir,
-                                capture_output=True,
-                                text=True,
-                            )
+                            cr.outcome = "skipped-test"
+                            _run_git(tmpdir, "reset", "--hard", "HEAD^")
                             logger.warning(
                                 "Validation failed for candidate #%d on %s; "
                                 "removed candidate and continuing.",
@@ -492,12 +492,17 @@ def _process_branch(
                             continue
                     applied_count += 1
 
-            # Push if we applied anything and validation passes.
-            applied = [r for r in result.results if r.outcome == "applied"]
+            # Push if the branch contains reviewable backport commits. That
+            # includes new commits from this run and commits already preserved
+            # on an existing sweep branch from a previous failed validation.
+            committed = [
+                r for r in result.results
+                if _result_is_on_backport_branch(r)
+            ]
             branch_has_changes = _branch_has_changes(tmpdir, target_branch)
             validation_failed = retained_validation_failure
-            if branch_has_changes and (applied or validation_failed):
-                if applied and not retained_validation_failure:
+            if branch_has_changes and (committed or validation_failed):
+                if committed and not retained_validation_failure:
                     ok, output = _validate_backport_branch(
                         tmpdir,
                         target_branch,
@@ -505,11 +510,14 @@ def _process_branch(
                         validation_rules or [],
                     )
                 else:
-                    ok, output = (not retained_validation_failure, "")
+                    ok, output = (
+                        not retained_validation_failure,
+                        retained_validation_output,
+                    )
                 if not ok:
                     validation_failed = True
-                    for item in applied:
-                        item.outcome = "skipped-test"
+                    for item in committed:
+                        item.outcome = "applied-validation-failed"
                         item.detail = output[:500]
                     logger.warning(
                         "Validation failed for %s; pushing draft PR with "
@@ -522,7 +530,15 @@ def _process_branch(
                     git_env,
                     force_with_lease=existing_pr is not None,
                 )
-                logger.info("Pushed %d commit(s) to %s/%s", len(applied), push_repo, backport_branch)
+                logger.info(
+                    "Pushed %d commit(s) to %s/%s",
+                    sum(
+                        1 for r in result.results
+                        if _result_is_on_backport_branch(r)
+                    ),
+                    push_repo,
+                    backport_branch,
+                )
 
                 # Upsert PR
                 pr_url = _upsert_pr(
@@ -912,7 +928,10 @@ def _head_changes_workflow_files(repo_dir: str) -> bool:
         text=True,
     )
     if result.returncode != 0:
-        return False
+        raise RuntimeError(
+            "could not inspect HEAD for workflow changes: "
+            + (result.stderr.strip()[:300] or "git diff-tree failed")
+        )
     return any(
         path.strip().startswith(".github/workflows/")
         for path in result.stdout.splitlines()
@@ -926,7 +945,14 @@ def _branch_has_changes(repo_dir: str, target_branch: str) -> bool:
         capture_output=True,
         text=True,
     )
-    return result.returncode == 1
+    if result.returncode == 0:
+        return False
+    if result.returncode == 1:
+        return True
+    raise RuntimeError(
+        f"could not compare branch to origin/{target_branch}: "
+        + (result.stderr.strip()[:300] or "git diff failed")
+    )
 
 
 def _sync_target_branch_to_source(
@@ -1098,12 +1124,10 @@ def _upsert_pr(gh: Any, base_repo: str, push_repo: str, target_branch: str, head
 
     if existing_pr:
         retry_github_call(lambda: existing_pr.edit(title=title, body=body), retries=2, description="update PR")
-        # Promote existing draft sweep PRs to "ready for review". Earlier
-        # versions of this script created PRs as drafts; we now want them
-        # open by default, and want any leftover drafts to be promoted on
-        # the next sweep run so maintainers see them in the active queue.
-        # The GitHub REST API has no endpoint for this transition, so use
-        # the GraphQL markPullRequestReadyForReview mutation.
+        # Validation can fail on one sweep and recover on a later sweep. Keep
+        # the PR draft while validation is broken, then promote it back to
+        # ready once the preserved branch validates. REST does not expose
+        # either draft transition, so use GraphQL for both directions.
         if draft and not getattr(existing_pr, "draft", False) and gql is not None:
             node_id = getattr(existing_pr, "node_id", None)
             if node_id:
@@ -1192,6 +1216,13 @@ def _list_already_applied(repo_dir: str, base_branch: str, backport_branch: str)
 
 
 
+def _result_is_on_backport_branch(result: CandidateResult) -> bool:
+    return result.outcome in {"applied", "applied-validation-failed"} or (
+        result.outcome == "skipped-existing"
+        and result.detail == DETAIL_ALREADY_ON_SWEEP_BRANCH
+    )
+
+
 def _build_pr_body(
     result: BranchSweepResult,
     *,
@@ -1231,15 +1262,20 @@ def _build_pr_body(
     # `Needs attention` continues to surface only this run's failures.
     applied = [
         r for r in result.results
-        if r.outcome == "applied"
-        or (
-            r.outcome == "skipped-existing"
-            and r.detail == DETAIL_ALREADY_ON_SWEEP_BRANCH
-        )
+        if _result_is_on_backport_branch(r)
+        and r.outcome != "applied-validation-failed"
+    ]
+    validation_failed_applied = [
+        r for r in result.results
+        if r.outcome == "applied-validation-failed"
     ]
     failed = [
         r for r in result.results
-        if r.outcome not in {"applied", "skipped-existing"}
+        if r.outcome not in {
+            "applied",
+            "applied-validation-failed",
+            "skipped-existing",
+        }
     ]
 
     if applied:
@@ -1247,6 +1283,22 @@ def _build_pr_body(
         for r in applied:
             lines.append(
                 f"| #{r.source_pr_number} | {_esc(r.source_pr_title)} | {_esc(r.detail)} |",
+            )
+        lines.append("")
+
+    if validation_failed_applied:
+        lines.extend([
+            "## Applied (validation failed)",
+            "",
+            "These candidates are present on the backport branch, but validation failed.",
+            "",
+            "| Source PR | Title | Validation output |",
+            "|---|---|---|",
+        ])
+        for r in validation_failed_applied:
+            lines.append(
+                f"| #{r.source_pr_number} | {_esc(r.source_pr_title)} | "
+                f"{_esc(r.detail)} |",
             )
         lines.append("")
 
@@ -1275,7 +1327,7 @@ def _build_pr_body(
 def _build_summary(results: list[BranchSweepResult]) -> str:
     lines = ["## Backport Sweep", ""]
     for r in results:
-        applied = sum(1 for c in r.results if c.outcome == "applied")
+        applied = sum(1 for c in r.results if _result_is_on_backport_branch(c))
         suffix = f" — [PR]({r.pr_url})" if r.pr_url else ""
         if r.error:
             suffix += f" — error: {r.error}"
@@ -1413,7 +1465,15 @@ def main() -> None:
         max_candidates=args.max_candidates,
     )
 
-    print(json.dumps({"branch": result.target_branch, "found": result.candidates_found, "applied": sum(1 for c in result.results if c.outcome == "applied"), "pr": result.pr_url}, indent=2))
+    print(json.dumps({
+        "branch": result.target_branch,
+        "found": result.candidates_found,
+        "applied": sum(
+            1 for c in result.results
+            if _result_is_on_backport_branch(c)
+        ),
+        "pr": result.pr_url,
+    }, indent=2))
     if args.discover_only or args.dry_run:
         return
 
