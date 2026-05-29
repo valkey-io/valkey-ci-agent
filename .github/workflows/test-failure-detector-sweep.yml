@@ -27,7 +27,7 @@ permissions: {}
 jobs:
   detect-failures:
     name: "Detect test failures"
-    if: github.repository == 'valkey-io/valkey-ci-agent'
+    if: github.repository == 'BChan-0/valkey-ci-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
