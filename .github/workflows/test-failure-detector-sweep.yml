@@ -3,7 +3,7 @@ name: Test Failure Detector
 on:
   schedule:
     # Run daily at 12:00 UTC — after the Daily CI (which runs at ~04:00 UTC)
-    - cron: "0 12 * * *"
+    - cron: "0 23 * * *"
   workflow_dispatch:
     inputs:
       repo:
