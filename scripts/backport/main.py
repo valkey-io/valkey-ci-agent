@@ -501,7 +501,6 @@ def _apply_resolutions(
     with ``git add``, then aborts the failed cherry-pick and commits
     the resolved state.
     """
-    any_resolved = False
     for result in resolution_results:
         if result.resolved_content is not None:
             file_path = os.path.join(repo_dir, result.path)
@@ -511,14 +510,9 @@ def _apply_resolutions(
             with open(file_path, "w", encoding="utf-8") as fh:
                 fh.write(result.resolved_content)
             _run_git(repo_dir, "add", result.path)
-            any_resolved = True
         else:
             raise ValueError(f"Cannot apply unresolved conflict for {result.path}")
 
-    if not any_resolved:
-        # Nothing staged means nothing to commit; caller already verified the
-        # input, so this is a defensive check rather than an expected path.
-        return
     # Complete the cherry-pick with resolved content.
     # Set core.editor=true to prevent git from opening an editor
     # in the non-interactive CI environment.
@@ -529,11 +523,9 @@ def _apply_resolutions(
             "cherry-pick",
             "--continue",
         )
-    except Exception as exc:
-        # If cherry-pick --continue fails, something is wrong with the
-        # resolution (e.g., all files matched target-branch content so
-        # there's nothing to commit). Don't create a pointless empty
-        # commit — let the caller see the error and skip this candidate.
+    except subprocess.CalledProcessError as exc:
+        # Let the caller see the failure and skip this candidate rather than
+        # leaving a half-applied cherry-pick behind.
         logger.warning("cherry-pick --continue failed: %s", exc)
         raise
 

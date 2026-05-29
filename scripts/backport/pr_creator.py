@@ -186,7 +186,7 @@ class BackportPRCreator:
                 retries=3,
                 description="apply labels to backport PR",
             )
-        except Exception as exc:
+        except GithubException as exc:
             logger.warning("Failed to apply labels to PR #%d: %s", pr.number, exc)
 
         logger.info("Backport PR created: %s", pr.html_url)

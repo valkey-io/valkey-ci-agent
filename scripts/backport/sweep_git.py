@@ -75,11 +75,6 @@ def list_already_applied(repo_dir: str, base_branch: str, backport_branch: str) 
     return pr_nums
 
 
-def abort_cherry_pick(repo_dir: str, *, run_git: RunGit = run_git_default) -> None:
-    """Abort an in-progress cherry-pick, failing closed on cleanup errors."""
-    run_git(repo_dir, "cherry-pick", "--abort")
-
-
 RunProcess = Callable[..., subprocess.CompletedProcess[Any]]
 
 

@@ -126,10 +126,7 @@ def run_claude_code(
         returncode = process.wait(timeout=timeout)
         reader.join(timeout=5)
         stdout = "".join(stdout_parts)
-        logger.info(
-            "Claude exited %d (%d chars stdout, %d chars stderr).",
-            returncode, len(stdout), 0,
-        )
+        logger.info("Claude exited %d (%d chars stdout).", returncode, len(stdout))
         return stdout, "", returncode
     except subprocess.TimeoutExpired:
         if process is not None:

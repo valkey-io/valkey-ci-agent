@@ -55,7 +55,7 @@ def retry_github_call(
         try:
             return operation()
         except Exception as exc:
-            if not _is_retryable_error(exc):
+            if not _is_retryable_error(exc) or attempt == retries - 1:
                 raise
             wait_seconds = _delay(attempt)
             logger.warning(
@@ -65,5 +65,4 @@ def retry_github_call(
                 exc,
             )
             time.sleep(wait_seconds)
-    # Final attempt: let any exception propagate to the caller.
-    return operation()
+    raise RuntimeError("unreachable: retry loop exited without returning or raising")

@@ -53,7 +53,6 @@ from scripts.backport.sweep_validation import (
     validate_branch_with_optional_repair,
 )
 from scripts.common.git_auth import GitAuth, github_https_url
-from scripts.common.github_client import retry_github_call
 from scripts.common.job_summary import emit_job_summary
 
 if TYPE_CHECKING:
@@ -208,11 +207,6 @@ def run_backport_sweep(
     )
 
     gh = Github(auth=Auth.Token(github_token))
-    repo = retry_github_call(
-        lambda: gh.get_repo(repo_full_name),
-        retries=3,
-        description=f"get {repo_full_name}",
-    )
 
     discovery = ProjectBackportDiscovery(
         GitHubGraphQLClient(github_token),
@@ -260,7 +254,6 @@ def run_backport_sweep(
 
     result = _process_branch(
         gh=gh,
-        repo=repo,
         repo_full_name=repo_full_name,
         github_token=github_token,
         target_branch=target_branch,
@@ -281,7 +274,6 @@ def run_backport_sweep(
 def _process_branch(
     *,
     gh: Any,
-    repo: Any,
     repo_full_name: str,
     github_token: str,
     target_branch: str,
@@ -295,7 +287,6 @@ def _process_branch(
     validation_rules: list[Any] | None = None,
     repair_validation_failures: bool = False,
 ) -> BranchSweepResult:
-    _ = repo
     result = BranchSweepResult(
         target_branch=target_branch,
         candidates_found=len(candidates),
@@ -507,6 +498,8 @@ def _process_branch(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     return result
+
+
 def _normalize(value: object) -> str:
     return str(value or "").strip().lower()
 

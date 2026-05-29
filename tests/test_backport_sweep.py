@@ -599,7 +599,6 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
 
     result = backport_sweep._process_branch(
         gh=MagicMock(),
-        repo=MagicMock(),
         repo_full_name="valkey-io/valkey",
         github_token="token",
         target_branch="8.1",
@@ -666,7 +665,6 @@ def test_process_branch_skips_workflow_candidates_before_push(monkeypatch):
 
     result = backport_sweep._process_branch(
         gh=MagicMock(),
-        repo=MagicMock(),
         repo_full_name="valkey-io/valkey",
         github_token="token",
         target_branch="8.1",
@@ -731,7 +729,6 @@ def _green_only_process_branch(monkeypatch, *, candidates, apply_fn, validate_fn
 
     result = backport_sweep._process_branch(
         gh=MagicMock(),
-        repo=MagicMock(),
         repo_full_name="valkey-io/valkey",
         github_token="token",
         target_branch="8.1",
