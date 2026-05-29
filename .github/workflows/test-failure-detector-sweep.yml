@@ -1,0 +1,82 @@
+name: Test Failure Detector
+
+on:
+  schedule:
+    # Run daily at 12:00 UTC — after the Daily CI (which runs at ~04:00 UTC)
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository to scan (default: valkey-io/valkey)"
+        required: false
+        type: string
+        default: "valkey-io/valkey"
+      run_id:
+        description: "Specific workflow run ID to analyze (empty = latest Daily run)"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Parse and report only — don't create/update issues"
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  detect-failures:
+    name: "Detect test failures"
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+
+      - name: Run test failure detector
+        env:
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
+          RUN_ID: ${{ inputs.run_id || '' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          args=(
+            -m scripts.test_failure_detector.main
+            --token "${TARGET_TOKEN}"
+            --repo "${TARGET_REPO}"
+            --verbose
+          )
+
+          if [[ -n "${RUN_ID}" ]]; then
+            args+=(--run-id "${RUN_ID}")
+          fi
+
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+
+          python "${args[@]}"
