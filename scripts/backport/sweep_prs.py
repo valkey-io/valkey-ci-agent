@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from github.GithubException import GithubException
+
 from scripts.backport.pr_creator import (
     build_pull_search_head_ref,
     create_pull_from_push_repo,
@@ -32,22 +34,20 @@ def find_existing_pr(gh: Any, base_repo: str, push_repo: str, branch: str) -> An
 
 
 def delete_stale_backport_branch(gh: Any, push_repo: str, branch: str) -> None:
+    repo = retry_github_call(lambda: gh.get_repo(push_repo), retries=2, description=f"get {push_repo}")
     try:
-        repo = retry_github_call(lambda: gh.get_repo(push_repo), retries=2, description=f"get {push_repo}")
         ref = retry_github_call(
             lambda: repo.get_git_ref(f"heads/{branch}"),
             retries=1,
             description=f"check ref {branch}",
         )
-        if ref is None:
-            return
-        logger.info("Deleting stale backport branch %s on %s (no open PR)", branch, push_repo)
-        retry_github_call(lambda: ref.delete(), retries=2, description=f"delete ref {branch}")
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "404" in msg:
+    except GithubException as exc:
+        if exc.status == 404:
             return
         logger.warning("Could not prune stale backport branch %s: %s", branch, exc)
+        return
+    logger.info("Deleting stale backport branch %s on %s (no open PR)", branch, push_repo)
+    retry_github_call(lambda: ref.delete(), retries=2, description=f"delete ref {branch}")
 
 
 def upsert_pr(

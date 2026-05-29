@@ -19,8 +19,6 @@ logger = logging.getLogger(__name__)
 RunGit = Callable[..., Any]
 RunProcess = Callable[..., subprocess.CompletedProcess[str]]
 ResolveConflicts = Callable[..., list[ResolutionResult]]
-CheckCommitSize = Callable[[str, ProjectBackportCandidate], str | None]
-ChangedPaths = Callable[[str], tuple[str, ...]]
 
 
 def _abort_cherry_pick(repo_dir: str, run_git: RunGit) -> None:
@@ -39,8 +37,6 @@ def apply_candidate(
     run_git: RunGit,
     resolve_conflicts: ResolveConflicts,
     run_process: RunProcess = subprocess.run,
-    check_commit_size: CheckCommitSize | None = None,
-    changed_paths_func: ChangedPaths | None = None,
 ) -> CandidateResult:
     sha = candidate.merge_commit_sha
     if not sha:
@@ -63,7 +59,7 @@ def apply_candidate(
                 ["git", "cherry-pick", sha],
                 cwd=repo_dir, capture_output=True, text=True,
             )
-    except Exception as exc:
+    except subprocess.CalledProcessError as exc:
         return CandidateResult(candidate.source_pr_number, candidate.source_pr_title, "error", str(exc))
 
     if result.returncode == 0:
@@ -132,14 +128,8 @@ def apply_candidate(
         validation_rules or [],
         conflicting_paths,
     )
-    if changed_paths_func is None:
-        def changed_paths_func(path: str) -> tuple[str, ...]:
-            return changed_paths_in_index_or_worktree(
-                path,
-                run_process=run_process,
-            )
-
-    allowed_resolution_paths = sorted(set(conflicting_paths) | set(changed_paths_func(repo_dir)))
+    worktree_paths = changed_paths_in_index_or_worktree(repo_dir, run_process=run_process)
+    allowed_resolution_paths = sorted(set(conflicting_paths) | set(worktree_paths))
     resolutions = resolve_conflicts(
         repo_dir, conflicting_files, pr_context,
         language=language, build_commands=resolver_validation_commands or None,
@@ -199,18 +189,7 @@ def apply_candidate(
             f"commit failed: {(commit_result.stderr or commit_result.stdout).strip()[:200]}",
         )
 
-    if check_commit_size is None:
-        def check_commit_size(
-            path: str,
-            item: ProjectBackportCandidate,
-        ) -> str | None:
-            return check_applied_commit_size(
-                path,
-                item,
-                run_process=run_process,
-            )
-
-    issue = check_commit_size(repo_dir, candidate)
+    issue = check_applied_commit_size(repo_dir, candidate, run_process=run_process)
     if issue:
         logger.warning(
             "Reverting cherry-pick for #%d: %s",
@@ -270,41 +249,33 @@ def check_applied_commit_size(
     if not source_sha:
         return None
 
-    try:
-        run_process(
-            ["git", "fetch", "origin", source_sha],
-            cwd=repo_dir, capture_output=True, text=True, check=False,
-        )
-        upstream_stats = run_process(
-            ["git", "show", "--stat", "--format=", source_sha],
-            cwd=repo_dir, capture_output=True, text=True, check=False,
-        )
-        upstream_additions = parse_additions_from_stat(upstream_stats.stdout)
-        applied_stats = run_process(
-            ["git", "show", "--stat", "--format=", "HEAD"],
-            cwd=repo_dir, capture_output=True, text=True, check=False,
-        )
-        applied_additions = parse_additions_from_stat(applied_stats.stdout)
-    except Exception:
-        return None
-
+    run_process(
+        ["git", "fetch", "origin", source_sha],
+        cwd=repo_dir, capture_output=True, text=True, check=False,
+    )
+    upstream_stats = run_process(
+        ["git", "show", "--stat", "--format=", source_sha],
+        cwd=repo_dir, capture_output=True, text=True, check=False,
+    )
+    upstream_additions = parse_additions_from_stat(upstream_stats.stdout)
     if upstream_additions <= 0:
         return None
 
+    applied_stats = run_process(
+        ["git", "show", "--stat", "--format=", "HEAD"],
+        cwd=repo_dir, capture_output=True, text=True, check=False,
+    )
+    applied_additions = parse_additions_from_stat(applied_stats.stdout)
+
     extra = applied_additions - upstream_additions
-    if applied_additions >= upstream_additions * 3 and extra > 100:
-        return (
-            f"applied +{applied_additions} vs upstream +{upstream_additions} "
-            f"(+{extra} extra lines, "
-            f"{applied_additions / max(1, upstream_additions):.1f}x)"
-        )
-    if extra > 300:
-        return (
-            f"applied +{applied_additions} vs upstream +{upstream_additions} "
-            f"(+{extra} extra lines, "
-            f"{applied_additions / max(1, upstream_additions):.1f}x)"
-        )
-    return None
+    ratio = applied_additions / upstream_additions
+    over_applied = (applied_additions >= upstream_additions * 3 and extra > 100) or extra > 300
+    if not over_applied:
+        return None
+    return (
+        f"applied +{applied_additions} vs upstream +{upstream_additions} "
+        f"(+{extra} extra lines, {ratio:.1f}x)"
+    )
 
 
 def parse_additions_from_stat(stat_output: str) -> int:
@@ -319,13 +290,8 @@ def read_index_stage(
     *,
     run_process: RunProcess = subprocess.run,
 ) -> str:
-    try:
-        result = run_process(
-            ["git", "show", f":{stage}:{path}"],
-            cwd=repo_dir, capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            return result.stdout
-    except Exception:
-        pass
-    return ""
+    result = run_process(
+        ["git", "show", f":{stage}:{path}"],
+        cwd=repo_dir, capture_output=True, text=True,
+    )
+    return result.stdout if result.returncode == 0 else ""

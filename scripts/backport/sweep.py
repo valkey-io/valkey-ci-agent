@@ -573,8 +573,6 @@ def _apply_candidate(
         run_git=_run_git,
         resolve_conflicts=resolve_conflicts_with_claude,
         run_process=subprocess.run,
-        check_commit_size=_check_applied_commit_size,
-        changed_paths_func=_changed_paths_in_index_or_worktree,
     )
 
 

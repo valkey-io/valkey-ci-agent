@@ -177,24 +177,18 @@ def branch_has_changes(repo_dir: str, target_branch: str) -> bool:
 def sync_target_branch_to_source(
     gh: Any, push_repo: str, source_repo: str, target_branch: str,
 ) -> None:
-    try:
-        source_repo_obj = retry_github_call(
-            lambda: gh.get_repo(source_repo),
-            retries=2, description=f"get {source_repo}",
-        )
-        push_repo_obj = retry_github_call(
-            lambda: gh.get_repo(push_repo),
-            retries=2, description=f"get {push_repo}",
-        )
-        source_sha = retry_github_call(
-            lambda: source_repo_obj.get_branch(target_branch).commit.sha,
-            retries=2, description=f"get {source_repo}:{target_branch} head",
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not resolve branch heads for sync of {push_repo}:{target_branch} "
-            f"against {source_repo}: {exc}"
-        ) from exc
+    source_repo_obj = retry_github_call(
+        lambda: gh.get_repo(source_repo),
+        retries=2, description=f"get {source_repo}",
+    )
+    push_repo_obj = retry_github_call(
+        lambda: gh.get_repo(push_repo),
+        retries=2, description=f"get {push_repo}",
+    )
+    source_sha = retry_github_call(
+        lambda: source_repo_obj.get_branch(target_branch).commit.sha,
+        retries=2, description=f"get {source_repo}:{target_branch} head",
+    )
 
     try:
         push_sha = retry_github_call(
@@ -203,68 +197,43 @@ def sync_target_branch_to_source(
         )
     except GithubException as exc:
         if exc.status != 404:
-            raise RuntimeError(
-                f"Could not resolve branch heads for sync of "
-                f"{push_repo}:{target_branch} against {source_repo}: {exc}"
-            ) from exc
+            raise
         logger.info(
             "Creating missing fork branch %s:%s at %s",
             push_repo, target_branch, source_sha[:8],
         )
-        try:
-            retry_github_call(
-                lambda: push_repo_obj.create_git_ref(
-                    ref=f"refs/heads/{target_branch}",
-                    sha=source_sha,
-                ),
-                retries=2,
-                description=f"create {push_repo}:{target_branch}",
-            )
-        except Exception as create_exc:
-            raise RuntimeError(
-                f"Could not create missing fork branch "
-                f"{push_repo}:{target_branch}: {create_exc}"
-            ) from create_exc
+        retry_github_call(
+            lambda: push_repo_obj.create_git_ref(
+                ref=f"refs/heads/{target_branch}",
+                sha=source_sha,
+            ),
+            retries=2,
+            description=f"create {push_repo}:{target_branch}",
+        )
         return
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not resolve branch heads for sync of "
-            f"{push_repo}:{target_branch} against {source_repo}: {exc}"
-        ) from exc
 
     if push_sha == source_sha:
         logger.info("push_repo %s:%s already in sync with %s", push_repo, target_branch, source_repo)
         return
 
-    try:
-        compare = retry_github_call(
-            lambda: gh.get_repo(source_repo).compare(push_sha, source_sha),
-            retries=2, description=f"compare {push_sha[:8]}..{source_sha[:8]}",
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not compare {push_repo}:{target_branch} to {source_repo}:{target_branch}: {exc}"
-        ) from exc
+    compare = retry_github_call(
+        lambda: gh.get_repo(source_repo).compare(push_sha, source_sha),
+        retries=2, description=f"compare {push_sha[:8]}..{source_sha[:8]}",
+    )
 
     if compare.status in ("identical", "ahead"):
         logger.info(
             "Fast-forwarding %s:%s from %s to %s (behind by %d)",
             push_repo, target_branch, push_sha[:8], source_sha[:8], compare.ahead_by,
         )
-        try:
-            ref = retry_github_call(
-                lambda: gh.get_repo(push_repo).get_git_ref(f"heads/{target_branch}"),
-                retries=2, description=f"get ref {target_branch}",
-            )
-            retry_github_call(
-                lambda: ref.edit(source_sha, force=False),
-                retries=2, description=f"fast-forward {target_branch}",
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Fast-forward of {push_repo}:{target_branch} to "
-                f"{source_repo}:{target_branch} failed: {exc}"
-            ) from exc
+        ref = retry_github_call(
+            lambda: gh.get_repo(push_repo).get_git_ref(f"heads/{target_branch}"),
+            retries=2, description=f"get ref {target_branch}",
+        )
+        retry_github_call(
+            lambda: ref.edit(source_sha, force=False),
+            retries=2, description=f"fast-forward {target_branch}",
+        )
     elif compare.status in ("diverged", "behind"):
         raise RuntimeError(
             f"{push_repo}:{target_branch} has diverged from "

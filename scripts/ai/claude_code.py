@@ -135,15 +135,10 @@ def run_claude_code(
         if process is not None:
             try:
                 process.kill()
-            except Exception:
+            except ProcessLookupError:
                 pass
-        # Wait briefly for the reader thread to flush any remaining buffered
-        # output before we read stdout_parts. Without this the returned
-        # stdout may be truncated mid-line or miss the final error.
-        try:
-            reader.join(timeout=5)
-        except Exception:
-            pass
+        # Let the reader thread flush buffered output before we read it.
+        reader.join(timeout=5)
         stdout = "".join(stdout_parts)
         logger.error("Claude timed out after %ds.", timeout)
         return stdout, f"timeout after {timeout}s", 1
@@ -192,8 +187,6 @@ def _default_disallowed_tools(allowed_tools: str) -> str:
         if token
     }
     return ",".join(tool for tool in ("Bash", "Write") if tool not in allowed)
-
-
 
 
 def _log_stream_event(raw_line: str) -> None:
