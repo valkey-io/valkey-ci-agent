@@ -50,7 +50,7 @@ jobs:
 
       - name: Generate GitHub App token
         id: generate-token
-        if: ${{ secrets.VALKEYRIE_BOT_APP_ID != '' }}
+        continue-on-error: true
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
@@ -59,7 +59,7 @@ jobs:
 
       - name: Run test failure detector
         env:
-          TARGET_TOKEN: ${{ steps.generate-token.outputs.token || secrets.TARGET_PAT || github.token }}
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token || secrets.TARGET_PAT }}
           TARGET_REPO: ${{ inputs.repo || 'BChan-0/valkey' }}
           RUN_ID: ${{ inputs.run_id || '' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
