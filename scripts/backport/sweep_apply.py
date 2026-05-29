@@ -99,6 +99,13 @@ def apply_candidate(
     for path in conflicting_paths:
         target_content = read_index_stage(repo_dir, path, 2, run_process=run_process)
         source_content = read_index_stage(repo_dir, path, 3, run_process=run_process)
+        # Binary files have no line-level merge, so the resolver can't act on
+        # them (git marks binary content with a NUL byte). Skip them rather
+        # than feeding them to the resolver. A candidate left with only binary
+        # conflicts has no resolvable files and is skipped below.
+        if "\x00" in target_content or "\x00" in source_content:
+            logger.warning("Skipping binary conflict: %s", path)
+            continue
         if not index_stage_exists(repo_dir, path, 2, run_process=run_process):
             target_missing_paths.add(path)
         conflicting_files.append(ConflictedFile(
@@ -106,6 +113,14 @@ def apply_candidate(
             target_branch_content=target_content,
             source_branch_content=source_content,
         ))
+    if not conflicting_files:
+        _abort_cherry_pick(repo_dir, run_git)
+        return CandidateResult(
+            candidate.source_pr_number,
+            candidate.source_pr_title,
+            "skipped-conflict",
+            "only binary file conflicts; nothing the resolver can act on",
+        )
     if target_missing_paths:
         _abort_cherry_pick(repo_dir, run_git)
         paths = ", ".join(sorted(target_missing_paths))
@@ -296,6 +311,6 @@ def read_index_stage(
 ) -> str:
     result = run_process(
         ["git", "show", f":{stage}:{path}"],
-        cwd=repo_dir, capture_output=True, text=True,
+        cwd=repo_dir, capture_output=True, text=True, errors="replace",
     )
     return result.stdout if result.returncode == 0 else ""

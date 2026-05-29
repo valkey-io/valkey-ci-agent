@@ -97,6 +97,49 @@ def test_apply_candidate_aborts_empty_cherry_pick(monkeypatch, tmp_path):
     assert ("cherry-pick", "--abort") in git_calls
 
 
+def test_apply_candidate_skips_binary_only_conflict(monkeypatch, tmp_path):
+    candidate = ProjectBackportCandidate(
+        source_pr_number=12,
+        source_pr_title="Binary fixture conflict",
+        source_pr_url="https://github.com/valkey-io/valkey-search/pull/12",
+        target_branch="1.1",
+        merge_commit_sha="abc123",
+    )
+    git_calls: list[tuple[str, ...]] = []
+    resolver = MagicMock()
+
+    def fake_run_git(_repo_dir, *args, **_kwargs):
+        git_calls.append(args)
+
+    def fake_subprocess_run(cmd, **_kwargs):
+        if cmd[:2] == ["git", "cherry-pick"] and cmd[2:3] != ["--abort"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="conflict")
+        if cmd[:4] == ["git", "diff", "--name-only", "--diff-filter=U"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="fixture.gz\n", stderr="")
+        if cmd[:2] == ["git", "show"]:  # :2:fixture.gz / :3:fixture.gz
+            return subprocess.CompletedProcess(cmd, 0, stdout="bin\x00ary", stderr="")
+        if cmd[:3] == ["git", "cherry-pick", "--abort"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(sweep_apply.subprocess, "run", fake_subprocess_run)
+
+    result = apply_candidate(
+        repo_dir=str(tmp_path),
+        candidate=candidate,
+        repo_full_name="valkey-io/valkey-search",
+        git_env={},
+        run_git=fake_run_git,
+        run_process=fake_subprocess_run,
+        resolve_conflicts=resolver,
+    )
+
+    assert result.outcome == "skipped-conflict"
+    assert "binary" in result.detail
+    resolver.assert_not_called()
+    assert ("cherry-pick", "--abort") in git_calls
+
+
 def test_apply_candidate_retries_squash_merge_commit_without_mainline(
     monkeypatch,
     tmp_path,
