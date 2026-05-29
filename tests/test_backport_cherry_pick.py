@@ -267,6 +267,41 @@ class TestConflictDetection:
         assert cf.target_branch_content == ""
         assert cf.source_branch_content == ""
 
+    @patch("scripts.backport.cherry_pick.subprocess.run")
+    def test_binary_conflict_is_skipped(self, mock_run: MagicMock) -> None:
+        # One text conflict and one binary conflict (NUL byte in content).
+        mock_run.side_effect = [
+            _ok(),                                  # checkout
+            _fail(stderr="conflict"),                # cherry-pick fails
+            _ok(stdout="src/main.c\nfixture.gz\n"),  # git diff --name-only
+            _ok(stdout="target text"),               # git show 8.1:src/main.c
+            _ok(stdout="source text"),               # git show CHERRY_PICK_HEAD:src/main.c
+            _ok(stdout="binary\x00blob"),            # git show 8.1:fixture.gz
+            _ok(stdout="binary\x00other"),           # git show CHERRY_PICK_HEAD:fixture.gz
+        ]
+
+        result = cherry_pick("/repo", "8.1", "mergesha", [])
+
+        assert result.success is False
+        # Only the text file survives; the binary one is skipped.
+        assert [cf.path for cf in result.conflicting_files] == ["src/main.c"]
+
+    @patch("scripts.backport.cherry_pick.subprocess.run")
+    def test_only_binary_conflicts_yields_empty_set(self, mock_run: MagicMock) -> None:
+        mock_run.side_effect = [
+            _ok(),                          # checkout
+            _fail(stderr="conflict"),        # cherry-pick fails
+            _ok(stdout="fixture.gz\n"),      # git diff --name-only
+            _ok(stdout="bin\x00a"),          # git show 8.1:fixture.gz
+            _ok(stdout="bin\x00b"),          # git show CHERRY_PICK_HEAD:fixture.gz
+        ]
+
+        result = cherry_pick("/repo", "8.1", "mergesha", [])
+
+        # No resolvable conflicts — caller skips the candidate.
+        assert result.success is False
+        assert result.conflicting_files == []
+
 
 class TestMergeCommitPreference:
     """Scenario 4 & 5: Merge commit SHA is preferred; sequential fallback."""

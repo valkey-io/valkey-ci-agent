@@ -118,7 +118,15 @@ def _collect_conflicts(repo_dir: str, target_branch: str) -> list[ConflictedFile
 
     conflicts: list[ConflictedFile] = []
     for path in paths:
-        conflicts.append(_build_conflicted_file(repo_dir, target_branch, path))
+        cf = _build_conflicted_file(repo_dir, target_branch, path)
+        # Binary files have no line-level merge, so the resolver can't act on
+        # them. Skip them (git marks binary content with a NUL byte). A
+        # cherry-pick left with only binary conflicts becomes an empty set and
+        # is skipped by the caller.
+        if "\x00" in cf.target_branch_content or "\x00" in cf.source_branch_content:
+            logger.warning("Skipping binary conflict: %s", path)
+            continue
+        conflicts.append(cf)
     return conflicts
 
 
@@ -183,6 +191,7 @@ def _run_git(
         cmd,
         capture_output=True,
         text=True,
+        errors="replace",
         cwd=repo_dir,
         check=False,
     )
