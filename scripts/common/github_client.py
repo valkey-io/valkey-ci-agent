@@ -51,16 +51,11 @@ def retry_github_call(
     description: str,
 ) -> _T:
     """Retry transient GitHub API failures with exponential backoff."""
-    if type(retries) is not int or retries < 0:
-        raise ValueError("retries must be a non-negative integer")
-    attempts = retries + 1
-    last_exc: Exception | None = None
-    for attempt in range(attempts):
+    for attempt in range(retries):
         try:
             return operation()
         except Exception as exc:
-            last_exc = exc
-            if not _is_retryable_error(exc) or attempt == attempts - 1:
+            if not _is_retryable_error(exc):
                 raise
             wait_seconds = _delay(attempt)
             logger.warning(
@@ -70,9 +65,5 @@ def retry_github_call(
                 exc,
             )
             time.sleep(wait_seconds)
-
-    # Unreachable in practice: either the loop returns (success) or the
-    # last attempt re-raises. Keep the fallback so mypy is happy about
-    # the function always returning _T or raising.
-    assert last_exc is not None
-    raise last_exc
+    # Final attempt: let any exception propagate to the caller.
+    return operation()

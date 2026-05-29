@@ -253,10 +253,6 @@ def resolve_conflicts_with_claude(
        more with the specific error as feedback. The retried files are
        re-checked.
 
-    Build/test validation of the resulting branch is the sweep's job
-    (``_run_test_commands``), not the resolver's. ``build_commands`` is
-    accepted for backward compatibility but unused here.
-
     Returns a ResolutionResult per conflicting file.
     """
     # Step 1: split off whitespace-only conflicts.

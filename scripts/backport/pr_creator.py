@@ -112,8 +112,8 @@ class BackportPRCreator:
         self._github = github_client
         self._base_repo = base_repo
         self._push_repo = push_repo
-        self._backport_label = backport_label or "backport"
-        self._llm_conflict_label = llm_conflict_label or "ai-resolved-conflicts"
+        self._backport_label = backport_label
+        self._llm_conflict_label = llm_conflict_label
 
     def create_backport_pr(
         self,
@@ -213,12 +213,6 @@ class BackportPRCreator:
                     label, self._base_repo, exc,
                 )
                 return
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "Unexpected error checking label %r on %s: %s",
-                label, self._base_repo, exc,
-            )
-            return
 
         color, description = _LABEL_DEFAULTS.get(
             label, ("ededed", f"Created by valkey-ci-agent for label {label!r}"),
@@ -249,16 +243,7 @@ class BackportPRCreator:
         *,
         applied_commits: list[str] | None = None,
     ) -> str:
-        """Build the PR body with links, commit list, conflict info.
-
-        Includes:
-        * Link to the source PR
-        * List of cherry-picked commit SHAs
-        * Whether conflicts were encountered
-        * Per-file LLM resolution summaries (when applicable)
-        * Human review disclaimer (when any file was LLM-resolved)
-
-        """
+        """Build the PR body with links, commit list, conflict info."""
         sections: list[str] = []
         results = resolution_results or []
         resolved_count = sum(result.resolved_content is not None for result in results)

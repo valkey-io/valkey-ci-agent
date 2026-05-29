@@ -19,23 +19,12 @@ def build_pr_title(source_pr_title: str, target_branch: str) -> str:
 
 
 def has_conflict_markers(content: str) -> bool:
-    """Check whether *content* contains git conflict markers.
-
-    Returns ``True`` if any of ``<<<<<<<``, ``=======``, or ``>>>>>>>``
-    (seven characters each) appear anywhere in the string.
-
-    """
+    """Return ``True`` if *content* contains git conflict markers."""
     return bool(_CONFLICT_MARKERS.search(content))
 
 
 def is_whitespace_only_conflict(target_content: str, source_content: str) -> bool:
-    """Return ``True`` when *target_content* and *source_content* differ only in whitespace.
-
-    Whitespace differences include spaces, tabs, indentation, trailing
-    whitespace, and line endings.  The comparison strips all whitespace
-    from both strings before checking equality.
-
-    """
+    """Return ``True`` when the two contents differ only in whitespace."""
     return _strip_all_whitespace(target_content) == _strip_all_whitespace(source_content)
 
 

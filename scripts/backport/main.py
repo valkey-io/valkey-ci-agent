@@ -170,7 +170,7 @@ def run_backport(
                         f"--- a/{f.filename}\n+++ b/{f.filename}\n{f.patch}"
                     )
             diff_content = "\n".join(diff_parts)
-        except Exception as exc:
+        except GithubException as exc:
             logger.warning("Could not fetch PR diff for #%s: %s", source_pr_number, exc)
             diff_content = ""
 
@@ -203,7 +203,7 @@ def run_backport(
                     cherry_result = cherry_pick(
                         tmp_dir, branch_name, merge_commit_sha, commits,
                     )
-                except Exception as exc:
+                except subprocess.CalledProcessError as exc:
                     msg = f"Cherry-pick failed: {exc}"
                     logger.error(msg)
                     _post_comment(repo, source_pr_number, f"Backport failed: {msg}")
@@ -360,7 +360,7 @@ def run_backport(
             backport_pr_url = pr_creator.create_backport_pr(
                 pr_context, cherry_result, resolution_results, branch_name,
             )
-        except Exception as exc:
+        except (GithubException, subprocess.CalledProcessError) as exc:
             msg = f"Failed to create backport PR: {exc}"
             logger.error(msg)
             _post_comment(repo, source_pr_number, f"Backport failed: {msg}")

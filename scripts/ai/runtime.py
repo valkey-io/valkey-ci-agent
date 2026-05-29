@@ -79,7 +79,6 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
 
 
 def get_agent_profile(name: AgentProfileName) -> AgentProfile:
-    """Return the immutable profile for ``name``."""
     return AGENT_PROFILES[name]
 
 
