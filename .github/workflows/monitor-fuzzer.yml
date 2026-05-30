@@ -47,7 +47,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          npm install -g @anthropic-ai/claude-code
+          npm install -g @anthropic-ai/claude-code@2.1.153
 
       - name: Generate GitHub App token
         id: generate-token

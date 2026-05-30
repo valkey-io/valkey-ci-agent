@@ -45,9 +45,7 @@ def shallow_clone_at_sha(repo: str, dest: Path, sha: str | None = None) -> bool:
         return False
 
     url = f"https://github.com/{repo}.git"
-    args = ["git", "clone", "--filter=blob:none"]
-    if sha is None:
-        args.extend(["--depth", "1"])
+    args = ["git", "clone", "--filter=blob:none", "--depth", "1"]
     args.extend([url, str(dest)])
 
     if not _run(args, timeout=_CLONE_TIMEOUT_S, desc=f"clone {repo}"):

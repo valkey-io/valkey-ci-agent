@@ -32,6 +32,32 @@ def test_extract_zip_refuses_oversized_archive(monkeypatch):
     assert _extract_zip(buf.getvalue()) == {}
 
 
+def test_download_keeps_token_off_cross_host_redirects(monkeypatch):
+    """The GitHub token must not be forwarded to the signed S3 redirect host."""
+    from scripts.common import workflow_artifacts as artifacts_mod
+
+    captured = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"zipbytes"
+
+    def fake_urlopen(req, timeout=0):
+        captured["req"] = req
+        return _Resp()
+
+    monkeypatch.setattr(artifacts_mod, "urlopen", fake_urlopen)
+    client = ArtifactClient(MagicMock(), token="secret")
+    client._download("/repos/x/actions/artifacts/1/zip")
+
+    req = captured["req"]
+    # has_header() checks both header sets, so assert on the dicts directly:
+    # normal headers are forwarded on redirect, unredirected ones are not.
+    assert "Authorization" not in req.headers
+    assert req.unredirected_hdrs.get("Authorization") == "Bearer secret"
+
+
 def test_client_requires_token():
     with pytest.raises(ValueError, match="token is required"):
         ArtifactClient(MagicMock(), token="")

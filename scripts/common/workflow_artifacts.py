@@ -86,12 +86,14 @@ class ArtifactClient:
     def _download(self, path: str) -> bytes:
         url = f"https://api.github.com{path}"
         req = Request(url, headers={
-            "Authorization": f"Bearer {self._token}",
             "Accept": "application/vnd.github+json",
             "User-Agent": "valkey-ci-agent",
         })
-        # urllib does not forward the Authorization header on cross-host
-        # redirects, which is what we want (GitHub redirects to signed S3 URLs).
+        # Use an unredirected header for the token: urllib forwards normal
+        # headers on cross-host redirects, but GitHub redirects to signed S3
+        # URLs that must not receive our token. add_unredirected_header keeps
+        # the Authorization off the redirected request.
+        req.add_unredirected_header("Authorization", f"Bearer {self._token}")
         for attempt in range(self._retries + 1):
             try:
                 with urlopen(req, timeout=120) as resp:
