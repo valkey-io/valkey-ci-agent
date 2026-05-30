@@ -59,3 +59,4 @@ ignore = [
 # Scripts with deliberate late imports (sys.path shim before scripts.*)
 "scripts/backport/main.py" = ["E402"]
 "scripts/backport/sweep.py" = ["E402"]
+"scripts/fuzzer/main.py" = ["E402"]

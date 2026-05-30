@@ -13,7 +13,9 @@ from github.GithubException import GithubException
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# HTTP statuses worth retrying. Shared with raw-urllib callers
+# (workflow_artifacts) that can't use retry_github_call directly.
+RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
 _BASE_DELAY_SECONDS = 1.0
 _MAX_DELAY_SECONDS = 8.0
 
@@ -31,7 +33,7 @@ _RATE_LIMIT_403_INDICATORS = (
 def _is_retryable_error(exc: Exception) -> bool:
     if not isinstance(exc, GithubException):
         return False
-    if exc.status in _RETRYABLE_STATUS_CODES:
+    if exc.status in RETRYABLE_HTTP_STATUS:
         return True
     # Only retry 403 when it's clearly rate-limiting, not a permission error.
     if exc.status == 403:
@@ -40,7 +42,8 @@ def _is_retryable_error(exc: Exception) -> bool:
     return False
 
 
-def _delay(attempt: int) -> float:
+def transient_backoff_delay(attempt: int) -> float:
+    """Jittered, capped exponential backoff for transient-failure retries."""
     return random.uniform(0, min(_MAX_DELAY_SECONDS, _BASE_DELAY_SECONDS * (2 ** attempt)))
 
 
@@ -57,7 +60,7 @@ def retry_github_call(
         except Exception as exc:
             if not _is_retryable_error(exc) or attempt == retries - 1:
                 raise
-            wait_seconds = _delay(attempt)
+            wait_seconds = transient_backoff_delay(attempt)
             logger.warning(
                 "Retrying GitHub API call for %s after %.2fs: %s",
                 description,
