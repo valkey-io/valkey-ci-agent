@@ -306,7 +306,8 @@ class FuzzerRunAnalyzer:
                 # Couldn't get a verdict from either signal — escalate.
                 overall_status, triage_verdict = "warning", "needs-human-triage"
 
-        summary = (claude_payload.get("summary") or "").strip() or (
+        raw_summary = claude_payload.get("summary")
+        summary = (raw_summary if isinstance(raw_summary, str) else "").strip() or (
             f"Run {run_id}: {len(anomalies)} anomalies" if anomalies
             else f"Run {run_id}: see findings"
         )
