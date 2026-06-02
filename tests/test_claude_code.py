@@ -54,6 +54,7 @@ def test_run_claude_code_streams_json_and_uses_bedrock_env(monkeypatch, caplog):
         return captured["process"]
 
     monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
     monkeypatch.delenv("CI_AGENT_CLAUDE_MODEL", raising=False)
     monkeypatch.delenv("CI_AGENT_CLAUDE_BEDROCK_OPUS_MODEL", raising=False)
     monkeypatch.setattr(claude_code.subprocess, "Popen", fake_popen)
@@ -77,12 +78,13 @@ def test_run_claude_code_streams_json_and_uses_bedrock_env(monkeypatch, caplog):
     assert captured["kwargs"]["env"]["CLAUDE_CODE_USE_BEDROCK"] == "1"
     assert captured["kwargs"]["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "us.anthropic.claude-opus-4-7"
     assert captured["kwargs"]["env"]["AWS_REGION"] == "us-east-1"
+    assert captured["kwargs"]["env"]["AWS_DEFAULT_REGION"] == "us-east-1"
     assert "Claude stream: system init model=opus session=abc cwd=/tmp/checkout" in caplog.text
     assert "Claude stream: assistant tool=Read file_path=src/a.c" in caplog.text
     assert "Claude stream: result success turns=2 duration_ms=123 cost_usd=0.01 text=done" in caplog.text
 
 
-def test_run_claude_code_preserves_existing_region_and_model(monkeypatch):
+def test_run_claude_code_pins_region_and_preserves_model(monkeypatch):
     captured = {}
 
     def fake_popen(cmd, **kwargs):
@@ -91,6 +93,7 @@ def test_run_claude_code_preserves_existing_region_and_model(monkeypatch):
         return _FakeProcess(cmd, stdout_text='{"type":"result","result":"ok"}\n', **kwargs)
 
     monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-2")
     monkeypatch.delenv("CI_AGENT_CLAUDE_MODEL", raising=False)
     monkeypatch.setattr(claude_code.subprocess, "Popen", fake_popen)
 
@@ -98,7 +101,8 @@ def test_run_claude_code_preserves_existing_region_and_model(monkeypatch):
 
     assert (stdout, stderr, rc) == ('{"type":"result","result":"ok"}\n', "", 0)
     assert captured["cmd"][captured["cmd"].index("--model") + 1] == "model-id"
-    assert captured["env"]["AWS_REGION"] == "us-west-2"
+    assert captured["env"]["AWS_REGION"] == "us-east-1"
+    assert captured["env"]["AWS_DEFAULT_REGION"] == "us-east-1"
 
 
 def test_run_claude_code_does_not_inherit_github_tokens(monkeypatch):
@@ -112,12 +116,14 @@ def test_run_claude_code_does_not_inherit_github_tokens(monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "gh-secret")
     monkeypatch.setenv("BACKPORT_GITHUB_TOKEN", "backport-secret")
     monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-2")
     monkeypatch.setattr(claude_code.subprocess, "Popen", fake_popen)
 
     stdout, stderr, rc = claude_code.run_claude_code("prompt")
 
     assert (stdout, stderr, rc) == ('{"type":"result","result":"ok"}\n', "", 0)
-    assert captured["env"]["AWS_REGION"] == "us-west-2"
+    assert captured["env"]["AWS_REGION"] == "us-east-1"
+    assert captured["env"]["AWS_DEFAULT_REGION"] == "us-east-1"
     assert "GITHUB_TOKEN" not in captured["env"]
     assert "GH_TOKEN" not in captured["env"]
     assert "BACKPORT_GITHUB_TOKEN" not in captured["env"]

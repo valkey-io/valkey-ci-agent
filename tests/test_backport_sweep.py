@@ -475,7 +475,18 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     monkeypatch.setattr(backport_sweep, "_run_git", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "_find_existing_pr", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "_delete_stale_backport_branch", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(backport_sweep, "_list_already_applied", lambda *_args, **_kwargs: {"2"})
+    monkeypatch.setattr(
+        backport_sweep,
+        "_list_already_applied_prs",
+        lambda *_args, **_kwargs: [
+            CandidateResult(
+                source_pr_number=2,
+                source_pr_title="PR 2",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+        ],
+    )
     monkeypatch.setattr(backport_sweep, "changed_paths_since_base", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(backport_sweep, "_run_test_commands", lambda *_args, **_kwargs: (True, ""))
 
@@ -527,6 +538,119 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     assert result.results[4].outcome == "skipped-conflict"
     assert pushed == ["agent/backport/sweep/8.1"]
     assert result.pr_url == "https://github.com/valkey-io/valkey/pull/100"
+
+
+def test_process_branch_keeps_branch_prs_missing_from_current_candidates(monkeypatch):
+    candidates = [
+        ProjectBackportCandidate(
+            source_pr_number=10,
+            source_pr_title="Fresh fix",
+            source_pr_url="https://github.com/valkey-io/valkey/pull/10",
+            target_branch="8.1",
+            merge_commit_sha="sha10",
+        )
+    ]
+
+    monkeypatch.setattr(backport_sweep, "_clone_target_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "_run_git", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "_find_existing_pr", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "_delete_stale_backport_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        backport_sweep,
+        "_list_already_applied_prs",
+        lambda *_args, **_kwargs: [
+            CandidateResult(
+                source_pr_number=99,
+                source_pr_title="Old fix from branch log",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+        ],
+    )
+    monkeypatch.setattr(backport_sweep, "changed_paths_since_base", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(backport_sweep, "_run_test_commands", lambda *_args, **_kwargs: (True, ""))
+    monkeypatch.setattr(backport_sweep, "_push_backport_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        backport_sweep,
+        "_apply_candidate",
+        lambda _repo_dir, candidate, *_args, **_kwargs: CandidateResult(
+            source_pr_number=candidate.source_pr_number,
+            source_pr_title=candidate.source_pr_title,
+            outcome="applied",
+        ),
+    )
+
+    upserted_results: list[list[int]] = []
+
+    def fake_upsert(*args, **_kwargs):
+        sweep_result = args[5]
+        upserted_results.append([r.source_pr_number for r in sweep_result.results])
+        return "https://github.com/valkey-io/valkey/pull/100"
+
+    monkeypatch.setattr(backport_sweep, "_upsert_pr", fake_upsert)
+
+    result = backport_sweep._process_branch(
+        gh=MagicMock(),
+        repo=MagicMock(),
+        repo_full_name="valkey-io/valkey",
+        github_token="token",
+        target_branch="8.1",
+        candidates=candidates,
+        push_repo="valkey-io/valkey",
+        test_commands=[],
+        max_applied=5,
+    )
+
+    assert [r.source_pr_number for r in result.results] == [10, 99]
+    assert upserted_results == [[10, 99]]
+    assert result.pr_url == "https://github.com/valkey-io/valkey/pull/100"
+
+
+def test_list_already_applied_prs_reads_commit_subjects(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        assert cmd == [
+            "git",
+            "log",
+            "--reverse",
+            "origin/8.1..agent/backport/sweep/8.1",
+            "--format=%s",
+        ]
+        assert kwargs["cwd"] == "/repo"
+        assert kwargs["check"] is True
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=(
+                "Fix first issue (#100)\n"
+                "Commit without PR marker\n"
+                "Fix second issue  (#101)\n"
+                "Follow-up duplicate marker (#100)\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(backport_sweep.subprocess, "run", fake_run)
+
+    results = backport_sweep._list_already_applied_prs(
+        "/repo",
+        "8.1",
+        "agent/backport/sweep/8.1",
+    )
+
+    assert results == [
+        CandidateResult(
+            source_pr_number=100,
+            source_pr_title="Fix first issue",
+            outcome="skipped-existing",
+            detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+        ),
+        CandidateResult(
+            source_pr_number=101,
+            source_pr_title="Fix second issue",
+            outcome="skipped-existing",
+            detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+        ),
+    ]
 
 
 def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

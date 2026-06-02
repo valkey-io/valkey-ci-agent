@@ -76,12 +76,11 @@ class CandidateResult:
 
 
 # Detail string used when a candidate PR is already cherry-picked onto the
-# backport sweep branch (detected by _list_already_applied scanning the
-# branch's commit log for the (#NNNN) marker). The PR-body builder treats
-# this case as "on the branch" and lists it under Applied, distinct from
-# other "skipped-existing" detail strings (e.g. "already applied or empty
-# cherry-pick") which mean the change is on the *release* branch and not
-# committed to the sweep branch.
+# backport sweep branch (detected by scanning the branch's commit log for
+# the (#NNNN) marker). The PR-body builder treats this case as "on the
+# branch" and lists it under Applied, distinct from other "skipped-existing"
+# detail strings (e.g. "already applied or empty cherry-pick") which mean
+# the change is on the *release* branch and not committed to the sweep branch.
 DETAIL_ALREADY_ON_SWEEP_BRANCH = "already on backport branch"
 
 
@@ -391,8 +390,20 @@ def _process_branch(
                 push_url = github_https_url(push_repo)
                 _run_git(tmpdir, "remote", "add", "push_target", push_url, env=git_env)
 
-            # Find already-applied PRs
-            already_applied = _list_already_applied(tmpdir, target_branch, backport_branch)
+            # Find PRs already represented by commits on the sweep branch.
+            # Some of these PRs may no longer be returned by project-board
+            # discovery, so keep them from the branch log itself to avoid
+            # dropping them from the PR description on later updates.
+            already_applied_results = _list_already_applied_prs(
+                tmpdir,
+                target_branch,
+                backport_branch,
+            )
+            already_applied = {
+                str(item.source_pr_number)
+                for item in already_applied_results
+            }
+            emitted_already_applied: set[str] = set()
             logger.info("Already applied on %s: %s", backport_branch, already_applied)
 
             applied_count = 0
@@ -404,6 +415,7 @@ def _process_branch(
                     )
                     break
                 if str(candidate.source_pr_number) in already_applied:
+                    emitted_already_applied.add(str(candidate.source_pr_number))
                     result.results.append(CandidateResult(
                         source_pr_number=candidate.source_pr_number,
                         source_pr_title=candidate.source_pr_title,
@@ -420,6 +432,10 @@ def _process_branch(
                 result.results.append(cr)
                 if cr.outcome == "applied":
                     applied_count += 1
+
+            for carried in already_applied_results:
+                if str(carried.source_pr_number) not in emitted_already_applied:
+                    result.results.append(carried)
 
             # Push if we applied anything and validation passes.
             applied = [r for r in result.results if r.outcome == "applied"]
@@ -1037,16 +1053,51 @@ def _list_already_applied(repo_dir: str, base_branch: str, backport_branch: str)
     set on error would make the sweep re-apply commits and create
     duplicate history.
     """
+    return {
+        str(item.source_pr_number)
+        for item in _list_already_applied_prs(repo_dir, base_branch, backport_branch)
+    }
+
+
+def _list_already_applied_prs(
+    repo_dir: str,
+    base_branch: str,
+    backport_branch: str,
+) -> list[CandidateResult]:
+    """Extract source PR metadata from commits already on the sweep branch.
+
+    Project board discovery can stop returning PRs after a prior sweep has
+    already added them to the backport branch. The PR description still needs
+    to list those commits, so this function derives carry-over rows directly
+    from the branch's commit subjects.
+    """
     result = subprocess.run(
-        ["git", "log", f"origin/{base_branch}..{backport_branch}", "--format=%s"],
+        [
+            "git",
+            "log",
+            "--reverse",
+            f"origin/{base_branch}..{backport_branch}",
+            "--format=%s",
+        ],
         cwd=repo_dir, capture_output=True, text=True, check=True,
     )
-    pr_nums: set[str] = set()
+    entries: list[CandidateResult] = []
+    seen: set[str] = set()
     for line in result.stdout.strip().splitlines():
-        m = re.search(r"\(#(\d+)\)", line)
+        m = re.search(r"\(#(\d+)\)\s*$", line)
         if m:
-            pr_nums.add(m.group(1))
-    return pr_nums
+            pr_num = m.group(1)
+            if pr_num in seen:
+                continue
+            seen.add(pr_num)
+            title = line[:m.start()].strip() or f"PR #{pr_num}"
+            entries.append(CandidateResult(
+                source_pr_number=int(pr_num),
+                source_pr_title=title,
+                outcome="skipped-existing",
+                detail=DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ))
+    return entries
 
 
 
@@ -1059,8 +1110,10 @@ def _build_pr_body(result: BranchSweepResult) -> str:
     ]
     # The Applied table reflects the cumulative state of the backport
     # branch: PRs cherry-picked in this run AND PRs already on the branch
-    # from prior sweeps. This way the PR description always matches the
-    # commits in the PR, regardless of how many sweep runs contributed.
+    # from prior sweeps. Carry-over PRs are derived from the branch's
+    # commit log, even if project-board discovery no longer returns them.
+    # This way the PR description always matches the commits in the PR,
+    # regardless of how many sweep runs contributed.
     #
     # `skipped-existing` is emitted in three different situations and
     # only the first means "the commit is on the backport branch":
