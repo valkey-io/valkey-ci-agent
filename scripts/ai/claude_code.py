@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CLAUDE_MODEL = "opus"
 _DEFAULT_BEDROCK_OPUS_MODEL = "us.anthropic.claude-opus-4-7"
+_BEDROCK_REGION = "us-east-1"
 _CLAUDE_MODEL_ENV = "CI_AGENT_CLAUDE_MODEL"
 _BEDROCK_OPUS_MODEL_ENV = "CI_AGENT_CLAUDE_BEDROCK_OPUS_MODEL"
 _DEFAULT_TIMEOUT_SECONDS = 60 * 60
@@ -31,8 +32,6 @@ _PASSTHROUGH_ENV_VARS = {
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
     "AWS_PROFILE",
     "AWS_SHARED_CREDENTIALS_FILE",
     "AWS_CONFIG_FILE",
@@ -69,12 +68,7 @@ def run_claude_code(
     # calls are idempotent by design (override wins each time).
     resolved_model = _resolve_claude_model(model)
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = _resolve_bedrock_opus_model()
-    if "AWS_REGION" not in env and "AWS_DEFAULT_REGION" not in env:
-        env["AWS_REGION"] = "us-east-1"
-    elif "AWS_REGION" not in env and "AWS_DEFAULT_REGION" in env:
-        env["AWS_REGION"] = env["AWS_DEFAULT_REGION"]
-    elif "AWS_DEFAULT_REGION" not in env and "AWS_REGION" in env:
-        env["AWS_DEFAULT_REGION"] = env["AWS_REGION"]
+    _pin_bedrock_region(env)
 
     cmd = [
         "claude", "--print",
@@ -167,7 +161,13 @@ def _build_claude_env(env_allowlist: tuple[str, ...] | None = None) -> dict[str,
     }
     env["CLAUDE_CODE_USE_BEDROCK"] = "1"
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = _resolve_bedrock_opus_model()
+    _pin_bedrock_region(env)
     return env
+
+
+def _pin_bedrock_region(env: dict[str, str]) -> None:
+    env["AWS_REGION"] = _BEDROCK_REGION
+    env["AWS_DEFAULT_REGION"] = _BEDROCK_REGION
 
 
 def _resolve_claude_model(model: str | None) -> str | None:

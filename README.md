@@ -92,7 +92,7 @@ On `valkey-io/valkey-ci-agent`:
 | Secret | `AWS_ROLE_ARN` | OIDC role ARN with Bedrock `InvokeModel` permission |
 | Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie GitHub App ID |
 | Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | Valkeyrie GitHub App private key |
-| Variable | `AWS_REGION` | e.g., `us-east-1` |
+| Variable | `AWS_REGION` | `us-east-1` |
 
 The workflows mint a short-lived installation token with `actions/create-github-app-token` and use that token for registry repository reads, branch pushes, PR creation, status comments, and project-board queries.
 

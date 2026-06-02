@@ -14,7 +14,10 @@ from scripts.backport.pr_creator import (
 )
 from scripts.backport.sweep_graphql import GitHubGraphQLClient
 from scripts.backport.sweep_models import BranchSweepResult
-from scripts.backport.sweep_reporting import build_pr_body
+from scripts.backport.sweep_reporting import (
+    build_pr_body,
+    preserve_existing_applied_details,
+)
 from scripts.common.github_client import retry_github_call
 
 logger = logging.getLogger(__name__)
@@ -61,6 +64,11 @@ def upsert_pr(
     gql: GitHubGraphQLClient | None = None,
 ) -> str:
     repo = retry_github_call(lambda: gh.get_repo(base_repo), retries=2, description=f"get {base_repo}")
+    if existing_pr:
+        preserve_existing_applied_details(
+            result,
+            getattr(existing_pr, "body", "") or "",
+        )
     body = build_pr_body(result)
     title = f"[backport] Backport sweep for {target_branch}"
 

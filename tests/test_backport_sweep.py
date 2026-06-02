@@ -10,7 +10,7 @@ import pytest
 from github.GithubException import GithubException
 
 from scripts.backport import sweep as backport_sweep
-from scripts.backport import sweep_apply, sweep_graphql, sweep_validation
+from scripts.backport import sweep_apply, sweep_git, sweep_graphql, sweep_validation
 from scripts.backport.models import ResolutionResult
 from scripts.backport.sweep import (
     BranchSweepResult,
@@ -21,13 +21,18 @@ from scripts.backport.sweep_apply import apply_candidate, check_applied_commit_s
 from scripts.backport.sweep_git import (
     changed_paths_in_index_or_worktree,
     clone_target_branch,
+    list_already_applied_prs,
     push_backport_branch,
     safe_tmp_component,
     sync_target_branch_to_source,
     worktree_changed_paths,
 )
 from scripts.backport.sweep_prs import upsert_pr
-from scripts.backport.sweep_reporting import build_pr_body, build_summary
+from scripts.backport.sweep_reporting import (
+    build_pr_body,
+    build_summary,
+    preserve_existing_applied_details,
+)
 from scripts.backport.sweep_validation import (
     build_validation_repair_prompt,
     repair_validation_failure_with_claude,
@@ -506,7 +511,7 @@ def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
         calls.append((cmd, kwargs))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(backport_sweep.subprocess, "run", fake_run)
+    monkeypatch.setattr(sweep_git.subprocess, "run", fake_run)
 
     dest = tmp_path / "checkout"
     clone_target_branch(
@@ -600,7 +605,18 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     monkeypatch.setattr(backport_sweep, "_run_git", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "find_existing_pr", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "delete_stale_backport_branch", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(backport_sweep, "list_already_applied", lambda *_args, **_kwargs: {"2"})
+    monkeypatch.setattr(
+        backport_sweep,
+        "list_already_applied_prs",
+        lambda *_args, **_kwargs: [
+            CandidateResult(
+                source_pr_number=2,
+                source_pr_title="PR 2",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+        ],
+    )
     monkeypatch.setattr(sweep_validation, "changed_paths_since_base", lambda *_args, **_kwargs: [], raising=False)
     monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_args, **_kwargs: (True, ""))
     monkeypatch.setattr(
@@ -660,6 +676,77 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     assert result.pr_url == "https://github.com/valkey-io/valkey/pull/100"
 
 
+def test_process_branch_keeps_branch_prs_missing_from_current_candidates(monkeypatch):
+    candidates = [
+        ProjectBackportCandidate(
+            source_pr_number=10,
+            source_pr_title="Fresh fix",
+            source_pr_url="https://github.com/valkey-io/valkey/pull/10",
+            target_branch="8.1",
+            merge_commit_sha="sha10",
+        )
+    ]
+
+    monkeypatch.setattr(backport_sweep, "clone_target_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "_run_git", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "find_existing_pr", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backport_sweep, "delete_stale_backport_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        backport_sweep,
+        "list_already_applied_prs",
+        lambda *_args, **_kwargs: [
+            CandidateResult(
+                source_pr_number=99,
+                source_pr_title="Old fix from branch log",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+        ],
+    )
+    monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_args: False)
+    monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_args, **_kwargs: (True, ""))
+    monkeypatch.setattr(
+        backport_sweep,
+        "validate_branch_with_optional_repair",
+        lambda *_args, **_kwargs: (True, ""),
+    )
+    monkeypatch.setattr(backport_sweep, "push_backport_branch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        backport_sweep,
+        "apply_candidate",
+        lambda _repo_dir, candidate, *_args, **_kwargs: CandidateResult(
+            source_pr_number=candidate.source_pr_number,
+            source_pr_title=candidate.source_pr_title,
+            outcome="applied",
+        ),
+    )
+
+    upserted_results: list[list[int]] = []
+
+    def fake_upsert(*args, **_kwargs):
+        sweep_result = args[5]
+        upserted_results.append([r.source_pr_number for r in sweep_result.results])
+        return "https://github.com/valkey-io/valkey/pull/100"
+
+    monkeypatch.setattr(backport_sweep, "upsert_pr", fake_upsert)
+
+    result = backport_sweep._process_branch(
+        gh=MagicMock(),
+        repo_full_name="valkey-io/valkey",
+        github_token="token",
+        target_branch="8.1",
+        candidates=candidates,
+        push_repo="valkey-io/valkey",
+        test_commands=[],
+        max_applied=5,
+    )
+
+    assert [r.source_pr_number for r in result.results] == [10, 99]
+    assert upserted_results == [[10, 99]]
+    assert result.pr_url == "https://github.com/valkey-io/valkey/pull/100"
+
+
 def test_process_branch_skips_workflow_candidates_before_push(monkeypatch):
     candidate = ProjectBackportCandidate(
         source_pr_number=3317,
@@ -678,7 +765,7 @@ def test_process_branch_skips_workflow_candidates_before_push(monkeypatch):
     )
     monkeypatch.setattr(backport_sweep, "find_existing_pr", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "delete_stale_backport_branch", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(backport_sweep, "list_already_applied", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(backport_sweep, "list_already_applied_prs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_args: True)
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
@@ -737,8 +824,16 @@ def _green_only_process_branch(monkeypatch, *, candidates, apply_fn, validate_fn
     monkeypatch.setattr(backport_sweep, "delete_stale_backport_branch", lambda *_a, **_k: None)
     monkeypatch.setattr(
         backport_sweep,
-        "list_already_applied",
-        lambda *_a, **_k: set(already_applied or set()),
+        "list_already_applied_prs",
+        lambda *_a, **_k: [
+            CandidateResult(
+                source_pr_number=int(pr_number),
+                source_pr_title=f"PR {pr_number}",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            )
+            for pr_number in (already_applied or set())
+        ],
     )
     monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_a: False)
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_a, **_k: True)
@@ -1189,6 +1284,53 @@ def test_safe_tmp_component_removes_branch_separators():
     assert safe_tmp_component("///") == "branch"
 
 
+def test_list_already_applied_prs_reads_commit_subjects(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        assert cmd == [
+            "git",
+            "log",
+            "--reverse",
+            "origin/8.1..agent/backport/sweep/8.1",
+            "--format=%s",
+        ]
+        assert kwargs["cwd"] == "/repo"
+        assert kwargs["check"] is True
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=(
+                "Fix first issue (#100)\n"
+                "Commit without PR marker\n"
+                "Fix second issue  (#101)\n"
+                "Follow-up duplicate marker (#100)\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(backport_sweep.subprocess, "run", fake_run)
+
+    results = list_already_applied_prs(
+        "/repo",
+        "8.1",
+        "agent/backport/sweep/8.1",
+    )
+
+    assert results == [
+        CandidateResult(
+            source_pr_number=100,
+            source_pr_title="Fix first issue",
+            outcome="skipped-existing",
+            detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+        ),
+        CandidateResult(
+            source_pr_number=101,
+            source_pr_title="Fix second issue",
+            outcome="skipped-existing",
+            detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+        ),
+    ]
+
+
 def test_build_pr_body_lists_already_on_branch_under_applied():
     """Applied table reflects cumulative state of the backport branch.
 
@@ -1259,6 +1401,85 @@ def test_build_pr_body_lists_already_on_branch_under_applied():
     # Applied would misrepresent the PR's commit set.
     assert "#4001" not in body
     assert "#4002" not in body
+
+
+def test_preserve_existing_applied_details_keeps_non_default_annotations():
+    result = BranchSweepResult(
+        target_branch="8.0",
+        results=[
+            CandidateResult(
+                source_pr_number=2915,
+                source_pr_title="Fix CLUSTER SLOTS crash",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+            CandidateResult(
+                source_pr_number=1298,
+                source_pr_title="Preserve TLS fd state",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+        ],
+    )
+    existing_body = """# Backport sweep for 8.0
+
+## Applied
+
+| Source PR | Title | Detail |
+|---|---|---|
+| #1298 | Preserve TLS fd state | already on backport branch |
+| #2915 | Fix CLUSTER SLOTS crash | conflicts resolved by Claude Code |
+"""
+
+    preserve_existing_applied_details(result, existing_body)
+
+    assert result.results[0].detail == "conflicts resolved by Claude Code"
+    assert result.results[1].detail == backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH
+
+
+def test_upsert_pr_preserves_existing_applied_details_on_edit():
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    existing_pr = MagicMock()
+    existing_pr.number = 1000
+    existing_pr.html_url = "https://github.com/valkey-io/valkey/pull/1000"
+    existing_pr.draft = False
+    existing_pr.body = """# Backport sweep for 8.0
+
+## Applied
+
+| Source PR | Title | Detail |
+|---|---|---|
+| #2915 | Fix CLUSTER SLOTS crash | conflicts resolved by Claude Code |
+"""
+
+    result = BranchSweepResult(
+        target_branch="8.0",
+        results=[
+            CandidateResult(
+                source_pr_number=2915,
+                source_pr_title="Fix CLUSTER SLOTS crash",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            )
+        ],
+    )
+
+    url = upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "8.0",
+        "agent/backport/sweep/8.0",
+        result,
+        existing_pr,
+    )
+
+    assert url == "https://github.com/valkey-io/valkey/pull/1000"
+    _, kwargs = existing_pr.edit.call_args
+    assert "| #2915 | Fix CLUSTER SLOTS crash | conflicts resolved by Claude Code |" in kwargs["body"]
 
 
 def test_build_summary_counts_applied_candidates():

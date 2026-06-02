@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from scripts.backport.sweep_models import (
     DETAIL_ALREADY_ON_SWEEP_BRANCH,
     BranchSweepResult,
@@ -10,10 +12,14 @@ from scripts.backport.sweep_models import (
 
 
 def result_is_on_backport_branch(result: CandidateResult) -> bool:
-    return result.outcome == "applied" or (
-        result.outcome == "skipped-existing"
-        and result.detail == DETAIL_ALREADY_ON_SWEEP_BRANCH
-    )
+    if result.outcome == "applied":
+        return True
+    if result.outcome != "skipped-existing":
+        return False
+    return result.detail not in {
+        "already applied or empty cherry-pick",
+        "resolution was already satisfied on target branch",
+    }
 
 
 def repair_diagnosis_from_detail(detail: str) -> str:
@@ -92,6 +98,32 @@ def build_pr_body(
     return "\n".join(lines)
 
 
+def preserve_existing_applied_details(
+    result: BranchSweepResult,
+    existing_body: str | None,
+) -> None:
+    """Carry forward Applied-row details from the current PR body.
+
+    Branch-log reconstruction can prove that a PR is on the sweep branch, but
+    it cannot recover whether the original run had details like "conflicts
+    resolved by Claude Code". Preserve those annotations when updating an
+    existing sweep PR.
+    """
+    existing_details = _parse_applied_details(existing_body or "")
+    if not existing_details:
+        return
+
+    for item in result.results:
+        if (
+            result_is_on_backport_branch(item)
+            and item.detail == DETAIL_ALREADY_ON_SWEEP_BRANCH
+            and item.source_pr_number in existing_details
+        ):
+            existing_detail = existing_details[item.source_pr_number]
+            if existing_detail:
+                item.detail = existing_detail
+
+
 def build_summary(results: list[BranchSweepResult]) -> str:
     lines = ["## Backport Sweep", ""]
     for r in results:
@@ -107,3 +139,51 @@ def build_summary(results: list[BranchSweepResult]) -> str:
 
 def _esc(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _parse_applied_details(body: str) -> dict[int, str]:
+    details: dict[int, str] = {}
+    in_applied = False
+
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            in_applied = line == "## Applied"
+            continue
+        if not in_applied or not line.startswith("|"):
+            continue
+
+        cells = _split_table_row(line)
+        if len(cells) < 3 or _is_table_separator(cells):
+            continue
+        match = re.search(r"#(\d+)", cells[0])
+        if not match:
+            continue
+        details[int(match.group(1))] = cells[2].strip()
+
+    return details
+
+
+def _split_table_row(line: str) -> list[str]:
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+
+    for char in line.strip().strip("|"):
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "|":
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+
+    cells.append("".join(current).strip())
+    return cells
+
+
+def _is_table_separator(cells: list[str]) -> bool:
+    return all(cell and set(cell) <= {"-", ":", " "} for cell in cells)

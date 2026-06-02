@@ -26,7 +26,7 @@ from scripts.backport.sweep_git import (
     branch_has_changes,
     clone_target_branch,
     head_changes_workflow_files,
-    list_already_applied,
+    list_already_applied_prs,
     push_backport_branch,
     safe_tmp_component,
     sync_target_branch_to_source,
@@ -370,11 +370,16 @@ def _process_branch(
                 push_url = github_https_url(push_repo)
                 _run_git(tmpdir, "remote", "add", "push_target", push_url, env=git_env)
 
-            already_applied = list_already_applied(
+            already_applied_results = list_already_applied_prs(
                 tmpdir,
                 target_branch,
                 backport_branch,
             )
+            already_applied = {
+                str(item.source_pr_number)
+                for item in already_applied_results
+            }
+            emitted_already_applied: set[str] = set()
             logger.info("Already applied on %s: %s", backport_branch, already_applied)
 
             applied_count = 0
@@ -390,6 +395,7 @@ def _process_branch(
                     break
 
                 if str(candidate.source_pr_number) in already_applied:
+                    emitted_already_applied.add(str(candidate.source_pr_number))
                     result.results.append(
                         CandidateResult(
                             source_pr_number=candidate.source_pr_number,
@@ -453,6 +459,10 @@ def _process_branch(
                     continue
 
                 applied_count += 1
+
+            for carried in already_applied_results:
+                if str(carried.source_pr_number) not in emitted_already_applied:
+                    result.results.append(carried)
 
             committed = [
                 item for item in result.results

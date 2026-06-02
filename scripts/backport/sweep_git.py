@@ -11,6 +11,10 @@ from typing import Any, Callable
 from github.GithubException import GithubException
 
 from scripts.backport.main import _run_git as run_git_default
+from scripts.backport.sweep_models import (
+    DETAIL_ALREADY_ON_SWEEP_BRANCH,
+    CandidateResult,
+)
 from scripts.common.git_auth import github_https_url
 from scripts.common.github_client import retry_github_call
 
@@ -63,16 +67,46 @@ def push_backport_branch(
 
 
 def list_already_applied(repo_dir: str, base_branch: str, backport_branch: str) -> set[str]:
+    return {
+        str(item.source_pr_number)
+        for item in list_already_applied_prs(repo_dir, base_branch, backport_branch)
+    }
+
+
+def list_already_applied_prs(
+    repo_dir: str,
+    base_branch: str,
+    backport_branch: str,
+) -> list[CandidateResult]:
+    """Extract PR rows from commits already present on the sweep branch."""
     result = subprocess.run(
-        ["git", "log", f"origin/{base_branch}..{backport_branch}", "--format=%s"],
+        [
+            "git",
+            "log",
+            "--reverse",
+            f"origin/{base_branch}..{backport_branch}",
+            "--format=%s",
+        ],
         cwd=repo_dir, capture_output=True, text=True, check=True,
     )
-    pr_nums: set[str] = set()
+    entries: list[CandidateResult] = []
+    seen: set[str] = set()
     for line in result.stdout.strip().splitlines():
-        m = re.search(r"\(#(\d+)\)", line)
+        m = re.search(r"\(#(\d+)\)\s*$", line)
         if m:
-            pr_nums.add(m.group(1))
-    return pr_nums
+            pr_num = m.group(1)
+            if pr_num in seen:
+                continue
+            seen.add(pr_num)
+            entries.append(
+                CandidateResult(
+                    source_pr_number=int(pr_num),
+                    source_pr_title=line[:m.start()].strip() or f"PR #{pr_num}",
+                    outcome="skipped-existing",
+                    detail=DETAIL_ALREADY_ON_SWEEP_BRANCH,
+                )
+            )
+    return entries
 
 
 RunProcess = Callable[..., subprocess.CompletedProcess[Any]]
