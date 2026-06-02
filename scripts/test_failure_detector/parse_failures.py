@@ -1,4 +1,4 @@
-"""Parse and deduplicate test failures from the consolidated artifact."""
+"""Parse and deduplicate test failures from the consolidated artifact"""
 
 from __future__ import annotations
 
@@ -34,7 +34,8 @@ class UniqueFailure:
 
 def parse_and_deduplicate(
     all_failures: dict[str, Any],
-    job_urls: dict[str, str],
+    
+
 ) -> list[UniqueFailure]:
     """Parse the all-test-failures JSON and deduplicate by test name + file.
 

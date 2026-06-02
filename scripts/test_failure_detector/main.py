@@ -1,11 +1,4 @@
-"""Test Failure Detector — main entry point.
-
-Orchestrates the full pipeline:
-1. Download the all-test-failures artifact from a Valkey Daily CI run
-2. Fetch job URLs for CI links
-3. Parse and deduplicate failures
-4. Create or update GitHub issues on the target repository
-"""
+"""Test Failure Detector — main entry point"""
 
 from __future__ import annotations
 
@@ -27,14 +20,13 @@ from scripts.test_failure_detector.parse_failures import parse_and_deduplicate
 
 logger = logging.getLogger(__name__)
 
-
+# Extra: Build a markdown summary for the GitHub Actions job summary.
 def _build_job_summary(
     run_id: int,
     repo_full_name: str,
     num_failures: int,
     result: dict[str, int],
 ) -> str:
-    """Build a markdown summary for the GitHub Actions job summary."""
     lines = [
         "## Test Failure Detector",
         "",

@@ -1,4 +1,4 @@
-"""Create or update GitHub issues for detected test failures."""
+"""Create or update GitHub issues for detected test failures"""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ _LABEL_NAME = "test-failure"
 _LABEL_COLOR = "e11d48"
 _LABEL_DESCRIPTION = "Test failure detected by CI"
 
-
 def ensure_label_exists(repo: Repository) -> None:
     """Ensure the test-failure label exists on the repository."""
     try:
@@ -29,8 +28,8 @@ def ensure_label_exists(repo: Repository) -> None:
             retries=3,
             description=f"get label {_LABEL_NAME}",
         )
-    except GithubException as exc:
-        if exc.status == 404:
+    except GithubException as e:
+        if e.status == 404:
             logger.info("Creating label %r on %s", _LABEL_NAME, repo.full_name)
             retry_github_call(
                 lambda: repo.create_label(
@@ -44,7 +43,6 @@ def ensure_label_exists(repo: Repository) -> None:
         else:
             raise
 
-
 def get_open_test_failure_issues(repo: Repository) -> list[Issue]:
     """Get all open issues with the test-failure label."""
     issues = retry_github_call(
@@ -54,10 +52,8 @@ def get_open_test_failure_issues(repo: Repository) -> list[Issue]:
     )
     return issues
 
-
 def _build_issue_title(failure: UniqueFailure) -> str:
     return f"[TEST-FAILURE] {failure.test_name} in {failure.test_file}"
-
 
 def _build_issue_body(failure: UniqueFailure) -> str:
     """Build the initial issue body for a new test failure."""
@@ -90,7 +86,6 @@ def _build_issue_body(failure: UniqueFailure) -> str:
         "*Auto-created by Test Failure Detector*",
     ])
 
-
 def _build_comment_body(failure: UniqueFailure) -> str:
     """Build a comment for an existing issue that failed again."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -98,7 +93,6 @@ def _build_comment_body(failure: UniqueFailure) -> str:
         f"- `{j.job}`: [CI link]({j.url})" for j in failure.jobs
     )
     return f"Test failed again on {today}.\n\n**Failed in:**\n{ci_links}"
-
 
 def _extract_environments_from_body(body: str) -> list[str]:
     """Extract existing environment names from an issue body."""
@@ -108,12 +102,10 @@ def _extract_environments_from_body(body: str) -> list[str]:
     env_inner = re.findall(r"`([^`]+)`", env_match.group(1))
     return env_inner
 
-
 def _update_environments_in_body(body: str, all_envs: list[str]) -> str:
     """Replace the Environments line in the issue body with updated list."""
     new_env_line = f"**Environments:** {', '.join(f'`{e}`' for e in all_envs)}"
     return re.sub(r"\*\*Environments:\*\*\s*.+", new_env_line, body)
-
 
 def process_failures(
     gh: Github,

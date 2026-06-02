@@ -1,4 +1,4 @@
-"""Download test failure artifacts from a Valkey CI workflow run."""
+"""Download test failure artifacts from a Valkey CI workflow run"""
 
 from __future__ import annotations
 
