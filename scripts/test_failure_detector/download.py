@@ -15,7 +15,6 @@ from scripts.common.github_client import retry_github_call
 
 logger = logging.getLogger(__name__)
 
-
 class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Strip Authorization header when following redirects.
 
@@ -29,7 +28,6 @@ class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
             "Accept": "application/octet-stream",
         })
 
-
 def _download_artifact(url: str, github_token: str) -> bytes:
     """Download a GitHub artifact zip, handling the auth-stripping redirect."""
     opener = urllib.request.build_opener(_NoAuthRedirectHandler)
@@ -42,7 +40,6 @@ def _download_artifact(url: str, github_token: str) -> bytes:
     )
     with opener.open(req, timeout=120) as resp:
         return resp.read()
-
 
 def get_latest_daily_run(
     gh: Github,
@@ -95,7 +92,6 @@ def get_latest_daily_run(
     logger.warning("No completed non-cancelled run found for %s/%s", workflow_name, branch)
     return None
 
-
 def download_all_test_failures(
     gh: Github,
     repo_full_name: str,
@@ -146,7 +142,6 @@ def download_all_test_failures(
         json_name = next((n for n in names if n.endswith(".json")), names[0])
         logger.info("Extracting %s from artifact zip", json_name)
         return zf.read(json_name)
-
 
 def get_job_urls(
     gh: Github,

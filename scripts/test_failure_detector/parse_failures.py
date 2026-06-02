@@ -31,10 +31,9 @@ class UniqueFailure:
     def display_name(self) -> str:
         return f"{self.test_name} in {self.test_file}"
 
-
 def parse_and_deduplicate(
     all_failures: dict[str, Any],
-    
+
 
 ) -> list[UniqueFailure]:
     """Parse the all-test-failures JSON and deduplicate by test name + file.

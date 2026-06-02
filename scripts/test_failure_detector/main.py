@@ -42,7 +42,6 @@ def _build_job_summary(
     ]
     return "\n".join(lines)
 
-
 def run(
     *,
     github_token: str,
@@ -124,7 +123,6 @@ def run(
     emit_job_summary(_build_job_summary(run_id, repo_full_name, len(unique_failures), result))
     return 0
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Detect test failures from Valkey Daily CI and create GitHub issues.",
@@ -179,7 +177,6 @@ def main() -> None:
             verbose=args.verbose,
         )
     )
-
 
 if __name__ == "__main__":
     main()
