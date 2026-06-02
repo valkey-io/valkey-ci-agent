@@ -21,6 +21,7 @@ from scripts.backport.sweep_apply import apply_candidate, check_applied_commit_s
 from scripts.backport.sweep_git import (
     changed_paths_in_index_or_worktree,
     clone_target_branch,
+    list_applied_prs_on_branch,
     push_backport_branch,
     safe_tmp_component,
     sync_target_branch_to_source,
@@ -496,6 +497,64 @@ def test_upsert_pr_skips_ready_promotion_when_already_open():
     mock_gql.execute.assert_not_called()
 
 
+def test_upsert_pr_preserves_existing_applied_detail_on_update():
+    """Already-on-branch candidates keep richer detail from the prior body."""
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    existing_pr = MagicMock()
+    existing_pr.number = 1001
+    existing_pr.html_url = "https://github.com/valkey-io/valkey/pull/1001"
+    existing_pr.draft = False
+    existing_pr.body = "\n".join(
+        [
+            "# Backport sweep for 8.0",
+            "",
+            "## Applied",
+            "",
+            "| Source PR | Title | Detail |",
+            "|---|---|---|",
+            "| #2915 | Fix CLUSTER SLOTS crash | conflicts resolved by Claude Code |",
+        ]
+    )
+
+    result = BranchSweepResult(
+        target_branch="8.0",
+        candidates_found=1,
+        results=[
+            CandidateResult(
+                2915,
+                "Fix CLUSTER SLOTS crash",
+                "skipped-existing",
+                backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            )
+        ],
+    )
+
+    upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "8.0",
+        "agent/backport/sweep/8.0",
+        result,
+        existing_pr=existing_pr,
+        branch_applied=[
+            CandidateResult(
+                2915,
+                "Fix CLUSTER SLOTS crash",
+                "skipped-existing",
+                backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            )
+        ],
+    )
+
+    _, kwargs = existing_pr.edit.call_args
+    assert "conflicts resolved by Claude Code" in kwargs["body"]
+    assert "already on backport branch" not in kwargs["body"]
+
+
 def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
     monkeypatch,
     tmp_path,
@@ -601,6 +660,7 @@ def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     monkeypatch.setattr(backport_sweep, "find_existing_pr", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "delete_stale_backport_branch", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(backport_sweep, "list_already_applied", lambda *_args, **_kwargs: {"2"})
+    monkeypatch.setattr(backport_sweep, "list_applied_prs_on_branch", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(sweep_validation, "changed_paths_since_base", lambda *_args, **_kwargs: [], raising=False)
     monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_args, **_kwargs: (True, ""))
     monkeypatch.setattr(
@@ -740,6 +800,7 @@ def _green_only_process_branch(monkeypatch, *, candidates, apply_fn, validate_fn
         "list_already_applied",
         lambda *_a, **_k: set(already_applied or set()),
     )
+    monkeypatch.setattr(backport_sweep, "list_applied_prs_on_branch", lambda *_a, **_k: [])
     monkeypatch.setattr(backport_sweep, "head_changes_workflow_files", lambda *_a: False)
     monkeypatch.setattr(backport_sweep, "branch_has_changes", lambda *_a, **_k: True)
     monkeypatch.setattr(backport_sweep, "run_test_commands", lambda *_a, **_k: (True, ""))
@@ -1189,6 +1250,35 @@ def test_safe_tmp_component_removes_branch_separators():
     assert safe_tmp_component("///") == "branch"
 
 
+def test_list_applied_prs_on_branch_reads_backport_commit_subjects(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "8.0")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "file.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "update-ref", "refs/remotes/origin/8.0", "HEAD")
+    _git(repo, "checkout", "-q", "-b", "agent/backport/sweep/8.0")
+
+    (repo / "file.txt").write_text("base\none\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "Preserve original fd blocking state (#1298)")
+    (repo / "file.txt").write_text("base\none\ntwo\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "Fix CLUSTER SLOTS crash (#2915)")
+
+    applied = list_applied_prs_on_branch(
+        str(repo),
+        "8.0",
+        "agent/backport/sweep/8.0",
+    )
+
+    assert [(r.source_pr_number, r.source_pr_title) for r in applied] == [
+        (1298, "Preserve original fd blocking state"),
+        (2915, "Fix CLUSTER SLOTS crash"),
+    ]
+
+
 def test_build_pr_body_lists_already_on_branch_under_applied():
     """Applied table reflects cumulative state of the backport branch.
 
@@ -1259,6 +1349,63 @@ def test_build_pr_body_lists_already_on_branch_under_applied():
     # Applied would misrepresent the PR's commit set.
     assert "#4001" not in body
     assert "#4002" not in body
+
+
+def test_build_pr_body_uses_branch_commits_and_preserves_prior_detail():
+    result = BranchSweepResult(
+        target_branch="8.0",
+        candidates_found=2,
+        results=[
+            CandidateResult(
+                source_pr_number=2915,
+                source_pr_title="Fix CLUSTER SLOTS crash",
+                outcome="skipped-existing",
+                detail=backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+            CandidateResult(
+                source_pr_number=1826,
+                source_pr_title="Fix Lua VM crash",
+                outcome="skipped-conflict",
+                detail="target branch lacks conflicted file(s): src/lua/engine_lua.c",
+            ),
+        ],
+    )
+    previous_body = "\n".join(
+        [
+            "# Backport sweep for 8.0",
+            "",
+            "## Applied",
+            "",
+            "| Source PR | Title | Detail |",
+            "|---|---|---|",
+            "| #2915 | Fix CLUSTER SLOTS crash | conflicts resolved by Claude Code |",
+        ]
+    )
+
+    body = build_pr_body(
+        result,
+        branch_applied=[
+            CandidateResult(
+                1298,
+                "Preserve original fd blocking state",
+                "skipped-existing",
+                backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+            CandidateResult(
+                2915,
+                "Fix CLUSTER SLOTS crash",
+                "skipped-existing",
+                backport_sweep.DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            ),
+        ],
+        previous_body=previous_body,
+    )
+
+    assert "#1298" in body
+    assert "#2915" in body
+    assert "#1826" in body
+    assert "conflicts resolved by Claude Code" in body
+    assert body.index("#1298") < body.index("#2915")
 
 
 def test_build_summary_counts_applied_candidates():

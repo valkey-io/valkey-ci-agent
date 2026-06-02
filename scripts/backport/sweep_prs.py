@@ -13,7 +13,7 @@ from scripts.backport.pr_creator import (
     pull_matches_push_repo,
 )
 from scripts.backport.sweep_graphql import GitHubGraphQLClient
-from scripts.backport.sweep_models import BranchSweepResult
+from scripts.backport.sweep_models import BranchSweepResult, CandidateResult
 from scripts.backport.sweep_reporting import build_pr_body
 from scripts.common.github_client import retry_github_call
 
@@ -59,9 +59,15 @@ def upsert_pr(
     result: BranchSweepResult,
     existing_pr: Any | None,
     gql: GitHubGraphQLClient | None = None,
+    branch_applied: list[CandidateResult] | None = None,
 ) -> str:
     repo = retry_github_call(lambda: gh.get_repo(base_repo), retries=2, description=f"get {base_repo}")
-    body = build_pr_body(result)
+    previous_body = getattr(existing_pr, "body", None) if existing_pr else None
+    body = build_pr_body(
+        result,
+        branch_applied=branch_applied,
+        previous_body=previous_body if isinstance(previous_body, str) else None,
+    )
     title = f"[backport] Backport sweep for {target_branch}"
 
     if existing_pr:

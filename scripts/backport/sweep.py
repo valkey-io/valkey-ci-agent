@@ -27,6 +27,7 @@ from scripts.backport.sweep_git import (
     clone_target_branch,
     head_changes_workflow_files,
     list_already_applied,
+    list_applied_prs_on_branch,
     push_backport_branch,
     safe_tmp_component,
     sync_target_branch_to_source,
@@ -481,6 +482,11 @@ def _process_branch(
                     result,
                     existing_pr,
                     gql=GitHubGraphQLClient(github_token),
+                    branch_applied=list_applied_prs_on_branch(
+                        tmpdir,
+                        target_branch,
+                        backport_branch,
+                    ),
                 )
 
     except Exception as exc:

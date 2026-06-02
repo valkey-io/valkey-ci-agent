@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from scripts.backport.sweep_models import (
     DETAIL_ALREADY_ON_SWEEP_BRANCH,
     BranchSweepResult,
@@ -48,6 +50,9 @@ def compact_validation_output(output: str, *, limit: int = 500) -> str:
 
 def build_pr_body(
     result: BranchSweepResult,
+    *,
+    branch_applied: list[CandidateResult] | None = None,
+    previous_body: str | None = None,
 ) -> str:
     lines = [
         f"# Backport sweep for {result.target_branch}",
@@ -56,7 +61,11 @@ def build_pr_body(
         "",
     ]
 
-    applied = [r for r in result.results if result_is_on_backport_branch(r)]
+    applied = merge_applied_results(
+        [r for r in result.results if result_is_on_backport_branch(r)],
+        branch_applied=branch_applied,
+        previous_body=previous_body,
+    )
     failed = [
         r for r in result.results
         if r.outcome not in {"applied", "skipped-existing"}
@@ -103,6 +112,127 @@ def build_summary(results: list[BranchSweepResult]) -> str:
             f"- `{r.target_branch}`: {applied}/{r.candidates_found} applied" + suffix
         )
     return "\n".join(lines)
+
+
+def merge_applied_results(
+    current: list[CandidateResult],
+    *,
+    branch_applied: list[CandidateResult] | None = None,
+    previous_body: str | None = None,
+) -> list[CandidateResult]:
+    previous = parse_previous_applied(previous_body or "")
+    previous_by_pr = {r.source_pr_number: r for r in previous}
+    current_by_pr = {r.source_pr_number: r for r in current}
+
+    if branch_applied is None:
+        base_results = [*previous, *current]
+    else:
+        base_results = [*branch_applied, *current]
+
+    merged: list[CandidateResult] = []
+    seen: set[int] = set()
+    for base in base_results:
+        if base.source_pr_number in seen:
+            continue
+        seen.add(base.source_pr_number)
+        current_result = current_by_pr.get(base.source_pr_number)
+        previous_result = previous_by_pr.get(base.source_pr_number)
+        merged.append(
+            _merge_applied_result(
+                base,
+                current_result=current_result,
+                previous_result=previous_result,
+            )
+        )
+    return merged
+
+
+def parse_previous_applied(body: str) -> list[CandidateResult]:
+    results: list[CandidateResult] = []
+    in_applied = False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped == "## Applied":
+            in_applied = True
+            continue
+        if in_applied and stripped.startswith("## "):
+            break
+        if not in_applied or not stripped.startswith("|"):
+            continue
+
+        cells = _split_markdown_table_row(stripped)
+        if len(cells) < 3:
+            continue
+        source, title, detail = cells[:3]
+        if source.lower() == "source pr" or set(source) <= {"-"}:
+            continue
+        match = re.search(r"#(\d+)", source)
+        if not match:
+            continue
+        results.append(
+            CandidateResult(
+                source_pr_number=int(match.group(1)),
+                source_pr_title=title,
+                outcome="applied",
+                detail=detail,
+            )
+        )
+    return results
+
+
+def _merge_applied_result(
+    base: CandidateResult,
+    *,
+    current_result: CandidateResult | None,
+    previous_result: CandidateResult | None,
+) -> CandidateResult:
+    if current_result is not None:
+        title = current_result.source_pr_title or base.source_pr_title
+        detail = current_result.detail
+        if detail == DETAIL_ALREADY_ON_SWEEP_BRANCH and previous_result is not None:
+            detail = previous_result.detail
+    else:
+        title = base.source_pr_title
+        detail = base.detail
+        if previous_result is not None:
+            detail = previous_result.detail
+            title = title or previous_result.source_pr_title
+
+    return CandidateResult(
+        source_pr_number=base.source_pr_number,
+        source_pr_title=title,
+        outcome="applied",
+        detail=detail,
+    )
+
+
+def _split_markdown_table_row(row: str) -> list[str]:
+    text = row.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in text:
+        if char == "\\" and not escaped:
+            escaped = True
+            current.append(char)
+            continue
+        if char == "|" and not escaped:
+            cells.append(_unesc("".join(current).strip()))
+            current = []
+            continue
+        current.append(char)
+        escaped = False
+    cells.append(_unesc("".join(current).strip()))
+    return cells
+
+
+def _unesc(value: str) -> str:
+    return value.replace("\\|", "|")
 
 
 def _esc(value: object) -> str:

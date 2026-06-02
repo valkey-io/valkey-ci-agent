@@ -11,6 +11,10 @@ from typing import Any, Callable
 from github.GithubException import GithubException
 
 from scripts.backport.main import _run_git as run_git_default
+from scripts.backport.sweep_models import (
+    DETAIL_ALREADY_ON_SWEEP_BRANCH,
+    CandidateResult,
+)
 from scripts.common.git_auth import github_https_url
 from scripts.common.github_client import retry_github_call
 
@@ -63,16 +67,47 @@ def push_backport_branch(
 
 
 def list_already_applied(repo_dir: str, base_branch: str, backport_branch: str) -> set[str]:
+    return {
+        str(result.source_pr_number)
+        for result in list_applied_prs_on_branch(repo_dir, base_branch, backport_branch)
+    }
+
+
+def list_applied_prs_on_branch(
+    repo_dir: str,
+    base_branch: str,
+    backport_branch: str,
+) -> list[CandidateResult]:
     result = subprocess.run(
-        ["git", "log", f"origin/{base_branch}..{backport_branch}", "--format=%s"],
+        [
+            "git",
+            "log",
+            "--reverse",
+            f"origin/{base_branch}..{backport_branch}",
+            "--format=%s",
+        ],
         cwd=repo_dir, capture_output=True, text=True, check=True,
     )
-    pr_nums: set[str] = set()
+    applied: list[CandidateResult] = []
+    seen: set[int] = set()
     for line in result.stdout.strip().splitlines():
         m = re.search(r"\(#(\d+)\)", line)
-        if m:
-            pr_nums.add(m.group(1))
-    return pr_nums
+        if not m:
+            continue
+        pr_number = int(m.group(1))
+        if pr_number in seen:
+            continue
+        seen.add(pr_number)
+        title = re.sub(r"\s*\(#\d+\)\s*$", "", line).strip() or line.strip()
+        applied.append(
+            CandidateResult(
+                source_pr_number=pr_number,
+                source_pr_title=title,
+                outcome="skipped-existing",
+                detail=DETAIL_ALREADY_ON_SWEEP_BRANCH,
+            )
+        )
+    return applied
 
 
 RunProcess = Callable[..., subprocess.CompletedProcess[Any]]
