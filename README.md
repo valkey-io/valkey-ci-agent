@@ -140,7 +140,7 @@ Monitors the Daily CI workflow on `valkey-io/valkey`, detects test failures, and
 ### How it works
 
 1. **Find the run** — locates the most recent completed (non-cancelled) Daily workflow run on the `unstable` branch, or uses a manually input run ID
-2. **Download artifact** — fetches the `all-test-failures` artifact from the run (a JSON file consolidated by the CI workflow). Uses a custom HTTP handler to strip the Authorization header on the redirect to Azure blob storage
+2. **Download artifact** — fetches the `all-test-failures` artifact from the CI workflow. Uses an HTTP handler to strip the Authorization header on the redirect to Azure blob storage
 3. **Get job URLs** — fetches job metadata from the run to build CI links for each failure, with normalized name variants for fuzzy matching against artifact names
 4. **Parse and deduplicate** — iterates the nested JSON (`{job → suite → [failures]}`) and groups by `{test_name, test_file}` such that a test failing across multiple  jobs becomes one unique failure with multiple job references
 5. **Create or update issues** — for each unique failure:
