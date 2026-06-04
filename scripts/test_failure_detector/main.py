@@ -74,6 +74,11 @@ def run(
         daily_run = get_latest_daily_run(gh, repo_full_name, workflow_name, branch)
         if daily_run is None:
             logger.error("No qualifying workflow run found.")
+            emit_job_summary(
+            f"### ⚠️ Test Failure Detector\n\n"
+            f"No qualifying `{workflow_name}` run found on "
+            f"`{repo_full_name}` (branch `{branch}`)."
+            )
             return 1
         run_id = daily_run.id
     else:

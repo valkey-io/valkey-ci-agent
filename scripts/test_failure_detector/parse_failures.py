@@ -45,6 +45,13 @@ def parse_and_deduplicate(
     """
     grouped: dict[str, UniqueFailure] = {}
 
+    if not isinstance(all_failures, dict):
+        logger.warning(
+            "Unexpected top-level format: expected dict, got %s",
+            type(all_failures).__name__,
+        )
+        return []
+
     for job_name, suites in all_failures.items():
         if not isinstance(suites, dict):
             logger.warning("Unexpected format for job %r: expected dict, got %s", job_name, type(suites).__name__)

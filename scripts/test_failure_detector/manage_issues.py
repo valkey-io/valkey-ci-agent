@@ -31,15 +31,26 @@ def ensure_label_exists(repo: Repository) -> None:
     except GithubException as e:
         if e.status == 404:
             logger.info("Creating label %r on %s", _LABEL_NAME, repo.full_name)
-            retry_github_call(
-                lambda: repo.create_label(
-                    name=_LABEL_NAME,
-                    color=_LABEL_COLOR,
-                    description=_LABEL_DESCRIPTION,
-                ),
-                retries=3,
-                description=f"create label {_LABEL_NAME}",
-            )
+            try:
+                retry_github_call(
+                    lambda: repo.create_label(
+                        name=_LABEL_NAME,
+                        color=_LABEL_COLOR,
+                        description=_LABEL_DESCRIPTION,
+                    ),
+                    retries=3,
+                    description=f"create label {_LABEL_NAME}",
+                )
+            except GithubException as create_exc:
+                # Another process may have created the label between our get_label
+                # and create_label calls, so return with "already exists" message.
+                if create_exc.status == 422 or "already exists" in str(create_exc).lower():
+                    logger.info(
+                        "Label %r already created by another process on %s",
+                        _LABEL_NAME, repo.full_name,
+                    )
+                else:
+                    raise
         else:
             raise
 

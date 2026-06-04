@@ -132,15 +132,28 @@ def download_all_test_failures(
         description="download artifact zip",
     )
 
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        names = zf.namelist()
-        if not names:
-            logger.warning("Artifact zip is empty")
-            return None
-        # The zip should contain all-test-failures.json
-        json_name = next((n for n in names if n.endswith(".json")), names[0])
-        logger.info("Extracting %s from artifact zip", json_name)
-        return zf.read(json_name)
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = zf.namelist()
+            if not names:
+                logger.warning("Artifact zip is empty")
+                return None
+
+            json_name = "all-test-failures.json"
+            if json_name not in names:
+                logger.warning(
+                    "Artifact zip for run %d does not contain %s; found: %s",
+                    run_id,
+                    json_name,
+                    names,
+                )
+                return None
+
+            logger.info("Extracting %s from artifact zip", json_name)
+            return zf.read(json_name)
+    except zipfile.BadZipFile as exc:
+        logger.warning("Artifact zip for run %d is invalid: %s", run_id, exc)
+        return None
 
 def get_job_urls(
     gh: Github,
