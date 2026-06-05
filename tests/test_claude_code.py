@@ -77,7 +77,7 @@ def test_run_claude_code_streams_json_and_uses_bedrock_env(monkeypatch, caplog):
     assert "--disallowedTools" not in captured["cmd"]
     assert captured["kwargs"]["cwd"] == "/tmp/checkout"
     assert captured["kwargs"]["env"]["CLAUDE_CODE_USE_BEDROCK"] == "1"
-    assert captured["kwargs"]["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "us.anthropic.claude-opus-4-7"
+    assert captured["kwargs"]["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "us.anthropic.claude-opus-4-8"
     assert captured["kwargs"]["env"]["AWS_REGION"] == "us-east-1"
     assert "Claude stream: system init model=opus session=abc cwd=/tmp/checkout" in caplog.text
     assert "Claude stream: assistant tool=Read file_path=src/a.c" in caplog.text

@@ -21,6 +21,7 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | Workflow | Status | Description |
 |----------|--------|-------------|
 | Backport | Active | Cherry-picks merged PRs onto release branches with AI conflict resolution |
+| Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Fuzzer Monitor | Planned | Analyzes fuzzer runs, triages failures, files issues |
@@ -68,7 +69,7 @@ repos:
 
 By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
 
-The sweep branch is always kept green: a candidate is only kept if the whole branch still validates after the cherry-pick, so one bad commit can never block later candidates. Each scheduled run keeps a single validated cherry-pick (`--max-candidates 1`) and reports candidates that were skipped or failed validation in the PR's "Needs attention" section without committing them. When `repair_validation_failures` is enabled, Claude Code gets one narrow edit-only attempt to fix a failing cherry-pick before it is dropped.
+The sweep branch is always kept green: a candidate is only kept if the whole branch still validates after the cherry-pick, so one bad commit can never block later candidates. Each scheduled run keeps up to two validated cherry-picks (`--max-candidates 2`) and reports candidates that were skipped or failed validation in the PR's "Needs attention" section without committing them. When `repair_validation_failures` is enabled, Claude Code gets one narrow edit-only attempt to fix a failing cherry-pick before it is dropped.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
@@ -81,7 +82,7 @@ See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
   - `pull-requests:write` on each repo (for opening PRs)
   - `issues:write` on each repo (for backport status comments)
   - `organization_projects:read` on the org (for querying project boards)
-- An AWS account with Bedrock access to `us.anthropic.claude-opus-4-7`
+- An AWS account with Bedrock access to `us.anthropic.claude-opus-4-8`
 - An OIDC trust between GitHub Actions and your AWS account
 
 #### Step 1: Configure secrets and variables
@@ -133,17 +134,50 @@ gh workflow run backport-sweep.yml \
   --field project_number=14
 ```
 
+## Fuzzer Monitor Workflow
+
+The fuzzer monitor watches scheduled `valkey-io/valkey-fuzzer` workflow runs, analyzes their artifacts, and files issues for runs that look anomalous.
+
+### How it works
+
+1. **Cron** — every 4 hours, the monitor checks the latest scheduled fuzzer run
+2. **Deterministic scan** — pattern-matches crash/sanitizer/failover/RDB signals against artifact JSON and node logs; ignores chaos-expected noise (CLUSTERDOWN, replication link loss)
+3. **Claude Code analysis** — drops the artifacts in a tempdir, shallow-clones `valkey-io/valkey` at the tested commit and `valkey-io/valkey-fuzzer` at the run's HEAD, then asks Claude (with read-only `Read,Grep,Glob` tools) to correlate the failure with source and decide whether the run reflects a real bug or chaos-expected noise. If a clone fails the prompt tells Claude not to cite source line numbers.
+4. **Issue upsert** — anomalous runs file (or update) an issue on `valkey-io/valkey-fuzzer`, deduplicated by a stable fingerprint over root cause and anomaly shape
+5. **Audit** — per-run JSON results and Claude evidence are uploaded as workflow artifacts
+
+The Claude Code subprocess runs under the `fuzzer_analysis_readonly` agent profile with `Read,Grep,Glob` tools only — no editing, no Bash, no network access beyond the Bedrock call itself.
+
+### Configuration
+
+The monitor reuses the same secrets and OIDC role as the backport workflow (see [Step 1](#step-1-configure-secrets-and-variables) above). The Valkeyrie GitHub App needs `actions:read`, `contents:read`, and `issues:write` on `valkey-io/valkey-fuzzer`; the workflow mints a short-lived installation token scoped to that repository only.
+
+### Manual run
+
+```bash
+# Run live against the latest scheduled fuzzer run (default)
+gh workflow run monitor-fuzzer.yml --repo valkey-io/valkey-ci-agent
+
+# Probe without invoking Claude or filing issues
+gh workflow run monitor-fuzzer.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field dry_run=true
+```
+
+Scheduled runs always run live.
+
 ## Test Failure Detector
 
 Monitors the Daily CI workflow on `valkey-io/valkey`, detects test failures, and automatically creates or updates GitHub issues to track them.
 
 ### How it works
 
-1. **Find the run** — locates the most recent completed (non-cancelled) Daily workflow run on the `unstable` branch, or uses a manually input run ID
-2. **Download artifact** — fetches the `all-test-failures` artifact from the CI workflow. Uses an HTTP handler to strip the Authorization header on the redirect to Azure blob storage
-3. **Get job URLs** — fetches job metadata from the run to build CI links for each failure, with normalized name variants for fuzzy matching against artifact names
-4. **Parse and deduplicate** — iterates the nested JSON (`{job → suite → [failures]}`) and groups by `{test_name, test_file}` such that a test failing across multiple  jobs becomes one unique failure with multiple job references
-5. **Create or update issues** — for each unique failure:
+1. **Daily sweep** - every day at 23:00 UTC, the preflight job reads from `valkey-io/valkey`
+2. **Find the run** — locates the most recent completed (non-cancelled) Daily workflow run on the `unstable` branch, or uses a manually input run ID
+3. **Download artifact** — fetches the `all-test-failures` artifact from the CI workflow. Uses an HTTP handler to strip the Authorization header on the redirect to Azure blob storage
+4. **Get job URLs** — fetches job metadata from the run to build CI links for each failure, with normalized name variants for fuzzy matching against artifact names
+5. **Parse and deduplicate** — iterates the nested JSON (`{job → suite → [failures]}`) and groups by `{test_name, test_file}` such that a test failing across multiple  jobs becomes one unique failure with multiple job references
+6. **Create or update issues** — for each unique failure:
    - If an open issue with matching title (`[TEST-FAILURE] {test_name} in {test_file}`) already exists: updates the environments list and adds a recurrence comment with the date
    - Otherwise: creates a new issue with the `test-failure` label, error stack trace, CI links, and environment list
 

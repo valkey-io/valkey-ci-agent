@@ -13,7 +13,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CLAUDE_MODEL = "opus"
-_DEFAULT_BEDROCK_OPUS_MODEL = "us.anthropic.claude-opus-4-7"
+_DEFAULT_BEDROCK_OPUS_MODEL = "us.anthropic.claude-opus-4-8"
 _CLAUDE_MODEL_ENV = "CI_AGENT_CLAUDE_MODEL"
 _BEDROCK_OPUS_MODEL_ENV = "CI_AGENT_CLAUDE_BEDROCK_OPUS_MODEL"
 _DEFAULT_TIMEOUT_SECONDS = 60 * 60

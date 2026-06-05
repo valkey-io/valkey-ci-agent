@@ -19,7 +19,7 @@ on:
         description: "Cap successfully applied cherry-picks per branch (0 = unlimited)"
         required: false
         type: string
-        default: "1"
+        default: "2"
       dry_run:
         description: "Discovery only — don't cherry-pick or push"
         required: false
@@ -91,7 +91,7 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       CLAUDE_CODE_USE_BEDROCK: "1"
       CI_AGENT_EVIDENCE_DIR: agent-evidence
-      MAX_CANDIDATES: ${{ inputs.max_candidates || '1' }}
+      MAX_CANDIDATES: ${{ inputs.max_candidates || '2' }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
     permissions:
       contents: read
