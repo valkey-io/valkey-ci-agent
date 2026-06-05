@@ -105,6 +105,54 @@ def test_search_failure_propagates_no_duplicate_issue():
     mock_repo.create_issue.assert_not_called()
 
 
+def test_body_transform_applied_on_update():
+    """``body_transform`` runs on the update path and its output feeds the
+    marker/occurrence machinery, so callers can carry state forward (e.g.
+    merging environments) into the edited body."""
+    marker = f"<!-- {NAMESPACE}:fp1 -->"
+    existing = MagicMock(
+        number=5, html_url="https://x/issues/5",
+        body=f"{marker}\n<!-- {NAMESPACE}:occurrences:1 -->\nEnvs: old",
+        title="old",
+    )
+    mock_repo = MagicMock()
+    mock_repo.get_issue.return_value = existing
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.return_value = [existing]
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, _ = publisher.upsert(
+        "o/r", fingerprint="fp1", render=_render_static(),
+        body_transform=lambda b: b.replace("Envs: old", "Envs: old, new"),
+    )
+    assert action == "updated"
+    edited_body = existing.edit.call_args.kwargs["body"]
+    assert "Envs: old, new" in edited_body
+    # Marker + bumped occurrence counter survive the transform.
+    assert marker in edited_body
+    assert f"<!-- {NAMESPACE}:occurrences:2 -->" in edited_body
+
+
+def test_body_transform_not_applied_on_create():
+    """The transform only makes sense for an existing body; on create it must
+    not run (there is nothing to carry forward)."""
+    mock_repo = MagicMock()
+    mock_issue = MagicMock(number=1, html_url="https://x/issues/1")
+    mock_repo.create_issue.return_value = mock_issue
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.return_value = iter([])
+
+    sentinel = MagicMock(side_effect=AssertionError("transform ran on create"))
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, _ = publisher.upsert(
+        "o/r", fingerprint="fp1", render=_render_static(), body_transform=sentinel,
+    )
+    assert action == "created"
+    sentinel.assert_not_called()
+
+
 def test_idempotency_key_recorded_on_create():
     """When idempotency_key is supplied, the new issue body records it."""
     mock_repo = MagicMock()

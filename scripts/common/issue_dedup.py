@@ -55,6 +55,7 @@ class IssueDedupPublisher:
         fingerprint: str,
         render: Callable[[str, int], IssueContent],
         idempotency_key: str | None = None,
+        body_transform: Callable[[str], str] | None = None,
     ) -> tuple[str, str]:
         """Create or update the issue for ``fingerprint``.
 
@@ -70,6 +71,14 @@ class IssueDedupPublisher:
         occurrence counter when the same key is seen again. Use this to
         guard against re-runs of the same source event (e.g. the same
         workflow run id) inflating the count.
+
+        ``body_transform`` is an optional hook applied only on the *update*
+        path: it receives the existing issue body and returns a modified
+        body, letting callers carry state forward that ``render`` can't see
+        (e.g. merging a running list of failing environments into the
+        already-published body). It runs before the marker/occurrence/
+        idempotency machinery, so those markers stay authoritative regardless
+        of what the transform returns. Ignored when creating a new issue.
         """
         repo = retry_github_call(
             lambda: self._gh.get_repo(repo_name),
@@ -96,6 +105,8 @@ class IssueDedupPublisher:
             return "created", issue.html_url
 
         body = existing.body or ""
+        if body_transform is not None:
+            body = body_transform(body)
 
         if idempotency_key is not None:
             last = _last_key_re(self._ns).search(body)

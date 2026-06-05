@@ -10,6 +10,7 @@ import sys
 from github import Auth, Github
 
 from scripts.common.job_summary import emit_job_summary
+from scripts.common.workflow_artifacts import ArtifactClient
 from scripts.test_failure_detector.download import (
     download_all_test_failures,
     get_job_urls,
@@ -67,6 +68,7 @@ def run(
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
     gh = Github(auth=Auth.Token(github_token))
+    artifact_client = ArtifactClient(gh, token=github_token)
 
     # Step 1: Find the workflow run
     if run_id is None:
@@ -86,7 +88,9 @@ def run(
 
     # Step 2: Download the all-test-failures artifact
     logger.info("Downloading all-test-failures artifact from run %d...", run_id)
-    artifact_content = download_all_test_failures(gh, repo_full_name, run_id, github_token)
+    artifact_content = download_all_test_failures(
+        gh, repo_full_name, run_id, github_token, artifact_client=artifact_client,
+    )
     if artifact_content is None:
         logger.info("No test failures artifact found — CI run likely passed cleanly.")
         emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}))
@@ -120,7 +124,7 @@ def run(
 
     # Step 5: Create or update issues
     logger.info("Processing issues on %s...", repo_full_name)
-    result = process_failures(gh, repo_full_name, unique_failures)
+    result = process_failures(gh, repo_full_name, unique_failures, run_id=run_id)
 
     emit_job_summary(_build_job_summary(run_id, repo_full_name, len(unique_failures), result))
     return 0

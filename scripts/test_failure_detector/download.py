@@ -2,44 +2,20 @@
 
 from __future__ import annotations
 
-import io
 import logging
 import re
-import urllib.request
-import zipfile
 
 from github import Github
 from github.WorkflowRun import WorkflowRun
 
 from scripts.common.github_client import retry_github_call
+from scripts.common.workflow_artifacts import ArtifactClient
 
 logger = logging.getLogger(__name__)
 
-class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Strip Authorization header when following redirects.
-
-    GitHub's artifact download endpoint returns a 302 to a temporary blob
-    storage URL. That URL uses its own auth baked into the query string;
-    forwarding the GitHub Authorization header causes a 401.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return urllib.request.Request(newurl, headers={
-            "Accept": "application/octet-stream",
-        })
-
-def _download_artifact(url: str, github_token: str) -> bytes:
-    """Download a GitHub artifact zip, handling the auth-stripping redirect."""
-    opener = urllib.request.build_opener(_NoAuthRedirectHandler)
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {github_token}",
-            "Accept": "application/vnd.github+json",
-        },
-    )
-    with opener.open(req, timeout=120) as resp:
-        return resp.read()
+# Name of the JSON file the Valkey CI workflow uploads inside its artifact zip.
+_FAILURES_JSON_NAME = "all-test-failures.json"
+_FAILURES_ARTIFACT_NAME = "all-test-failures"
 
 def get_latest_daily_run(
     gh: Github,
@@ -96,64 +72,48 @@ def download_all_test_failures(
     repo_full_name: str,
     run_id: int,
     github_token: str,
+    *,
+    artifact_client: ArtifactClient | None = None,
 ) -> bytes | None:
     """Download the 'all-test-failures' artifact from a workflow run.
 
-    Returns the raw JSON content as bytes, or None if the artifact is not found.
+    Returns the raw JSON content as bytes, or None if the artifact (or the
+    JSON file inside it) is not found. Delegates the listing, download, and
+    zip extraction to the shared :class:`ArtifactClient`, which handles the
+    auth-stripping redirect, transient-failure retries, expired (404)
+    artifacts, and a runaway-extraction cap.
     """
-    repo = retry_github_call(
-        lambda: gh.get_repo(repo_full_name),
-        retries=3,
-        description=f"get repo {repo_full_name}",
+    client = artifact_client or ArtifactClient(gh, token=github_token)
+
+    artifacts = client.list_run_artifacts(repo_full_name, run_id)
+    target = next(
+        (a for a in artifacts if a.name == _FAILURES_ARTIFACT_NAME), None
     )
-
-    artifacts = retry_github_call(
-        lambda: repo.get_workflow_run(run_id).get_artifacts(),
-        retries=3,
-        description=f"list artifacts for run {run_id}",
-    )
-
-    target_artifact = None
-    for artifact in artifacts:
-        if artifact.name == "all-test-failures":
-            target_artifact = artifact
-            break
-
-    if target_artifact is None:
-        logger.info("No 'all-test-failures' artifact found in run %d", run_id)
+    if target is None:
+        logger.info(
+            "No %r artifact found in run %d", _FAILURES_ARTIFACT_NAME, run_id
+        )
+        return None
+    if target.expired:
+        logger.warning(
+            "Artifact %r (id=%d) in run %d has expired",
+            target.name, target.artifact_id, run_id,
+        )
         return None
 
-    logger.info("Downloading artifact: %s (id=%d)", target_artifact.name, target_artifact.id)
+    logger.info("Downloading artifact: %s (id=%d)", target.name, target.artifact_id)
+    files = client.download_artifact(repo_full_name, target.artifact_id)
 
-    url = target_artifact.archive_download_url
-    zip_bytes = retry_github_call(
-        lambda: _download_artifact(url, github_token),
-        retries=3,
-        description="download artifact zip",
-    )
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            names = zf.namelist()
-            if not names:
-                logger.warning("Artifact zip is empty")
-                return None
-
-            json_name = "all-test-failures.json"
-            if json_name not in names:
-                logger.warning(
-                    "Artifact zip for run %d does not contain %s; found: %s",
-                    run_id,
-                    json_name,
-                    names,
-                )
-                return None
-
-            logger.info("Extracting %s from artifact zip", json_name)
-            return zf.read(json_name)
-    except zipfile.BadZipFile as exc:
-        logger.warning("Artifact zip for run %d is invalid: %s", run_id, exc)
+    content = files.get(_FAILURES_JSON_NAME)
+    if content is None:
+        logger.warning(
+            "Artifact zip for run %d does not contain %s; found: %s",
+            run_id, _FAILURES_JSON_NAME, sorted(files),
+        )
         return None
+
+    logger.info("Extracted %s from artifact zip", _FAILURES_JSON_NAME)
+    return content
 
 def get_job_urls(
     gh: Github,

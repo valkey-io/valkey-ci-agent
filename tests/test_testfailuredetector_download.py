@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import io
 import json
-import zipfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,14 +29,6 @@ def _make_mock_run(run_number: int, run_id: int, conclusion: str, status: str = 
     run.status = status
     run.created_at = "2026-06-01 00:00:00+00:00"
     return run
-
-
-def _make_artifact_zip(content: dict) -> bytes:
-    """Create a zip file in memory containing all-test-failures.json."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("all-test-failures.json", json.dumps(content))
-    return buf.getvalue()
 
 
 class TestGetLatestDailyRun:
@@ -149,68 +139,76 @@ class TestGetLatestDailyRun:
 
 
 class TestDownloadAllTestFailures:
-    @patch("scripts.test_failure_detector.download._download_artifact")
-    @patch("scripts.test_failure_detector.download.retry_github_call")
-    def test_downloads_and_extracts_json(self, mock_retry, mock_dl) -> None:
-        """Should download the zip and extract the JSON content."""
+    """Download now delegates to a (mocked) ArtifactClient."""
+
+    @staticmethod
+    def _make_artifact(name: str, artifact_id: int = 555, expired: bool = False):
+        from scripts.common.workflow_artifacts import WorkflowArtifact
+
+        return WorkflowArtifact(
+            artifact_id=artifact_id, name=name, size_in_bytes=10, expired=expired,
+        )
+
+    def test_downloads_and_extracts_json(self) -> None:
+        """Should locate the artifact and return the extracted JSON content."""
         failures_data = {"job-1": {"suite": [{"test_name": "t", "test_file": "f.tcl", "error": "e"}]}}
-        mock_dl.return_value = _make_artifact_zip(failures_data)
 
-        mock_artifact = MagicMock()
-        mock_artifact.name = "all-test-failures"
-        mock_artifact.id = 555
-        mock_artifact.archive_download_url = "https://api.github.com/artifacts/555/zip"
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [self._make_artifact("all-test-failures")]
+        client.download_artifact.return_value = {
+            "all-test-failures.json": json.dumps(failures_data).encode(),
+        }
 
-        mock_run = MagicMock()
-        mock_run.get_artifacts.return_value = [mock_artifact]
-
-        mock_repo = MagicMock()
-        mock_repo.get_workflow_run.return_value = mock_run
-
-        mock_retry.side_effect = lambda op, **kwargs: op()
-
-        mock_gh = MagicMock()
-        mock_gh.get_repo.return_value = mock_repo
-
-        result = download_all_test_failures(mock_gh, "owner/repo", 123, "fake-token")
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
         assert result is not None
         assert json.loads(result) == failures_data
+        client.download_artifact.assert_called_once_with("owner/repo", 555)
 
-    @patch("scripts.test_failure_detector.download.retry_github_call")
-    def test_returns_none_when_no_artifact(self, mock_retry) -> None:
+    def test_returns_none_when_no_artifact(self) -> None:
         """Should return None if no all-test-failures artifact exists."""
-        mock_artifact = MagicMock()
-        mock_artifact.name = "some-other-artifact"
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [self._make_artifact("some-other-artifact")]
 
-        mock_run = MagicMock()
-        mock_run.get_artifacts.return_value = [mock_artifact]
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
+        assert result is None
+        client.download_artifact.assert_not_called()
 
-        mock_repo = MagicMock()
-        mock_repo.get_workflow_run.return_value = mock_run
+    def test_returns_none_when_no_artifacts_at_all(self) -> None:
+        """Should return None if the run has no artifacts."""
+        client = MagicMock()
+        client.list_run_artifacts.return_value = []
 
-        mock_retry.side_effect = lambda op, **kwargs: op()
-
-        mock_gh = MagicMock()
-        mock_gh.get_repo.return_value = mock_repo
-
-        result = download_all_test_failures(mock_gh, "owner/repo", 123, "fake-token")
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
         assert result is None
 
-    @patch("scripts.test_failure_detector.download.retry_github_call")
-    def test_returns_none_when_no_artifacts_at_all(self, mock_retry) -> None:
-        """Should return None if the run has no artifacts."""
-        mock_run = MagicMock()
-        mock_run.get_artifacts.return_value = []
+    def test_returns_none_when_artifact_expired(self) -> None:
+        """Should return None (without downloading) if the artifact is expired."""
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [
+            self._make_artifact("all-test-failures", expired=True)
+        ]
 
-        mock_repo = MagicMock()
-        mock_repo.get_workflow_run.return_value = mock_run
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
+        assert result is None
+        client.download_artifact.assert_not_called()
 
-        mock_retry.side_effect = lambda op, **kwargs: op()
+    def test_returns_none_when_json_missing_from_zip(self) -> None:
+        """Should return None if the zip lacks the expected JSON file."""
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [self._make_artifact("all-test-failures")]
+        client.download_artifact.return_value = {"something-else.txt": b"nope"}
 
-        mock_gh = MagicMock()
-        mock_gh.get_repo.return_value = mock_repo
-
-        result = download_all_test_failures(mock_gh, "owner/repo", 123, "fake-token")
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
         assert result is None
 
 
