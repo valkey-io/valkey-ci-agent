@@ -38,6 +38,9 @@ from scripts.common.job_summary import emit_job_summary
 
 logger = logging.getLogger(__name__)
 
+BOT_NAME = "valkeyrie-bot[bot]"
+BOT_EMAIL = "3692572+valkeyrie-bot[bot]@users.noreply.github.com"
+
 
 
 
@@ -459,11 +462,11 @@ def _clone_repo(
     )
     # Configure git identity for cherry-pick commits
     subprocess.run(
-        ["git", "config", "user.name", "valkeyrie-bot[bot]"],
+        ["git", "config", "user.name", BOT_NAME],
         cwd=dest_dir, check=True, capture_output=True, text=True,
     )
     subprocess.run(
-        ["git", "config", "user.email", "3692572+valkeyrie-bot[bot]@users.noreply.github.com"],
+        ["git", "config", "user.email", BOT_EMAIL],
         cwd=dest_dir, check=True, capture_output=True, text=True,
     )
     # Fetch all branches so cherry-pick can reference any commit

@@ -10,7 +10,7 @@ import pytest
 from github.GithubException import GithubException
 
 from scripts.backport import sweep as backport_sweep
-from scripts.backport import sweep_apply, sweep_graphql, sweep_validation
+from scripts.backport import sweep_apply, sweep_git, sweep_graphql, sweep_validation
 from scripts.backport.models import ResolutionResult
 from scripts.backport.sweep import (
     BranchSweepResult,
@@ -572,7 +572,11 @@ def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
         calls.append((cmd, kwargs))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    monkeypatch.setattr(backport_sweep.subprocess, "run", fake_run)
+    monkeypatch.setattr(sweep_git.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sweep_git, "run_git_default",
+        lambda repo_dir, *args, **_kwargs: calls.append((["git", *args], {})),
+    )
 
     dest = tmp_path / "checkout"
     clone_target_branch(
@@ -582,25 +586,27 @@ def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
         {"GIT_ASKPASS": "/tmp/askpass"},
     )
 
-    assert calls == [
-        (
-            [
-                "git",
-                "clone",
-                "--branch",
-                "1.0",
-                "https://github.com/owner/repo.git",
-                str(dest),
-            ],
-            {
-                "check": True,
-                "capture_output": True,
-                "text": True,
-                "env": {"GIT_ASKPASS": "/tmp/askpass"},
-            },
-        )
-    ]
+    assert calls[0] == (
+        [
+            "git",
+            "clone",
+            "--branch",
+            "1.0",
+            "https://github.com/owner/repo.git",
+            str(dest),
+        ],
+        {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "env": {"GIT_ASKPASS": "/tmp/askpass"},
+        },
+    )
     assert "cwd" not in calls[0][1]
+    assert [cmd for cmd, _ in calls[1:]] == [
+        ["git", "config", "user.name", sweep_git.BOT_NAME],
+        ["git", "config", "user.email", sweep_git.BOT_EMAIL],
+    ]
 
 
 def test_push_backport_branch_uses_plain_push_for_new_branch(monkeypatch):

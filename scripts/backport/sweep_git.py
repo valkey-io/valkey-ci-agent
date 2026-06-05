@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from github.GithubException import GithubException
 
+from scripts.backport.main import BOT_EMAIL, BOT_NAME
 from scripts.backport.main import _run_git as run_git_default
 from scripts.backport.sweep_models import (
     DETAIL_ALREADY_ON_SWEEP_BRANCH,
@@ -44,6 +45,8 @@ def clone_target_branch(
         text=True,
         env=git_env,
     )
+    run_git_default(dest_dir, "config", "user.name", BOT_NAME)
+    run_git_default(dest_dir, "config", "user.email", BOT_EMAIL)
 
 
 def push_backport_branch(

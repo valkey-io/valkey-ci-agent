@@ -297,13 +297,6 @@ def _process_branch(
         with GitAuth(github_token, prefix="backport-sweep-git-askpass-") as git_auth:
             git_env = git_auth.env()
             clone_target_branch(repo_full_name, target_branch, tmpdir, git_env)
-            _run_git(tmpdir, "config", "user.name", "valkeyrie-bot[bot]")
-            _run_git(
-                tmpdir,
-                "config",
-                "user.email",
-                "3692572+valkeyrie-bot[bot]@users.noreply.github.com",
-            )
 
             setup_ok, setup_output = run_test_commands(
                 tmpdir,

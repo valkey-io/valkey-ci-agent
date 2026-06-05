@@ -1,0 +1,121 @@
+name: Manual Revert Commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository owning the backport branch (owner/repo)"
+        required: false
+        type: string
+        default: "valkey-io/valkey"
+      branch:
+        description: "Agent backport branch (must start with agent/backport/sweep/)"
+        required: true
+        type: string
+      commit_sha:
+        description: "Commit hash to revert on the branch"
+        required: true
+        type: string
+      push_repo:
+        description: "Override different-owner fork that holds the branch"
+        required: false
+        type: string
+        default: ""
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions: {}
+
+jobs:
+  revert-commit:
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve target repo
+        id: target
+        shell: bash
+        env:
+          REPO: ${{ inputs.repo }}
+          PUSH_REPO: ${{ inputs.push_repo }}
+        run: |
+          set -euo pipefail
+          FULL="${PUSH_REPO:-$REPO}"
+          if [[ ! "${FULL}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Invalid repo: ${FULL}"
+            exit 1
+          fi
+          echo "owner=${FULL%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${FULL#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.name }}
+
+      - name: Revert commit
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
+          REPO: ${{ inputs.repo }}
+          BRANCH: ${{ inputs.branch }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          PUSH_REPO: ${{ inputs.push_repo }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Invalid repo: ${REPO}"
+            exit 1
+          fi
+          if [[ "${BRANCH}" != agent/backport/sweep/* ]]; then
+            echo "::error::Branch must start with 'agent/backport/sweep/' (got: ${BRANCH})"
+            exit 1
+          fi
+          if [[ ! "${BRANCH}" =~ ^[A-Za-z0-9._/-]+$ || "${BRANCH}" == *..* ]]; then
+            echo "::error::Invalid branch: ${BRANCH}"
+            exit 1
+          fi
+          if [[ ! "${COMMIT_SHA}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+            echo "::error::Invalid commit_sha: ${COMMIT_SHA}"
+            exit 1
+          fi
+          if [[ -n "${PUSH_REPO}" && ! "${PUSH_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Invalid push_repo: ${PUSH_REPO}"
+            exit 1
+          fi
+          BASE_BRANCH="${BRANCH#agent/backport/sweep/}"
+          args=(
+            -m scripts.backport.revert_commit
+            --repo "${REPO}"
+            --branch "${BRANCH}"
+            --commit-sha "${COMMIT_SHA}"
+            --base-branch "${BASE_BRANCH}"
+            --token "${TARGET_TOKEN}"
+            --verbose
+          )
+          if [[ -n "${PUSH_REPO}" ]]; then
+            args+=(--push-repo "${PUSH_REPO}")
+          fi
+          python "${args[@]}"
