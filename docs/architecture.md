@@ -152,7 +152,8 @@ main.py (daily cron or manual dispatch)
 - `scripts/test_failure_detector/main.py` — CLI entry point and pipeline orchestration
 - `scripts/test_failure_detector/download.py` — workflow run discovery and artifact download
 - `scripts/test_failure_detector/parse_failures.py` — JSON parsing and deduplication
-- `scripts/test_failure_detector/manage_issues.py` — issue creation, update, and label management
+- `scripts/test_failure_detector/manage_issues.py` — thin orchestration over the shared dedup publisher to create/update issues
+- `scripts/test_failure_detector/issue_renderer.py` — test-failure-specific title/body/comment rendering and label assignment
 
 ## Planned Workflows
 

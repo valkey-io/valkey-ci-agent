@@ -21,9 +21,8 @@ on:
         default: false
         type: boolean
 
-permissions: 
+permissions:
   contents: read
-  issues: write
 
 jobs:
   detect-failures:
@@ -32,8 +31,6 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       github.repository == 'valkey-io/valkey-ci-agent')
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Check out agent repository
         uses: actions/checkout@v6
