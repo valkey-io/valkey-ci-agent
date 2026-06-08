@@ -38,6 +38,7 @@ def _build_job_summary(
         "|--------|-------|",
         f"| Unique failures detected | {num_failures} |",
         f"| Issues created | {result.get('created', 0)} |",
+        f"| Issues skipped (duplicate run) | {result.get('skipped', 0)} |",
         f"| Issues updated | {result.get('updated', 0)} |",
         "",
     ]
@@ -77,9 +78,9 @@ def run(
         if daily_run is None:
             logger.error("No qualifying workflow run found.")
             emit_job_summary(
-            f"### ⚠️ Test Failure Detector\n\n"
-            f"No qualifying `{workflow_name}` run found on "
-            f"`{repo_full_name}` (branch `{branch}`)."
+                f"### ⚠️ Test Failure Detector\n\n"
+                f"No qualifying `{workflow_name}` run found on "
+                f"`{repo_full_name}` (branch `{branch}`)."
             )
             return 1
         run_id = daily_run.id
