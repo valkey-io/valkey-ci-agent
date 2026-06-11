@@ -32,6 +32,37 @@ def _branch(tmp_path):
     return registry.get_branch("org/core", "1.0")
 
 
+def _empty_result(branch: str) -> BranchSweepResult:
+    return BranchSweepResult(target_branch=branch, candidates_found=0)
+
+
+def test_poll_branch_queries_correct_backport_branch(monkeypatch, tmp_path):
+    repo_entry, branch_entry = _branch(tmp_path)
+
+    captured = {}
+
+    monkeypatch.setattr(poller, "Github", lambda *a, **k: object())
+    monkeypatch.setattr(
+        poller,
+        "find_existing_pr",
+        lambda gh, base, push, branch: captured.update(
+            base=base, push=push, branch=branch
+        )
+        or None,
+    )
+    monkeypatch.setattr(poller, "run_backport_sweep", lambda **k: _empty_result("1.0"))
+
+    poller.poll_branch(
+        repo_entry=repo_entry,
+        branch_entry=branch_entry,
+        github_token="token",
+    )
+
+    assert captured["branch"] == "agent/backport/sweep/1.0"
+    assert captured["base"] == "org/core"
+    assert captured["push"] == "org/core"
+
+
 def test_poll_branch_skips_when_open_pr_exists(monkeypatch, tmp_path):
     repo_entry, branch_entry = _branch(tmp_path)
 
@@ -150,10 +181,7 @@ def test_poll_branch_passes_max_candidates_through(monkeypatch, tmp_path):
 
     def _fake_sweep(*, repo_entry, branch_entry, github_token, max_candidates):
         captured["max_candidates"] = max_candidates
-        return BranchSweepResult(
-            target_branch=branch_entry.branch,
-            candidates_found=0,
-        )
+        return _empty_result(branch_entry.branch)
 
     monkeypatch.setattr(poller, "run_backport_sweep", _fake_sweep)
 
@@ -163,5 +191,13 @@ def test_poll_branch_passes_max_candidates_through(monkeypatch, tmp_path):
         github_token="token",
         max_candidates=5,
     )
-
     assert captured["max_candidates"] == 5
+
+    # 0 means unlimited and must reach the sweep unchanged, not be floored.
+    poller.poll_branch(
+        repo_entry=repo_entry,
+        branch_entry=branch_entry,
+        github_token="token",
+        max_candidates=0,
+    )
+    assert captured["max_candidates"] == 0

@@ -59,9 +59,10 @@ def poll_branch(
 
     Returns a result dict describing the action taken: ``skipped-open-pr`` when
     a sweep PR is already open, ``swept`` (or ``would-sweep`` under dry run) when
-    no PR is open, or ``error`` when the open-PR check itself failed. A failed
-    check degrades to an error result rather than crashing, matching how
-    ``run_backport_sweep`` handles failures.
+    no PR is open, or ``error`` when the open-PR check itself failed. Only the
+    open-PR check is guarded here; once a sweep starts, it owns its own error
+    handling and records failures on the returned result (matching the daily
+    sweep), so a raise from deep inside the sweep still propagates.
     """
     repo_full_name = repo_entry.repo
     push_repo = repo_entry.effective_push_repo

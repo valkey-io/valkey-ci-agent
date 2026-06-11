@@ -136,20 +136,16 @@ jobs:
           TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
         run: |
           set -euo pipefail
-          args=(
-            -m scripts.backport.poller
-            --registry repos.yml
-            --repo "${{ matrix.repo }}"
-            --branch "${{ matrix.branch }}"
-            --target-token "${TARGET_TOKEN}"
-            --verbose
-          )
-
-          if [[ "${MAX_CANDIDATES}" != "0" ]]; then
-            args+=(--max-candidates "${MAX_CANDIDATES}")
-          fi
-
-          python "${args[@]}" | tee backport-poll-result.json
+          # Pass --max-candidates unconditionally, including 0, which the
+          # poller treats as unlimited. Dropping it at 0 would fall back to the
+          # Python default instead of unlimited.
+          python -m scripts.backport.poller \
+            --registry repos.yml \
+            --repo "${{ matrix.repo }}" \
+            --branch "${{ matrix.branch }}" \
+            --target-token "${TARGET_TOKEN}" \
+            --max-candidates "${MAX_CANDIDATES}" \
+            --verbose | tee backport-poll-result.json
 
       - name: Upload result
         if: always()
