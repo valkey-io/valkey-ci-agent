@@ -118,6 +118,28 @@ def test_poll_branch_degrades_when_pr_check_fails(monkeypatch, tmp_path):
     assert result["branch"] == "1.0"
 
 
+def test_poll_branch_dry_run_reports_would_sweep(monkeypatch, tmp_path):
+    repo_entry, branch_entry = _branch(tmp_path)
+
+    monkeypatch.setattr(poller, "Github", lambda *a, **k: object())
+    monkeypatch.setattr(poller, "find_existing_pr", lambda *a, **k: None)
+
+    def _must_not_run(*a, **k):
+        raise AssertionError("run_backport_sweep called during dry run")
+
+    monkeypatch.setattr(poller, "run_backport_sweep", _must_not_run)
+
+    result = poller.poll_branch(
+        repo_entry=repo_entry,
+        branch_entry=branch_entry,
+        github_token="token",
+        dry_run=True,
+    )
+
+    assert result["action"] == "would-sweep"
+    assert result["branch"] == "1.0"
+
+
 def test_poll_branch_passes_max_candidates_through(monkeypatch, tmp_path):
     repo_entry, branch_entry = _branch(tmp_path)
 

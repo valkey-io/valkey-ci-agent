@@ -46,16 +46,22 @@ def poll_branch(
     branch_entry: "BranchEntry",
     github_token: str,
     max_candidates: int = 2,
+    dry_run: bool = False,
 ) -> dict:
     """Run a sweep for one branch unless an open sweep PR already exists.
 
     ``max_candidates`` defaults to 2 to match the daily sweep's effective cap,
     not ``run_backport_sweep``'s own default of 5.
 
+    When ``dry_run`` is set, the open-PR check still runs but a branch with no
+    open PR reports ``would-sweep`` instead of sweeping. This previews the
+    poller's decision without any writes.
+
     Returns a result dict describing the action taken: ``skipped-open-pr`` when
-    a sweep PR is already open, ``swept`` when a sweep ran, or ``error`` when the
-    open-PR check itself failed. A failed check degrades to an error result
-    rather than crashing, matching how ``run_backport_sweep`` handles failures.
+    a sweep PR is already open, ``swept`` (or ``would-sweep`` under dry run) when
+    no PR is open, or ``error`` when the open-PR check itself failed. A failed
+    check degrades to an error result rather than crashing, matching how
+    ``run_backport_sweep`` handles failures.
     """
     repo_full_name = repo_entry.repo
     push_repo = repo_entry.effective_push_repo
@@ -85,6 +91,14 @@ def poll_branch(
             "branch": target_branch,
             "action": "skipped-open-pr",
             "pr": existing_pr.html_url,
+        }
+
+    if dry_run:
+        logger.info("Branch %s: no open sweep PR, would sweep (dry run)", target_branch)
+        return {
+            "repo": repo_full_name,
+            "branch": target_branch,
+            "action": "would-sweep",
         }
 
     logger.info("Branch %s: no open sweep PR, running sweep", target_branch)
@@ -129,6 +143,11 @@ def main() -> None:
         default=2,
         help="Cap the number of applied cherry-picks per branch (0 = unlimited)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report the poll decision without running a sweep",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -145,6 +164,7 @@ def main() -> None:
         branch_entry=branch_entry,
         github_token=args.target_token,
         max_candidates=args.max_candidates,
+        dry_run=args.dry_run,
     )
 
     print(json.dumps(result, indent=2))
