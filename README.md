@@ -22,8 +22,9 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 |----------|--------|-------------|
 | Backport | Active | Cherry-picks merged PRs onto release branches with AI conflict resolution |
 | Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
+| Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
-| Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
+| Additional Daily CI Analysis	| Planned	| Detects flaky tests, generates fix PRs |
 
 ## Backport Workflow
 
@@ -163,6 +164,50 @@ gh workflow run monitor-fuzzer.yml \
 ```
 
 Scheduled runs always run live.
+
+## Test Failure Detector
+
+Monitors the Daily CI workflow on `valkey-io/valkey`, detects test failures, and automatically creates or updates GitHub issues to track them.
+
+### How it works
+
+The detector is a thin pipeline (`scripts/test_failure_detector/`) layered on shared building blocks in `scripts/common/` — `ArtifactClient` for artifact download and `IssueDedupPublisher` for issue dedup/publishing — so the same primitives back the Fuzzer Monitor.
+
+1. **Daily sweep** — every day at 23:00 UTC the workflow runs on `valkey-io/valkey-ci-agent` and reads from `valkey-io/valkey`
+2. **Find the run** — locates the most recent completed, non-cancelled/skipped Daily workflow run on the target branch (`unstable` by default), or uses a manually supplied run ID
+3. **Download artifact** — `ArtifactClient` fetches the `all-test-failures` artifact, handling the auth-header-stripping redirect to Azure blob storage, transient-failure retries, and expired-artifact (404) cases
+4. **Get job URLs** — fetches job metadata from the run to build CI links for each failure, with normalized name variants for fuzzy matching against artifact names
+5. **Parse and deduplicate** — iterates the nested JSON (`{job → suite → [failures]}`) and groups by a `{test_name}::{test_file}` fingerprint, so a test failing across multiple jobs becomes one `UniqueFailure` with multiple job references
+6. **Create or update issues** — `IssueDedupPublisher` upserts one issue per fingerprint, matching on a hidden body marker (`<!-- valkey-ci-agent:test-failure:{test_name}::{test_file} -->`) rather than the title. Per-failure rendering (title, body, recurrence comment, `test-failure` label) lives in `issue_renderer.py`. Each failure resolves to one of three outcomes:
+   - **created** — no matching issue exists: opens one titled `[TEST-FAILURE] {test_name} in {test_file}` with the `test-failure` label, error trace, CI links, and environment list
+   - **updated** — a matching issue exists: merges any new failing environments into the body and bumps the occurrence counter / adds a recurrence comment
+   - **skipped** — the run ID matches the `last-key` marker already recorded on the issue, so a re-triggered sweep over the same CI run does not inflate the occurrence count or post a duplicate comment
+
+A GitHub Actions job summary is emitted at every exit path with a table of metrics (failures detected, issues created/updated).
+
+#### Prerequisites: Cross-repo Authentication
+
+The workflow generates a GitHub App installation token scoped to the `valkey-io` org using the same App secrets as the backport workflow (`VALKEYRIE_BOT_APP_ID` + `VALKEYRIE_BOT_PRIVATE_KEY`). This token provides `actions:read` (to download artifacts) and `issues:write` (to create/update issues) on `valkey-io/valkey`.
+
+### Usage
+
+#### Scheduled (automatic)
+
+Runs daily at 23:00 UTC via cron. The workflow runs on `valkey-io/valkey-ci-agent` and uses a GitHub App token to read artifacts from and write issues to `valkey-io/valkey`. Valkey Daily CI runs daily at 00:00 UTC, with runs typically completing within 4-7 hours, with slight exception, such that Test Failure Detector should always capture the current day's workflow. 
+
+#### Manual dispatch
+
+```bash
+gh workflow run test-failure-detector-sweep.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field repo=valkey-io/valkey \
+  --field run_id=12345678 \
+  --field dry_run=true
+```
+
+- `repo` — target repository to scan (default: `valkey-io/valkey`)
+- `run_id` — specific workflow run ID to analyze (empty = latest Daily run)
+- `dry_run` — parse and report only, don't create/update issues
 
 ## Safety
 
