@@ -118,7 +118,6 @@ jobs:
           python -m scripts.backport.mark_done \
             --registry repos.yml \
             --repo "${REPO}" \
-            --mode poll \
             --target-branch "${BRANCH}" \
             --target-token "${TARGET_TOKEN}" \
             --verbose | tee mark-done-result.json

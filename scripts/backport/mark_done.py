@@ -1,17 +1,13 @@
 """Mark project-board backport items done once the backport actually lands.
 
-Two entry points share the same status-mutation core:
+``reconcile_project_board`` lists every board item still in "To be backported",
+verifies each source PR actually has a commit on the target branch, and flips
+only the verified ones. It runs from the scheduled poller and is self-healing:
+it reconciles the whole board against branch reality on every run, so it does
+not depend on any merge hook firing.
 
-* ``mark_backport_items_done`` — given an explicit set of source PR numbers
-  (parsed from a merged backport PR body / head ref), flip the matching board
-  items to Done. Used by the merge-triggered workflow.
-* ``reconcile_project_board`` — list every board item still in
-  "To be backported", verify each source PR actually has a commit on the
-  target branch, and flip only the verified ones. Used by the scheduled
-  poller, which is self-healing: it does not depend on a merge hook firing.
-
-Both gate Done on the branch genuinely containing the source PR's commit
-(the same ``(#<pr>)`` signal the sweep uses to skip already-applied PRs), so a
+Done is gated on the branch genuinely containing the source PR's commit (the
+same ``(#<pr>)`` signal the sweep uses to skip already-applied PRs), so a
 backport PR body that merely *claims* a PR was applied can never mark it Done
 on its own.
 """
@@ -24,10 +20,8 @@ import logging
 import os
 import re
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from scripts.backport.sweep_graphql import GitHubGraphQLClient
@@ -64,38 +58,6 @@ class BackportStatusUpdateResult:
             "skipped": {str(k): v for k, v in sorted(self.skipped.items())},
             "unverified": self.unverified,
         }
-
-
-def parse_backport_source_pr_numbers(
-    body: str,
-    *,
-    head_ref: str = "",
-) -> list[int]:
-    """Extract source PR numbers from backport PR body text.
-
-    Sweep PRs may contain failed candidates in a later "Needs attention"
-    section, so only the "Applied" section is authoritative for that format.
-    Manual single-PR backports use a "Source PR" summary row.
-    """
-    numbers: set[int] = set()
-
-    applied_section = _markdown_section(body, "Applied")
-    if applied_section:
-        numbers.update(_pr_numbers_from_table_cells(applied_section))
-
-    numbers.update(
-        int(match.group(1))
-        for match in re.finditer(
-            r"(?im)^\|\s*Source PR\s*\|\s*(?:\[)?#(\d+)(?:\]\([^)]*\))?\s*\|",
-            body,
-        )
-    )
-
-    branch_match = re.search(r"(?:^|/)backport/(\d+)-to-[A-Za-z0-9._/-]+$", head_ref)
-    if branch_match:
-        numbers.add(int(branch_match.group(1)))
-
-    return sorted(numbers)
 
 
 def verify_prs_on_branch(
@@ -207,16 +169,14 @@ def mark_backport_items_done(
     status_field: str = _DEFAULT_STATUS_FIELD,
     from_status: str = _DEFAULT_FROM_STATUS,
     done_status: str = _DEFAULT_DONE_STATUS,
-    verified_pr_numbers: set[int] | None = None,
+    verified_pr_numbers: set[int],
     project: dict[str, Any] | None = None,
     dry_run: bool = False,
 ) -> BackportStatusUpdateResult:
     """Flip board items for ``source_pr_numbers`` from ``from_status`` to Done.
 
-    When ``verified_pr_numbers`` is provided, only PRs in that set are eligible
-    to be marked Done; the rest are recorded as ``unverified`` and left as-is.
-    Passing ``None`` keeps the legacy unverified behaviour for callers that have
-    already established presence some other way.
+    Only PRs in ``verified_pr_numbers`` are eligible to be marked Done; the rest
+    are recorded as ``unverified`` and left as-is.
 
     ``project`` may be a board already loaded by the caller (e.g. the poller),
     to avoid re-fetching it.
@@ -263,7 +223,7 @@ def mark_backport_items_done(
                 f"{status_field} is {current_status!r}, not {from_status!r}"
             )
             continue
-        if verified_pr_numbers is not None and number not in verified_pr_numbers:
+        if number not in verified_pr_numbers:
             result.unverified.append(number)
             continue
 
@@ -560,32 +520,14 @@ def main() -> None:
     parser.add_argument("--registry", default="repos.yml")
     parser.add_argument("--repo", required=True)
     parser.add_argument(
-        "--mode",
-        choices=("merge", "poll"),
-        default="merge",
-        help="merge: mark Done the source PRs from a merged backport PR "
-        "(verified against the branch). poll: reconcile every "
-        "'To be backported' item against the branch.",
-    )
-    parser.add_argument(
         "--target-branch",
-        help="Release branch. Required for merge mode; in poll mode, omit to "
-        "reconcile every branch configured for the repo.",
+        help="Release branch to reconcile. Omit to reconcile every branch "
+        "configured for the repo.",
     )
     parser.add_argument("--target-token", required=True)
-    parser.add_argument("--body", default="")
-    parser.add_argument("--body-file", default="")
-    parser.add_argument("--head-ref", default="")
-    parser.add_argument("--source-pr-number", action="append", type=int, default=[])
     parser.add_argument("--status-field", default=_DEFAULT_STATUS_FIELD)
     parser.add_argument("--from-status", default=_DEFAULT_FROM_STATUS)
     parser.add_argument("--done-status", default=_DEFAULT_DONE_STATUS)
-    parser.add_argument(
-        "--no-verify",
-        action="store_true",
-        help="merge mode only: skip branch-presence verification (legacy "
-        "behaviour; trusts the PR body).",
-    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -604,60 +546,12 @@ def main() -> None:
     registry = load_registry(args.registry)
     gql = GitHubGraphQLClient(args.target_token)
 
-    if args.mode == "poll":
-        results = _run_poll(
-            registry, gql, repo=args.repo, target_branch=args.target_branch,
-            status_field=args.status_field, from_status=args.from_status,
-            done_status=args.done_status, token=args.target_token, dry_run=args.dry_run,
-        )
-        print(json.dumps(results, indent=2))
-        return
-
-    if not args.target_branch:
-        parser.error("--target-branch is required in merge mode")
-
-    body = args.body
-    if args.body_file:
-        body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text(encoding="utf-8")
-
-    source_pr_numbers = sorted(
-        set(args.source_pr_number)
-        | set(parse_backport_source_pr_numbers(body, head_ref=args.head_ref))
+    results = _run_poll(
+        registry, gql, repo=args.repo, target_branch=args.target_branch,
+        status_field=args.status_field, from_status=args.from_status,
+        done_status=args.done_status, token=args.target_token, dry_run=args.dry_run,
     )
-    if not source_pr_numbers:
-        print(json.dumps(BackportStatusUpdateResult(requested=[]).as_dict(), indent=2))
-        return
-
-    repo_entry, branch_entry = registry.get_branch(args.repo, args.target_branch)
-
-    verified: set[int] | None
-    if args.no_verify:
-        verified = None
-    else:
-        # Presence is established by the cherry-pick's trailing (#N) subject on
-        # the branch, or by the source PR appearing in a sweep commit's
-        # ## Applied table.
-        verified = verify_prs_on_branch(
-            repo_entry.repo,
-            branch_entry.branch,
-            set(source_pr_numbers),
-            token=args.target_token,
-        )
-
-    result = mark_backport_items_done(
-        gql,
-        project_owner=repo_entry.project_owner,
-        project_number=branch_entry.project_number,
-        source_repo=repo_entry.repo,
-        source_pr_numbers=source_pr_numbers,
-        project_owner_type=repo_entry.project_owner_type,
-        status_field=args.status_field,
-        from_status=args.from_status,
-        done_status=args.done_status,
-        verified_pr_numbers=verified,
-        dry_run=args.dry_run,
-    )
-    print(json.dumps(result.as_dict(), indent=2))
+    print(json.dumps(results, indent=2))
 
 
 def _run_poll(

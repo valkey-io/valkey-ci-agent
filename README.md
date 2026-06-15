@@ -124,33 +124,29 @@ Creates one PR named `[Backport 9.0] <original title>`.
 
 #### Mark merged backports done
 
-Target repositories can call the reusable status workflow when a backport PR is merged:
+A scheduled poller reconciles each project board against branch reality and
+flips items from `To be backported` to `Done` once the backport actually lands.
+It runs hourly via `backport-mark-done-poll.yml` and reconciles every repo and
+branch in `repos.yml`. Because it reconciles the whole board on every run, it is
+self-healing: it picks up backports applied by the sweep, by an earlier run, or
+by a manual cherry-pick, without depending on a merge event.
 
-```yaml
-name: Backport Status
+An item is marked `Done` only when the source PR's commit is genuinely on the
+target branch — verified by the cherry-pick's trailing `(#N)` subject, or by the
+PR appearing in a sweep commit's `## Applied` table. A backport PR body that
+merely claims a PR was applied can never mark it `Done` on its own.
 
-on:
-  pull_request:
-    types: [closed]
+Run it manually for a single repo (omit `--target-branch` to reconcile every
+configured branch), and add `--dry-run` to report what would change without
+mutating the board:
 
-jobs:
-  mark-done:
-    if: github.event.pull_request.merged == true
-    uses: valkey-io/valkey-ci-agent/.github/workflows/backport-merged.yml@main
-    permissions:
-      contents: read
-      id-token: write
-    with:
-      repo_full_name: ${{ github.repository }}
-      target_branch: ${{ github.event.pull_request.base.ref }}
-      backport_pr_body: ${{ github.event.pull_request.body }}
-      backport_pr_head_ref: ${{ github.event.pull_request.head.ref }}
-    secrets:
-      VALKEYRIE_BOT_APP_ID: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-      VALKEYRIE_BOT_PRIVATE_KEY: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+```bash
+python -m scripts.backport.mark_done \
+  --repo valkey-io/valkey \
+  --target-branch 9.1 \
+  --target-token "$TOKEN" \
+  --dry-run
 ```
-
-The workflow parses the merged backport PR body. Sweep PRs update every PR listed in the `Applied` section, while manual backport PRs update the single `Source PR` row.
 
 #### Filtering the sweep
 

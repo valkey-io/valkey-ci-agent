@@ -6,47 +6,8 @@ import scripts.backport.mark_done as mark_done
 from scripts.backport.mark_done import (
     BackportStatusUpdateResult,
     mark_backport_items_done,
-    parse_backport_source_pr_numbers,
     reconcile_project_board,
 )
-
-
-def test_parse_sweep_body_uses_only_applied_section() -> None:
-    body = """# Backport sweep for 8.1
-
-Automated cherry-picks from PRs marked "To be backported".
-
-## Applied
-
-| Source PR | Title | Detail |
-|---|---|---|
-| #101 | Good fix |  |
-| #102 | Other fix | conflicts resolved |
-
-## Needs attention
-
-| Source PR | Title | Outcome | Reason |
-|---|---|---|---|
-| #999 | Bad fix | skipped-conflict | conflict |
-"""
-
-    assert parse_backport_source_pr_numbers(body) == [101, 102]
-
-
-def test_parse_manual_body_source_pr_row() -> None:
-    body = """## Backport Summary
-
-| Field | Value |
-|---|---|
-| Source PR | [#123](https://github.com/valkey-io/valkey/pull/123) |
-| Target branch | `8.1` |
-"""
-
-    assert parse_backport_source_pr_numbers(body) == [123]
-
-
-def test_parse_head_ref_for_single_pr_backport() -> None:
-    assert parse_backport_source_pr_numbers("", head_ref="backport/456-to-8.1") == [456]
 
 
 def test_mark_backport_items_done_updates_matching_to_be_backported_items() -> None:
@@ -65,6 +26,7 @@ def test_mark_backport_items_done_updates_matching_to_be_backported_items() -> N
         project_number=14,
         source_repo="valkey-io/valkey",
         source_pr_numbers=[101, 102, 103, 104, 105],
+        verified_pr_numbers={101, 102, 103, 104, 105},
     )
 
     assert result.updated == [101]
