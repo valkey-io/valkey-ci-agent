@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import scripts.backport.mark_done as mark_done
 from scripts.backport.mark_done import (
     BackportStatusUpdateResult,
@@ -104,19 +106,19 @@ def test_mark_backport_items_done_gates_on_verified_set() -> None:
 def test_reconcile_marks_only_branch_present_items(monkeypatch) -> None:
     gql = FakeGraphQLClient(
         project_items=[
-            _project_item(201, "valkey-io/valkey", "item-201", "To be backported"),
-            _project_item(202, "valkey-io/valkey", "item-202", "To be backported"),
-            _project_item(203, "valkey-io/valkey", "item-203", "Done"),
-            _project_item(204, "valkey-io/valkey-bloom", "item-204", "To be backported"),
+            _project_item(201, "valkey-io/valkey", "item-201", "To be backported", merge_sha="aaa"),
+            _project_item(202, "valkey-io/valkey", "item-202", "To be backported", merge_sha="bbb"),
+            _project_item(203, "valkey-io/valkey", "item-203", "Done", merge_sha="ccc"),
+            _project_item(204, "valkey-io/valkey-bloom", "item-204", "To be backported", merge_sha="ddd"),
         ]
     )
 
     captured: dict = {}
 
-    def fake_verify(repo, branch, pr_numbers, *, git_env=None):
+    def fake_verify(repo, branch, pr_merge_shas, *, git_env=None):
         captured["repo"] = repo
         captured["branch"] = branch
-        captured["candidates"] = sorted(pr_numbers)
+        captured["pr_merge_shas"] = dict(pr_merge_shas)
         return {201}  # only 201 actually landed on the branch
 
     monkeypatch.setattr(mark_done, "verify_prs_on_branch", fake_verify)
@@ -129,8 +131,9 @@ def test_reconcile_marks_only_branch_present_items(monkeypatch) -> None:
         target_branch="9.1",
     )
 
-    # Only valkey-io/valkey items still "To be backported" are candidates.
-    assert captured["candidates"] == [201, 202]
+    # Only valkey-io/valkey items still "To be backported" are candidates,
+    # each paired with its development-branch merge SHA.
+    assert captured["pr_merge_shas"] == {201: "aaa", 202: "bbb"}
     assert captured["repo"] == "valkey-io/valkey"
     assert captured["branch"] == "9.1"
     assert result.updated == [201]
@@ -159,21 +162,68 @@ def test_reconcile_no_candidates_is_noop(monkeypatch) -> None:
     assert gql.mutations == []
 
 
-def test_pr_numbers_on_branch_extracts_squash_subjects(tmp_path) -> None:
+def test_pr_numbers_from_subjects_ignores_body_only_mentions() -> None:
+    from scripts.backport.utils import pr_numbers_from_commit_subjects
+
+    # Each element is a commit *subject*. A (#N) here means that commit is PR N.
+    subjects = [
+        "Fix a thing (#3801)",
+        "Unrelated work without a ref",
+        "Another fix (#3920)",
+    ]
+    assert pr_numbers_from_commit_subjects(subjects) == {3801, 3920}
+
+
+def test_verify_counts_subject_and_sha_but_not_body_mention(tmp_path, monkeypatch) -> None:
     import subprocess
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    env = {**__import__("os").environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
-    (repo / "f").write_text("x")
-    subprocess.run(["git", "add", "f"], cwd=repo, check=True, env=env)
-    subprocess.run(["git", "commit", "-qm", "Fix a thing (#3801)"], cwd=repo, check=True, env=env)
-    (repo / "f").write_text("y")
-    subprocess.run(["git", "commit", "-aqm", "Unrelated work without ref"], cwd=repo, check=True, env=env)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
 
-    assert mark_done._pr_numbers_on_branch(str(repo)) == {3801}
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, env=env,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    (repo / "f").write_text("1")
+    git("add", "f")
+    git("commit", "-qm", "Cherry-picked fix (#3801)")
+    sha_3801 = git("rev-parse", "HEAD")  # this commit's own SHA = the "merge sha" case
+
+    (repo / "f").write_text("2")
+    git(
+        "commit", "-aqm",
+        "Some later work\n\nThis follows up on (#3920) but does not apply it.",
+    )
+
+    # Clone is the local repo (skip network). verify operates on the checked-out tree.
+    def fake_clone(repo_full_name, target_branch, dest_dir, git_env):
+        subprocess.run(["git", "clone", "-q", str(repo), dest_dir], check=True, env=env)
+
+    monkeypatch.setattr(mark_done, "_shallow_clone", fake_clone)
+
+    present = mark_done.verify_prs_on_branch(
+        "valkey-io/valkey",
+        "9.1",
+        {
+            3801: "irrelevant",   # present via subject (#3801)
+            3920: "irrelevant",   # only mentioned in a body -> NOT present
+            3801_000 + 1: sha_3801,  # present via merge-SHA ancestry
+            4242: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",  # unknown sha -> absent
+        },
+    )
+
+    assert 3801 in present
+    assert 3801_000 + 1 in present
+    assert 3920 not in present
+    assert 4242 not in present
 
 
 class FakeGraphQLClient:
@@ -212,13 +262,16 @@ class FakeGraphQLClient:
         }
 
 
-def _project_item(number: int, repo: str, item_id: str, status: str) -> dict:
+def _project_item(
+    number: int, repo: str, item_id: str, status: str, *, merge_sha: str = ""
+) -> dict:
     return {
         "id": item_id,
         "content": {
             "__typename": "PullRequest",
             "number": number,
             "repository": {"nameWithOwner": repo},
+            "mergeCommit": {"oid": merge_sha} if merge_sha else None,
         },
         "fieldValues": {
             "nodes": [

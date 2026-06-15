@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -30,6 +31,8 @@ from pathlib import Path
 from typing import Any
 
 from scripts.backport.sweep_graphql import GitHubGraphQLClient
+from scripts.backport.utils import pr_numbers_from_commit_subjects
+from scripts.common.git_auth import github_https_url
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +40,9 @@ _DEFAULT_STATUS_FIELD = "Status"
 _DEFAULT_FROM_STATUS = "To be backported"
 _DEFAULT_DONE_STATUS = "Done"
 
-# How many commits of branch history to fetch when verifying presence. A release
-# branch accumulates backports steadily; a few thousand commits comfortably
-# covers any PR still sitting in "To be backported".
+# Depth of the shallow verification clone. A release branch accumulates backports
+# steadily, so a few thousand commits comfortably covers any PR still sitting in
+# "To be backported" since the branch was cut.
 _VERIFY_CLONE_DEPTH = 5000
 
 
@@ -95,58 +98,79 @@ def parse_backport_source_pr_numbers(
     return sorted(numbers)
 
 
-def _pr_numbers_on_branch(repo_dir: str, *, max_count: int = _VERIFY_CLONE_DEPTH) -> set[int]:
-    """Return source PR numbers referenced by ``(#N)`` in the branch's commits.
-
-    This is the same signal the sweep uses to detect already-applied PRs, so
-    mark-done and the sweep agree on what "present on the branch" means. A
-    squash-merged backport sweep keeps each cherry-picked commit's original
-    ``... (#N)`` subject, and manual cherry-picks keep it via ``-x``/the merge
-    title, so the source PR number is recoverable from history.
-    """
-    import subprocess
-
-    result = subprocess.run(
-        ["git", "log", f"--max-count={max_count}", "--format=%s%n%b", "HEAD"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return {int(match.group(1)) for match in re.finditer(r"\(#(\d+)\)", result.stdout)}
-
-
 def verify_prs_on_branch(
     repo_full_name: str,
     target_branch: str,
-    pr_numbers: list[int],
+    pr_merge_shas: dict[int, str],
     *,
     git_env: dict[str, str] | None = None,
 ) -> set[int]:
-    """Shallow-clone ``target_branch`` and return which ``pr_numbers`` are present.
+    """Return which of ``pr_merge_shas`` actually landed on ``target_branch``.
 
-    Presence is decided by a ``(#N)`` reference in the branch's commit history.
-    Returns the subset of ``pr_numbers`` that are genuinely on the branch.
+    A PR is considered present if either:
+
+    * its development-branch merge commit is an ancestor of the branch tip
+      (a direct merge or fast-forward — exact, no heuristic), or
+    * a commit on the branch carries the PR's ``(#N)`` suffix in its subject
+      (a cherry-pick, whose SHA differs). This reuses
+      :func:`list_applied_prs_on_branch`, the exact rule the sweep uses to skip
+      already-applied PRs, so mark-done and the sweep never disagree.
+
+    Mentions of ``(#N)`` in a commit *body* do not count — only subjects.
     """
-    wanted = set(pr_numbers)
-    if not wanted:
+    if not pr_merge_shas:
         return set()
 
     env = dict(os.environ if git_env is None else git_env)
     with tempfile.TemporaryDirectory(prefix="mark-done-verify-") as tmp:
         repo_dir = os.path.join(tmp, "repo")
         _shallow_clone(repo_full_name, target_branch, repo_dir, env)
-        present = _pr_numbers_on_branch(repo_dir)
-    return wanted & present
+
+        # Cherry-picked PRs keep their (#N) subject; match the whole shallow
+        # history of the branch tip using the same rule the sweep uses.
+        subjects = _branch_commit_subjects(repo_dir)
+        applied_by_subject = pr_numbers_from_commit_subjects(subjects)
+
+        present: set[int] = set()
+        for pr_number, merge_sha in pr_merge_shas.items():
+            if pr_number in applied_by_subject:
+                present.add(pr_number)
+            elif merge_sha and _commit_is_ancestor(repo_dir, merge_sha):
+                present.add(pr_number)
+    return present
+
+
+def _branch_commit_subjects(repo_dir: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "log", "--format=%s", "HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.splitlines()
+
+
+def _commit_is_ancestor(repo_dir: str, commit_sha: str) -> bool:
+    """True if ``commit_sha`` is reachable from HEAD.
+
+    Returns False when the commit is not present in the shallow clone (the
+    shallow boundary makes it unknown, which we treat as "not yet present" — a
+    later, deeper run can still pick it up). Never raises on a missing commit.
+    """
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit_sha, "HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+    )
+    # 0 = ancestor; 1 = not an ancestor; other (e.g. 128 unknown commit) = treat as absent.
+    return result.returncode == 0
 
 
 def _shallow_clone(
     repo_full_name: str, target_branch: str, dest_dir: str, git_env: dict[str, str]
 ) -> None:
-    import subprocess
-
-    from scripts.common.git_auth import github_https_url
-
     subprocess.run(
         [
             "git", "clone",
@@ -175,6 +199,7 @@ def mark_backport_items_done(
     from_status: str = _DEFAULT_FROM_STATUS,
     done_status: str = _DEFAULT_DONE_STATUS,
     verified_pr_numbers: set[int] | None = None,
+    project: dict[str, Any] | None = None,
 ) -> BackportStatusUpdateResult:
     """Flip board items for ``source_pr_numbers`` from ``from_status`` to Done.
 
@@ -182,18 +207,22 @@ def mark_backport_items_done(
     to be marked Done; the rest are recorded as ``unverified`` and left as-is.
     Passing ``None`` keeps the legacy unverified behaviour for callers that have
     already established presence some other way.
+
+    ``project`` may be a board already loaded by the caller (e.g. the poller),
+    to avoid re-fetching it.
     """
     requested = sorted(set(source_pr_numbers))
     result = BackportStatusUpdateResult(requested=requested)
     if not requested:
         return result
 
-    project = _load_project(
-        gql,
-        project_owner=project_owner,
-        project_number=project_number,
-        project_owner_type=project_owner_type,
-    )
+    if project is None:
+        project = _load_project(
+            gql,
+            project_owner=project_owner,
+            project_number=project_number,
+            project_owner_type=project_owner_type,
+        )
     status_field_id, done_option_id = _find_status_field_and_option(
         project["fields"],
         status_field=status_field,
@@ -270,7 +299,7 @@ def reconcile_project_board(
         project_owner_type=project_owner_type,
     )
 
-    candidates: list[int] = []
+    pr_merge_shas: dict[int, str] = {}
     for item in project["items"]:
         content = item.get("content") or {}
         if content.get("__typename") != "PullRequest":
@@ -280,18 +309,19 @@ def reconcile_project_board(
         if _normalize(_item_single_select_value(item, status_field)) != _normalize(from_status):
             continue
         number = content.get("number")
-        if isinstance(number, int):
-            candidates.append(number)
+        if not isinstance(number, int):
+            continue
+        pr_merge_shas[number] = str((content.get("mergeCommit") or {}).get("oid") or "")
 
-    if not candidates:
+    if not pr_merge_shas:
         return BackportStatusUpdateResult(requested=[])
 
     verified = verify_prs_on_branch(
-        source_repo, target_branch, candidates, git_env=git_env
+        source_repo, target_branch, pr_merge_shas, git_env=git_env
     )
     logger.info(
         "Branch %s: %d candidate(s) in %r, %d verified present",
-        target_branch, len(candidates), from_status, len(verified),
+        target_branch, len(pr_merge_shas), from_status, len(verified),
     )
 
     return mark_backport_items_done(
@@ -299,12 +329,13 @@ def reconcile_project_board(
         project_owner=project_owner,
         project_number=project_number,
         source_repo=source_repo,
-        source_pr_numbers=candidates,
+        source_pr_numbers=sorted(pr_merge_shas),
         project_owner_type=project_owner_type,
         status_field=status_field,
         from_status=from_status,
         done_status=done_status,
         verified_pr_numbers=verified,
+        project=project,
     )
 
 
@@ -458,6 +489,7 @@ query($owner: String!, $number: Int!, $cursor: String) {{
             ... on PullRequest {{
               number
               repository {{ nameWithOwner }}
+              mergeCommit {{ oid }}
             }}
           }}
           fieldValues(first: 50) {{
@@ -551,8 +583,13 @@ def main() -> None:
     if args.no_verify:
         verified = None
     else:
+        # Merge mode parses PR numbers from the merged backport PR, so the
+        # development-branch merge SHAs aren't known here; presence is
+        # established by the cherry-pick's (#N) subject on the branch.
         verified = verify_prs_on_branch(
-            repo_entry.repo, branch_entry.branch, source_pr_numbers
+            repo_entry.repo,
+            branch_entry.branch,
+            {pr: "" for pr in source_pr_numbers},
         )
 
     result = mark_backport_items_done(
