@@ -32,7 +32,7 @@ from typing import Any
 
 from scripts.backport.sweep_graphql import GitHubGraphQLClient
 from scripts.backport.utils import pr_numbers_from_commit_subjects
-from scripts.common.git_auth import github_https_url
+from scripts.common.git_auth import GitAuth, github_https_url
 
 logger = logging.getLogger(__name__)
 
@@ -103,41 +103,48 @@ def verify_prs_on_branch(
     target_branch: str,
     pr_merge_shas: dict[int, str],
     *,
+    token: str = "",
     git_env: dict[str, str] | None = None,
 ) -> set[int]:
     """Return which of ``pr_merge_shas`` actually landed on ``target_branch``.
 
-    A PR is considered present if either:
+    A PR is considered present if any of:
 
     * its development-branch merge commit is an ancestor of the branch tip
       (a direct merge or fast-forward — exact, no heuristic), or
     * a commit on the branch carries the PR's trailing ``(#N)`` in its subject
-      (a cherry-pick, whose SHA differs). Subject matching goes through
-      :func:`pr_numbers_from_commit_subjects`, the same helper the sweep uses to
-      identify already-applied PRs, so mark-done and the sweep never disagree.
+      (a cherry-pick that kept the source PR's title), or
+    * a backport commit on the branch lists the PR in an ``## Applied`` table
+      in its body. The sweep squash-merges a batch of cherry-picks into one
+      commit whose subject is the *backport* PR; the source PRs it carried are
+      only recoverable from that ``## Applied`` table.
 
-    Only the trailing ``(#N)`` of a subject counts; references elsewhere in a
-    subject or body do not.
+    Subject matching uses the trailing ``(#N)`` only; body matching is limited
+    to the structured ``## Applied`` section (parsed by
+    :func:`parse_backport_source_pr_numbers`), so a stray ``(#N)`` reference in
+    prose never counts.
+
+    ``token`` authenticates the clone for private/auth-required repos.
     """
     if not pr_merge_shas:
         return set()
 
     env = dict(os.environ if git_env is None else git_env)
-    with tempfile.TemporaryDirectory(prefix="mark-done-verify-") as tmp:
-        repo_dir = os.path.join(tmp, "repo")
-        _shallow_clone(repo_full_name, target_branch, repo_dir, env)
+    with GitAuth(token, prefix="mark-done-git-askpass-") as git_auth:
+        env = git_auth.env(env)
+        with tempfile.TemporaryDirectory(prefix="mark-done-verify-") as tmp:
+            repo_dir = os.path.join(tmp, "repo")
+            _shallow_clone(repo_full_name, target_branch, repo_dir, env)
 
-        # Cherry-picked PRs keep their (#N) subject; match the whole shallow
-        # history of the branch tip using the same rule the sweep uses.
-        subjects = _branch_commit_subjects(repo_dir)
-        applied_by_subject = pr_numbers_from_commit_subjects(subjects)
+            applied = pr_numbers_from_commit_subjects(_branch_commit_subjects(repo_dir))
+            applied |= _applied_prs_from_commit_bodies(repo_dir)
 
-        present: set[int] = set()
-        for pr_number, merge_sha in pr_merge_shas.items():
-            if pr_number in applied_by_subject:
-                present.add(pr_number)
-            elif merge_sha and _commit_is_ancestor(repo_dir, merge_sha):
-                present.add(pr_number)
+            present: set[int] = set()
+            for pr_number, merge_sha in pr_merge_shas.items():
+                if pr_number in applied:
+                    present.add(pr_number)
+                elif merge_sha and _commit_is_ancestor(repo_dir, merge_sha):
+                    present.add(pr_number)
     return present
 
 
@@ -150,6 +157,32 @@ def _branch_commit_subjects(repo_dir: str) -> list[str]:
         check=True,
     )
     return result.stdout.splitlines()
+
+
+# git log -z NUL-separates commit records, letting us split multi-line bodies.
+_COMMIT_RECORD_DELIM = "\x00"
+
+
+def _applied_prs_from_commit_bodies(repo_dir: str) -> set[int]:
+    """Source PR numbers listed in ``## Applied`` tables of backport commits.
+
+    Squash-merged backport sweeps record the cherry-picked source PRs only in
+    the commit body's ``## Applied`` section. Reuses the same body parser as the
+    merge-hook path, so a (#N) outside that table (e.g. a "Needs attention" row
+    or prose) is not treated as applied.
+    """
+    result = subprocess.run(
+        ["git", "log", "-z", "--format=%B", "HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    numbers: set[int] = set()
+    for message in result.stdout.split(_COMMIT_RECORD_DELIM):
+        if "## Applied" in message:
+            numbers.update(parse_backport_source_pr_numbers(message))
+    return numbers
 
 
 def _commit_is_ancestor(repo_dir: str, commit_sha: str) -> bool:
@@ -201,6 +234,7 @@ def mark_backport_items_done(
     done_status: str = _DEFAULT_DONE_STATUS,
     verified_pr_numbers: set[int] | None = None,
     project: dict[str, Any] | None = None,
+    dry_run: bool = False,
 ) -> BackportStatusUpdateResult:
     """Flip board items for ``source_pr_numbers`` from ``from_status`` to Done.
 
@@ -211,6 +245,9 @@ def mark_backport_items_done(
 
     ``project`` may be a board already loaded by the caller (e.g. the poller),
     to avoid re-fetching it.
+
+    When ``dry_run`` is true, no mutation is sent; ``updated`` lists the items
+    that *would* be marked Done.
     """
     requested = sorted(set(source_pr_numbers))
     result = BackportStatusUpdateResult(requested=requested)
@@ -255,13 +292,14 @@ def mark_backport_items_done(
             result.unverified.append(number)
             continue
 
-        _set_project_item_status(
-            gql,
-            project_id=project["id"],
-            item_id=item["id"],
-            field_id=status_field_id,
-            option_id=done_option_id,
-        )
+        if not dry_run:
+            _set_project_item_status(
+                gql,
+                project_id=project["id"],
+                item_id=item["id"],
+                field_id=status_field_id,
+                option_id=done_option_id,
+            )
         result.updated.append(number)
 
     result.missing = sorted(requested_set - found)
@@ -282,7 +320,9 @@ def reconcile_project_board(
     status_field: str = _DEFAULT_STATUS_FIELD,
     from_status: str = _DEFAULT_FROM_STATUS,
     done_status: str = _DEFAULT_DONE_STATUS,
+    token: str = "",
     git_env: dict[str, str] | None = None,
+    dry_run: bool = False,
 ) -> BackportStatusUpdateResult:
     """Self-healing reconcile: mark Done every "To be backported" item that is
     genuinely on ``target_branch``.
@@ -318,7 +358,7 @@ def reconcile_project_board(
         return BackportStatusUpdateResult(requested=[])
 
     verified = verify_prs_on_branch(
-        source_repo, target_branch, pr_merge_shas, git_env=git_env
+        source_repo, target_branch, pr_merge_shas, token=token, git_env=git_env
     )
     logger.info(
         "Branch %s: %d candidate(s) in %r, %d verified present",
@@ -337,6 +377,7 @@ def reconcile_project_board(
         done_status=done_status,
         verified_pr_numbers=verified,
         project=project,
+        dry_run=dry_run,
     )
 
 
@@ -541,6 +582,11 @@ def main() -> None:
         help="merge mode only: skip branch-presence verification (legacy "
         "behaviour; trusts the PR body).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be marked Done without mutating the board.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -558,7 +604,7 @@ def main() -> None:
         results = _run_poll(
             registry, gql, repo=args.repo, target_branch=args.target_branch,
             status_field=args.status_field, from_status=args.from_status,
-            done_status=args.done_status,
+            done_status=args.done_status, token=args.target_token, dry_run=args.dry_run,
         )
         print(json.dumps(results, indent=2))
         return
@@ -591,6 +637,7 @@ def main() -> None:
             repo_entry.repo,
             branch_entry.branch,
             {pr: "" for pr in source_pr_numbers},
+            token=args.target_token,
         )
 
     result = mark_backport_items_done(
@@ -604,6 +651,7 @@ def main() -> None:
         from_status=args.from_status,
         done_status=args.done_status,
         verified_pr_numbers=verified,
+        dry_run=args.dry_run,
     )
     print(json.dumps(result.as_dict(), indent=2))
 
@@ -617,6 +665,8 @@ def _run_poll(
     status_field: str,
     from_status: str,
     done_status: str,
+    token: str = "",
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     repo_entry = registry.get_repo(repo)
     if target_branch:
@@ -636,6 +686,8 @@ def _run_poll(
             status_field=status_field,
             from_status=from_status,
             done_status=done_status,
+            token=token,
+            dry_run=dry_run,
         )
         out[branch_entry.branch] = result.as_dict()
     return out

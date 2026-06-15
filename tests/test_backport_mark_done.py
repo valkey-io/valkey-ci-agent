@@ -115,7 +115,7 @@ def test_reconcile_marks_only_branch_present_items(monkeypatch) -> None:
 
     captured: dict = {}
 
-    def fake_verify(repo, branch, pr_merge_shas, *, git_env=None):
+    def fake_verify(repo, branch, pr_merge_shas, *, token="", git_env=None):
         captured["repo"] = repo
         captured["branch"] = branch
         captured["pr_merge_shas"] = dict(pr_merge_shas)
@@ -233,6 +233,73 @@ def test_verify_counts_subject_and_sha_but_not_body_mention(tmp_path, monkeypatc
     assert 3801_000 + 1 in present
     assert 3920 not in present
     assert 4242 not in present
+
+
+def test_verify_detects_squash_merged_applied_table(tmp_path, monkeypatch) -> None:
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=repo, check=True, env=env, capture_output=True, text=True)
+
+    # A squash-merged backport sweep: subject names the backport PR (#3774);
+    # the source PRs it applied live only in the ## Applied table.
+    body = (
+        "[backport] Backport sweep for 9.1 (#3774)\n\n"
+        "## Applied\n\n"
+        "| Source PR | Title | Detail |\n"
+        "|---|---|---|\n"
+        "| #3801 | Validate DB clause | |\n"
+        "| #3847 | Harden SENTINEL | |\n\n"
+        "## Needs attention\n\n"
+        "| #9999 | Failed one | skipped-conflict |\n"
+    )
+    git("init", "-q")
+    (repo / "f").write_text("1")
+    git("add", "f")
+    git("commit", "-qm", body)
+
+    def fake_clone(repo_full_name, target_branch, dest_dir, git_env):
+        subprocess.run(["git", "clone", "-q", str(repo), dest_dir], check=True, env=env)
+
+    monkeypatch.setattr(mark_done, "_shallow_clone", fake_clone)
+
+    present = mark_done.verify_prs_on_branch(
+        "valkey-io/valkey",
+        "9.1",
+        {3801: "", 3847: "", 9999: ""},  # no merge SHAs -> body table is the only signal
+    )
+
+    # Applied source PRs are detected; the failed "Needs attention" row is not.
+    assert present == {3801, 3847}
+
+
+def test_dry_run_reports_without_mutating() -> None:
+    gql = FakeGraphQLClient(
+        project_items=[
+            _project_item(101, "valkey-io/valkey", "item-101", "To be backported"),
+        ]
+    )
+
+    result = mark_backport_items_done(
+        gql,
+        project_owner="valkey-io",
+        project_number=14,
+        source_repo="valkey-io/valkey",
+        source_pr_numbers=[101],
+        verified_pr_numbers={101},
+        dry_run=True,
+    )
+
+    assert result.updated == [101]
+    assert gql.mutations == []
 
 
 class FakeGraphQLClient:
