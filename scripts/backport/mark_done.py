@@ -365,13 +365,43 @@ def _markdown_section(body: str, heading: str) -> str:
 
 
 def _pr_numbers_from_table_cells(markdown: str) -> set[int]:
-    return {
-        int(match.group(1))
-        for match in re.finditer(
-            r"\|\s*(?:\[)?#(\d+)(?:\]\([^)]*\))?\s*\|",
-            markdown,
-        )
-    }
+    """Source PR numbers from the ``Source PR`` column of a markdown table.
+
+    Only the ``Source PR`` column is read, so a ``#N`` appearing in a Title or
+    Detail cell (e.g. a revert subject, or a "depends on #N" note) is never
+    counted. Cells whose text wraps across newlines are reassembled first: a
+    logical row begins at a line starting with ``|`` and absorbs the lines that
+    follow until the next row. When no ``Source PR`` header is present the first
+    column is used, since the sweep always lists the source PR first.
+    """
+    rows: list[str] = []
+    for line in markdown.splitlines():
+        if line.lstrip().startswith("|"):
+            rows.append(line)
+        elif rows:
+            rows[-1] += " " + line.strip()
+
+    pr_cell = re.compile(r"^(?:\[)?#(\d+)(?:\]\([^)]*\))?$")
+    column: int | None = None
+    numbers: set[int] = set()
+    for row in rows:
+        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+        if column is None:
+            for index, cell in enumerate(cells):
+                if _normalize(cell) == "source pr":
+                    column = index
+                    break
+            else:
+                column = 0  # no header row; sweep lists the source PR first
+            if any(_normalize(cell) == "source pr" for cell in cells):
+                continue  # consumed the header row itself
+        if all(set(cell) <= set("-: ") for cell in cells if cell):
+            continue  # separator row (|---|---|)
+        if column < len(cells):
+            match = pr_cell.match(cells[column])
+            if match:
+                numbers.add(int(match.group(1)))
+    return numbers
 
 
 def _normalize(value: object) -> str:

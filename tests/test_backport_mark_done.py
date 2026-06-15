@@ -251,7 +251,7 @@ def test_verify_detects_squash_merged_applied_table(tmp_path, monkeypatch) -> No
         "| Source PR | Title | Detail |\n"
         "|---|---|---|\n"
         "| #3801 | Validate DB clause | |\n"
-        "| #3847 | Harden SENTINEL | |\n\n"
+        "| #3847 | Revert work (#7777) | depends on #8888 |\n\n"
         "## Needs attention\n\n"
         "| Source PR | Title | Outcome | Reason |\n"
         "|---|---|---|---|\n"
@@ -270,10 +270,12 @@ def test_verify_detects_squash_merged_applied_table(tmp_path, monkeypatch) -> No
     present = mark_done.verify_prs_on_branch(
         "valkey-io/valkey",
         "9.1",
-        {3801, 3847, 9999},  # the ## Applied table is the only signal
+        {3801, 3847, 7777, 8888, 9999},  # the ## Applied table is the only signal
     )
 
-    # Applied source PRs are detected; the failed "Needs attention" row is not.
+    # Only Source-PR-column entries of the Applied table count: the #7777 in a
+    # Title cell, the #8888 in a Detail cell, and the Needs-attention #9999 are
+    # all excluded.
     assert present == {3801, 3847}
 
 
