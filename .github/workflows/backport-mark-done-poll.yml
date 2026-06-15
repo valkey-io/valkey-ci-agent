@@ -1,0 +1,132 @@
+name: Backport Mark Done Poll
+
+# Self-healing reconcile of project-board backport status. For every
+# "To be backported" item, verify the source PR's commit is actually on the
+# target branch and flip verified items to Done. Independent of any merge hook:
+# catches items backported by the sweep, manual cherry-picks, or older runs.
+
+on:
+  schedule:
+    # Hourly, offset from the daily sweep so a sweep's results get picked up soon.
+    - cron: "30 * * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Filter to this repository (empty = all repos in registry)"
+        required: false
+        type: string
+        default: ""
+      project_number:
+        description: "Filter to this project number (empty = all)"
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  preflight:
+    name: "Generate matrix"
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has_entries: ${{ steps.matrix.outputs.has_entries }}
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Generate matrix from registry
+        id: matrix
+        shell: bash
+        env:
+          REPO_FILTER: ${{ inputs.repo || '' }}
+          PROJECT_FILTER: ${{ inputs.project_number || '' }}
+        run: |
+          set -euo pipefail
+          args=(--registry repos.yml)
+          if [[ -n "${REPO_FILTER}" ]]; then
+            args+=(--repo "${REPO_FILTER}")
+          fi
+          if [[ -n "${PROJECT_FILTER}" ]]; then
+            args+=(--project-number "${PROJECT_FILTER}")
+          fi
+          python -m scripts.backport.matrix "${args[@]}" --output-file "$GITHUB_OUTPUT"
+
+  reconcile:
+    name: "mark-done/${{ matrix.repo }}/${{ matrix.branch }}"
+    needs: preflight
+    if: needs.preflight.outputs.has_entries == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.preflight.outputs.matrix) }}
+    concurrency:
+      group: backport-mark-done-${{ matrix.repo }}-${{ matrix.branch }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+
+      - name: Reconcile board status against branch
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
+          REPO: ${{ matrix.repo }}
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          set -euo pipefail
+          python -m scripts.backport.mark_done \
+            --registry repos.yml \
+            --repo "${REPO}" \
+            --mode poll \
+            --target-branch "${BRANCH}" \
+            --target-token "${TARGET_TOKEN}" \
+            --verbose | tee mark-done-result.json
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mark-done-result-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
+          path: mark-done-result.json
+          retention-days: 30

@@ -1,12 +1,30 @@
-"""Mark project-board backport items done after a backport PR merges."""
+"""Mark project-board backport items done once the backport actually lands.
+
+Two entry points share the same status-mutation core:
+
+* ``mark_backport_items_done`` — given an explicit set of source PR numbers
+  (parsed from a merged backport PR body / head ref), flip the matching board
+  items to Done. Used by the merge-triggered workflow.
+* ``reconcile_project_board`` — list every board item still in
+  "To be backported", verify each source PR actually has a commit on the
+  target branch, and flip only the verified ones. Used by the scheduled
+  poller, which is self-healing: it does not depend on a merge hook firing.
+
+Both gate Done on the branch genuinely containing the source PR's commit
+(the same ``(#<pr>)`` signal the sweep uses to skip already-applied PRs), so a
+backport PR body that merely *claims* a PR was applied can never mark it Done
+on its own.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,6 +37,11 @@ _DEFAULT_STATUS_FIELD = "Status"
 _DEFAULT_FROM_STATUS = "To be backported"
 _DEFAULT_DONE_STATUS = "Done"
 
+# How many commits of branch history to fetch when verifying presence. A release
+# branch accumulates backports steadily; a few thousand commits comfortably
+# covers any PR still sitting in "To be backported".
+_VERIFY_CLONE_DEPTH = 5000
+
 
 @dataclass
 class BackportStatusUpdateResult:
@@ -27,6 +50,7 @@ class BackportStatusUpdateResult:
     already_done: list[int] = field(default_factory=list)
     missing: list[int] = field(default_factory=list)
     skipped: dict[int, str] = field(default_factory=dict)
+    unverified: list[int] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +59,7 @@ class BackportStatusUpdateResult:
             "already_done": self.already_done,
             "missing": self.missing,
             "skipped": {str(k): v for k, v in sorted(self.skipped.items())},
+            "unverified": self.unverified,
         }
 
 
@@ -70,6 +95,74 @@ def parse_backport_source_pr_numbers(
     return sorted(numbers)
 
 
+def _pr_numbers_on_branch(repo_dir: str, *, max_count: int = _VERIFY_CLONE_DEPTH) -> set[int]:
+    """Return source PR numbers referenced by ``(#N)`` in the branch's commits.
+
+    This is the same signal the sweep uses to detect already-applied PRs, so
+    mark-done and the sweep agree on what "present on the branch" means. A
+    squash-merged backport sweep keeps each cherry-picked commit's original
+    ``... (#N)`` subject, and manual cherry-picks keep it via ``-x``/the merge
+    title, so the source PR number is recoverable from history.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "log", f"--max-count={max_count}", "--format=%s%n%b", "HEAD"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {int(match.group(1)) for match in re.finditer(r"\(#(\d+)\)", result.stdout)}
+
+
+def verify_prs_on_branch(
+    repo_full_name: str,
+    target_branch: str,
+    pr_numbers: list[int],
+    *,
+    git_env: dict[str, str] | None = None,
+) -> set[int]:
+    """Shallow-clone ``target_branch`` and return which ``pr_numbers`` are present.
+
+    Presence is decided by a ``(#N)`` reference in the branch's commit history.
+    Returns the subset of ``pr_numbers`` that are genuinely on the branch.
+    """
+    wanted = set(pr_numbers)
+    if not wanted:
+        return set()
+
+    env = dict(os.environ if git_env is None else git_env)
+    with tempfile.TemporaryDirectory(prefix="mark-done-verify-") as tmp:
+        repo_dir = os.path.join(tmp, "repo")
+        _shallow_clone(repo_full_name, target_branch, repo_dir, env)
+        present = _pr_numbers_on_branch(repo_dir)
+    return wanted & present
+
+
+def _shallow_clone(
+    repo_full_name: str, target_branch: str, dest_dir: str, git_env: dict[str, str]
+) -> None:
+    import subprocess
+
+    from scripts.common.git_auth import github_https_url
+
+    subprocess.run(
+        [
+            "git", "clone",
+            "--branch", target_branch,
+            "--single-branch",
+            f"--depth={_VERIFY_CLONE_DEPTH}",
+            github_https_url(repo_full_name),
+            dest_dir,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=git_env,
+    )
+
+
 def mark_backport_items_done(
     gql: GitHubGraphQLClient,
     *,
@@ -81,7 +174,15 @@ def mark_backport_items_done(
     status_field: str = _DEFAULT_STATUS_FIELD,
     from_status: str = _DEFAULT_FROM_STATUS,
     done_status: str = _DEFAULT_DONE_STATUS,
+    verified_pr_numbers: set[int] | None = None,
 ) -> BackportStatusUpdateResult:
+    """Flip board items for ``source_pr_numbers`` from ``from_status`` to Done.
+
+    When ``verified_pr_numbers`` is provided, only PRs in that set are eligible
+    to be marked Done; the rest are recorded as ``unverified`` and left as-is.
+    Passing ``None`` keeps the legacy unverified behaviour for callers that have
+    already established presence some other way.
+    """
     requested = sorted(set(source_pr_numbers))
     result = BackportStatusUpdateResult(requested=requested)
     if not requested:
@@ -120,6 +221,9 @@ def mark_backport_items_done(
                 f"{status_field} is {current_status!r}, not {from_status!r}"
             )
             continue
+        if verified_pr_numbers is not None and number not in verified_pr_numbers:
+            result.unverified.append(number)
+            continue
 
         _set_project_item_status(
             gql,
@@ -133,7 +237,75 @@ def mark_backport_items_done(
     result.missing = sorted(requested_set - found)
     result.updated = sorted(set(result.updated))
     result.already_done = sorted(set(result.already_done))
+    result.unverified = sorted(set(result.unverified))
     return result
+
+
+def reconcile_project_board(
+    gql: GitHubGraphQLClient,
+    *,
+    project_owner: str,
+    project_number: int,
+    source_repo: str,
+    target_branch: str,
+    project_owner_type: str = "organization",
+    status_field: str = _DEFAULT_STATUS_FIELD,
+    from_status: str = _DEFAULT_FROM_STATUS,
+    done_status: str = _DEFAULT_DONE_STATUS,
+    git_env: dict[str, str] | None = None,
+) -> BackportStatusUpdateResult:
+    """Self-healing reconcile: mark Done every "To be backported" item that is
+    genuinely on ``target_branch``.
+
+    Unlike :func:`mark_backport_items_done`, this does not need a merged-PR body
+    or a merge hook. It scans the board, clones the branch once, verifies each
+    candidate by ``(#N)`` presence, and flips only the verified items. Items not
+    yet on the branch are recorded as ``unverified`` and left untouched so a
+    later run can pick them up.
+    """
+    project = _load_project(
+        gql,
+        project_owner=project_owner,
+        project_number=project_number,
+        project_owner_type=project_owner_type,
+    )
+
+    candidates: list[int] = []
+    for item in project["items"]:
+        content = item.get("content") or {}
+        if content.get("__typename") != "PullRequest":
+            continue
+        if (content.get("repository") or {}).get("nameWithOwner") != source_repo:
+            continue
+        if _normalize(_item_single_select_value(item, status_field)) != _normalize(from_status):
+            continue
+        number = content.get("number")
+        if isinstance(number, int):
+            candidates.append(number)
+
+    if not candidates:
+        return BackportStatusUpdateResult(requested=[])
+
+    verified = verify_prs_on_branch(
+        source_repo, target_branch, candidates, git_env=git_env
+    )
+    logger.info(
+        "Branch %s: %d candidate(s) in %r, %d verified present",
+        target_branch, len(candidates), from_status, len(verified),
+    )
+
+    return mark_backport_items_done(
+        gql,
+        project_owner=project_owner,
+        project_number=project_number,
+        source_repo=source_repo,
+        source_pr_numbers=candidates,
+        project_owner_type=project_owner_type,
+        status_field=status_field,
+        from_status=from_status,
+        done_status=done_status,
+        verified_pr_numbers=verified,
+    )
 
 
 def _markdown_section(body: str, heading: str) -> str:
@@ -309,7 +481,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--registry", default="repos.yml")
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--target-branch", required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("merge", "poll"),
+        default="merge",
+        help="merge: mark Done the source PRs from a merged backport PR "
+        "(verified against the branch). poll: reconcile every "
+        "'To be backported' item against the branch.",
+    )
+    parser.add_argument(
+        "--target-branch",
+        help="Release branch. Required for merge mode; in poll mode, omit to "
+        "reconcile every branch configured for the repo.",
+    )
     parser.add_argument("--target-token", required=True)
     parser.add_argument("--body", default="")
     parser.add_argument("--body-file", default="")
@@ -318,6 +502,12 @@ def main() -> None:
     parser.add_argument("--status-field", default=_DEFAULT_STATUS_FIELD)
     parser.add_argument("--from-status", default=_DEFAULT_FROM_STATUS)
     parser.add_argument("--done-status", default=_DEFAULT_DONE_STATUS)
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="merge mode only: skip branch-presence verification (legacy "
+        "behaviour; trusts the PR body).",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -328,27 +518,45 @@ def main() -> None:
 
     from scripts.backport.registry import load_registry
 
+    registry = load_registry(args.registry)
+    gql = GitHubGraphQLClient(args.target_token)
+
+    if args.mode == "poll":
+        results = _run_poll(
+            registry, gql, repo=args.repo, target_branch=args.target_branch,
+            status_field=args.status_field, from_status=args.from_status,
+            done_status=args.done_status,
+        )
+        print(json.dumps(results, indent=2))
+        return
+
+    if not args.target_branch:
+        parser.error("--target-branch is required in merge mode")
+
     body = args.body
     if args.body_file:
-        if args.body_file == "-":
-            body = sys.stdin.read()
-        else:
-            body = Path(args.body_file).read_text(encoding="utf-8")
+        body = sys.stdin.read() if args.body_file == "-" else Path(args.body_file).read_text(encoding="utf-8")
 
     source_pr_numbers = sorted(
         set(args.source_pr_number)
         | set(parse_backport_source_pr_numbers(body, head_ref=args.head_ref))
     )
     if not source_pr_numbers:
-        result = BackportStatusUpdateResult(requested=[])
-        print(json.dumps(result.as_dict(), indent=2))
+        print(json.dumps(BackportStatusUpdateResult(requested=[]).as_dict(), indent=2))
         return
 
-    registry = load_registry(args.registry)
     repo_entry, branch_entry = registry.get_branch(args.repo, args.target_branch)
 
+    verified: set[int] | None
+    if args.no_verify:
+        verified = None
+    else:
+        verified = verify_prs_on_branch(
+            repo_entry.repo, branch_entry.branch, source_pr_numbers
+        )
+
     result = mark_backport_items_done(
-        GitHubGraphQLClient(args.target_token),
+        gql,
         project_owner=repo_entry.project_owner,
         project_number=branch_entry.project_number,
         source_repo=repo_entry.repo,
@@ -357,8 +565,42 @@ def main() -> None:
         status_field=args.status_field,
         from_status=args.from_status,
         done_status=args.done_status,
+        verified_pr_numbers=verified,
     )
     print(json.dumps(result.as_dict(), indent=2))
+
+
+def _run_poll(
+    registry: Any,
+    gql: GitHubGraphQLClient,
+    *,
+    repo: str,
+    target_branch: str | None,
+    status_field: str,
+    from_status: str,
+    done_status: str,
+) -> dict[str, Any]:
+    repo_entry = registry.get_repo(repo)
+    if target_branch:
+        branches = [registry.get_branch(repo, target_branch)[1]]
+    else:
+        branches = list(repo_entry.branches)
+
+    out: dict[str, Any] = {}
+    for branch_entry in branches:
+        result = reconcile_project_board(
+            gql,
+            project_owner=repo_entry.project_owner,
+            project_number=branch_entry.project_number,
+            source_repo=repo_entry.repo,
+            target_branch=branch_entry.branch,
+            project_owner_type=repo_entry.project_owner_type,
+            status_field=status_field,
+            from_status=from_status,
+            done_status=done_status,
+        )
+        out[branch_entry.branch] = result.as_dict()
+    return out
 
 
 if __name__ == "__main__":
