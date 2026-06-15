@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import scripts.backport.mark_done as mark_done
 from scripts.backport.mark_done import (
     BackportStatusUpdateResult,
     mark_backport_items_done,
     parse_backport_source_pr_numbers,
     reconcile_project_board,
 )
-import scripts.backport.mark_done as mark_done
 
 
 def test_parse_sweep_body_uses_only_applied_section() -> None:
