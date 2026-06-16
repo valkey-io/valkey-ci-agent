@@ -1,0 +1,153 @@
+name: CI Fix Bot
+
+# A maintainer triggers a fix manually via workflow_dispatch (the Actions UI or
+# `gh workflow run`), supplying the PR and the failing run URL. A comment-based
+# trigger (`@valkeyrie-bot fix ...` on a valkey-io/valkey PR) needs a thin
+# wrapper in the target repo to forward the event here, since issue_comment
+# events only fire in the repo where the comment is made; that wrapper is a
+# follow-up. See README for the dispatch invocation.
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "PR repository, e.g. valkey-io/valkey"
+        required: true
+        type: string
+      pr:
+        description: "Backport PR number"
+        required: true
+        type: number
+      run_url:
+        description: "Failed GitHub Actions run URL"
+        required: true
+        type: string
+      hint:
+        description: "Optional diagnosis hint"
+        required: false
+        type: string
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  ci-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      # Serialize ci-fix runs for the same PR so two dispatches don't push at
+      # once. This does not coordinate with other workflows that write the same
+      # branch; the fast-forward-only push (see push.py) is what keeps a
+      # concurrent branch update from being clobbered.
+      group: ci-fix-${{ inputs.pr }}
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      CLAUDE_CODE_USE_BEDROCK: "1"
+      CI_AGENT_EVIDENCE_DIR: agent-evidence
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          npm install -g @anthropic-ai/claude-code@2.1.153
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          # members:read for the contributors-team auth check; contents:write
+          # to push the fix; pull-requests:write + issues:write to comment (the
+          # PR comment uses the Issues comments API); actions:read for logs.
+          permission-members: read
+          permission-actions: read
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-metadata: read
+
+      - name: Generate agent-repo token (macOS verify dispatch)
+        id: agent-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey-ci-agent
+          # actions:write to dispatch the verify-macos workflow and read its
+          # run status; nothing else on the agent repo.
+          permission-actions: write
+          permission-metadata: read
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: valkey-ci-fix-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run the CI fix
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
+          CI_FIX_MACOS_AGENT_REPO: valkey-io/valkey-ci-agent
+          CI_FIX_MACOS_AGENT_REF: main
+          CI_FIX_MACOS_TOKEN: ${{ steps.agent-token.outputs.token }}
+          CI_FIX_REPO: ${{ inputs.repo }}
+          CI_FIX_PR: ${{ inputs.pr }}
+          CI_FIX_RUN_URL: ${{ inputs.run_url }}
+          CI_FIX_COMMENTER: ${{ github.actor }}
+          CI_FIX_HINT: ${{ inputs.hint || '' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${CI_FIX_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid repo: ${CI_FIX_REPO}" >&2
+            exit 1
+          fi
+          if [[ "${CI_FIX_REPO}" != "valkey-io/valkey" ]]; then
+            echo "ci-fix.yml is currently scoped to valkey-io/valkey (got: ${CI_FIX_REPO})" >&2
+            exit 1
+          fi
+          if [[ ! "${CI_FIX_PR}" =~ ^[0-9]+$ ]]; then
+            echo "Invalid PR number: ${CI_FIX_PR}" >&2
+            exit 1
+          fi
+          args=(
+            -m scripts.ci_fix.main
+            --repo "${CI_FIX_REPO}"
+            --pr "${CI_FIX_PR}"
+            --run-url "${CI_FIX_RUN_URL}"
+            --commenter "${CI_FIX_COMMENTER}"
+          )
+          if [[ -n "${CI_FIX_HINT}" ]]; then
+            args+=(--hint "${CI_FIX_HINT}")
+          fi
+          python "${args[@]}"
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-fix-agent-evidence-${{ github.run_id }}
+          path: agent-evidence
+          if-no-files-found: ignore
+          retention-days: 30

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from scripts.ai.runtime import run_agent
+from scripts.common.ai_output import extract_json_object
 from scripts.common.git_clone import shallow_clone_at_sha
 from scripts.common.incidents import compute_fingerprint
 from scripts.common.text_utils import strip_ansi
@@ -165,7 +166,7 @@ def _invoke_claude(context: FuzzerRunContext, anomalies: list[FuzzerSignal],
         (art_dir / name).write_text(text)
 
     # Clone valkey at the tested commit (skipping if the manifest didn't record
-    # one — cloning the default branch would have Claude triage a different
+    # one - cloning the default branch would have Claude triage a different
     # tree than the one that crashed). Clone the fuzzer at the run's HEAD too.
     if context.tested_valkey_sha:
         valkey_ok = shallow_clone_at_sha(
@@ -196,53 +197,37 @@ def _invoke_claude(context: FuzzerRunContext, anomalies: list[FuzzerSignal],
 
 def _format_source_note(context: FuzzerRunContext, *, valkey_ok: bool, fuzzer_ok: bool) -> str:
     """Tell Claude exactly which source trees are available and at what SHA."""
-    lines = ["- _artifacts/ — results.json and per-node Valkey server logs."]
+    lines = ["- _artifacts/ - results.json and per-node Valkey server logs."]
     if valkey_ok:
         lines.append(
-            f"- valkey/ — Valkey source at commit {context.tested_valkey_sha}. "
+            f"- valkey/ - Valkey source at commit {context.tested_valkey_sha}. "
             "Grep for assertion text, crash handlers, BUG REPORT lines."
         )
     elif not context.tested_valkey_sha:
         lines.append(
-            "- valkey/ — NOT AVAILABLE (the fuzzer manifest did not record the "
+            "- valkey/ - NOT AVAILABLE (the fuzzer manifest did not record the "
             "tested commit). Do not cite source line numbers."
         )
     else:
         lines.append(
-            "- valkey/ — NOT AVAILABLE (clone failed). Do not cite source line numbers."
+            "- valkey/ - NOT AVAILABLE (clone failed). Do not cite source line numbers."
         )
     if fuzzer_ok:
         lines.append(
-            "- valkey-fuzzer/ — Fuzzer source at the run's HEAD. "
+            "- valkey-fuzzer/ - Fuzzer source at the run's HEAD. "
             "Check validation logic in src/ if a check failed."
         )
     else:
-        lines.append("- valkey-fuzzer/ — NOT AVAILABLE (clone failed).")
+        lines.append("- valkey-fuzzer/ - NOT AVAILABLE (clone failed).")
     return "\n".join(lines)
 
 
 def _parse_claude_response(stdout: str) -> dict[str, Any]:
-    """Find the last stream-json `result` event, fall back to plain JSON."""
-    text = stdout
-    for line in stdout.strip().splitlines():
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(ev, dict) and ev.get("type") == "result" and "result" in ev:
-            text = ev["result"]
-    decoder = json.JSONDecoder()
-    start = text.find("{")
-    while start != -1:
-        try:
-            obj, _ = decoder.raw_decode(text[start:])
-        except ValueError:
-            start = text.find("{", start + 1)
-            continue
-        if isinstance(obj, dict) and "overall_status" in obj:
-            return obj
-        start = text.find("{", start + 1)
-    raise ValueError("No analysis JSON object in Claude response")
+    """Find the analysis JSON object in the Claude response."""
+    obj = extract_json_object(stdout, required_key="overall_status")
+    if obj is None:
+        raise ValueError("No analysis JSON object in Claude response")
+    return obj
 
 
 class FuzzerRunAnalyzer:
@@ -303,7 +288,7 @@ class FuzzerRunAnalyzer:
         else:
             overall_status, triage_verdict = _triage(anomalies)
             if claude_error and not anomalies:
-                # Couldn't get a verdict from either signal — escalate.
+                # Couldn't get a verdict from either signal - escalate.
                 overall_status, triage_verdict = "warning", "needs-human-triage"
 
         raw_summary = claude_payload.get("summary")

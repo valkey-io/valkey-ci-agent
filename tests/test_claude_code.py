@@ -74,6 +74,7 @@ def test_run_claude_code_streams_json_and_uses_bedrock_env(monkeypatch, caplog):
     assert "Edit" in tools
     assert "MultiEdit" in tools
     assert "--dangerously-skip-permissions" in captured["cmd"]
+    assert "--strict-mcp-config" in captured["cmd"]
     assert "--disallowedTools" not in captured["cmd"]
     assert captured["kwargs"]["cwd"] == "/tmp/checkout"
     assert captured["kwargs"]["env"]["CLAUDE_CODE_USE_BEDROCK"] == "1"

@@ -89,6 +89,20 @@ class ArtifactClient:
             f"/repos/{repo_full_name}/actions/artifacts/{artifact_id}/zip"
         ))
 
+    def download_run_logs(self, repo_full_name: str, run_id: int) -> dict[str, bytes]:
+        """Download a workflow run's console logs as a ``{path: bytes}`` map.
+
+        GitHub returns the whole run's logs as a zip whose members are the
+        per-step text logs (one file per job step, plus per-job rollups).
+        Unlike ``download_artifact`` this is the raw CI console output, not a
+        user-uploaded artifact bundle. Shares the same token-redirect, retry,
+        and uncompressed-size-cap discipline as artifact downloads. Returns an
+        empty map if the logs have expired (404) or the zip is unreadable.
+        """
+        return _extract_zip(self._download(
+            f"/repos/{repo_full_name}/actions/runs/{run_id}/logs"
+        ))
+
     def _download(self, path: str) -> bytes:
         url = f"https://api.github.com{path}"
         req = Request(url, headers={
@@ -124,8 +138,8 @@ class ArtifactClient:
         raise AssertionError("unreachable: retry loop must return or raise")
 
 
-# Defends against a buggy fuzzer producing a runaway log dump that would
-# exhaust the runner. Real fuzzer artifacts are typically <50 MB.
+# Defends against a runaway log/artifact dump that would exhaust the runner.
+# Real fuzzer artifacts and CI run logs are typically well under this.
 _MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024
 
 

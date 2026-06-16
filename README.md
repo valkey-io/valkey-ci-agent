@@ -1,6 +1,6 @@
 # valkey-ci-agent
 
-An AI-powered CI automation agent for the Valkey project. Uses Claude Code (Anthropic Claude Opus via Bedrock) to perform tasks that require code understanding — conflict resolution, code review, failure analysis, and more.
+An AI-powered CI automation agent for the Valkey project. Uses Claude Code (Anthropic Claude Opus via Bedrock) to perform tasks that require code understanding - conflict resolution, code review, failure analysis, and more.
 
 ## Architecture
 
@@ -9,7 +9,9 @@ The agent is structured as a layered framework:
 ```text
 scripts/
   ai/          AI layer: Claude Code subprocess orchestration
-  backport/    Workflow 1: automated backports (active)
+  backport/    Automated backports (active)
+  fuzzer/      Fuzzer run monitoring (active)
+  ci_fix/      On-demand CI test-fix bot (active)
   common/      Shared infrastructure (git auth, GitHub client, safety guards)
 repos.yml      Central registry of repos, branches, and project boards
 ```
@@ -22,22 +24,23 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 |----------|--------|-------------|
 | Backport | Active | Cherry-picks merged PRs onto release branches with AI conflict resolution |
 | Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
+| CI Fix | Active | On-demand `@valkeyrie-bot fix <ci-link>` - diagnoses and fixes a failing test on a backport PR |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
 
 ## Backport Workflow
 
-The currently active workflow. Cherry-picks merged PRs onto release branches with AI-powered conflict resolution. Works for any repo defined in `repos.yml` — Valkey core, Valkey modules (bloom, search, json), or anything else following the per-branch project-board pattern.
+The currently active workflow. Cherry-picks merged PRs onto release branches with AI-powered conflict resolution. Works for any repo defined in `repos.yml` - Valkey core, Valkey modules (bloom, search, json), or anything else following the per-branch project-board pattern.
 
 ### How it works
 
-1. **Daily sweep** — every day at 09:00 UTC, the preflight job reads `repos.yml` and generates one matrix leg per `{repo, branch}` pair
-2. **Project discovery** — each leg queries the GitHub Project v2 board for PRs marked "To be backported"
-3. **Cherry-pick** — attempts `git cherry-pick` for each candidate onto the target release branch
-4. **AI conflict resolution** — when cherry-pick conflicts, Claude Code reads both sides and resolves the conflict in place
-5. **Validation** — registry-configured build commands run before push; any failure blocks the push
-6. **PR creation** — pushes the branch and opens (or updates) a PR with a summary table
-7. **Status sync** — after a backport PR is merged into the release branch, the source PR's Project v2 status can be moved from "To be backported" to "Done"
+1. **Daily sweep** - every day at 09:00 UTC, the preflight job reads `repos.yml` and generates one matrix leg per `{repo, branch}` pair
+2. **Project discovery** - each leg queries the GitHub Project v2 board for PRs marked "To be backported"
+3. **Cherry-pick** - attempts `git cherry-pick` for each candidate onto the target release branch
+4. **AI conflict resolution** - when cherry-pick conflicts, Claude Code reads both sides and resolves the conflict in place
+5. **Validation** - registry-configured build commands run before push; any failure blocks the push
+6. **PR creation** - pushes the branch and opens (or updates) a PR with a summary table
+7. **Status sync** - after a backport PR is merged into the release branch, the source PR's Project v2 status can be moved from "To be backported" to "Done"
 
 Manual single-PR backports are also supported via `workflow_dispatch`.
 
@@ -99,7 +102,7 @@ The workflows mint a short-lived installation token with `actions/create-github-
 
 #### Step 2: Edit `repos.yml`
 
-Add your repo(s) to the registry. No per-repo config files are needed — everything lives in `repos.yml`.
+Add your repo(s) to the registry. No per-repo config files are needed - everything lives in `repos.yml`.
 
 #### Step 3: Enable the workflows
 
@@ -132,7 +135,7 @@ self-healing: it picks up backports applied by the sweep, by an earlier run, or
 by a manual cherry-pick, without depending on a merge event.
 
 An item is marked `Done` only when the source PR's commit is genuinely on the
-target branch — verified by the cherry-pick's trailing `(#N)` subject, or by the
+target branch - verified by the cherry-pick's trailing `(#N)` subject, or by the
 PR appearing in a sweep commit's `## Applied` table. A backport PR body that
 merely claims a PR was applied can never mark it `Done` on its own.
 
@@ -165,13 +168,13 @@ The fuzzer monitor watches scheduled `valkey-io/valkey-fuzzer` workflow runs, an
 
 ### How it works
 
-1. **Cron** — every 4 hours, the monitor checks the latest scheduled fuzzer run
-2. **Deterministic scan** — pattern-matches crash/sanitizer/failover/RDB signals against artifact JSON and node logs; ignores chaos-expected noise (CLUSTERDOWN, replication link loss)
-3. **Claude Code analysis** — drops the artifacts in a tempdir, shallow-clones `valkey-io/valkey` at the tested commit and `valkey-io/valkey-fuzzer` at the run's HEAD, then asks Claude (with read-only `Read,Grep,Glob` tools) to correlate the failure with source and decide whether the run reflects a real bug or chaos-expected noise. If a clone fails the prompt tells Claude not to cite source line numbers.
-4. **Issue upsert** — anomalous runs file (or update) an issue on `valkey-io/valkey-fuzzer`, deduplicated by a stable fingerprint over root cause and anomaly shape
-5. **Audit** — per-run JSON results and Claude evidence are uploaded as workflow artifacts
+1. **Cron** - every 4 hours, the monitor checks the latest scheduled fuzzer run
+2. **Deterministic scan** - pattern-matches crash/sanitizer/failover/RDB signals against artifact JSON and node logs; ignores chaos-expected noise (CLUSTERDOWN, replication link loss)
+3. **Claude Code analysis** - drops the artifacts in a tempdir, shallow-clones `valkey-io/valkey` at the tested commit and `valkey-io/valkey-fuzzer` at the run's HEAD, then asks Claude (with read-only `Read,Grep,Glob` tools) to correlate the failure with source and decide whether the run reflects a real bug or chaos-expected noise. If a clone fails the prompt tells Claude not to cite source line numbers.
+4. **Issue upsert** - anomalous runs file (or update) an issue on `valkey-io/valkey-fuzzer`, deduplicated by a stable fingerprint over root cause and anomaly shape
+5. **Audit** - per-run JSON results and Claude evidence are uploaded as workflow artifacts
 
-The Claude Code subprocess runs under the `fuzzer_analysis_readonly` agent profile with `Read,Grep,Glob` tools only — no editing, no Bash, no network access beyond the Bedrock call itself.
+The Claude Code subprocess runs under the `fuzzer_analysis_readonly` agent profile with `Read,Grep,Glob` tools only - no editing, no Bash, no network access beyond the Bedrock call itself.
 
 ### Configuration
 
@@ -191,17 +194,107 @@ gh workflow run monitor-fuzzer.yml \
 
 Scheduled runs always run live.
 
+## CI Fix Workflow
+
+An on-demand workflow that fixes a single failing test on a backport PR when a
+maintainer asks for it. From this agent repository, run it explicitly:
+
+```bash
+gh workflow run ci-fix.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field repo=valkey-io/valkey \
+  --field pr=<pr-number> \
+  --field run_url=https://github.com/valkey-io/valkey/actions/runs/<run_id>
+```
+
+The workflow is dispatch-only today and is scoped to `valkey-io/valkey`,
+matching the GitHub App token it mints. A comment trigger
+(`@valkeyrie-bot fix <run-url>` on a `valkey-io/valkey` PR) needs a thin
+wrapper in `valkey-io/valkey` that forwards the `issue_comment` event here,
+because such events only fire in the repository where the comment is made; that
+wrapper is a planned follow-up. The invocation must start the comment, and the
+hint is only the rest of that line, so a conversational comment that merely
+quotes or mentions the command does not trigger a run. The intended comment
+shape is:
+
+```text
+@valkeyrie-bot fix https://github.com/valkey-io/valkey/actions/runs/<run_id>
+```
+
+Add a free-text hint via the dispatch `hint` input to steer the diagnosis
+(e.g. `look at the valgrind timeout`). The bot fixes one test per invocation;
+re-run it to address the next failing test in the same run.
+
+### How it works
+
+The division of labor is the whole design: **AI judges, code executes and
+owns every verdict.** The AI never runs a command and never pushes.
+
+1. **Gate** (code, fail-closed) - parses the command, verifies the commenter
+   is an active member of `valkey-io/contributors`, and binds the failed run
+   to the PR head (`head_repo` + `head_branch` + `head_sha`). If the branch
+   moved since the run, it refuses - the log no longer describes the code.
+2. **Fetch** (code) - downloads the failed run's logs and shallow-clones the
+   repo at the exact failed commit.
+3. **Diagnose** (AI, read-only) - reads the log and the repo, including the
+   project's *own* CI workflow files to learn how it builds and tests, then
+   returns a structured proposal: port an existing upstream fix, author a
+   test-scaffolding fix, or refuse. Nothing about the test framework is
+   hardcoded, so the same engine works for any repo.
+4. **Select the verifier** (code) - code, not the AI, decides where the fix is
+   verified. It lists the jobs that actually failed in the linked run, requires
+   the AI's job hint to match one of them, and classifies that job's runner from
+   its workflow definition: an x86 Linux job verifies locally, a container job
+   verifies inside that image via Docker, a macOS job verifies on a macOS
+   runner. Anything it cannot classify safely (arm, self-hosted, dynamic) is
+   refused.
+5. **Verify + review** - apply the fix (edit-only AI; never weakens the
+   assertion under test), then verify with the selected backend:
+   - Linux/Docker: run the AI's targeted command in a **sanitized subprocess**
+     (scrubbed environment, locked working directory, timeout, output cap;
+     Docker adds no-network, dropped capabilities, non-root), where the real
+     exit code is the verdict. This path retries on failure.
+   - macOS: send the approved patch to a macOS runner the agent controls, which
+     checks out the PR head, applies the patch, and runs the command; its CI
+     conclusion is the verdict.
+   A skeptic review (read-only AI) judges whether the fix addresses the root
+   cause rather than silencing the symptom. A push requires both a passing
+   verification and an approving review.
+6. **Push** (code) - extracts only the approved patch, applies it in a fresh
+   trusted clone at the gated SHA, commits authored as the bot (no DCO
+   sign-off - a human must certify before merge), and pushes to the PR's own
+   `agent/backport/...` branch. The checkout that ran tests never receives
+   credentials. The PR's normal CI re-runs as the authoritative check. The bot
+   never merges.
+
+This is targeted verification of the one failing check, not a replay of the
+whole CI job. Every refusal posts a PR comment explaining why, with evidence,
+so when the bot can't safely fix something (a real product bug, a flaky test,
+an unverifiable environment), a maintainer can take over immediately.
+
+### Configuration
+
+Reuses the same secrets and OIDC role as the other workflows (see
+[Step 1](#step-1-configure-secrets-and-variables)). The workflow mints two
+short-lived App tokens:
+
+- On `valkey-io/valkey`: `members:read` (team authorization), `actions:read`
+  (run logs and failed-job listing), `contents:write` (push the fix),
+  `issues:write` (PR comments), `pull-requests:write` (PR metadata).
+- On `valkey-io/valkey-ci-agent`: `actions:write` (dispatch and read the
+  macOS verification workflow). Used only for the macOS backend.
+
 ## Safety
 
-- **Branch namespace** — the agent writes only `agent/backport/...` branches and opens PRs for maintainer review.
-- **Credential isolation** — all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
-- **Claude Code env isolation** — `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
-- **Deterministic validation** — registry-configured build commands run before push. A validation failure blocks the push.
-- **Fork sync** — when a different-owner `push_repo` is configured, the agent fast-forwards that fork's release branch to match upstream before cherry-picking
-- **Stale branch pruning** — if a previous backport PR was closed without merging, the agent deletes the orphaned branch before starting fresh
-- **DCO** — all agent commits are signed off
+- **Branch namespace** - the agent writes only `agent/backport/...` branches and opens PRs for maintainer review.
+- **Credential isolation** - all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
+- **Claude Code env isolation** - `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
+- **Deterministic validation** - registry-configured build commands run before push. A validation failure blocks the push.
+- **Fork sync** - when a different-owner `push_repo` is configured, the agent fast-forwards that fork's release branch to match upstream before cherry-picking
+- **Stale branch pruning** - if a previous backport PR was closed without merging, the agent deletes the orphaned branch before starting fresh
+- **DCO** - backport commits are signed off. ci_fix commits are authored by the bot without a sign-off, so a human certifies the change before merge.
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) — full system design including planned workflows
-- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup and code structure
+- [docs/architecture.md](docs/architecture.md) - full system design including planned workflows
+- [CONTRIBUTING.md](CONTRIBUTING.md) - development setup and code structure

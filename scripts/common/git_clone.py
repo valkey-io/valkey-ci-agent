@@ -9,14 +9,17 @@ injection. Returns ``True`` on success, ``False`` on any failure.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
 
+from scripts.common.proc import LOCKED_GIT_CONFIG, PROCESS_BASICS, filter_env
+
 logger = logging.getLogger(__name__)
 
-_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
-_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
+REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 _CLONE_TIMEOUT_S = 120
 _CHECKOUT_TIMEOUT_S = 30
@@ -31,16 +34,16 @@ def shallow_clone_at_sha(repo: str, dest: Path, sha: str | None = None) -> bool:
     ``--depth 1`` clone of the default branch.
 
     Returns True on success, False on any failure. Failures are logged at
-    warning level — callers are expected to keep going (e.g. tell their
+    warning level - callers are expected to keep going (e.g. tell their
     AI subprocess that source is unavailable) rather than abort.
 
     Inputs are validated to defend against argument injection into git:
     ``repo`` must match ``owner/name``, ``sha`` must match a hex commit hash.
     """
-    if not _REPO_RE.fullmatch(repo):
+    if not REPO_RE.fullmatch(repo):
         logger.warning("Refusing to clone unrecognized repo identifier: %r", repo)
         return False
-    if sha is not None and not _SHA_RE.fullmatch(sha):
+    if sha is not None and not SHA_RE.fullmatch(sha):
         logger.warning("Refusing to clone %s at non-SHA value: %r", repo, sha)
         return False
 
@@ -70,10 +73,20 @@ def shallow_clone_at_sha(repo: str, dest: Path, sha: str | None = None) -> bool:
 
 
 def _run(args: list[str], *, timeout: int, desc: str, cwd: Path | None = None) -> bool:
+    # The cloned tree is untrusted: a PR branch can carry .gitattributes filters
+    # or repo config that execute code on checkout. Run with hooks/credential
+    # helpers/external diff disabled, no system/global config, and a scrubbed
+    # environment (no GitHub token, no AWS credentials) so a checkout filter can
+    # neither run a credential helper nor read a secret from the environment.
+    git_args = [args[0], *LOCKED_GIT_CONFIG, *args[1:]] if args and args[0] == "git" else args
+    env = filter_env(PROCESS_BASICS)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         result = subprocess.run(
-            args, cwd=str(cwd) if cwd else None,
-            capture_output=True, text=True, timeout=timeout,
+            git_args, cwd=str(cwd) if cwd else None,
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
     except subprocess.TimeoutExpired:
         logger.warning("git %s timed out after %ds", desc, timeout)

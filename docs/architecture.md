@@ -1,8 +1,8 @@
 # Architecture
 
-The Valkey CI Agent runs scheduled workflows that act on Valkey repositories
-defined in the central `repos.yml` registry. Two workflows are active today:
-backports and fuzzer monitoring.
+The Valkey CI Agent runs workflows that act on Valkey repositories defined in
+the central `repos.yml` registry. Three workflows are active today: backports
+and fuzzer monitoring (scheduled), and the CI test-fix bot (on-demand).
 
 ## Layers
 
@@ -10,6 +10,7 @@ backports and fuzzer monitoring.
 scripts/
   backport/    Backport workflow
   fuzzer/      Fuzzer monitor workflow
+  ci_fix/      CI test-fix bot
   ai/          Claude Code subprocess orchestration
   common/      Shared infrastructure
 repos.yml      Registry of repos, release branches, and project boards
@@ -62,12 +63,12 @@ two never race for the same branch.
 
 ### Entry Points
 
-- `scripts/backport/sweep.py` — daily sweep across registered repos and release branches
-- `scripts/backport/poller.py` — short-cron poll that sweeps a branch only when no sweep PR is open
-- `scripts/backport/main.py` — single-PR backport (manual dispatch)
-- `scripts/backport/matrix.py` — GitHub Actions matrix generation from `repos.yml`
-- `scripts/backport/registry.py` — typed registry loader and validation
-- `scripts/backport/sweep_*.py` — focused sweep support modules:
+- `scripts/backport/sweep.py` - daily sweep across registered repos and release branches
+- `scripts/backport/poller.py` - short-cron poll that sweeps a branch only when no sweep PR is open
+- `scripts/backport/main.py` - single-PR backport (manual dispatch)
+- `scripts/backport/matrix.py` - GitHub Actions matrix generation from `repos.yml`
+- `scripts/backport/registry.py` - typed registry loader and validation
+- `scripts/backport/sweep_*.py` - focused sweep support modules:
   typed sweep results, Git workspace operations, GitHub PR operations,
   GraphQL access, validation command execution, and Markdown reporting
 
@@ -91,7 +92,7 @@ fuzzer/main.py (cron every 4 hours)
        fuzzer.issue_renderer.render_for(analysis) -> title/body/comment
 ```
 
-Claude is given `Read,Grep,Glob` only — no edits, no shell, no network. The
+Claude is given `Read,Grep,Glob` only - no edits, no shell, no network. The
 clones give Claude line-level access so it can grep for assertion text or
 crash handlers in `valkey/src/` to distinguish known-benign asserts from new
 crashes. If a clone fails, the prompt tells Claude not to cite source line
@@ -102,15 +103,94 @@ If the fuzzer run produced no artifact bundle the analyzer surfaces that
 as an error rather than triaging from raw logs.
 
 Unlike the backport flow, the fuzzer monitor never writes to `valkey-io/valkey`
-or `valkey-io/valkey-fuzzer` source — its only side effect is creating or
+or `valkey-io/valkey-fuzzer` source - its only side effect is creating or
 updating issues on `valkey-fuzzer`.
 
 ### Entry Points
 
-- `scripts/fuzzer/main.py` — CLI entry point (cron / manual dispatch)
-- `scripts/fuzzer/analyzer.py` — orchestration, deterministic scan, Claude Code integration
-- `scripts/fuzzer/issue_renderer.py` — fuzzer-specific title/body/comment rendering
-- `scripts/fuzzer/models.py` — typed dataclasses for the analysis pipeline
+- `scripts/fuzzer/main.py` - CLI entry point (cron / manual dispatch)
+- `scripts/fuzzer/analyzer.py` - orchestration, deterministic scan, Claude Code integration
+- `scripts/fuzzer/issue_renderer.py` - fuzzer-specific title/body/comment rendering
+- `scripts/fuzzer/models.py` - typed dataclasses for the analysis pipeline
+
+## CI Fix Flow
+
+On-demand, triggered by a maintainer commenting `@valkeyrie-bot fix <ci-link>`
+on a backport PR. Decoupled from the backport sweep; it shares only the
+common infrastructure.
+
+```text
+ci_fix/main.py (workflow_dispatch event)
+  -> gate.build_fix_request(...)        fail-closed auth (contributors team)
+                                        + SHA-bound run gating
+  -> pipeline.run_ci_fix(...)
+       verify.github_runs        -> list the jobs that actually failed (code,
+                                    not the AI, owns this)
+       common.workflow_artifacts -> download the failed run's logs
+       common.git_clone          -> shallow-clone the repo at the failed SHA
+       diagnose.diagnose_failure -> read-only AI returns a FixProposal
+                                    (port | author | refuse) + a failing-job hint
+       pipeline._plan_verification
+                                 -> code matches the hint to a real failed job
+                                    and classifies its workflow environment
+                                    (verify.workflow_env) into a VerificationPlan:
+                                    local | docker(image) | macos | refuse
+       local/docker:
+         review.run_fix_loop     -> apply (edit-only AI)
+                                    -> runner.run_verification_command (code runs
+                                       the AI command in a sanitized subprocess,
+                                       inside the job's container for docker;
+                                       exit code is the verdict)
+                                    -> build_and_review_patch (skeptic AI)
+                                    retry on feedback; needs pass AND approve
+       macos:
+         apply + build_and_review_patch, then
+         verify.macos.MacosVerifier -> dispatch the agent's verify-macos job,
+                                       wait, conclusion is the verdict
+       push.commit_and_push_fix  -> extract approved patch
+                                    -> apply in a fresh trusted clone
+                                    -> commit (no sign-off), push to the PR's own
+                                       agent/backport/... branch (never merge)
+  -> comment.render_comment(outcome) -> posted on the PR
+```
+
+The defining invariant is the AI/code split plus a hard checkout boundary: the
+AI proposes (which check failed, how to fix, a targeted command, a job hint,
+whether the fix is sound) and code disposes (selects the verifier environment
+from the real failed job, runs the command, owns pass/fail, performs the push).
+The AI never selects where verification runs, never executes a command, and
+never touches the remote. The checkout that runs untrusted test code never
+receives push credentials; publishing applies the approved patch in a fresh
+clone at the gated SHA. This is targeted verification of the one failing check,
+not a replay of the whole CI job.
+
+Nothing about the test framework is hardcoded. The diagnosis reads the target
+repo's own CI workflow files to learn how it builds and runs tests, so the
+same engine works for any repo with a comment-triggerable PR - not just Valkey
+core's Tcl suite.
+
+Every failure mode - un-runnable variant, a real product bug, a flaky test, a
+moved branch, a non-member commenter - returns a `FixOutcome` that becomes an
+explanatory PR comment rather than a silent failure or an unsafe push.
+
+### Entry Points
+
+- `scripts/ci_fix/main.py` - workflow_dispatch entry point; mints the target and agent-repo tokens
+- `scripts/ci_fix/gate.py` - command parsing, fail-closed team auth, SHA-bound run gating
+- `scripts/ci_fix/diagnose.py` - read-only AI diagnosis into a structured proposal (fix + job hint)
+- `scripts/ci_fix/apply.py` - edit-only AI fix application
+- `scripts/ci_fix/runner.py` - sanitized local/Docker command execution that owns the verdict
+- `scripts/ci_fix/review.py` - skeptic review, the apply/run/review loop, and the shared patch helpers
+- `scripts/ci_fix/push.py` - patch handoff, commit (no sign-off), namespace-restricted push
+- `scripts/ci_fix/comment.py` - render the outcome into a PR comment
+- `scripts/ci_fix/pipeline.py` - top-level orchestration; code-owned verifier selection
+- `scripts/ci_fix/models.py` - typed dataclasses for the pipeline
+- `scripts/ci_fix/verify/` - the verifier layer:
+  - `base.py` - VerifyEnv, FailedJob, VerificationPlan, VerificationResult, the VerifyBackend protocol
+  - `workflow_env.py` - classify a failed job's runner (x86 Linux / Docker / macOS / unsupported)
+  - `github_runs.py` - list the jobs that actually failed in a run (code-owned)
+  - `macos.py` - the macOS verifier: dispatch the verify-macos job and wait
+- `.github/workflows/ci-fix-verify-macos.yml` - the macOS verification job
 
 ## AI Layer
 
@@ -122,27 +202,34 @@ runtime.run_agent(profile, prompt, cwd=...)
 
 Profiles registered today:
 
-- `conflict_resolve_edit_only` — backport conflict resolution (Read/Edit/Bash, writes allowed)
-- `fuzzer_analysis_readonly` — fuzzer triage (Read/Grep/Glob only, no writes)
+- `conflict_resolve_edit_only` - backport conflict resolution (Read/Edit/Bash, writes allowed)
+- `fuzzer_analysis_readonly` - fuzzer triage (Read/Grep/Glob only, no writes)
+- `ci_fix_diagnose_readonly` - CI-fix diagnosis and skeptic review (Read/Grep/Glob only, no writes)
 
 ## Common Infrastructure
 
 Workflow-agnostic helpers in `scripts/common/`:
 
-- `git_auth.py` — GIT_ASKPASS credential helper
-- `github_client.py` — retry wrapper for GitHub API
-- `text_utils.py` — ANSI stripping for log scanning
-- `workflow_artifacts.py` — list and download GitHub Actions workflow runs
-  and their uploaded artifact bundles. Used by the fuzzer flow today; any
-  future workflow that needs to analyze recent runs of a target workflow
-  reuses it directly.
-- `git_clone.py` — `shallow_clone_at_sha(repo, dest, sha)` — defensive
+- `git_auth.py` - GIT_ASKPASS credential helper
+- `github_client.py` - retry wrapper for GitHub API
+- `text_utils.py` - ANSI stripping for log scanning
+- `workflow_artifacts.py` - list and download GitHub Actions workflow runs
+  and their uploaded artifact bundles, plus `download_run_logs(...)` for a
+  run's raw console logs. Used by the fuzzer flow (artifacts) and the CI-fix
+  flow (run logs).
+- `git_clone.py` - `shallow_clone_at_sha(repo, dest, sha)` - defensive
   shallow clone of a public repo at a specific commit, with input
-  validation against argument injection. Used by the fuzzer flow to give
-  Claude source access at the tested SHA.
-- `incidents.py` — `compute_fingerprint(namespace, shapes)` produces a stable
+  validation against argument injection. Gives the AI source access at the
+  tested SHA in both the fuzzer and CI-fix flows.
+- `proc.py` - `git_output(...)` (run a git command and return stdout) and
+  `filter_env(allowlist)` (the single place that turns an env allowlist into
+  a concrete, scrubbed subprocess environment).
+- `ai_output.py` - `extract_json_object(stdout, required_key=...)` parses a
+  structured verdict out of Claude Code's stream-json output. Shared by the
+  fuzzer and CI-fix flows.
+- `incidents.py` - `compute_fingerprint(namespace, shapes)` produces a stable
   hash over normalized anomaly shapes for issue deduplication.
-- `issue_dedup.py` — `IssueDedupPublisher` creates or updates a GitHub
+- `issue_dedup.py` - `IssueDedupPublisher` creates or updates a GitHub
   issue keyed by a fingerprint marker. Workflows supply the rendered title,
   body, and comment via a small `render(marker, occurrences) -> IssueContent`
   callback; the publisher owns the dedup machinery.
@@ -160,7 +247,9 @@ the normal deployment model.
 
 ## Planned Workflows
 
-Future sibling modules to `backport/` and `fuzzer/`:
+Future sibling modules and extensions:
 
-- **PR Reviewer** — two-stage code review with skeptic pass
-- **Daily CI Analysis** — detect flaky tests, generate fix PRs
+- **PR Reviewer** - two-stage code review with skeptic pass
+- **Autonomous CI-fix poller** - the CI-fix engine, driven by a poller that
+  detects red backport PRs (or test-failure issues) instead of a maintainer
+  `@`-mention. Same pipeline, a different front door.

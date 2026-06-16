@@ -21,6 +21,31 @@ def test_rejects_non_sha_value(tmp_path):
     assert not shallow_clone_at_sha("owner/name", tmp_path / "x", sha="--upload-pack=evil")
 
 
+def test_clone_runs_with_scrubbed_env_and_config_isolation(tmp_path, monkeypatch):
+    """The untrusted clone must not inherit secrets and must isolate git config."""
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("TARGET_TOKEN", "secret")
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["env"] = kwargs.get("env")
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _R()
+
+    with patch("scripts.common.git_clone.subprocess.run", side_effect=fake_run):
+        shallow_clone_at_sha("owner/name", tmp_path / "dest")
+    env = captured["env"]
+    assert env is not None
+    assert "GITHUB_TOKEN" not in env
+    assert "TARGET_TOKEN" not in env
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
 def test_default_branch_uses_depth_1(tmp_path):
     """Cloning without a SHA does a depth-1 clone of the default branch."""
     captured = {}
@@ -60,11 +85,14 @@ def test_sha_path_runs_clone_fetch_checkout(tmp_path):
     with patch("scripts.common.git_clone.subprocess.run", side_effect=fake_run):
         ok = shallow_clone_at_sha("owner/name", tmp_path / "dest", sha=sha)
     assert ok is True
-    assert calls[0][:2] == ["git", "clone"]
-    # The SHA clone must NOT be shallow — a depth-1 clone can't reach a
+    assert calls[0][0] == "git"
+    assert "clone" in calls[0]
+    # Hooks must be disabled on the untrusted checkout.
+    assert "core.hooksPath=/dev/null" in calls[0]
+    # The SHA clone must NOT be shallow - a depth-1 clone can't reach a
     # non-tip commit since GitHub refuses fetching arbitrary SHAs.
     assert "--depth" not in calls[0]
-    assert calls[1][:2] == ["git", "checkout"]
+    assert "checkout" in calls[1]
     assert len(calls) == 2
 
 

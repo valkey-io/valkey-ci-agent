@@ -10,6 +10,8 @@ import subprocess
 import threading
 from typing import Any
 
+from scripts.common.proc import filter_env
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CLAUDE_MODEL = "opus"
@@ -65,7 +67,7 @@ def run_claude_code(
     # Resolve once here so the env-var override (CI_AGENT_CLAUDE_MODEL)
     # always wins, regardless of whether the caller pre-resolved.
     # runtime.run_agent intentionally calls _resolve_claude_model too so
-    # it can capture the resolved value in the audit record — the two
+    # it can capture the resolved value in the audit record - the two
     # calls are idempotent by design (override wins each time).
     resolved_model = _resolve_claude_model(model)
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = _resolve_bedrock_opus_model()
@@ -87,6 +89,11 @@ def run_claude_code(
         # is already hardened (GitHub tokens stripped, AWS-only) and runs in
         # throwaway checkouts.
         "--dangerously-skip-permissions",
+        # cwd is an untrusted checkout, so ignore any .mcp.json it carries:
+        # --tools gates the model's tools but not an MCP server the project
+        # config could otherwise auto-register into this AWS-credentialed
+        # subprocess.
+        "--strict-mcp-config",
         "--output-format", "stream-json",
         "--verbose",
     ]
@@ -160,11 +167,7 @@ def _build_claude_env(env_allowlist: tuple[str, ...] | None = None) -> dict[str,
     by the Bedrock provider.
     """
     allowed = set(env_allowlist or DEFAULT_CLAUDE_ENV_ALLOWLIST)
-    env = {
-        name: value
-        for name, value in os.environ.items()
-        if name in allowed and value
-    }
+    env = filter_env(tuple(allowed))
     env["CLAUDE_CODE_USE_BEDROCK"] = "1"
     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = _resolve_bedrock_opus_model()
     return env

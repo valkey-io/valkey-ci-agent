@@ -20,6 +20,7 @@ AgentProfileName = Literal[
     "conflict_resolve_edit_only",
     "validation_repair_edit_only",
     "fuzzer_analysis_readonly",
+    "ci_fix_diagnose_readonly",
 ]
 
 
@@ -82,6 +83,18 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         timeout=1200,
         effort="max",
         max_turns=200,
+        writes_allowed=False,
+        output_schema="text",
+    ),
+    "ci_fix_diagnose_readonly": AgentProfile(
+        name="ci_fix_diagnose_readonly",
+        allowed_tools="Read,Grep,Glob",
+        timeout=3600,
+        # Diagnosis is "read a log + a test, decide" - not an open-ended
+        # investigation. A bounded turn budget forces the agent to commit to a
+        # conclusion instead of re-verifying it indefinitely.
+        effort="high",
+        max_turns=40,
         writes_allowed=False,
         output_schema="text",
     ),
