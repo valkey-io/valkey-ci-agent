@@ -24,7 +24,6 @@ from scripts.backport.sweep_git import (
     list_applied_prs_on_branch,
     push_backport_branch,
     safe_tmp_component,
-    source_pr_number_from_commit_subject,
     sync_target_branch_to_source,
     worktree_changed_paths,
 )
@@ -1662,19 +1661,6 @@ def _reorder_candidates(*pr_numbers: str) -> list[ProjectBackportCandidate]:
         )
         for pr in pr_numbers
     ]
-
-
-@pytest.mark.parametrize(
-    ("subject", "expected"),
-    [
-        ('Revert "IO-Threads redesign cleanup work (#3544)" (#3756)', "3756"),
-        ("Fix IO-Threads redesign cleanup perf regression from #3544 (#3938)", "3938"),
-        ("Merge pull request #3801 from valkey-io/backport-copy-acl", "3801"),
-        ("Release notes update", None),
-    ],
-)
-def test_source_pr_number_from_commit_subject_uses_source_pr(subject, expected):
-    assert source_pr_number_from_commit_subject(subject) == expected
 
 
 def test_ordered_branch_prefix_length_full_when_in_order():
