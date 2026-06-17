@@ -248,12 +248,16 @@ owns every verdict.** The AI never runs a command and never pushes.
    verifies inside that image via Docker, a macOS job verifies on a macOS
    runner. Anything it cannot classify safely (arm, self-hosted, dynamic) is
    refused.
-5. **Verify + review** - apply the fix (edit-only AI; never weakens the
-   assertion under test), then verify with the selected backend:
+5. **Verify + review** - before fixing anything, the failure must **reproduce**
+   on the clean checkout; a failure that does not reproduce is treated as flaky
+   or environment-specific and refused. Then apply the fix (edit-only AI; never
+   weakens the assertion under test) and verify with the selected backend:
    - Linux/Docker: run the AI's targeted command in a **sanitized subprocess**
      (scrubbed environment, locked working directory, timeout, output cap;
      Docker adds no-network, dropped capabilities, non-root), where the real
-     exit code is the verdict. This path retries on failure.
+     exit code is the verdict. The build runs once and the verify command must
+     pass **K times in a row** (default 2) so a single flaky-green run cannot
+     gate a push. This path retries on failure.
    - macOS: send the approved patch to a macOS runner the agent controls, which
      checks out the PR head, applies the patch, and runs the command; its CI
      conclusion is the verdict.
@@ -283,6 +287,11 @@ short-lived App tokens:
   `issues:write` (PR comments), `pull-requests:write` (PR metadata).
 - On `valkey-io/valkey-ci-agent`: `actions:write` (dispatch and read the
   macOS verification workflow). Used only for the macOS backend.
+
+Optional tuning: `CI_FIX_VERIFY_RUNS` sets how many times a fix must pass the
+verify command before it is trusted (default 2). The build runs once regardless,
+so raising it only repeats the verify step. Applies to the Linux/Docker
+backends; macOS verification runs once on its dedicated runner.
 
 ## Safety
 

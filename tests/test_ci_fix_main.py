@@ -136,3 +136,21 @@ def test_main_unexpected_error_still_posts_comment(tmp_path, monkeypatch):
     assert "internal error" in posted["body"].lower()
     # The raw exception text must not leak into the public comment.
     assert "boom" not in posted["body"]
+
+
+def test_verify_runs_env_parsing(monkeypatch):
+    """CI_FIX_VERIFY_RUNS controls K; bad/unset values fall back to the default."""
+    from scripts.ci_fix.main import _verify_runs
+    from scripts.ci_fix.review import DEFAULT_VERIFY_RUNS
+
+    monkeypatch.delenv("CI_FIX_VERIFY_RUNS", raising=False)
+    assert _verify_runs() == DEFAULT_VERIFY_RUNS
+
+    monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "5")
+    assert _verify_runs() == 5
+
+    monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "0")
+    assert _verify_runs() == 1            # clamped to at least one run
+
+    monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "not-a-number")
+    assert _verify_runs() == DEFAULT_VERIFY_RUNS

@@ -33,6 +33,7 @@ from scripts.ci_fix.models import (
 )
 from scripts.ci_fix.push import PushRefused, commit_and_push_fix
 from scripts.ci_fix.review import (
+    DEFAULT_VERIFY_RUNS,
     LoopResult,
     build_and_review_patch,
     combined_command,
@@ -69,6 +70,7 @@ def run_ci_fix(
     artifact_client: ArtifactClient,
     org: str = "valkey-io",
     auth_team: str = "contributors",
+    verify_runs: int = DEFAULT_VERIFY_RUNS,
     diagnose_func: Diagnose = diagnose_failure,
     run_loop_func: RunLoop = run_fix_loop,
     push_func: Push = commit_and_push_fix,
@@ -89,7 +91,7 @@ def run_ci_fix(
             Path(workdir_str), request, failed_jobs,
             artifact_client=artifact_client, git_env=git_env,
             diagnose_func=diagnose_func, run_loop_func=run_loop_func, push_func=push_func,
-            macos_verifier=macos_verifier,
+            macos_verifier=macos_verifier, verify_runs=verify_runs,
         )
     run_url = f"https://github.com/{request.repo_full_name}/actions/runs/{request.run_id}"
     return replace(outcome, failing_run_url=run_url)
@@ -106,6 +108,7 @@ def _run_in_workspace(
     run_loop_func: RunLoop,
     push_func: Push,
     macos_verifier: VerifyBackend | None,
+    verify_runs: int,
 ) -> FixOutcome:
     logs = artifact_client.download_run_logs(request.repo_full_name, request.run_id)
     if not logs:
@@ -138,6 +141,7 @@ def _run_in_workspace(
     return _loop_and_push(
         repo_dir, request, proposal, plan,
         run_loop_func=run_loop_func, git_env=git_env, push_func=push_func,
+        verify_runs=verify_runs,
     )
 
 
@@ -177,9 +181,12 @@ def _plan_verification(
 def _loop_and_push(
     repo_dir: Path, request: FixRequest, proposal: FixProposal, plan: VerificationPlan,
     *, run_loop_func: RunLoop, git_env: dict[str, str], push_func: Push,
+    verify_runs: int,
 ) -> FixOutcome:
     """Local/Docker: apply, verify in-loop (retry on fail), review, push on green."""
-    loop = run_loop_func(str(repo_dir), proposal, container_image=plan.image)
+    loop = run_loop_func(
+        str(repo_dir), proposal, container_image=plan.image, verify_runs=verify_runs,
+    )
     if not loop.success:
         return FixOutcome(
             kind=OutcomeKind.REFUSED, summary=loop.detail, proposal=proposal,
