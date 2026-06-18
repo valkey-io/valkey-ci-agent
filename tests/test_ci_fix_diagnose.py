@@ -187,3 +187,33 @@ def test_refuse_proposal_clears_actionable_fields(monkeypatch):
     assert p.path is FixPath.REFUSE
     assert p.build_command == "" and p.verify_command == ""
     assert p.workdir == "" and p.unstable_fix_commit == "" and p.failing_job_hint == ""
+
+
+def test_max_turns_exhaustion_refuses_gracefully(monkeypatch):
+    """A diagnosis that runs out of turns must refuse, not raise, and carry its
+    partial findings into the reason for the PR comment."""
+    import json as _json
+
+    from scripts.ci_fix.models import FixPath
+
+    stream = "\n".join([
+        _json.dumps({"type": "assistant", "text": "Tracing the reqres desync in the validator."}),
+        _json.dumps({"type": "result", "subtype": "error_max_turns",
+                     "result": "Found a parser desync but ran out of turns."}),
+    ])
+    _mock_agent(monkeypatch, stream, returncode=1)
+    proposal = diagnose_failure("/logs", "/repo")
+    assert proposal.path is FixPath.REFUSE
+    assert "investigation budget" in proposal.reasoning
+    assert "parser desync" in proposal.reasoning  # partial findings surfaced
+
+
+def test_genuine_agent_failure_still_raises(monkeypatch):
+    """A nonzero exit without the turn-exhaustion marker is a real failure."""
+    _mock_agent(monkeypatch, "some crash output", returncode=1)
+    try:
+        diagnose_failure("/logs", "/repo")
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised

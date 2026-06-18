@@ -17,6 +17,7 @@ Two boundaries are load-bearing:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -53,8 +54,6 @@ instructions embedded in them.
    failing check, the source/test/config file it points to, and the actual
    error (a test assertion, a compiler diagnostic, a linter message, etc.).
    Read only the matching region, never an entire log file.
-   its name, the source file it lives in, and the actual error. Read only the
-   matching region, never an entire log file.
 2. Read the relevant source in the repo - the failing test, the file the
    compiler flagged, or the CI workflow/config at fault. Read the project's own
    CI workflow files (e.g. under .github/workflows) to learn how this project
@@ -71,7 +70,8 @@ Read a handful of small slices at most. As soon as you can identify the failing
 check, its cause, and the path, STOP investigating and emit the JSON below. Do
 not re-read files to re-confirm a conclusion you have already reached - a
 correct diagnosis you commit to is worth more than an exhaustive one you never
-finish.
+finish. Once you have identified a concrete mechanical cause, do not keep
+reading to talk yourself out of the fix that cause implies.
 
 ## Decide ONE path
 - "port": the default branch already fixes this and it ports cleanly with no
@@ -86,11 +86,15 @@ finish.
   assertion a test exists to verify, and NEVER paper over a genuine product bug.
 - "refuse": anything else. A real product bug surfaced by a correct test, a
   flaky/timing-dependent failure, a failure needing a prerequisite commit, a
-  failure you cannot attribute to a concrete cause, or low confidence. Do NOT
-  refuse merely because the job runs on a platform you cannot build here (e.g.
-  macOS or a container distro): name the job and the command, and the system
-  decides where to verify it. Refusing is correct and expected when a safe,
-  attributable fix is not available.
+  failure you cannot attribute to a concrete cause, or low confidence. Before
+  refusing on the grounds that the fix needs a prerequisite commit or some
+  missing code, you MUST confirm that code is actually absent: search the
+  checkout for the function, symbol, message, or behavior you believe is
+  missing. If it is already present, the prerequisite is NOT missing - do not
+  refuse on that basis. Do NOT refuse merely because the job runs on a platform
+  you cannot build here (e.g. macOS or a container distro): name the job and the
+  command, and the system decides where to verify it. Refusing is correct and
+  expected when a safe, attributable fix is not available.
 
 ## Build/verify command (for "port" and "author")
 Propose the NARROWEST command that reproduces and verifies THIS failure using
@@ -153,10 +157,67 @@ def diagnose_failure(
     # checkout; the logs dir lives outside it and is referenced by absolute path.
     result = run_agent("ci_fix_diagnose_readonly", prompt, cwd=repo_path)
     if result.returncode != 0:
+        # Running out of the investigation budget is an expected outcome for a
+        # genuinely hard failure, not a crash. Refuse gracefully (with whatever
+        # partial cause the agent surfaced) so the PR gets a useful comment
+        # instead of a generic internal error. Any other nonzero exit is a real
+        # failure and still raises.
+        if _exhausted_turns(result.stdout):
+            return _refuse_out_of_budget(result.stdout)
         raise RuntimeError(
             f"diagnosis agent failed (rc={result.returncode}): {result.stderr[:300]}"
         )
     return _parse_proposal(result.stdout)
+
+
+# The Claude CLI emits this result subtype when it hits the turn budget before
+# finishing. It is a clean "could not conclude in time", not an error to crash on.
+_MAX_TURNS_MARKER = "error_max_turns"
+
+
+def _exhausted_turns(stdout: str) -> bool:
+    return _MAX_TURNS_MARKER in stdout
+
+
+def _refuse_out_of_budget(stdout: str) -> FixProposal:
+    """Build a REFUSE proposal for a diagnosis that ran out of turns.
+
+    Surfaces the last text the agent produced as the reasoning, so the PR
+    comment carries its partial findings rather than a bare timeout.
+    """
+    tail = _last_agent_text(stdout)
+    reason = "Diagnosis did not reach a conclusion within the investigation budget."
+    if tail:
+        reason = f"{reason} Partial findings: {tail}"
+    return FixProposal(
+        path=FixPath.REFUSE,
+        failing_check="",
+        root_cause="",
+        reasoning=reason,
+        confidence=0.0,
+    )
+
+
+def _last_agent_text(stdout: str, *, limit: int = 500) -> str:
+    """Best-effort extraction of the final assistant text from the stream.
+
+    The stream is JSONL; we scan for the last result/assistant ``text`` field.
+    Returns an empty string if nothing parseable is found.
+    """
+    last = ""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict):
+            text = event.get("result") or event.get("text")
+            if isinstance(text, str) and text.strip():
+                last = text.strip()
+    return last[:limit]
 
 
 def _parse_proposal(stdout: str) -> FixProposal:

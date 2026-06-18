@@ -90,11 +90,13 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="ci_fix_diagnose_readonly",
         allowed_tools="Read,Grep,Glob",
         timeout=3600,
-        # Diagnosis is "read a log + a test, decide" - not an open-ended
-        # investigation. A bounded turn budget forces the agent to commit to a
-        # conclusion instead of re-verifying it indefinitely.
+        # Read-only investigation budget, matching the analogous
+        # fuzzer_analysis_readonly profile. Hard failures (a protocol desync, a
+        # multi-file backport) need room to trace the cause; the prompt's "be
+        # decisive" guidance, not a tight turn cap, is what keeps it from
+        # re-verifying a conclusion it already reached.
         effort="high",
-        max_turns=40,
+        max_turns=200,
         writes_allowed=False,
         output_schema="text",
     ),
