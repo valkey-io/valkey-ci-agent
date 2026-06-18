@@ -30,8 +30,8 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     """Stable dedup key for a failure: a hash of test name + file.
 
     The identity is still ``test_name`` + ``test_file``, hashed via
-    :func:`scripts.common.incidents.compute_fingerprint`, mirroring the 
-    fuzzer pipeline. Hashing yields a fixed-shape hex token that is safe in 
+    :func:`scripts.common.incidents.compute_fingerprint`, mirroring the
+    fuzzer pipeline. Hashing yields a fixed-shape hex token that is safe in
     both places.
 
     The name/file pair is the *identity*, so it goes in ``namespace`` (joined
