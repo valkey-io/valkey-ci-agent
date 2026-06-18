@@ -248,8 +248,10 @@ owns every verdict.** The AI never runs a command and never pushes.
    verifies inside that image via Docker, a macOS job verifies on a macOS
    runner. Anything it cannot classify safely (arm, self-hosted, dynamic) is
    refused.
-5. **Verify + review** - apply the fix (edit-only AI; never weakens the
-   assertion under test), then verify with the selected backend:
+5. **Verify + review** - the verification policy depends on the fix path:
+   - PORT: when the fix is an existing default-branch commit that cherry-picks
+     cleanly, the bot may push the port and rely on this PR's normal CI as the
+     authority. This exception is limited to already-merged upstream fixes.
    - Linux/Docker: run the AI's targeted command in a **sanitized subprocess**
      (scrubbed environment, locked working directory, timeout, output cap;
      Docker adds no-network, dropped capabilities, non-root), where the real

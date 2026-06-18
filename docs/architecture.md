@@ -130,11 +130,18 @@ ci_fix/main.py (workflow_dispatch event)
        common.git_clone          -> shallow-clone the repo at the failed SHA
        diagnose.diagnose_failure -> read-only AI returns a FixProposal
                                     (port | author | refuse) + a failing-job hint
+       port_discovery            -> code-discovered default-branch candidates
+                                    are fed into diagnosis so missing backports
+                                    are preferred over refusals
        pipeline._plan_verification
                                  -> code matches the hint to a real failed job
                                     and classifies its workflow environment
                                     (verify.workflow_env) into a VerificationPlan:
                                     local | docker(image) | macos | refuse
+       port:
+         apply.apply_port_commit -> cherry-pick the upstream fix commit without
+                                    committing; push and rely on this PR's
+                                    normal CI as the verification authority
        local/docker:
          review.run_fix_loop     -> apply (edit-only AI)
                                     -> runner.run_verification_command (code runs

@@ -30,8 +30,10 @@ from scripts.ci_fix.models import (
     FixProposal,
     FixRequest,
     OutcomeKind,
+    ReviewVerdict,
 )
-from scripts.ci_fix.push import PushRefused, commit_and_push_fix
+from scripts.ci_fix.port_discovery import discover_port_candidates
+from scripts.ci_fix.push import PushRefused, commit_and_push_fix, commit_and_push_port
 from scripts.ci_fix.review import (
     LoopResult,
     build_and_review_patch,
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 Diagnose = Callable[..., FixProposal]
 RunLoop = Callable[..., LoopResult]
 Push = Callable[..., str]
+PortPush = Callable[..., str]
 
 
 def run_ci_fix(
@@ -72,6 +75,7 @@ def run_ci_fix(
     diagnose_func: Diagnose = diagnose_failure,
     run_loop_func: RunLoop = run_fix_loop,
     push_func: Push = commit_and_push_fix,
+    port_push_func: PortPush = commit_and_push_port,
     macos_verifier: VerifyBackend | None = None,
 ) -> FixOutcome:
     """Run the whole pipeline and return a terminal ``FixOutcome``."""
@@ -89,7 +93,7 @@ def run_ci_fix(
             Path(workdir_str), request, failed_jobs,
             artifact_client=artifact_client, git_env=git_env,
             diagnose_func=diagnose_func, run_loop_func=run_loop_func, push_func=push_func,
-            macos_verifier=macos_verifier,
+            port_push_func=port_push_func, macos_verifier=macos_verifier,
         )
     run_url = f"https://github.com/{request.repo_full_name}/actions/runs/{request.run_id}"
     return replace(outcome, failing_run_url=run_url)
@@ -105,6 +109,7 @@ def _run_in_workspace(
     diagnose_func: Diagnose,
     run_loop_func: RunLoop,
     push_func: Push,
+    port_push_func: PortPush,
     macos_verifier: VerifyBackend | None,
 ) -> FixOutcome:
     logs = artifact_client.download_run_logs(request.repo_full_name, request.run_id)
@@ -122,9 +127,19 @@ def _run_in_workspace(
             summary=f"Could not clone {request.repo_full_name} at {request.head_sha[:12]}.",
         )
 
-    proposal = diagnose_func(str(logs_dir), str(repo_dir), hint=request.hint)
+    port_candidates = discover_port_candidates(str(repo_dir), str(logs_dir))
+    proposal = diagnose_func(
+        str(logs_dir), str(repo_dir), hint=request.hint,
+        port_candidates=port_candidates,
+    )
     if proposal.path is FixPath.REFUSE:
         return _refuse(proposal, proposal.reasoning or "No safe fix found.")
+
+    if proposal.path is FixPath.PORT:
+        return _port_and_push(
+            repo_dir, request, proposal, failed_jobs, git_env=git_env,
+            port_push_func=port_push_func,
+        )
 
     plan = _plan_verification(repo_dir, request, proposal, failed_jobs)
     if isinstance(plan, str):  # a refusal reason
@@ -191,6 +206,56 @@ def _loop_and_push(
         repo_dir, request, proposal, loop.changed_paths,
         review=loop.review, run_result=loop.run_result,
         verify_backend=backend, git_env=git_env, push_func=push_func,
+    )
+
+
+def _port_and_push(
+    repo_dir: Path, request: FixRequest, proposal: FixProposal, failed_jobs: tuple[str, ...],
+    *, git_env: dict[str, str], port_push_func: PortPush = commit_and_push_port,
+) -> FixOutcome:
+    """Apply an already-merged upstream fix and publish it.
+
+    PORT is the only path allowed to rely on the PR's normal CI as the
+    authoritative verifier. Code still requires the hinted job to be a real
+    failed job and requires the upstream commit to cherry-pick cleanly, with the
+    original authorship preserved.
+    """
+    job = _match_failed_job(proposal.failing_job_hint, failed_jobs)
+    if job is None:
+        return _refuse(
+            proposal,
+            f"The named job {proposal.failing_job_hint or '(none)'!r} is not among the failed "
+            f"jobs of the linked run ({', '.join(failed_jobs) or 'none found'}); "
+            "refusing rather than porting a fix for a job that did not fail.",
+        )
+    if not proposal.unstable_fix_commit.strip():
+        return _refuse(proposal, "diagnosis chose PORT but did not name an upstream fix commit")
+
+    try:
+        commit_sha = port_push_func(
+            str(repo_dir),
+            head_repo_full_name=request.head_repo_full_name,
+            head_branch=request.head_branch,
+            head_sha=request.head_sha,
+            unstable_fix_commit=proposal.unstable_fix_commit,
+            git_env=git_env,
+        )
+    except PushRefused as exc:
+        return _refuse(proposal, str(exc))
+
+    review = ReviewVerdict(
+        approved=True,
+        reasoning=(
+            f"Ported upstream commit {proposal.unstable_fix_commit[:12]} with its original "
+            "authorship; this PORT path relies on the PR's normal CI as the verification authority."
+        ),
+    )
+    return FixOutcome(
+        kind=OutcomeKind.PUSHED,
+        summary=f"Ported upstream fix for {proposal.failing_check}",
+        proposal=proposal, review=review, commit_sha=commit_sha,
+        verify_backend="upstream-port",
+        other_failing_checks=proposal.other_failing_checks,
     )
 
 

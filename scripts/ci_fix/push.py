@@ -108,6 +108,60 @@ def commit_and_push_fix(
         return git_output(str(clean_repo), "rev-parse", "HEAD").strip()
 
 
+def commit_and_push_port(
+    repo_dir: str,
+    *,
+    head_repo_full_name: str,
+    head_branch: str,
+    head_sha: str,
+    unstable_fix_commit: str,
+    git_env: dict[str, str],
+) -> str:
+    """Cherry-pick an existing upstream fix onto the PR branch and push it.
+
+    Unlike an authored fix, a PORT carries an already-merged upstream commit, so
+    we preserve its original authorship and add the standard ``cherry picked
+    from`` trailer rather than re-authoring it as the bot. The same push
+    discipline applies: namespaced branch, validated repo/SHA, fast-forward-only
+    push from a fresh clone. A conflicting or empty cherry-pick, or any git
+    failure, becomes ``PushRefused`` so the outcome is always a comment.
+    """
+    if not head_branch.startswith(ALLOWED_BRANCH_PREFIX):
+        raise PushRefused(
+            f"Refusing to push to {head_branch!r}: ci_fix only pushes to branches "
+            f"under {ALLOWED_BRANCH_PREFIX}."
+        )
+    if not REPO_RE.fullmatch(head_repo_full_name):
+        raise PushRefused(f"Refusing to push to malformed repo {head_repo_full_name!r}.")
+    if not SHA_RE.fullmatch(head_sha):
+        raise PushRefused(f"Refusing to push from malformed head SHA {head_sha!r}.")
+    if not SHA_RE.fullmatch(unstable_fix_commit):
+        raise PushRefused(f"Refusing to port malformed commit {unstable_fix_commit!r}.")
+    if not _is_valid_branch_name(head_branch):
+        raise PushRefused(f"Refusing to push to malformed branch {head_branch!r}.")
+
+    with tempfile.TemporaryDirectory(prefix="ci-fix-port-") as tmpdir:
+        clean_repo = Path(tmpdir) / "repo"
+        _clone_clean(head_repo_full_name, clean_repo)
+        try:
+            # The fix commit lives on the default branch and may not be in the
+            # blobless clone yet; fetch the exact object before picking.
+            run_git(str(clean_repo), "fetch", "origin", unstable_fix_commit)
+            run_git(str(clean_repo), "checkout", head_sha)
+            run_git(str(clean_repo), "checkout", "-B", head_branch)
+            # -x records "cherry picked from commit <sha>"; the commit keeps the
+            # original author and their sign-off, not the bot's.
+            run_git(str(clean_repo), "cherry-pick", "-x", unstable_fix_commit)
+
+            run_git(str(clean_repo), "remote", "set-url", "origin", github_https_url(head_repo_full_name))
+            run_git(str(clean_repo), "push", "origin", f"HEAD:{head_branch}", env=git_env)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or str(exc)).strip()[:300]
+            raise PushRefused(f"Refusing to push: git failed: {detail}") from exc
+
+        return git_output(str(clean_repo), "rev-parse", "HEAD").strip()
+
+
 def _clone_clean(head_repo_full_name: str, dest: Path) -> None:
     url = github_https_url(head_repo_full_name)
     try:

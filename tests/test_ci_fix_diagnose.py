@@ -16,6 +16,7 @@ import pytest
 from scripts.ci_fix import diagnose as diagnose_mod
 from scripts.ci_fix.diagnose import diagnose_failure, write_logs_to_workspace
 from scripts.ci_fix.models import FixPath
+from scripts.ci_fix.port_discovery import PortCandidate
 
 
 def _stream_json_result(obj: dict) -> str:
@@ -144,6 +145,32 @@ def test_hint_is_included_in_prompt(monkeypatch):
     diagnose_failure("/tmp/ci.log", "/tmp/repo", hint="look at the valgrind timeout")
     assert "valgrind timeout" in captured["prompt"]
     assert "Maintainer hint" in captured["prompt"]
+
+
+def test_port_candidates_are_included_in_prompt(monkeypatch):
+    captured = {}
+
+    def fake_run_agent(profile, prompt, **kwargs):
+        captured["prompt"] = prompt
+        return MagicMock(
+            stdout=_stream_json_result({"path": "refuse", "confidence": 0.0}),
+            stderr="", returncode=0,
+        )
+
+    monkeypatch.setattr(diagnose_mod, "run_agent", fake_run_agent)
+    diagnose_failure(
+        "/tmp/ci.log", "/tmp/repo",
+        port_candidates=(
+            PortCandidate(
+                sha="9f374e15848d7b070cdd58a071a741c0a59a6c75",
+                subject="Skips the internal clients from logresreq checks (#3154)",
+                paths=("src/logreqres.c",),
+            ),
+        ),
+    )
+    assert "Default-branch candidate fixes" in captured["prompt"]
+    assert "9f374e15848d" in captured["prompt"]
+    assert "src/logreqres.c" in captured["prompt"]
 
 
 def test_long_hint_is_truncated(monkeypatch):

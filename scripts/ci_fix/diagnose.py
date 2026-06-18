@@ -24,6 +24,7 @@ from typing import Any
 
 from scripts.ai.runtime import run_agent
 from scripts.ci_fix.models import FixPath, FixProposal
+from scripts.ci_fix.port_discovery import PortCandidate, format_port_candidates
 from scripts.common.ai_output import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,7 @@ express a command that reproduces and verifies the failure at all, choose
 "refuse".
 
 {hint_block}
+{port_candidates_block}
 ## Output
 Return ONLY a single JSON object, no markdown:
 {{
@@ -132,6 +134,7 @@ def diagnose_failure(
     repo_path: str,
     *,
     hint: str = "",
+    port_candidates: tuple[PortCandidate, ...] = (),
 ) -> FixProposal:
     """Run the read-only diagnosis and return a structured proposal.
 
@@ -152,6 +155,7 @@ def diagnose_failure(
         logs_dir=logs_dir,
         repo_path=repo_path,
         hint_block=hint_block,
+        port_candidates_block=format_port_candidates(port_candidates),
     )
     # cwd is the repo so Read/Grep/Glob resolve relative paths against the
     # checkout; the logs dir lives outside it and is referenced by absolute path.

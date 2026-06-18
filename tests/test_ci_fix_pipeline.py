@@ -217,6 +217,20 @@ def test_render_pushed_surfaces_target_check_and_run_link():
     assert "actions/runs/9" in body
 
 
+def test_render_port_comment_uses_pr_ci_as_authority():
+    outcome = FixOutcome(
+        kind=OutcomeKind.PUSHED, summary="pushed",
+        proposal=_proposal(FixPath.PORT),
+        review=ReviewVerdict(approved=True, reasoning="Ported upstream commit 9f374e15848d"),
+        commit_sha="abcdef1234567890",
+        verify_backend="upstream-port",
+    )
+    body = render_comment(outcome)
+    assert "ported upstream fix" in body
+    assert "normal CI is the verification authority" in body
+    assert "Targeted verification" not in body
+
+
 def test_render_pushed_comment_escapes_backticks_in_output():
     # Untrusted output containing a code fence must not break out of the block.
     malicious = RunResult(
@@ -303,6 +317,7 @@ def _run_pipeline(monkeypatch, **overrides):
         diagnose_func=overrides.get("diagnose", lambda *a, **k: _proposal()),
         run_loop_func=overrides.get("loop", lambda *a, **k: _loop_success()),
         push_func=overrides.get("push", lambda *a, **k: "deadbeef" * 5),
+        port_push_func=overrides.get("port_push", lambda *a, **k: "deadbeef" * 5),
     )
 
 
@@ -361,6 +376,44 @@ def test_pipeline_loop_failure(monkeypatch):
     outcome = _run_pipeline(monkeypatch, loop=lambda *a, **k: _loop_failure())
     assert outcome.kind is OutcomeKind.REFUSED
     assert "still failing" in outcome.summary
+
+
+def test_pipeline_port_cherry_pick_pushes_without_local_verify(monkeypatch):
+    loop = MagicMock(side_effect=AssertionError("PORT must not run local verifier"))
+    classify = MagicMock(side_effect=AssertionError("PORT does not need env classification"))
+    proposal = _proposal(FixPath.PORT).__class__(
+        **{**_proposal(FixPath.PORT).__dict__, "unstable_fix_commit": "9f374e15848d"}
+    )
+    ported = MagicMock(return_value="abc123" * 6)
+
+    outcome = _run_pipeline(
+        monkeypatch, diagnose=lambda *a, **k: proposal,
+        loop=loop, classify=classify, port_push=ported,
+    )
+
+    assert outcome.kind is OutcomeKind.PUSHED
+    assert outcome.verify_backend == "upstream-port"
+    assert outcome.review is not None
+    assert "Ported upstream commit" in outcome.review.reasoning
+    # the port push got the upstream commit, not an extracted patch
+    assert ported.call_args.kwargs["unstable_fix_commit"] == "9f374e15848d"
+    loop.assert_not_called()
+    classify.assert_not_called()
+
+
+def test_pipeline_port_conflict_refuses(monkeypatch):
+    proposal = _proposal(FixPath.PORT).__class__(
+        **{**_proposal(FixPath.PORT).__dict__, "unstable_fix_commit": "9f374e15848d"}
+    )
+
+    def refuse(*_a, **_k):
+        raise PushRefused("upstream fix did not cherry-pick cleanly: conflict")
+
+    outcome = _run_pipeline(
+        monkeypatch, diagnose=lambda *a, **k: proposal, port_push=refuse,
+    )
+    assert outcome.kind is OutcomeKind.REFUSED
+    assert "cherry-pick" in outcome.summary
 
 
 def test_pipeline_push_refused(monkeypatch):

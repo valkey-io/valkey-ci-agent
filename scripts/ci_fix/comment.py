@@ -73,10 +73,16 @@ def _render_pushed(outcome: FixOutcome) -> str:
     if review is not None and review.reasoning:
         lines += [f"**Review:** {review.reasoning}", ""]
     lines += _remaining_checks(outcome)
-    lines.append(
-        "_The fix passed targeted verification of the failing check; this PR's "
-        "full CI will confirm. I do not merge._"
-    )
+    if outcome.verify_backend == "upstream-port":
+        lines.append(
+            "_This is a port of an upstream fix; this PR's normal CI is the "
+            "verification authority. I do not merge._"
+        )
+    else:
+        lines.append(
+            "_The fix passed targeted verification of the failing check; this PR's "
+            "full CI will confirm. I do not merge._"
+        )
     return "\n".join(lines)
 
 
@@ -114,6 +120,8 @@ def _backend_label(outcome: FixOutcome) -> str:
     if backend == "macos":
         run = f" ([run]({outcome.macos_run_url}))" if outcome.macos_run_url else ""
         return f"targeted verification on a macOS runner{run}"
+    if backend == "upstream-port":
+        return "ported upstream fix; awaiting this PR's normal CI"
     return backend
 
 

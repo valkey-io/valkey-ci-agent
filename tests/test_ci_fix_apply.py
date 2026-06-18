@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import MagicMock
 
 from scripts.ci_fix import apply as apply_mod
@@ -68,14 +69,12 @@ def test_feedback_included_in_prompt(monkeypatch):
     assert "rejected" in captured["prompt"].lower()
 
 
-def test_port_uses_edit_only_profile(monkeypatch):
-    captured = {}
-
-    def fake_run_agent(profile, prompt, **kwargs):
-        captured["profile"] = profile
-        return MagicMock(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(apply_mod, "run_agent", fake_run_agent)
-    monkeypatch.setattr(apply_mod, "worktree_changed_paths", lambda _r: ("t",))
-    apply_fix("/repo", _proposal(FixPath.PORT))
-    assert captured["profile"] == "validation_repair_edit_only"
+def test_apply_fix_declines_port_path(monkeypatch):
+    """PORT is cherry-picked in the pipeline with its original authorship, so
+    apply_fix (the authored-fix editor) must not act on a PORT proposal."""
+    agent = MagicMock()
+    monkeypatch.setattr(apply_mod, "run_agent", agent)
+    ok, changed = apply_fix("/repo", _proposal(FixPath.PORT))
+    assert ok is False
+    assert changed == ()
+    agent.assert_not_called()
