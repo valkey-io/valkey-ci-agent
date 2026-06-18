@@ -38,6 +38,13 @@ def test_parse_command_with_hint():
     assert cmd.hint == "look at the NAN payload"
 
 
+def test_parse_command_accepts_valkeyrie_ops():
+    cmd = parse_command(f"@valkeyrie-ops fix {_RUN_URL}")
+    assert cmd is not None
+    assert cmd.run_owner == "valkey-io"
+    assert cmd.run_id == 27559908167
+
+
 def test_parse_command_case_insensitive():
     cmd = parse_command(f"@Valkeyrie-Bot FIX {_RUN_URL}")
     assert cmd is not None

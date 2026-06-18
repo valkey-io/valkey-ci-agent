@@ -31,12 +31,12 @@ logger = logging.getLogger(__name__)
 
 # The comment must *begin* with the invocation (after optional leading
 # whitespace) so quoting or mentioning the command mid-discussion does not
-# trigger a fix. The hint is only the remainder of the invocation line, not the
-# whole comment: a future comment trigger must not fold a multi-line
-# conversational reply into the hint. The invocation must also start the
-# comment (anchored), so quoting it mid-discussion does not fire.
+# trigger a fix. Either bot identity may drive it: @valkeyrie-bot (manual
+# dispatch) or @valkeyrie-ops (the App that opens the PRs, used by the comment
+# poller). The hint is only the remainder of the invocation line, not the whole
+# comment, so a multi-line conversational reply is not folded into the hint.
 _COMMAND_RE = re.compile(
-    r"^\s*@valkeyrie-bot\s+fix\s+(?P<url>\S+)(?:[^\S\n]+(?P<hint>[^\n]*))?",
+    r"^\s*@valkeyrie-(?:bot|ops)\s+fix\s+(?P<url>\S+)(?:[^\S\n]+(?P<hint>[^\n]*))?",
     re.IGNORECASE,
 )
 # Actions run URL: .../<owner>/<repo>/actions/runs/<run_id>

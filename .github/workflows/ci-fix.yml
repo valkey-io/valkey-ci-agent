@@ -25,6 +25,10 @@ on:
         description: "Optional diagnosis hint"
         required: false
         type: string
+      commenter:
+        description: "Requesting user (honored only when dispatched by the trusted poller App)"
+        required: false
+        type: string
 
 permissions: {}
 
@@ -115,7 +119,12 @@ jobs:
           CI_FIX_REPO: ${{ inputs.repo }}
           CI_FIX_PR: ${{ inputs.pr }}
           CI_FIX_RUN_URL: ${{ inputs.run_url }}
-          CI_FIX_COMMENTER: ${{ github.actor }}
+          # The commenter input is honored only when the trusted poller App
+          # dispatched this run; any other dispatcher (a human via the Actions
+          # UI) falls back to github.actor, so a manual run cannot rewrite the
+          # audit attribution. The engine's authorization check runs against
+          # whichever principal is chosen regardless.
+          CI_FIX_COMMENTER: ${{ (github.actor == 'valkeyrie-ops[bot]' && inputs.commenter) || github.actor }}
           CI_FIX_HINT: ${{ inputs.hint || '' }}
         run: |
           set -euo pipefail
