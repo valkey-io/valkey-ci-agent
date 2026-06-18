@@ -50,17 +50,33 @@ def _rejected() -> ReviewVerdict:
     return ReviewVerdict(approved=False, reasoning="weakens assertion")
 
 
+def _reproduce_then_pass():
+    """A run_command fake matching the real call order: the reproduce run fails
+    (the failure is real), then every later build/verify run passes.
+
+    The loop calls run_command once to reproduce (must fail), then per attempt
+    runs the build once and the verify command ``verify_runs`` times; returning
+    ``_passed()`` for all of those drives a clean single-attempt success.
+    """
+    results = iter([_failed()])
+
+    def fake(*_a, **_k):
+        return next(results, _passed())
+
+    return fake
+
+
 def _loop(*, path: FixPath = FixPath.AUTHOR, patch: str = "the diff", **overrides):
     """run_fix_loop with safe fakes; override individual collaborators per test.
 
     Patches the shared ``build_approved_patch`` (the review loop calls it
-    directly) to return ``patch`` without needing a real git repo. Pass
-    ``patch=""`` is not allowed - use ``patch_raises=EmptyPatch`` semantics by
-    patching directly in the test.
+    directly) to return ``patch`` without needing a real git repo. The default
+    ``run_command`` fails the reproduce run then passes, so the reproduce gate
+    sees a genuine failure and the fix verifies clean.
     """
     defaults = dict(
         apply_func=lambda *a, **k: (True, ("test.tcl",)),
-        run_command=lambda *a, **k: _passed(),
+        run_command=_reproduce_then_pass(),
         review_func=lambda *a, **k: _approved(),
         reset_func=MagicMock(),
     )
@@ -82,8 +98,9 @@ def test_refuse_proposal_short_circuits():
     assert "not applied" in result.detail
 
 
-def test_retries_when_test_fails_then_passes():
-    runs = [_failed(), _passed()]
+def test_retries_when_verify_fails_then_passes():
+    # reproduce(fail); attempt1 build(pass)+verify1(fail); attempt2 build(pass)+verify x2(pass).
+    runs = [_failed(), _passed(), _failed(), _passed(), _passed(), _passed()]
     result = _loop(max_attempts=3, run_command=lambda *a, **k: runs.pop(0))
     assert result.success is True
     assert result.attempts == 2
@@ -105,7 +122,9 @@ def test_gives_up_after_max_attempts():
 
 def test_unrunnable_command_breaks_loop():
     unrunnable = RunResult(ran=False, passed=False, exit_code=-1, command="c", output_tail="no cwd")
-    result = _loop(run_command=lambda *a, **k: unrunnable)
+    # reproduce fails (real), then the post-fix build/verify cannot run at all.
+    runs = [_failed(), unrunnable]
+    result = _loop(run_command=lambda *a, **k: runs.pop(0))
     assert result.success is False
     assert "could not run" in result.detail
 
@@ -132,10 +151,11 @@ def test_feedback_passed_to_apply_on_retry():
         seen_feedback.append(feedback)
         return True, ("test.tcl",)
 
-    runs = [_failed(), _passed()]
+    # reproduce(fail); attempt1 build(pass)+verify1(fail); attempt2 build(pass)+verify x2(pass).
+    runs = [_failed(), _passed(), _failed(), _passed(), _passed(), _passed()]
     _loop(max_attempts=2, apply_func=fake_apply, run_command=lambda *a, **k: runs.pop(0))
     assert seen_feedback[0] == ""           # first attempt: no feedback
-    assert "did not make the test pass" in seen_feedback[1]
+    assert "did not make the check pass" in seen_feedback[1]
 
 
 def _stream_result(obj: dict) -> str:
@@ -246,7 +266,7 @@ def test_oversized_patch_refuses():
         result = run_fix_loop(
             "/repo", _proposal(),
             apply_func=lambda *a, **k: (True, ("test.tcl",)),
-            run_command=lambda *a, **k: _passed(),
+            run_command=_reproduce_then_pass(),
             review_func=review_called,
             reset_func=MagicMock(),
         )
@@ -272,7 +292,7 @@ def test_empty_patch_refuses_instead_of_approving():
         result = run_fix_loop(
             "/repo", _proposal(),
             apply_func=lambda *a, **k: (True, ("test.tcl",)),
-            run_command=lambda *a, **k: _passed(),
+            run_command=_reproduce_then_pass(),
             review_func=review_called,
             reset_func=MagicMock(),
         )
@@ -324,3 +344,157 @@ def test_build_and_review_patch_empty_oversized_rejected_ok(monkeypatch):
     # ok
     r = build_and_review_patch("/repo", ("f",), _proposal(), review_func=lambda *a, **k: _approved())
     assert r.ok is True and r.patch == "small diff" and r.review.approved is True
+
+
+# --- flaky-detection gates: reproduce-before-fix and K-green verification ---
+
+def _calls_recorder():
+    """A run_command fake that records (command) of every call and returns a
+    scripted RunResult per call, so we can assert call order and counts."""
+    calls = []
+
+    def make(results):
+        seq = list(results)
+
+        def fake(_repo, command, **_k):
+            calls.append(command)
+            return seq.pop(0)
+
+        return fake
+
+    return calls, make
+
+
+def test_reproduce_green_refuses_as_flaky():
+    """If the unpatched command passes, the failure did not reproduce: refuse."""
+    apply_called = MagicMock()
+    result = _loop(
+        run_command=lambda *a, **k: _passed(),   # reproduce sees green
+        apply_func=apply_called,
+    )
+    assert result.success is False
+    assert "did not reproduce" in result.detail
+    apply_called.assert_not_called()             # never even attempted a fix
+
+
+def test_reproduce_unrunnable_refuses():
+    """If the baseline reproduce can't run at all, refuse (no baseline)."""
+    unrunnable = RunResult(ran=False, passed=False, exit_code=-1, command="c", output_tail="no cwd")
+    result = _loop(run_command=lambda *a, **k: unrunnable)
+    assert result.success is False
+    assert "baseline reproduce" in result.detail
+
+
+def test_verify_runs_k_times_and_builds_once():
+    """A clean fix: reproduce(fail), build once, verify exactly K times."""
+    calls, make = _calls_recorder()
+    # reproduce(fail) -> build(pass) -> verify(pass) x3
+    run = make([_failed(), _passed(), _passed(), _passed(), _passed()])
+    result = _loop(verify_runs=3, run_command=run)
+    assert result.success is True
+    # 1 reproduce (combined) + 1 build + 3 verify = 5 calls.
+    assert len(calls) == 5
+    assert calls[0] == "make && ./runtest --single x"   # reproduce is the combined recipe
+    assert calls[1] == "make"                            # build once
+    assert calls[2:] == ["./runtest --single x"] * 3     # verify K times
+
+
+def test_one_of_k_verify_runs_fails_retries():
+    """A fix that passes once then fails a later run is unstable: not a success."""
+    calls, make = _calls_recorder()
+    # reproduce(fail); attempt1: build(pass), verify1(pass), verify2(FAIL) -> retry exhausted.
+    run = make([_failed(), _passed(), _passed(), _failed()])
+    result = _loop(verify_runs=2, max_attempts=1, run_command=run)
+    assert result.success is False
+    assert "still failing" in result.detail
+
+
+def test_empty_build_runs_verify_command_k_times():
+    """With no separate build command, the verify command is run K times whole."""
+    proposal = FixProposal(
+        path=FixPath.AUTHOR, failing_check="t", root_cause="rc", reasoning="w",
+        confidence=0.9, build_command="", verify_command="make && ./runtest x",
+    )
+    calls, make = _calls_recorder()
+    # reproduce(fail) -> verify x2(pass); no separate build call.
+    run = make([_failed(), _passed(), _passed()])
+    with patch_build_approved(lambda *a, **k: "diff"):
+        result = run_fix_loop(
+            "/repo", proposal, verify_runs=2,
+            apply_func=lambda *a, **k: (True, ("f",)),
+            run_command=run,
+            review_func=lambda *a, **k: _approved(),
+            reset_func=MagicMock(),
+        )
+    assert result.success is True
+    # reproduce + 2 verify = 3; the verify command is the whole recipe each time.
+    assert calls == ["make && ./runtest x", "make && ./runtest x", "make && ./runtest x"]
+
+
+def test_build_failure_after_fix_retries():
+    """If the build breaks after the fix, treat as a failed attempt, not flaky-green."""
+    calls, make = _calls_recorder()
+    # reproduce(fail); attempt1 build FAILS (the fix broke the build).
+    run = make([_failed(), _failed()])
+    result = _loop(verify_runs=2, max_attempts=1, run_command=run)
+    assert result.success is False
+    # reproduce + build = 2 calls; verify never reached after a broken build.
+    assert calls == ["make && ./runtest --single x", "make"]
+
+
+def test_reproduced_the_named_failure_matching():
+    """The reproduce match confirms the failing check appears in the output."""
+    from scripts.ci_fix.review import reproduced_the_named_failure
+
+    prop = FixProposal(path=FixPath.AUTHOR, failing_check="zset listpack with NAN score",
+                       root_cause="rc", reasoning="w", confidence=0.9,
+                       build_command="make", verify_command="./runtest x")
+    hit = RunResult(ran=True, passed=False, exit_code=1, command="c",
+                    output_tail="[err]: zset listpack with NAN score in tests/x.tcl\nExpected ...")
+    miss = RunResult(ran=True, passed=False, exit_code=1, command="c",
+                     output_tail="ld: symbol not found, unrelated link error")
+    assert reproduced_the_named_failure(prop, hit) is True
+    assert reproduced_the_named_failure(prop, miss) is False
+
+    # An empty failing_check can never be confirmed.
+    blank = FixProposal(path=FixPath.AUTHOR, failing_check="", root_cause="rc",
+                        reasoning="w", confidence=0.9, build_command="m", verify_command="v")
+    assert reproduced_the_named_failure(blank, hit) is False
+
+    # A too-short name is too generic to confirm by substring, even if present.
+    short = FixProposal(path=FixPath.AUTHOR, failing_check="io", root_cause="rc",
+                        reasoning="w", confidence=0.9, build_command="m", verify_command="v")
+    short_hit = RunResult(ran=True, passed=False, exit_code=1, command="c",
+                          output_tail="io error in cluster bus")
+    assert reproduced_the_named_failure(short, short_hit) is False
+
+
+def test_reproduce_unconfirmed_match_still_proceeds(caplog):
+    """A failing reproduce whose check name is absent proceeds but is logged.
+
+    Build/lint failures legitimately omit the check name; refusing on absence
+    would wrongly reject those. We proceed and warn instead.
+    """
+    import logging
+
+    proposal = FixProposal(
+        path=FixPath.AUTHOR, failing_check="cluster slot migration test",
+        root_cause="rc", reasoning="w", confidence=0.9,
+        build_command="make", verify_command="./runtest --single x",
+    )
+    # reproduce fails with a link error that does not name the check; then pass.
+    seq = [
+        RunResult(ran=True, passed=False, exit_code=2, command="c", output_tail="ld: missing symbol"),
+        _passed(), _passed(), _passed(),
+    ]
+    with caplog.at_level(logging.WARNING):
+        with patch_build_approved(lambda *a, **k: "diff"):
+            result = run_fix_loop(
+                "/repo", proposal,
+                apply_func=lambda *a, **k: (True, ("f",)),
+                run_command=lambda *a, **k: seq.pop(0),
+                review_func=lambda *a, **k: _approved(),
+                reset_func=MagicMock(),
+            )
+    assert result.success is True
+    assert any("proceeding unconfirmed" in r.message for r in caplog.records)

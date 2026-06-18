@@ -8,16 +8,29 @@ are both required before a push.
 
 ``run_fix_loop`` is the orchestration:
 
+    reproduce the failure on the clean tree  -- green => could not reproduce,
+                                                refuse as likely flaky/environmental
     for each attempt (up to max_attempts):
         apply the fix (edit-only)            -- no edits => refuse
-        run the verification command (code)  -- exit code is the verdict
-        if not passed: feed the output back, retry
+        build once, then verify K times      -- every run's exit code is the verdict
+        if any run fails: feed the output back, retry
         review the passing fix (skeptic)     -- AI judgment
         if approved: done
         else: feed the rejection back, retry
 
-The loop resets the worktree between attempts so each revision starts from a
-clean tree and the feedback - not a half-applied prior edit - drives the retry.
+Two deterministic gates guard against flakiness, the asymmetric risk being a
+single green run that only flaked green:
+
+- Reproduce-before-fix: run the unpatched command first. A failure that does
+  not reproduce on a clean checkout is likely flaky or environment-specific, so
+  we refuse rather than "fix" a failure we never saw.
+- Repeated verification: a fix must pass the verify command ``verify_runs``
+  times in a row, not once. The build runs once; only the verify command is
+  repeated, so K green is cheap when the build/verify split is available.
+
+The loop resets the worktree between attempts (and after the reproduce run) so
+each revision starts from a clean tree and the feedback - not a half-applied
+prior edit or leftover build artifact - drives the retry.
 """
 
 from __future__ import annotations
@@ -39,6 +52,18 @@ logger = logging.getLogger(__name__)
 ApplyFix = Callable[..., tuple[bool, tuple[str, ...]]]
 RunCommand = Callable[..., RunResult]
 ReviewFix = Callable[..., ReviewVerdict]
+
+# Default number of times a fix must pass the verify command before it is
+# trusted. A single green run cannot tell a real fix from a test that flaked
+# green; requiring K consecutive passes lowers that probability. K=2 with the
+# reproduce-before-fix gate is a deliberate balance of confidence against the
+# cost of extra runs; callers can raise it.
+DEFAULT_VERIFY_RUNS = 2
+
+# A failing-check name shorter than this is too generic to confirm by substring
+# match (a name like "io" would appear in almost any output). Below it, we do
+# not claim a confirmed reproduce match.
+_MIN_MATCHABLE_CHECK_CHARS = 8
 
 # A scaffolding fix is small. If the approved patch exceeds this, the skeptic
 # cannot meaningfully review the whole thing in one pass, and a broad change is
@@ -104,14 +129,20 @@ def review_fix(repo_dir: str, proposal: FixProposal, diff: str) -> ReviewVerdict
 
 
 def _reset_worktree(repo_dir: str) -> None:
-    """Discard all working-tree changes back to HEAD, including untracked files.
+    """Discard all working-tree changes back to HEAD, including untracked and
+    ignored files.
 
-    ``reset --hard`` alone leaves untracked files (e.g. test build artifacts)
-    behind; ``clean -fd`` removes them so a later ``git add`` cannot stage
-    anything a verification run produced.
+    ``reset --hard`` alone leaves untracked files behind, and ``clean -fd``
+    still leaves *ignored* files, which is exactly where build outputs live (a
+    Makefile's ``.o``/binaries, caches). The reproduce run and each attempt
+    build into this clone, so without ``-x`` the next phase would reuse stale
+    artifacts and the "verified from a clean tree" guarantee would not hold.
+    ``-ffdx`` removes untracked and ignored files (and nested repos) so every
+    phase starts from a genuinely clean checkout. This is the bot's own temp
+    clone, so discarding ignored files is safe.
     """
     git_output(repo_dir, "reset", "--hard", "HEAD")
-    git_output(repo_dir, "clean", "-fd")
+    git_output(repo_dir, "clean", "-ffdx")
 
 
 @dataclass
@@ -187,30 +218,149 @@ def build_and_review_patch(
     return PatchReview(ok=True, patch=patch, review=review)
 
 
+def reproduce_failure(
+    repo_dir: str,
+    proposal: FixProposal,
+    *,
+    container_image: str = "",
+    run_command: RunCommand = run_verification_command,
+) -> RunResult:
+    """Run the unpatched command to confirm the failure actually reproduces.
+
+    Runs the full build+verify recipe on the clean checkout, before any fix is
+    applied. The caller treats a *passing* result as "could not reproduce" (the
+    failure is likely flaky or environment-specific) and refuses; a result that
+    ran and failed means the failure is real and the fix attempt proceeds; a
+    result that could not run at all is a refusal (no baseline was established).
+    The caller is responsible for resetting the worktree afterwards so the
+    build artifacts this produces do not leak into the fix.
+    """
+    return run_command(
+        repo_dir,
+        combined_command(proposal),
+        workdir=proposal.workdir,
+        container_image=container_image,
+    )
+
+
+def reproduced_the_named_failure(proposal: FixProposal, result: RunResult) -> bool:
+    """Whether a failing reproduce run looks like *the* failure we set out to fix.
+
+    A reproduce run that fails for some unrelated reason (a missing local
+    dependency, an environment quirk) would let the bot "fix" a failure CI never
+    reported. When the ``failing_check`` name appears in the output, the match is
+    confirmed. When it does not, we cannot confirm or deny: build, link, and lint
+    checks often fail without their check name appearing in compiler output, so
+    refusing on absence would wrongly reject legitimate build-failure fixes.
+    Absence is therefore reported (the caller logs it) but not treated as a
+    mismatch. This is a deliberate, conservative-toward-acting choice.
+
+    A very short check name would substring-match almost any output, so we only
+    trust the match for names long enough to be a meaningful signal.
+    """
+    check = proposal.failing_check.strip()
+    if len(check) < _MIN_MATCHABLE_CHECK_CHARS:
+        return False
+    return check in result.output_tail
+
+
+def verify_repeatedly(
+    repo_dir: str,
+    proposal: FixProposal,
+    *,
+    runs: int,
+    container_image: str = "",
+    run_command: RunCommand = run_verification_command,
+) -> RunResult:
+    """Build once, then run the verify command ``runs`` times; all must pass.
+
+    Returns the first non-passing ``RunResult`` (a build failure, an un-runnable
+    command, or a verify run that failed), or the last passing verify result
+    when every run is green. Separating the build from the verify means K green
+    runs cost one build, not K. When the proposal has no separate build command,
+    the verify command is the whole recipe and is simply run ``runs`` times.
+    """
+    runs = max(1, runs)
+    build = proposal.build_command.strip()
+    if build:
+        build_result = run_command(
+            repo_dir, build, workdir=proposal.workdir, container_image=container_image,
+        )
+        if not build_result.ran or not build_result.passed:
+            return build_result
+
+    verify = proposal.verify_command.strip()
+    # runs >= 1, so this loop always assigns result at least once.
+    for _ in range(runs):
+        result = run_command(
+            repo_dir, verify, workdir=proposal.workdir, container_image=container_image,
+        )
+        if not result.ran or not result.passed:
+            return result
+    return result
+
+
 def run_fix_loop(
     repo_dir: str,
     proposal: FixProposal,
     *,
     max_attempts: int = 3,
+    verify_runs: int = DEFAULT_VERIFY_RUNS,
     container_image: str = "",
     apply_func: ApplyFix = apply_fix,
     run_command: RunCommand = run_verification_command,
     review_func: ReviewFix = review_fix,
     reset_func: Callable[[str], None] = _reset_worktree,
 ) -> LoopResult:
-    """Apply, run, and review the fix, iterating on feedback up to N times.
+    """Reproduce, apply, verify, and review the fix, iterating up to N times.
 
-    Returns a ``LoopResult`` whose ``success`` is True only when the test ran
-    and passed AND the skeptic approved. Every non-success path leaves the
-    worktree reset to HEAD so the caller never pushes a partial edit.
+    Returns a ``LoopResult`` whose ``success`` is True only when the failure
+    reproduced, the fix passed verification ``verify_runs`` times, AND the
+    skeptic approved. Every non-success path leaves the worktree reset to HEAD
+    so the caller never pushes a partial edit.
     """
     max_attempts = max(1, max_attempts)
+    verify_runs = max(1, verify_runs)
     precheck = precheck_command(proposal)
     if precheck:
         return LoopResult(
             success=False, run_result=None, review=None,
             changed_paths=(), attempts=0, detail=precheck,
         )
+
+    # Gate 1: reproduce the failure on the clean tree before fixing anything. A
+    # failure that does not reproduce here is likely flaky or environmental, so
+    # we refuse rather than push a "fix" for something we never observed.
+    reset_func(repo_dir)
+    repro = reproduce_failure(
+        repo_dir, proposal, container_image=container_image, run_command=run_command,
+    )
+    if not repro.ran:
+        reset_func(repo_dir)
+        return LoopResult(
+            success=False, run_result=repro, review=None,
+            changed_paths=(), attempts=0,
+            detail=f"could not run the baseline reproduce; refusing: {repro.output_tail[:300]}",
+        )
+    if repro.passed:
+        reset_func(repo_dir)
+        return LoopResult(
+            success=False, run_result=repro, review=None,
+            changed_paths=(), attempts=0,
+            detail=(
+                "the failure did not reproduce on a clean checkout; it is likely "
+                "flaky or environment-specific, so refusing rather than pushing a fix"
+            ),
+        )
+    if not reproduced_the_named_failure(proposal, repro):
+        # The command failed, but the failing check's name is not in the output.
+        # We proceed (build/lint failures legitimately omit it), but record it so
+        # an unrelated local failure masquerading as the target is traceable.
+        logger.warning(
+            "reproduce failed but %r not found in output; proceeding unconfirmed",
+            proposal.failing_check,
+        )
+
     last_detail = "no attempt made"
     last_run: RunResult | None = None
     last_review: ReviewVerdict | None = None
@@ -225,11 +375,10 @@ def run_fix_loop(
             last_detail = "fix not applied (agent declined or made no edits)"
             break
 
-        run_result = run_command(
-            repo_dir,
-            combined_command(proposal),
-            workdir=proposal.workdir,
-            container_image=container_image,
+        # Gate 2: build once, then require the verify command to pass K times.
+        run_result = verify_repeatedly(
+            repo_dir, proposal, runs=verify_runs,
+            container_image=container_image, run_command=run_command,
         )
         last_run = run_result
         if not run_result.ran:
@@ -237,10 +386,11 @@ def run_fix_loop(
             break
         if not run_result.passed:
             feedback = (
-                f"The fix did not make the test pass. Command exit "
-                f"{run_result.exit_code}. Output tail:\n{run_result.output_tail[-2000:]}"
+                f"The fix did not make the check pass reliably ({verify_runs} runs "
+                f"required). Command exit {run_result.exit_code}. Output tail:\n"
+                f"{run_result.output_tail[-2000:]}"
             )
-            last_detail = "test still failing after fix"
+            last_detail = "check still failing after fix"
             continue
 
         reviewed = build_and_review_patch(repo_dir, changed, proposal, review_func=review_func)
@@ -249,7 +399,7 @@ def run_fix_loop(
             return LoopResult(
                 success=True, run_result=run_result, review=reviewed.review,
                 changed_paths=changed, attempts=attempt,
-                detail="test passed and review approved",
+                detail=f"check passed {verify_runs} run(s) and review approved",
             )
         if reviewed.review is None:
             # Empty or oversized patch: nothing the AI can usefully retry on.
