@@ -15,7 +15,7 @@ from scripts.ci_fix.models import FixOutcome, OutcomeKind
 _OUTPUT_TAIL_IN_COMMENT = 3000
 
 
-def _fenced(body: str) -> str:
+def _fenced(body: str, *, lang: str = "") -> str:
     """Wrap untrusted text in a code fence it cannot break out of.
 
     Command output may itself contain ``` runs; per CommonMark, the fence must
@@ -23,7 +23,7 @@ def _fenced(body: str) -> str:
     """
     longest = max((len(m) for m in re.findall(r"`+", body)), default=0)
     fence = "`" * max(3, longest + 1)
-    return f"{fence}\n{body}\n{fence}"
+    return f"{fence}{lang}\n{body}\n{fence}"
 
 
 def render_comment(outcome: FixOutcome) -> str:
@@ -31,6 +31,8 @@ def render_comment(outcome: FixOutcome) -> str:
         return _render_pushed(outcome)
     if outcome.kind is OutcomeKind.REFUSED:
         return _render_refused(outcome)
+    if outcome.kind is OutcomeKind.HANDOFF:
+        return _render_handoff(outcome)
     return _render_failed(outcome)
 
 
@@ -135,6 +137,32 @@ def _render_refused(outcome: FixOutcome) -> str:
 
 def _render_failed(outcome: FixOutcome) -> str:
     return f"I hit an error and could not complete the fix: {outcome.summary}"
+
+
+def _render_handoff(outcome: FixOutcome) -> str:
+    proposal = outcome.proposal
+    lines = [
+        "I diagnosed this and prepared a fix, but I could not verify it in my "
+        "environment, so I am handing it off rather than pushing it unverified.",
+        "",
+    ]
+    if outcome.failing_run_url:
+        lines += [f"From the failure in [this run]({outcome.failing_run_url}).", ""]
+    if proposal is not None and proposal.root_cause:
+        lines += [f"**Root cause:** {proposal.root_cause}", ""]
+    lines += [f"**Why not verified:** {outcome.summary}", ""]
+    if outcome.review is not None and outcome.review.reasoning:
+        lines += [f"**Review:** {outcome.review.reasoning}", ""]
+    if outcome.handoff_patch:
+        lines += [
+            "Proposed patch (apply and let this PR's CI judge it):",
+            "",
+            _fenced(outcome.handoff_patch[:_OUTPUT_TAIL_IN_COMMENT], lang="diff"),
+            "",
+        ]
+    lines += _remaining_checks(outcome)
+    lines.append("_I did not push this; a human should apply it. I do not merge._")
+    return "\n".join(lines)
 
 
 def _remaining_checks(outcome: FixOutcome) -> list[str]:

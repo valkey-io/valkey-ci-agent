@@ -106,6 +106,8 @@ class OutcomeKind(str, Enum):
     PUSHED = "pushed"          # fix validated, reviewed, and pushed
     REFUSED = "refused"        # could not safely fix; nothing changed
     FAILED = "failed"          # an internal error stopped the run
+    HANDOFF = "handoff"        # a fix was authored but could not be verified
+                               # here; the patch is posted for a human
 
 
 @dataclass(frozen=True)
@@ -126,4 +128,7 @@ class FixOutcome:
     verify_backend: str = ""
     # For the macOS backend: the URL of the verification run that proved the fix.
     macos_run_url: str = ""
+    # For HANDOFF: the unverified candidate patch, posted for a human to apply
+    # and let real CI judge.
+    handoff_patch: str = ""
     other_failing_checks: tuple[str, ...] = ()

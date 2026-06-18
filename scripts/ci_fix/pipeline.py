@@ -180,6 +180,13 @@ def _loop_and_push(
 ) -> FixOutcome:
     """Local/Docker: apply, verify in-loop (retry on fail), review, push on green."""
     loop = run_loop_func(str(repo_dir), proposal, container_image=plan.image)
+    if loop.handoff:
+        return FixOutcome(
+            kind=OutcomeKind.HANDOFF, summary=loop.detail, proposal=proposal,
+            run_result=loop.run_result, review=loop.review,
+            handoff_patch=loop.handoff_patch,
+            other_failing_checks=proposal.other_failing_checks,
+        )
     if not loop.success:
         return FixOutcome(
             kind=OutcomeKind.REFUSED, summary=loop.detail, proposal=proposal,

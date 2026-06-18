@@ -103,11 +103,15 @@ def test_gives_up_after_max_attempts():
     assert "review rejected" in result.detail
 
 
-def test_unrunnable_command_breaks_loop():
-    unrunnable = RunResult(ran=False, passed=False, exit_code=-1, command="c", output_tail="no cwd")
+def test_unrunnable_command_hands_off_with_patch():
+    """A verify command that cannot run here is not a failed fix: the loop hands
+    off the authored patch for a human rather than refusing as if it failed."""
+    unrunnable = RunResult(ran=False, passed=False, exit_code=-1, command="c", output_tail="no jsonschema")
     result = _loop(run_command=lambda *a, **k: unrunnable)
     assert result.success is False
-    assert "could not run" in result.detail
+    assert result.handoff is True
+    assert result.handoff_patch == "the diff"
+    assert "could not verify" in result.detail
 
 
 def test_worktree_reset_on_failure():

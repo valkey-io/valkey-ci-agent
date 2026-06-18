@@ -124,6 +124,11 @@ class LoopResult:
     changed_paths: tuple[str, ...]
     attempts: int
     detail: str
+    # Set when a fix was authored but verification could not run here (e.g. the
+    # job's setup cannot be reproduced locally). The patch is carried for handoff
+    # to a human rather than pushed unverified.
+    handoff: bool = False
+    handoff_patch: str = ""
 
 
 @dataclass
@@ -233,7 +238,25 @@ def run_fix_loop(
         )
         last_run = run_result
         if not run_result.ran:
-            last_detail = f"verification could not run: {run_result.output_tail[:300]}"
+            # Verification could not run here at all (e.g. the job installs
+            # dependencies via setup the local sandbox cannot reproduce). The
+            # fix may well be correct, so rather than refuse as if it failed,
+            # build the patch and hand it off for a human to apply and let real
+            # CI judge. A best-effort skeptic review still gates obvious junk.
+            reviewed = build_and_review_patch(repo_dir, changed, proposal, review_func=review_func)
+            if reviewed.ok or reviewed.patch:
+                detail = (
+                    "could not verify the fix here "
+                    f"({run_result.output_tail[:200]}); handing off the patch for review"
+                )
+                result = LoopResult(
+                    success=False, run_result=run_result, review=reviewed.review,
+                    changed_paths=changed, attempts=attempt, detail=detail,
+                    handoff=True, handoff_patch=reviewed.patch,
+                )
+                reset_func(repo_dir)
+                return result
+            last_detail = f"verification could not run and produced no patch: {run_result.output_tail[:200]}"
             break
         if not run_result.passed:
             feedback = (

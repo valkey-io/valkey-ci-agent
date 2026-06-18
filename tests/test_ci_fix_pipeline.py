@@ -544,3 +544,20 @@ def test_read_workflow_safely_skips_symlink_and_oversized(tmp_path):
     assert _read_workflow_safely(link) is None
 
     assert _read_workflow_safely(tmp_path / "missing.yml") is None
+
+
+def test_pipeline_handoff_when_verify_cannot_run(monkeypatch):
+    """A loop that could not verify the fix yields a HANDOFF outcome carrying
+    the patch, not a refusal or a push."""
+    from scripts.ci_fix.review import LoopResult
+
+    handoff_loop = LoopResult(
+        success=False, run_result=None, review=ReviewVerdict(True, "looks sane"),
+        changed_paths=("src/x.c",), attempts=1,
+        detail="could not verify the fix here (missing dep); handing off",
+        handoff=True, handoff_patch="--- a/src/x.c\n+++ b/src/x.c\n",
+    )
+    outcome = _run_pipeline(monkeypatch, loop=lambda *a, **k: handoff_loop)
+    assert outcome.kind is OutcomeKind.HANDOFF
+    assert outcome.handoff_patch == "--- a/src/x.c\n+++ b/src/x.c\n"
+    assert "could not verify" in outcome.summary
