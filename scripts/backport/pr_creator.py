@@ -255,8 +255,16 @@ class BackportPRCreator:
         resolution_results: list[ResolutionResult] | None,
         *,
         applied_commits: list[str] | None = None,
+        comment_links: dict[str, str] | None = None,
     ) -> str:
-        """Build the PR body with links, commit list, conflict info."""
+        """Build the PR body with links, commit list, conflict info.
+
+        *comment_links* maps a resolved file path to the URL of its AI-diff
+        comment. When provided, each resolved file's status line links to its
+        comment. The body is built once before comments exist (no links), then
+        rebuilt after reconcile with the links filled in.
+        """
+        links = comment_links or {}
         sections: list[str] = []
         results = resolution_results or []
         resolved_count = sum(result.resolved_content is not None for result in results)
@@ -316,11 +324,19 @@ class BackportPRCreator:
                     "Resolved automatically" if result.resolved_content is not None
                     else "Needs manual resolution"
                 )
+                link = links.get(result.path)
+                suffix = f" ([view diff]({link}))" if link else ""
                 file_lines.append(
-                    f"- `{result.path}`: {status}. {result.resolution_summary}"
+                    f"- `{result.path}`: {status}. {result.resolution_summary}{suffix}"
+                )
+            conflict_details = "\n".join(file_lines)
+            if any(_was_llm_resolved(r) for r in results):
+                conflict_details += (
+                    "\n\nAI resolution details are posted as a comment on this "
+                    "PR when available."
                 )
             sections.append(
-                "### Conflict Details\n\n" + "\n".join(file_lines)
+                "### Conflict Details\n\n" + conflict_details
             )
 
         # Human review disclaimer (when any file was LLM-resolved).

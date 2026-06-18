@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -32,6 +33,14 @@ def _file_hash(path: str) -> str:
     """SHA-256 of file content, or empty string if unreadable."""
     try:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _read_text(path: str) -> str:
+    """Return file content as text, or empty string if unreadable."""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
 
@@ -82,6 +91,58 @@ def _unresolved(files: list[ConflictedFile], summary: str) -> list[ResolutionRes
         ResolutionResult(path=cf.path, resolved_content=None, resolution_summary=summary)
         for cf in files
     ]
+
+
+def _resolution_diff(path: str, before: str, after: str) -> str | None:
+    """Return a unified diff of the AI's edit, or ``None`` when unchanged.
+
+    *before* is the conflicted working-tree content git left after the
+    cherry-pick (still carrying ``<<<<<<<``/``=======``/``>>>>>>>`` markers).
+    *after* is the content the AI wrote. The diff therefore shows only what
+    the AI changed to resolve the conflict, not the full backport delta.
+    """
+    if before == after:
+        return None
+    diff = difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{path} (conflicted)",
+        tofile=f"b/{path} (AI resolved)",
+    )
+    rendered = "".join(diff).rstrip("\n")
+    return rendered or None
+
+
+def _reviewer_diff(path: str, before: str, after: str) -> str | None:
+    """Return the clean before/after diff reviewers should inspect first."""
+    if before == after:
+        return None
+    diff = difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{path} (target)",
+        tofile=f"b/{path} (AI resolved)",
+    )
+    rendered = "".join(diff).rstrip("\n")
+    return rendered or None
+
+
+def _agent_result_text(stdout: str) -> str:
+    """Extract Claude Code's final result text from its JSONL stream."""
+    result_text = ""
+    for line in stdout.strip().splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if event.get("type") != "result" or "result" not in event:
+            continue
+        raw_result = event.get("result")
+        if isinstance(raw_result, str):
+            result_text = raw_result
+        elif raw_result is not None:
+            result_text = json.dumps(raw_result, sort_keys=True, default=str)
+    return result_text.strip()
 
 
 def _build_prompt(
@@ -149,6 +210,9 @@ def _validate_file(
     repo_dir: str,
     cf: ConflictedFile,
     pre_hashes: dict[str, str],
+    pre_contents: dict[str, str],
+    *,
+    llm_summary: str = "",
 ) -> tuple[ResolutionResult | None, str | None]:
     """Validate a single resolved file.
 
@@ -170,13 +234,20 @@ def _validate_file(
             resolution_summary=f"failed to read: {exc}",
         ), None
 
-    if hashlib.sha256(content.encode("utf-8")).hexdigest() == pre_hashes.get(cf.path):
+    baseline = pre_contents.get(cf.path, "")
+    # Compare raw-byte hashes (matching how pre_hashes was computed via
+    # _file_hash) so an unedited file with non-UTF-8 bytes is not misdetected
+    # as changed by the read_text(errors="replace") round-trip above.
+    if _file_hash(file_path) == pre_hashes.get(cf.path):
         # File unchanged — but if it has no conflict markers, git's auto-merge
         # already produced a clean result. Treat it as resolved so it gets staged.
         if not has_conflict_markers(content):
             return ResolutionResult(
                 path=cf.path, resolved_content=content,
                 resolution_summary="auto-merged cleanly (no conflict markers, no edits needed)",
+                resolution_diff=_resolution_diff(cf.path, baseline, content),
+                reviewer_diff=_reviewer_diff(cf.path, cf.target_branch_content, content),
+                llm_summary=llm_summary or None,
             ), None
         return ResolutionResult(
             path=cf.path, resolved_content=None,
@@ -189,6 +260,9 @@ def _validate_file(
     return ResolutionResult(
         path=cf.path, resolved_content=content,
         resolution_summary="resolved by Claude Code",
+        resolution_diff=_resolution_diff(cf.path, baseline, content),
+        reviewer_diff=_reviewer_diff(cf.path, cf.target_branch_content, content),
+        llm_summary=llm_summary or None,
     ), None
 
 
@@ -197,6 +271,9 @@ def _collect_allowed_path_edits(
     allowed_paths: set[str],
     conflict_paths: set[str],
     pre_hashes: dict[str, str],
+    pre_contents: dict[str, str],
+    *,
+    llm_summary: str = "",
 ) -> list[ResolutionResult]:
     """Return Claude edits to allowed auto-merged files so callers stage them."""
     results: list[ResolutionResult] = []
@@ -224,6 +301,13 @@ def _collect_allowed_path_edits(
             path=path,
             resolved_content=content,
             resolution_summary="auto-merged cherry-pick file adapted by Claude Code",
+            resolution_diff=_resolution_diff(
+                path, pre_contents.get(path, ""), content,
+            ),
+            reviewer_diff=_reviewer_diff(
+                path, pre_contents.get(path, ""), content,
+            ),
+            llm_summary=llm_summary or None,
         ))
     return results
 
@@ -282,8 +366,15 @@ def resolve_conflicts_with_claude(
 
     # Snapshot worktree state so we can detect unexpected edits.
     pre_hashes = {cf.path: _file_hash(os.path.join(repo_dir, cf.path)) for cf in llm_files}
+    # Snapshot the conflicted content (with markers) so the resolution diff
+    # reflects only the AI's edit, not the full backport delta.
+    pre_contents = {cf.path: _read_text(os.path.join(repo_dir, cf.path)) for cf in llm_files}
     allowed_pre_hashes = {
         path: _file_hash(os.path.join(repo_dir, path))
+        for path in allowed_path_set
+    }
+    allowed_pre_contents = {
+        path: _read_text(os.path.join(repo_dir, path))
         for path in allowed_path_set
     }
     pre_changed_paths = _git_changed_paths(repo_dir)
@@ -307,19 +398,7 @@ def resolve_conflicts_with_claude(
     )
     agent_result = run_agent("conflict_resolve_edit_only", prompt, cwd=repo_dir)
 
-    # Surface "result" event from the JSONL stream for the log line below.
-    result_text = ""
-    for line in agent_result.stdout.strip().splitlines():
-        try:
-            event = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if event.get("type") == "result" and "result" in event:
-            raw_result = event.get("result")
-            if isinstance(raw_result, str):
-                result_text = raw_result
-            elif raw_result is not None:
-                result_text = json.dumps(raw_result, sort_keys=True, default=str)
+    result_text = _agent_result_text(agent_result.stdout)
 
     logger.info(
         "Claude Code finished (rc=%d). Result: %s",
@@ -347,7 +426,9 @@ def resolve_conflicts_with_claude(
     # Step 3: validate each file. Collect retry candidates.
     needs_retry: list[tuple[ConflictedFile, str]] = []
     for cf in llm_files:
-        result, retry_error = _validate_file(repo_dir, cf, pre_hashes)
+        result, retry_error = _validate_file(
+            repo_dir, cf, pre_hashes, pre_contents, llm_summary=result_text,
+        )
         if result is not None:
             results.append(result)
         else:
@@ -360,6 +441,8 @@ def resolve_conflicts_with_claude(
             allowed_path_set,
             conflict_paths,
             allowed_pre_hashes,
+            allowed_pre_contents,
+            llm_summary=result_text,
         )
 
     # Step 4: retry once. One Claude call covering all retry-eligible files.
@@ -374,6 +457,7 @@ def resolve_conflicts_with_claude(
         "Do NOT run `git add` or `git commit`."
     )
     retry_result = run_agent("conflict_resolve_edit_only", retry_prompt, cwd=repo_dir)
+    retry_summary = _agent_result_text(retry_result.stdout)
     if retry_result.returncode != 0:
         retry_detail = (retry_result.stderr or "")[:200]
         for cf, err in needs_retry:
@@ -403,7 +487,13 @@ def resolve_conflicts_with_claude(
 
     # Re-validate the retried files.
     for cf, original_error in needs_retry:
-        result, retry_error = _validate_file(repo_dir, cf, pre_hashes)
+        result, retry_error = _validate_file(
+            repo_dir,
+            cf,
+            pre_hashes,
+            pre_contents,
+            llm_summary=retry_summary or result_text,
+        )
         if result is not None:
             results.append(result)
         else:
@@ -419,4 +509,6 @@ def resolve_conflicts_with_claude(
         allowed_path_set,
         conflict_paths,
         allowed_pre_hashes,
+        allowed_pre_contents,
+        llm_summary=retry_summary or result_text,
     )

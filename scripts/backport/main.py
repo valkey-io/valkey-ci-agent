@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,11 +19,13 @@ from github.GithubException import GithubException
 
 from scripts.backport.cherry_pick import cherry_pick
 from scripts.backport.conflict_resolver import resolve_conflicts_with_claude
+from scripts.backport.diff_comments import reconcile_diff_comments
 from scripts.backport.models import (
     BackportConfig,
     BackportOutcome,
     BackportPRContext,
     BackportResult,
+    CherryPickResult,
     ResolutionResult,
 )
 from scripts.backport.pr_creator import BackportPRCreator
@@ -40,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 BOT_NAME = "valkeyrie-bot[bot]"
 BOT_EMAIL = "3692572+valkeyrie-bot[bot]@users.noreply.github.com"
+
+# Login that authors the AI-diff comments. Defaults to the bot, but the comment
+# author follows the token identity, so a fork run using a personal PAT sets
+# CI_AGENT_DIFF_COMMENT_LOGIN to that user so the ownership gate still matches.
+DIFF_COMMENT_LOGIN = os.environ.get("CI_AGENT_DIFF_COMMENT_LOGIN", BOT_NAME)
 
 
 
@@ -213,6 +221,7 @@ def run_backport(
                     return BackportResult(outcome="error", error_message=msg)
 
                 resolution_results = None
+                resolved_commit_sha: str | None = None
                 if cherry_result.success and not cherry_result.applied_commits:
                     msg = (
                         f"Source PR #{source_pr_number} is already applied to "
@@ -308,6 +317,14 @@ def run_backport(
                         tmp_dir,
                         resolution_results,
                     )
+                    # Record the resolution commit so diff comments can link
+                    # each file to its native diff in the commit view.
+                    head = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=tmp_dir, capture_output=True, text=True,
+                    )
+                    if head.returncode == 0:
+                        resolved_commit_sha = head.stdout.strip()
 
                 commands: list[str] = []
                 if build_commands or validation_rules:
@@ -368,6 +385,14 @@ def run_backport(
             logger.error(msg)
             _post_comment(repo, source_pr_number, f"Backport failed: {msg}")
             return BackportResult(outcome="error", error_message=msg)
+
+        # Post AI-resolution details as PR comments (best-effort). The
+        # backport already succeeded; a comment failure must never change that.
+        if resolution_results:
+            _reconcile_diff_comments_best_effort(
+                repo, backport_pr_url, pr_context, cherry_result, resolution_results,
+                resolved_commit_sha=resolved_commit_sha,
+            )
 
         files_resolved = 0
         files_unresolved = 0
@@ -434,6 +459,69 @@ def _post_comment(repo: object, pr_number: int, body: str) -> None:
         logger.info("Posted comment on PR #%d.", pr_number)
     except Exception as exc:
         logger.warning("Failed to post comment on PR #%d: %s", pr_number, exc)
+
+
+def _reconcile_diff_comments_best_effort(
+    repo: object,
+    backport_pr_url: str,
+    pr_context: BackportPRContext,
+    cherry_result: CherryPickResult,
+    resolution_results: list[ResolutionResult],
+    *,
+    resolved_commit_sha: str | None = None,
+) -> None:
+    """Post AI-resolution diff comments, then link them from the PR body.
+
+    Best-effort: the backport already succeeded, so neither the comment
+    reconcile nor the body re-edit may raise into the caller.
+    """
+    match = re.search(r"/pull/(\d+)", backport_pr_url)
+    if not match:
+        logger.warning("Could not parse PR number from %s; skipping diff comments.", backport_pr_url)
+        return
+    pr_number = int(match.group(1))
+    try:
+        pr = retry_github_call(
+            lambda: repo.get_pull(pr_number),  # type: ignore[attr-defined]
+            retries=3,
+            description=f"get backport PR #{pr_number} for diff comments",
+        )
+        # Key the comment markers on the source PR (not the backport PR), so the
+        # identity matches the sweep path and the module's documented scheme.
+        comment_links = reconcile_diff_comments(
+            pr,
+            pr_context.source_pr_number,
+            resolution_results,
+            source_title=pr_context.source_pr_title,
+            cherry_pick_sha=cherry_result.conflicting_commit_sha,
+            resolved_commit_sha=resolved_commit_sha,
+            bot_login=DIFF_COMMENT_LOGIN,
+        )
+        logger.info("Reconciled AI-diff comments on PR #%d.", pr_number)
+    except Exception as exc:
+        logger.warning("Failed to reconcile diff comments on PR #%d: %s", pr_number, exc)
+        return
+
+    if not comment_links:
+        return
+
+    # Second pass: rebuild the body with links now that comment URLs exist.
+    try:
+        linked_body = BackportPRCreator.build_pr_body(
+            pr_context,
+            not cherry_result.success,
+            resolution_results,
+            applied_commits=cherry_result.applied_commits,
+            comment_links=comment_links,
+        )
+        retry_github_call(
+            lambda: pr.edit(body=linked_body),
+            retries=3,
+            description=f"link AI-diff comments in PR #{pr_number} body",
+        )
+        logger.info("Linked AI-diff comments in PR #%d body.", pr_number)
+    except Exception as exc:
+        logger.warning("Failed to link diff comments in PR #%d body: %s", pr_number, exc)
 
 
 def _clone_repo(

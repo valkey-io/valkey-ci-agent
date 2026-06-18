@@ -12,7 +12,12 @@ from scripts.backport.conflict_resolver import resolve_conflicts_with_claude
 from scripts.backport.main import _run_git as run_git_default
 from scripts.backport.models import BackportPRContext, ConflictedFile, ResolutionResult
 from scripts.backport.sweep_git import changed_paths_in_index_or_worktree
-from scripts.backport.sweep_models import CandidateResult, ProjectBackportCandidate
+from scripts.backport.sweep_models import (
+    DETAIL_EMPTY_ON_TARGET,
+    DETAIL_RESOLVED_BY_AI,
+    CandidateResult,
+    ProjectBackportCandidate,
+)
 from scripts.backport.validation import select_validation_commands
 
 logger = logging.getLogger(__name__)
@@ -24,6 +29,38 @@ ResolveConflicts = Callable[..., list[ResolutionResult]]
 
 def _abort_cherry_pick(repo_dir: str, run_git: RunGit) -> None:
     run_git(repo_dir, "cherry-pick", "--abort")
+
+
+def _empty_skip_reason(
+    conflicting_files: list[ConflictedFile],
+    resolutions: list[ResolutionResult],
+) -> str:
+    """A deterministic reason a resolved cherry-pick produced no net change.
+
+    Derived only from provable facts, never from the resolver's prose. When the
+    resolution of every conflicted file matched the target branch's existing
+    content, the source PR's change does not apply on this branch (the code it
+    modifies differs or is absent here), so the cherry-pick is a no-op.
+    """
+    target_by_path = {cf.path: cf.target_branch_content for cf in conflicting_files}
+    matched_target = [
+        r.path
+        for r in resolutions
+        if r.resolved_content is not None
+        and r.path in target_by_path
+        and r.resolved_content == target_by_path[r.path]
+    ]
+    if matched_target and len(matched_target) == len(
+        [r for r in resolutions if r.resolved_content is not None]
+    ):
+        return (
+            "The change does not apply to this branch: resolving the conflict "
+            "matched the existing code, so the cherry-pick added nothing."
+        )
+    return (
+        "The cherry-pick produced no net change on this branch, so there is "
+        "nothing to backport."
+    )
 
 
 def apply_candidate(
@@ -177,7 +214,9 @@ def apply_candidate(
             candidate.source_pr_number,
             candidate.source_pr_title,
             "skipped-existing",
-            "resolution was already satisfied on target branch",
+            DETAIL_EMPTY_ON_TARGET,
+            resolutions=resolutions,
+            skip_reason=_empty_skip_reason(conflicting_files, resolutions),
         )
 
     commit_result = run_process(
@@ -196,7 +235,7 @@ def apply_candidate(
             return CandidateResult(
                 candidate.source_pr_number, candidate.source_pr_title,
                 "skipped-existing",
-                "resolution was already satisfied on target branch",
+                DETAIL_EMPTY_ON_TARGET,
             )
         _abort_cherry_pick(repo_dir, run_git)
         return CandidateResult(
@@ -205,11 +244,27 @@ def apply_candidate(
             f"commit failed: {(commit_result.stderr or commit_result.stdout).strip()[:200]}",
         )
 
+    # Capture the resolution commit so diff comments can link each file to its
+    # native diff in the commit view.
+    head_result = run_process(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_dir, capture_output=True, text=True,
+    )
+    resolved_sha = (
+        head_result.stdout.strip() if head_result.returncode == 0 else None
+    )
+
+    # Carry the per-file resolutions and a durable resolved-by-AI flag so the
+    # sweep can post diff comments on the sweep PR and the sweep-PR-body table
+    # keeps the "resolved by Claude" record across later runs.
     return CandidateResult(
         candidate.source_pr_number,
         candidate.source_pr_title,
         "applied",
-        "conflicts resolved by Claude Code",
+        DETAIL_RESOLVED_BY_AI,
+        resolutions=resolutions,
+        resolved_by_ai=True,
+        resolved_commit_sha=resolved_sha,
     )
 
 

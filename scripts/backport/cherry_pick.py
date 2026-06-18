@@ -69,6 +69,7 @@ def _cherry_pick_merge(
             success=False,
             conflicting_files=conflicts,
             applied_commits=[],
+            conflicting_commit_sha=merge_commit_sha,
         )
     logger.info("Cherry-pick of merge commit %s succeeded", merge_commit_sha)
     return CherryPickResult(
@@ -105,6 +106,7 @@ def _cherry_pick_sequential(
                 success=False,
                 conflicting_files=conflicts,
                 applied_commits=applied,
+                conflicting_commit_sha=sha,
             )
         applied.append(sha)
     logger.info("All %d commits cherry-picked cleanly", len(applied))

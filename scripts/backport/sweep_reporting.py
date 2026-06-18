@@ -7,9 +7,33 @@ from collections.abc import Iterator
 
 from scripts.backport.sweep_models import (
     DETAIL_ALREADY_ON_SWEEP_BRANCH,
+    DETAIL_EMPTY_ON_TARGET,
+    DETAIL_RESOLVED_BY_AI,
     BranchSweepResult,
     CandidateResult,
 )
+
+
+def _is_ai_resolved(result: CandidateResult | None) -> bool:
+    """Whether *result* records an AI conflict resolution, durably or by detail."""
+    if result is None:
+        return False
+    return result.resolved_by_ai or result.detail == DETAIL_RESOLVED_BY_AI
+
+
+_SKIP_REASON_FALLBACK = (
+    "The cherry-pick produced no net change on this branch, so there is "
+    "nothing to backport."
+)
+
+
+def _skip_reason(result: CandidateResult) -> str:
+    """A concise, maintainer-readable reason a candidate was skipped.
+
+    Uses the deterministic reason recorded at apply time (derived from whether
+    the resolution matched the target branch), falling back to a generic line.
+    """
+    return result.skip_reason.strip() or _SKIP_REASON_FALLBACK
 
 
 def result_is_on_backport_branch(result: CandidateResult) -> bool:
@@ -54,7 +78,9 @@ def build_pr_body(
     *,
     branch_applied: list[CandidateResult] | None = None,
     previous_body: str | None = None,
+    comment_urls: dict[int, str] | None = None,
 ) -> str:
+    comment_urls = comment_urls or {}
     lines = [
         f"# Backport sweep for {result.target_branch}",
         "",
@@ -69,9 +95,16 @@ def build_pr_body(
     )
     resolved = {r.source_pr_number for r in applied}
     failed_now = []
+    skipped_empty = []
     for r in result.results:
         if r.outcome in {"applied", "skipped-existing"}:
             resolved.add(r.source_pr_number)
+            if (
+                r.outcome == "skipped-existing"
+                and r.detail == DETAIL_EMPTY_ON_TARGET
+                and r.source_pr_number not in {a.source_pr_number for a in applied}
+            ):
+                skipped_empty.append(r)
         else:
             failed_now.append(r)
     failed = merge_failed_results(failed_now, resolved=resolved, previous_body=previous_body)
@@ -79,8 +112,35 @@ def build_pr_body(
     if applied:
         lines.extend(["## Applied", "", "| Source PR | Title | Detail |", "|---|---|---|"])
         for r in applied:
+            detail = _esc(r.detail)
+            url = comment_urls.get(r.source_pr_number)
+            if url and _is_ai_resolved(r):
+                detail = f"[{detail}]({url})"
             lines.append(
-                f"| #{r.source_pr_number} | {_esc(r.source_pr_title)} | {_esc(r.detail)} |",
+                f"| #{r.source_pr_number} | {_esc(r.source_pr_title)} | {detail} |",
+            )
+        lines.append("")
+        if any(_is_ai_resolved(r) for r in applied):
+            lines.extend([
+                "AI resolution details are posted as comments on this PR when available.",
+                "",
+            ])
+
+    if skipped_empty:
+        lines.extend([
+            "## Skipped",
+            "",
+            "These candidates were evaluated but contribute no change to this "
+            "branch, e.g. the fix targets code that does not exist here. No "
+            "backport commit was created for them.",
+            "",
+            "| Source PR | Title | Reason |",
+            "|---|---|---|",
+        ])
+        for r in skipped_empty:
+            lines.append(
+                f"| #{r.source_pr_number} | {_esc(r.source_pr_title)} | "
+                f"{_esc(_skip_reason(r))} |",
             )
         lines.append("")
 
@@ -166,7 +226,10 @@ def merge_failed_results(
 
 def parse_previous_applied(body: str) -> list[CandidateResult]:
     return [
-        CandidateResult(pr_number, cells[1], "applied", cells[2])
+        CandidateResult(
+            pr_number, cells[1], "applied", cells[2],
+            resolved_by_ai=cells[2] == DETAIL_RESOLVED_BY_AI,
+        )
         for pr_number, cells in _parse_section_rows(body, "## Applied", min_cells=3)
     ]
 
@@ -208,6 +271,15 @@ def _merge_applied_result(
     current_result: CandidateResult | None,
     previous_result: CandidateResult | None,
 ) -> CandidateResult:
+    # Whether this candidate's conflicts were resolved by the AI, from any
+    # source that survives across runs: the current run's durable flag/detail,
+    # the membership base, or the detail parsed from the previous PR body.
+    resolved_by_ai = (
+        _is_ai_resolved(current_result)
+        or _is_ai_resolved(base)
+        or _is_ai_resolved(previous_result)
+    )
+
     if current_result is not None:
         title = current_result.source_pr_title or base.source_pr_title
         detail = current_result.detail
@@ -220,7 +292,11 @@ def _merge_applied_result(
             detail = previous_result.detail
             title = title or previous_result.source_pr_title
 
-    if detail == DETAIL_ALREADY_ON_SWEEP_BRANCH:
+    if resolved_by_ai:
+        # The fact that the AI resolved this candidate is durable; never let it
+        # collapse into the generic prior-sweep string on later runs.
+        detail = DETAIL_RESOLVED_BY_AI
+    elif detail == DETAIL_ALREADY_ON_SWEEP_BRANCH:
         detail = "cherry-picked in a prior sweep"
 
     return CandidateResult(
@@ -228,6 +304,7 @@ def _merge_applied_result(
         source_pr_title=title,
         outcome="applied",
         detail=detail,
+        resolved_by_ai=resolved_by_ai,
     )
 
 

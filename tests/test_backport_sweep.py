@@ -574,6 +574,287 @@ def test_upsert_pr_preserves_existing_applied_detail_on_update():
     assert "already on backport branch" not in kwargs["body"]
 
 
+def test_sweep_body_points_to_ai_comments_when_ai_resolved():
+    from scripts.backport.sweep_models import DETAIL_RESOLVED_BY_AI
+
+    with_ai = build_pr_body(BranchSweepResult(
+        target_branch="8.1", candidates_found=1,
+        results=[CandidateResult(50, "AI fix", "applied", DETAIL_RESOLVED_BY_AI, resolved_by_ai=True)],
+    ))
+    assert "AI resolution details are posted as comments on this PR when available." in with_ai
+
+    without_ai = build_pr_body(BranchSweepResult(
+        target_branch="8.1", candidates_found=1,
+        results=[CandidateResult(51, "Clean fix", "applied", "cherry-picked cleanly")],
+    ))
+    assert "AI resolution details are posted as comments on this PR" not in without_ai
+
+
+def test_sweep_body_links_ai_row_to_comment_when_url_known():
+    from scripts.backport.sweep_models import DETAIL_RESOLVED_BY_AI
+
+    result = BranchSweepResult(
+        target_branch="8.1", candidates_found=2,
+        results=[
+            CandidateResult(50, "AI fix", "applied", DETAIL_RESOLVED_BY_AI, resolved_by_ai=True),
+            CandidateResult(51, "Clean fix", "applied", "cherry-picked cleanly"),
+        ],
+    )
+    url = "https://github.com/o/r/pull/9#issuecomment-123"
+    body = build_pr_body(result, comment_urls={50: url})
+    # AI-resolved row's detail becomes a link to its comment.
+    assert f"[conflicts resolved by Claude Code]({url})" in body
+    # Clean row (no AI resolution) is not linked even if a stray URL existed.
+    assert "| #51 | Clean fix | cherry-picked cleanly |" in body
+
+
+def test_sweep_body_preserves_ai_resolution_across_unprocessed_runs():
+    """A day-0 AI resolution must not flatten to the generic prior-sweep
+    string on a later run where the candidate is not re-processed."""
+    from scripts.backport.sweep_models import (
+        DETAIL_ALREADY_ON_SWEEP_BRANCH,
+        DETAIL_RESOLVED_BY_AI,
+    )
+
+    # Day 0: candidate resolved by the AI this run.
+    day0 = BranchSweepResult(
+        target_branch="8.1",
+        candidates_found=1,
+        results=[
+            CandidateResult(100, "Fix X", "applied", DETAIL_RESOLVED_BY_AI, resolved_by_ai=True),
+        ],
+    )
+    body0 = build_pr_body(day0)
+    assert "conflicts resolved by Claude Code" in body0
+
+    # Day 1: candidate not re-processed; only on the branch via membership.
+    membership = [
+        CandidateResult(100, "Fix X", "applied", DETAIL_ALREADY_ON_SWEEP_BRANCH),
+    ]
+    body1 = build_pr_body(
+        BranchSweepResult(target_branch="8.1", candidates_found=0, results=[]),
+        branch_applied=membership,
+        previous_body=body0,
+    )
+    assert "conflicts resolved by Claude Code" in body1
+    assert "cherry-picked in a prior sweep" not in body1
+
+    # Day 2: same again, fed day-1 body. Signal still preserved.
+    body2 = build_pr_body(
+        BranchSweepResult(target_branch="8.1", candidates_found=0, results=[]),
+        branch_applied=membership,
+        previous_body=body1,
+    )
+    assert "conflicts resolved by Claude Code" in body2
+
+
+def test_sweep_reconcile_deletes_stale_source_pr_comment_groups():
+    """A source PR commented on by an earlier sweep must have its comments
+    deleted once it is no longer represented in the current result."""
+    from scripts.backport.diff_comments import (
+        parse_marker,
+        render_diff_comment,
+    )
+    from scripts.backport.sweep_prs import _reconcile_sweep_diff_comments
+
+    BOT = "valkeyrie-bot[bot]"
+
+    class FakeComment:
+        def __init__(self, body, author=BOT):
+            self.body = body
+            self.deleted = False
+            self.user = type("U", (), {"login": author})()
+            self.html_url = "https://github.com/o/r/pull/9#c"
+
+        def edit(self, body):
+            self.body = body
+
+        def delete(self):
+            self.deleted = True
+
+    class FakePR:
+        def __init__(self, comments):
+            self._c = comments
+            self.html_url = "https://github.com/o/r/pull/9"
+
+        def get_issue_comments(self):
+            return [c for c in self._c if not c.deleted]
+
+        def create_issue_comment(self, body):
+            c = FakeComment(body)
+            self._c.append(c)
+            return c
+
+    # Prior sweep left a comment for source PR #2.
+    stale = FakeComment(render_diff_comment(2, [
+        ResolutionResult(
+            path="src/old.c", resolved_content="x\n",
+            resolution_summary="resolved by Claude Code",
+            resolution_diff="-a\n+b",
+            reviewer_diff="-a\n+b",
+        ),
+    ]))
+    pr = FakePR([stale])
+
+    # Current result only has source PR #1 with fresh resolutions; #2 is gone.
+    result = BranchSweepResult(
+        target_branch="8.1",
+        candidates_found=1,
+        results=[
+            CandidateResult(
+                1, "Fix one", "applied", "conflicts resolved by Claude Code",
+                resolutions=[
+                    ResolutionResult(
+                        path="src/new.c", resolved_content="x\n",
+                        resolution_summary="resolved by Claude Code",
+                        resolution_diff="-a\n+b",
+                        reviewer_diff="-a\n+b",
+                    ),
+                ],
+                resolved_by_ai=True,
+            ),
+        ],
+    )
+
+    _reconcile_sweep_diff_comments(pr, result)
+
+    live = {
+        parse_marker(c.body).source_pr
+        for c in pr.get_issue_comments()
+        if parse_marker(c.body)
+    }
+    assert stale.deleted, "stale source PR #2 comment should be deleted"
+    assert live == {1}, "only the current source PR #1 group should remain"
+
+
+def test_sweep_reconcile_keeps_comments_for_still_applied_candidate_on_rerun():
+    """A rerun where an AI-resolved candidate is already on the branch (no fresh
+    resolutions) must keep its diff comments, not delete them."""
+    from scripts.backport.diff_comments import parse_marker, render_diff_comment
+    from scripts.backport.sweep_models import DETAIL_ALREADY_ON_SWEEP_BRANCH
+    from scripts.backport.sweep_prs import _reconcile_sweep_diff_comments
+
+    BOT = "valkeyrie-bot[bot]"
+
+    class FakeComment:
+        def __init__(self, body, author=BOT):
+            self.body = body
+            self.deleted = False
+            self.user = type("U", (), {"login": author})()
+            self.html_url = "https://github.com/o/r/pull/9#c"
+
+        def edit(self, body):
+            self.body = body
+
+        def delete(self):
+            self.deleted = True
+
+    class FakePR:
+        def __init__(self, comments):
+            self._c = comments
+            self.html_url = "https://github.com/o/r/pull/9"
+
+        def get_issue_comments(self):
+            return [c for c in self._c if not c.deleted]
+
+        def create_issue_comment(self, body):
+            c = FakeComment(body)
+            self._c.append(c)
+            return c
+
+    # Prior sweep posted a comment for source PR #5.
+    kept = FakeComment(render_diff_comment(5, [
+        ResolutionResult(
+            path="src/x.c", resolved_content="x\n",
+            resolution_summary="resolved by Claude Code",
+            resolution_diff="-a\n+b",
+            reviewer_diff="-a\n+b",
+        ),
+    ]))
+    pr = FakePR([kept])
+
+    # Rerun: #5 is still on the branch but only as already-on-branch, with no
+    # fresh resolutions carried.
+    result = BranchSweepResult(
+        target_branch="8.1",
+        candidates_found=1,
+        results=[
+            CandidateResult(5, "Fix five", "skipped-existing", DETAIL_ALREADY_ON_SWEEP_BRANCH),
+        ],
+    )
+
+    _reconcile_sweep_diff_comments(pr, result)
+
+    assert not kept.deleted, "comments for a still-on-branch candidate must be kept"
+    live = {
+        parse_marker(c.body).source_pr
+        for c in pr.get_issue_comments()
+        if parse_marker(c.body)
+    }
+    assert live == {5}
+
+
+def test_sweep_reconcile_keeps_comments_for_branch_applied_membership_only():
+    """The PR body's branch_applied membership and comment cleanup must agree."""
+    from scripts.backport.diff_comments import parse_marker, render_diff_comment
+    from scripts.backport.sweep_models import DETAIL_ALREADY_ON_SWEEP_BRANCH
+    from scripts.backport.sweep_prs import _reconcile_sweep_diff_comments
+
+    BOT = "valkeyrie-bot[bot]"
+
+    class FakeComment:
+        def __init__(self, body, author=BOT):
+            self.body = body
+            self.deleted = False
+            self.user = type("U", (), {"login": author})()
+            self.html_url = "https://github.com/o/r/pull/9#c"
+
+        def edit(self, body):
+            self.body = body
+
+        def delete(self):
+            self.deleted = True
+
+    class FakePR:
+        def __init__(self, comments):
+            self._c = comments
+            self.html_url = "https://github.com/o/r/pull/9"
+
+        def get_issue_comments(self):
+            return [c for c in self._c if not c.deleted]
+
+        def create_issue_comment(self, body):
+            c = FakeComment(body)
+            self._c.append(c)
+            return c
+
+    kept = FakeComment(render_diff_comment(5, [
+        ResolutionResult(
+            path="src/x.c", resolved_content="x\n",
+            resolution_summary="resolved by Claude Code",
+            resolution_diff="-a\n+b",
+            reviewer_diff="-a\n+b",
+        ),
+    ]))
+    pr = FakePR([kept])
+
+    _reconcile_sweep_diff_comments(
+        pr,
+        BranchSweepResult(target_branch="8.1", candidates_found=0, results=[]),
+        branch_applied=[
+            CandidateResult(5, "Fix five", "skipped-existing", DETAIL_ALREADY_ON_SWEEP_BRANCH),
+        ],
+    )
+
+    assert not kept.deleted
+    live = {
+        parse_marker(c.body).source_pr
+        for c in pr.get_issue_comments()
+        if parse_marker(c.body)
+    }
+    assert live == {5}
+
+
 def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
     monkeypatch,
     tmp_path,
@@ -1271,21 +1552,116 @@ def test_build_pr_body_lists_already_on_branch_under_applied():
     body = build_pr_body(result)
 
     assert "## Applied" in body
-    # The Applied section is the only commit-listing section in the body
-    # (no Needs attention because there are no failures, and the legacy
-    # "Already on branch" section is removed). Asserting against the full
-    # body therefore only checks the Applied table.
     assert "## Needs attention" not in body
     assert "Already on branch" not in body
-    # Newly applied + on-sweep-branch carry-overs are listed.
+    # Newly applied + on-sweep-branch carry-overs are listed in Applied.
     assert "#3654" in body
     assert "#3380" in body
     assert "#3619" in body
-    # Already-on-release-branch and no-op resolutions must NOT be listed:
-    # those changes are not on the sweep branch, so listing them under
-    # Applied would misrepresent the PR's commit set.
-    assert "#4001" not in body
-    assert "#4002" not in body
+
+    # The Applied table must not list changes that are not on the sweep branch.
+    applied_section = body.split("## Applied", 1)[1].split("## ", 1)[0]
+    assert "#4001" not in applied_section
+    assert "#4002" not in applied_section
+
+    # A conflict resolution that collapsed to a no-op is surfaced under
+    # "Skipped" so maintainers see it was
+    # evaluated and intentionally skipped, rather than vanishing silently.
+    assert "## Skipped" in body
+    skipped_section = body.split("## Skipped", 1)[1]
+    assert "#4002" in skipped_section
+
+
+def test_build_pr_body_surfaces_no_op_resolution_under_skipped():
+    """A candidate resolved to a no-op is surfaced under Skipped, not dropped.
+
+    When the resolution contributes nothing to the target branch (e.g. the fix
+    targets code absent on this branch), the candidate is recorded as
+    ``skipped-existing`` with ``DETAIL_EMPTY_ON_TARGET`` and a deterministic
+    ``skip_reason``. It must not appear in Applied, but the body must list it
+    under "Skipped" with that reason so maintainers see why it was skipped.
+    """
+    from scripts.backport.sweep_models import DETAIL_EMPTY_ON_TARGET
+
+    result = BranchSweepResult(
+        target_branch="8.0",
+        candidates_found=2,
+        results=[
+            CandidateResult(
+                source_pr_number=312,
+                source_pr_title="Fix RESP3 type violation",
+                outcome="applied",
+                detail="conflicts resolved by Claude Code",
+            ),
+            CandidateResult(
+                source_pr_number=313,
+                source_pr_title="Fix off_t truncation in bio repl",
+                outcome="skipped-existing",
+                detail=DETAIL_EMPTY_ON_TARGET,
+                skip_reason=(
+                    "The change does not apply to this branch: resolving the "
+                    "conflict matched the existing code, so the cherry-pick "
+                    "added nothing."
+                ),
+            ),
+        ],
+    )
+
+    body = build_pr_body(result)
+
+    assert "## Skipped" in body
+    skipped = body.split("## Skipped", 1)[1]
+    assert "#313" in skipped
+    # The per-row reason is the deterministic skip_reason, not resolver prose.
+    assert "does not apply to this branch" in skipped
+
+    applied = body.split("## Applied", 1)[1].split("## ", 1)[0]
+    assert "#312" in applied
+    assert "#313" not in applied
+
+
+
+def test_empty_skip_reason_detects_change_not_applicable():
+    from scripts.backport.models import ConflictedFile, ResolutionResult
+    from scripts.backport.sweep_apply import _empty_skip_reason
+
+    # Every resolved file matched the target's existing content -> the change
+    # does not apply on this branch.
+    cf = [ConflictedFile("src/server.c", "TARGET", "SOURCE")]
+    res = [ResolutionResult("src/server.c", "TARGET", "r")]
+    assert "does not apply to this branch" in _empty_skip_reason(cf, res)
+
+
+def test_empty_skip_reason_generic_fallback():
+    from scripts.backport.models import ConflictedFile, ResolutionResult
+    from scripts.backport.sweep_apply import _empty_skip_reason
+
+    # Resolution differs from target -> fall back to the generic no-net-change
+    # statement rather than asserting a cause we cannot prove.
+    cf = [ConflictedFile("src/server.c", "TARGET", "SOURCE")]
+    res = [ResolutionResult("src/server.c", "DIFFERENT", "r")]
+    reason = _empty_skip_reason(cf, res)
+    assert "no net change" in reason
+
+
+def test_build_pr_body_omits_skipped_section_when_none():
+    """No Skipped section is rendered when every candidate applied cleanly."""
+    result = BranchSweepResult(
+        target_branch="8.0",
+        candidates_found=1,
+        results=[
+            CandidateResult(
+                source_pr_number=400,
+                source_pr_title="Clean backport",
+                outcome="applied",
+                detail="cherry-picked cleanly",
+            ),
+        ],
+    )
+
+    body = build_pr_body(result)
+
+    assert "## Skipped" not in body
 
 
 def test_build_pr_body_uses_branch_commits_and_preserves_prior_detail():
@@ -1362,7 +1738,10 @@ def test_build_pr_body_round_trips_applied_and_failed_detail():
     )
 
     assert parse_previous_applied(second) == [
-        CandidateResult(2915, "Fix | crash", "applied", "conflicts resolved by Claude Code"),
+        CandidateResult(
+            2915, "Fix | crash", "applied", "conflicts resolved by Claude Code",
+            resolved_by_ai=True,
+        ),
     ]
     assert [(r.source_pr_number, r.detail) for r in parse_previous_failed(second)] == [
         (1826, "lacks src/lua/engine_lua.c"),

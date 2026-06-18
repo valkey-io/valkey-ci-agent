@@ -69,6 +69,14 @@ def test_claude_resolves_conflict(tmp_path: Path) -> None:
     assert len(results) == 1
     assert results[0].resolved_content == "new code\n"
     assert "Claude Code" in results[0].resolution_summary
+    assert results[0].resolution_diff is not None
+    # The diff baseline is the conflicted working-tree content (with markers),
+    # so the resolution diff shows the markers being removed, not a target->source edit.
+    assert "--- a/src/cluster.c (conflicted)" in results[0].resolution_diff
+    assert "+++ b/src/cluster.c (AI resolved)" in results[0].resolution_diff
+    assert "-<<<<<<< HEAD" in results[0].resolution_diff
+    assert "-old code" in results[0].resolution_diff
+    assert ">>>>>>> abc123" in results[0].resolution_diff
     assert "untrusted data" in captured["prompt"]
 
 
@@ -104,6 +112,11 @@ def test_claude_can_adapt_allowed_auto_merged_file(tmp_path: Path) -> None:
     assert {r.path for r in results} == {"src/cluster.c", "src/vector_base.h"}
     adapted = next(r for r in results if r.path == "src/vector_base.h")
     assert adapted.resolved_content == "adapted target-branch API\n"
+    # The adapted auto-merged file must also carry a diff so the PR body can
+    # render it, with the pre-edit auto-merged content as the baseline.
+    assert adapted.resolution_diff is not None
+    assert "-auto-merged source API" in adapted.resolution_diff
+    assert "+adapted target-branch API" in adapted.resolution_diff
     assert "auto-merged changed files" in captured["prompt"]
     assert "src/vector_base.h" in captured["prompt"]
 

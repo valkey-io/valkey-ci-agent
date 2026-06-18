@@ -34,6 +34,9 @@ class ResolutionResult:
     resolved_content: str | None  # None = resolution failed
     resolution_summary: str
     source: ResolutionSource = "llm"
+    resolution_diff: str | None = None
+    reviewer_diff: str | None = None
+    llm_summary: str | None = None
 
 
 @dataclass
@@ -43,6 +46,7 @@ class CherryPickResult:
     success: bool  # True if no conflicts
     conflicting_files: list[ConflictedFile] = field(default_factory=list)
     applied_commits: list[str] = field(default_factory=list)
+    conflicting_commit_sha: str | None = None
 
 
 @dataclass

@@ -192,6 +192,92 @@ def test_build_pr_body_includes_checklist_and_plain_status_labels() -> None:
     assert "❌" not in body
 
 
+def test_build_pr_body_is_lean_and_points_to_diff_comments() -> None:
+    context = BackportPRContext(
+        source_pr_number=123,
+        source_pr_title="Fix failover edge case",
+        source_pr_url="https://github.com/owner/repo/pull/123",
+        source_pr_diff="diff",
+        target_branch="8.1",
+        commits=["abc1234"],
+    )
+    results = [
+        ResolutionResult(
+            path="src/server.c",
+            resolved_content="new code\n",
+            resolution_summary="resolved by Claude Code",
+            resolution_diff="--- a/src/server.c (conflicted)\n+new code",
+        ),
+    ]
+
+    body = BackportPRCreator.build_pr_body(
+        context,
+        had_conflicts=True,
+        resolution_results=results,
+    )
+
+    # Per-file status stays in the body.
+    assert "`src/server.c`: Resolved automatically" in body
+    # The diff itself is NOT inlined; the body points to PR comments instead.
+    assert "```diff" not in body
+    assert "<details>" not in body
+    assert "AI resolution details are posted as a comment on this PR" in body
+
+
+def test_build_pr_body_links_to_comments_when_provided() -> None:
+    context = BackportPRContext(
+        source_pr_number=123,
+        source_pr_title="Fix failover edge case",
+        source_pr_url="https://github.com/owner/repo/pull/123",
+        source_pr_diff="diff",
+        target_branch="8.1",
+        commits=["abc1234"],
+    )
+    results = [
+        ResolutionResult(
+            path="src/server.c",
+            resolved_content="new\n",
+            resolution_summary="resolved by Claude Code",
+            resolution_diff="-old\n+new",
+        ),
+    ]
+    url = "https://github.com/owner/repo/pull/200#issuecomment-9"
+
+    body = BackportPRCreator.build_pr_body(
+        context,
+        had_conflicts=True,
+        resolution_results=results,
+        comment_links={"src/server.c": url},
+    )
+
+    assert f"([view diff]({url}))" in body
+
+
+def test_build_pr_body_omits_pointer_when_no_llm_resolution() -> None:
+    context = BackportPRContext(
+        source_pr_number=123,
+        source_pr_title="Whitespace only",
+        source_pr_url="https://github.com/owner/repo/pull/123",
+        source_pr_diff="diff",
+        target_branch="8.1",
+        commits=["abc1234"],
+    )
+    results = [
+        ResolutionResult(
+            path="src/ws.c",
+            resolved_content="x\n",
+            resolution_summary="whitespace-only (no LLM needed)",
+            source="automatic",
+        ),
+    ]
+
+    body = BackportPRCreator.build_pr_body(
+        context, had_conflicts=True, resolution_results=results,
+    )
+
+    assert "AI resolution details are posted as a comment on this PR" not in body
+
+
 def test_automatic_resolution_does_not_get_llm_disclaimer() -> None:
     context = BackportPRContext(
         source_pr_number=123,
