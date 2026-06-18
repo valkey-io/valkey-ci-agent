@@ -176,10 +176,14 @@ def test_claim_failure_is_not_a_win():
 # --- lookback clamping ---
 
 def test_lookback_default_and_clamp(monkeypatch):
-    from scripts.ci_fix.comment_poll import _MAX_LOOKBACK_MINUTES, _lookback_minutes
+    from scripts.ci_fix.comment_poll import (
+        _DEFAULT_LOOKBACK_MINUTES,
+        _MAX_LOOKBACK_MINUTES,
+        _lookback_minutes,
+    )
 
     monkeypatch.delenv("CI_FIX_POLL_LOOKBACK_MINUTES", raising=False)
-    assert _lookback_minutes() == 30
+    assert _lookback_minutes() == _DEFAULT_LOOKBACK_MINUTES
 
     monkeypatch.setenv("CI_FIX_POLL_LOOKBACK_MINUTES", "120")
     assert _lookback_minutes() == 120
@@ -191,7 +195,7 @@ def test_lookback_default_and_clamp(monkeypatch):
     assert _lookback_minutes() == _MAX_LOOKBACK_MINUTES
 
     monkeypatch.setenv("CI_FIX_POLL_LOOKBACK_MINUTES", "garbage")
-    assert _lookback_minutes() == 30
+    assert _lookback_minutes() == _DEFAULT_LOOKBACK_MINUTES
 
 
 # --- helpers exercised directly (these would catch the PyGithub-shape bugs) ---

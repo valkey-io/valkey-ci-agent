@@ -7,14 +7,14 @@ name: CI Fix Comment Poll
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       lookback_minutes:
-        description: "Comment lookback window in minutes (default 30; widen to backfill after an outage, capped at 7 days)"
+        description: "Comment lookback window in minutes (default 180; widen to backfill after an outage, capped at 7 days)"
         required: false
         type: string
-        default: "30"
+        default: "180"
 
 permissions: {}
 
@@ -62,5 +62,5 @@ jobs:
         env:
           CI_FIX_POLL_TOKEN: ${{ steps.token.outputs.token }}
           CI_FIX_POLL_APP_SLUG: ${{ steps.token.outputs.app-slug }}
-          CI_FIX_POLL_LOOKBACK_MINUTES: ${{ inputs.lookback_minutes || '30' }}
+          CI_FIX_POLL_LOOKBACK_MINUTES: ${{ inputs.lookback_minutes || '180' }}
         run: python -m scripts.ci_fix.comment_poll

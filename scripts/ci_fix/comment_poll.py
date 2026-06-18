@@ -36,7 +36,13 @@ _CLAIM_REACTION = "eyes"
 # Manual backfill must not page unbounded history on a typo. A week is well past
 # any realistic outage while keeping the comment listing cheap.
 _MAX_LOOKBACK_MINUTES = 7 * 24 * 60
-_DEFAULT_LOOKBACK_MINUTES = 30
+# GitHub throttles scheduled workflows on a busy public repo: the cron asks for
+# a tick every few minutes but runs land roughly hourly, and have been seen over
+# two hours apart under load. The lookback must comfortably exceed that real
+# worst-case gap, or a comment posted between two ticks falls out of the window
+# and is never seen. The reaction marker prevents reprocessing, so a generous
+# window only costs a slightly larger comment listing.
+_DEFAULT_LOOKBACK_MINUTES = 180
 
 DispatchFn = Callable[[str, int, ParsedCommand, str], None]
 """(repo_full_name, pr_number, command, commenter) -> None."""
