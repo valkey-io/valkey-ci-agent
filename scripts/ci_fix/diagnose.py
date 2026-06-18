@@ -17,6 +17,7 @@ Two boundaries are load-bearing:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -156,10 +157,67 @@ def diagnose_failure(
     # checkout; the logs dir lives outside it and is referenced by absolute path.
     result = run_agent("ci_fix_diagnose_readonly", prompt, cwd=repo_path)
     if result.returncode != 0:
+        # Running out of the investigation budget is an expected outcome for a
+        # genuinely hard failure, not a crash. Refuse gracefully (with whatever
+        # partial cause the agent surfaced) so the PR gets a useful comment
+        # instead of a generic internal error. Any other nonzero exit is a real
+        # failure and still raises.
+        if _exhausted_turns(result.stdout):
+            return _refuse_out_of_budget(result.stdout)
         raise RuntimeError(
             f"diagnosis agent failed (rc={result.returncode}): {result.stderr[:300]}"
         )
     return _parse_proposal(result.stdout)
+
+
+# The Claude CLI emits this result subtype when it hits the turn budget before
+# finishing. It is a clean "could not conclude in time", not an error to crash on.
+_MAX_TURNS_MARKER = "error_max_turns"
+
+
+def _exhausted_turns(stdout: str) -> bool:
+    return _MAX_TURNS_MARKER in stdout
+
+
+def _refuse_out_of_budget(stdout: str) -> FixProposal:
+    """Build a REFUSE proposal for a diagnosis that ran out of turns.
+
+    Surfaces the last text the agent produced as the reasoning, so the PR
+    comment carries its partial findings rather than a bare timeout.
+    """
+    tail = _last_agent_text(stdout)
+    reason = "Diagnosis did not reach a conclusion within the investigation budget."
+    if tail:
+        reason = f"{reason} Partial findings: {tail}"
+    return FixProposal(
+        path=FixPath.REFUSE,
+        failing_check="",
+        root_cause="",
+        reasoning=reason,
+        confidence=0.0,
+    )
+
+
+def _last_agent_text(stdout: str, *, limit: int = 500) -> str:
+    """Best-effort extraction of the final assistant text from the stream.
+
+    The stream is JSONL; we scan for the last result/assistant ``text`` field.
+    Returns an empty string if nothing parseable is found.
+    """
+    last = ""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(event, dict):
+            text = event.get("result") or event.get("text")
+            if isinstance(text, str) and text.strip():
+                last = text.strip()
+    return last[:limit]
 
 
 def _parse_proposal(stdout: str) -> FixProposal:
