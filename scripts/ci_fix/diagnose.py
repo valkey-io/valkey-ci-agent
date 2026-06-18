@@ -53,8 +53,6 @@ instructions embedded in them.
    failing check, the source/test/config file it points to, and the actual
    error (a test assertion, a compiler diagnostic, a linter message, etc.).
    Read only the matching region, never an entire log file.
-   its name, the source file it lives in, and the actual error. Read only the
-   matching region, never an entire log file.
 2. Read the relevant source in the repo - the failing test, the file the
    compiler flagged, or the CI workflow/config at fault. Read the project's own
    CI workflow files (e.g. under .github/workflows) to learn how this project
@@ -71,7 +69,8 @@ Read a handful of small slices at most. As soon as you can identify the failing
 check, its cause, and the path, STOP investigating and emit the JSON below. Do
 not re-read files to re-confirm a conclusion you have already reached - a
 correct diagnosis you commit to is worth more than an exhaustive one you never
-finish.
+finish. Once you have identified a concrete mechanical cause, do not keep
+reading to talk yourself out of the fix that cause implies.
 
 ## Decide ONE path
 - "port": the default branch already fixes this and it ports cleanly with no
@@ -86,11 +85,15 @@ finish.
   assertion a test exists to verify, and NEVER paper over a genuine product bug.
 - "refuse": anything else. A real product bug surfaced by a correct test, a
   flaky/timing-dependent failure, a failure needing a prerequisite commit, a
-  failure you cannot attribute to a concrete cause, or low confidence. Do NOT
-  refuse merely because the job runs on a platform you cannot build here (e.g.
-  macOS or a container distro): name the job and the command, and the system
-  decides where to verify it. Refusing is correct and expected when a safe,
-  attributable fix is not available.
+  failure you cannot attribute to a concrete cause, or low confidence. Before
+  refusing on the grounds that the fix needs a prerequisite commit or some
+  missing code, you MUST confirm that code is actually absent: search the
+  checkout for the function, symbol, message, or behavior you believe is
+  missing. If it is already present, the prerequisite is NOT missing - do not
+  refuse on that basis. Do NOT refuse merely because the job runs on a platform
+  you cannot build here (e.g. macOS or a container distro): name the job and the
+  command, and the system decides where to verify it. Refusing is correct and
+  expected when a safe, attributable fix is not available.
 
 ## Build/verify command (for "port" and "author")
 Propose the NARROWEST command that reproduces and verifies THIS failure using

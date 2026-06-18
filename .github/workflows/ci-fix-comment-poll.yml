@@ -1,0 +1,66 @@
+name: CI Fix Comment Poll
+
+# Scans recent valkey-io/valkey PR comments for "@valkeyrie-ops fix <ci-link>"
+# and dispatches the ci-fix workflow for each new one. The trigger only; the
+# fix itself runs in ci-fix.yml. Idempotency is a reaction marker on the
+# comment, so overlapping or replayed ticks never double-dispatch.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_minutes:
+        description: "Comment lookback window in minutes (default 30; widen to backfill after an outage, capped at 7 days)"
+        required: false
+        type: string
+        default: "30"
+
+permissions: {}
+
+jobs:
+  poll:
+    name: "Poll for fix commands"
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate App token
+        id: token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: |
+            valkey
+            valkey-ci-agent
+          permission-members: read
+          permission-issues: write
+          permission-pull-requests: read
+          permission-actions: write
+          permission-metadata: read
+
+      - name: Poll and dispatch
+        env:
+          CI_FIX_POLL_TOKEN: ${{ steps.token.outputs.token }}
+          CI_FIX_POLL_APP_SLUG: ${{ steps.token.outputs.app-slug }}
+          CI_FIX_POLL_LOOKBACK_MINUTES: ${{ inputs.lookback_minutes || '30' }}
+        run: python -m scripts.ci_fix.comment_poll
