@@ -26,6 +26,19 @@ class CandidateResult:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class BranchAppliedPr:
+    """A PR already cherry-picked onto the sweep branch, with its commit SHA.
+
+    The SHA lets the sweep reset to a precise point and replay only the
+    out-of-order suffix instead of rebuilding the whole branch.
+    """
+
+    source_pr_number: int
+    source_pr_title: str
+    commit_sha: str
+
+
 # Detail string used when a candidate PR is already cherry-picked onto the
 # backport sweep branch. Reporting treats this as "on the branch", unlike
 # empty cherry-picks that mean "already on the release branch".
@@ -37,6 +50,7 @@ class BranchSweepResult:
     target_branch: str
     candidates_found: int = 0
     results: list[CandidateResult] = field(default_factory=list)
+    branch_notes: list[str] = field(default_factory=list)
     pr_url: str = ""
     error: str = ""
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -211,6 +212,93 @@ def apply_candidate(
         "applied",
         "conflicts resolved by Claude Code",
     )
+
+
+def candidate_is_empty_on_ref(
+    repo_dir: str,
+    candidate: ProjectBackportCandidate,
+    base_ref: str,
+    git_env: dict[str, str],
+    *,
+    run_git: RunGit = run_git_default,
+    run_process: RunProcess = subprocess.run,
+) -> bool:
+    """True if cherry-picking the candidate onto ``base_ref`` is a no-op.
+
+    Trial-applies the candidate's merge commit on a throwaway worktree of the
+    clean target branch. A candidate whose change is already present there
+    (e.g. a revert carried in by an earlier sweep) cherry-picks empty, so it
+    can be skipped instead of forcing a branch reorder it would not actually
+    contribute to.
+    """
+    sha = candidate.merge_commit_sha
+    if not sha:
+        return False
+
+    run_git(repo_dir, "fetch", "origin", sha, env=git_env)
+    with tempfile.TemporaryDirectory(prefix="backport-empty-check-") as temp_dir:
+        worktree_dir = str(Path(temp_dir, "worktree"))
+        add_result = run_process(
+            ["git", "worktree", "add", "--detach", worktree_dir, base_ref],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+        )
+        if add_result.returncode != 0:
+            raise RuntimeError(
+                "could not create target-branch worktree for empty cherry-pick check: "
+                + ((add_result.stderr or add_result.stdout).strip()[:300] or "git worktree add failed")
+            )
+
+        try:
+            result = run_process(
+                ["git", "cherry-pick", "-m", "1", sha],
+                cwd=worktree_dir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0 and is_non_merge_mainline_error(
+                f"{result.stdout}\n{result.stderr}"
+            ):
+                result = run_process(
+                    ["git", "cherry-pick", sha],
+                    cwd=worktree_dir,
+                    capture_output=True,
+                    text=True,
+                )
+
+            if result.returncode == 0:
+                return False
+
+            conflict_result = run_process(
+                ["git", "diff", "--name-only", "--diff-filter=U"],
+                cwd=worktree_dir,
+                capture_output=True,
+                text=True,
+            )
+            conflicting_paths = [
+                line.strip()
+                for line in conflict_result.stdout.splitlines()
+                if line.strip()
+            ]
+            if conflicting_paths:
+                return False
+
+            output = f"{result.stdout}\n{result.stderr}"
+            return "cherry-pick is now empty" in output or "nothing to commit" in output
+        finally:
+            run_process(
+                ["git", "cherry-pick", "--abort"],
+                cwd=worktree_dir,
+                capture_output=True,
+                text=True,
+            )
+            run_process(
+                ["git", "worktree", "remove", "--force", worktree_dir],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+            )
 
 
 def has_staged_changes(repo_dir: str, *, run_process: RunProcess = subprocess.run) -> bool:

@@ -76,6 +76,12 @@ def build_pr_body(
             failed_now.append(r)
     failed = merge_failed_results(failed_now, resolved=resolved, previous_body=previous_body)
 
+    if result.branch_notes:
+        lines.extend(["## Branch updates", ""])
+        for note in result.branch_notes:
+            lines.append(f"- {_esc(note)}")
+        lines.append("")
+
     if applied:
         lines.extend(["## Applied", "", "| Source PR | Title | Detail |", "|---|---|---|"])
         for r in applied:

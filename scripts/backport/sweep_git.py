@@ -14,6 +14,7 @@ from scripts.backport.main import BOT_EMAIL, BOT_NAME
 from scripts.backport.main import _run_git as run_git_default
 from scripts.backport.sweep_models import (
     DETAIL_ALREADY_ON_SWEEP_BRANCH,
+    BranchAppliedPr,
     CandidateResult,
 )
 from scripts.backport.utils import pr_numbers_from_commit_subjects
@@ -72,9 +73,49 @@ def push_backport_branch(
 
 def list_already_applied(repo_dir: str, base_branch: str, backport_branch: str) -> set[str]:
     return {
-        str(result.source_pr_number)
-        for result in list_applied_prs_on_branch(repo_dir, base_branch, backport_branch)
+        str(applied.source_pr_number)
+        for applied in list_branch_applied_prs(repo_dir, base_branch, backport_branch)
     }
+
+
+def list_branch_applied_prs(
+    repo_dir: str,
+    base_branch: str,
+    backport_branch: str,
+) -> list[BranchAppliedPr]:
+    """Return the PRs on the sweep branch, in branch order, with commit SHAs."""
+    result = subprocess.run(
+        [
+            "git",
+            "log",
+            "--reverse",
+            f"origin/{base_branch}..{backport_branch}",
+            "--format=%H%x00%s",
+        ],
+        cwd=repo_dir, capture_output=True, text=True, check=True,
+    )
+    applied: list[BranchAppliedPr] = []
+    seen: set[int] = set()
+    for line in result.stdout.strip().splitlines():
+        if "\0" not in line:
+            continue
+        commit_sha, subject = line.split("\0", 1)
+        matched = pr_numbers_from_commit_subjects([subject])
+        if not matched:
+            continue
+        pr_number = next(iter(matched))
+        if pr_number in seen:
+            continue
+        seen.add(pr_number)
+        title = re.sub(r"\s*\(#\d+\)\s*$", "", subject).strip() or subject.strip()
+        applied.append(
+            BranchAppliedPr(
+                source_pr_number=pr_number,
+                source_pr_title=title,
+                commit_sha=commit_sha,
+            )
+        )
+    return applied
 
 
 def list_applied_prs_on_branch(
@@ -82,36 +123,15 @@ def list_applied_prs_on_branch(
     base_branch: str,
     backport_branch: str,
 ) -> list[CandidateResult]:
-    result = subprocess.run(
-        [
-            "git",
-            "log",
-            "--reverse",
-            f"origin/{base_branch}..{backport_branch}",
-            "--format=%s",
-        ],
-        cwd=repo_dir, capture_output=True, text=True, check=True,
-    )
-    applied: list[CandidateResult] = []
-    seen: set[int] = set()
-    for line in result.stdout.strip().splitlines():
-        matched = pr_numbers_from_commit_subjects([line])
-        if not matched:
-            continue
-        pr_number = next(iter(matched))
-        if pr_number in seen:
-            continue
-        seen.add(pr_number)
-        title = re.sub(r"\s*\(#\d+\)\s*$", "", line).strip() or line.strip()
-        applied.append(
-            CandidateResult(
-                source_pr_number=pr_number,
-                source_pr_title=title,
-                outcome="skipped-existing",
-                detail=DETAIL_ALREADY_ON_SWEEP_BRANCH,
-            )
+    return [
+        CandidateResult(
+            source_pr_number=applied.source_pr_number,
+            source_pr_title=applied.source_pr_title,
+            outcome="skipped-existing",
+            detail=DETAIL_ALREADY_ON_SWEEP_BRANCH,
         )
-    return applied
+        for applied in list_branch_applied_prs(repo_dir, base_branch, backport_branch)
+    ]
 
 
 RunProcess = Callable[..., subprocess.CompletedProcess[Any]]
