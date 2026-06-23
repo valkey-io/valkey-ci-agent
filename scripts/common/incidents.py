@@ -26,6 +26,11 @@ def compute_fingerprint(*, namespace: Iterable[str], shapes: Iterable[str],
 
     Normalization runs *before* dedup and slicing so volatile variants do
     not change which `max_shapes` survive the cap.
+
+    ``namespace`` is the stable identity tuple (joined in order, never
+    normalized); ``shapes`` are volatile finding details that are normalized,
+    deduped, sorted, and capped. A caller whose entire identity is fixed (no
+    volatile evidence) can pass it all in ``namespace`` with empty ``shapes``.
     """
     parts = [n.lower() for n in namespace]
     normalized = sorted({_VOLATILE_RE.sub("_", s.lower()) for s in shapes})[:max_shapes]

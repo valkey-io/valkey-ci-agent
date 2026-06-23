@@ -4,8 +4,8 @@ The rendering is test-failure-specific (test name/file, error trace, the list
 of CI jobs the failure appeared in); the create-or-update machinery lives in
 :mod:`scripts.common.issue_dedup`.
 
-A test failure's identity is ``test_name`` + ``test_file`` — that pair is the
-dedup fingerprint. Across recurrences we accumulate the set of failing
+A test failure's identity is the ``test_name`` + ``test_file`` pair, which is
+the dedup fingerprint. Across recurrences we accumulate the set of failing
 environments (CI jobs) into the issue body; because the dedup publisher's
 ``render`` callback can't see the previously published body, that merge is done
 via the publisher's ``body_transform`` hook (see :func:`merge_environments`).
@@ -29,15 +29,15 @@ _LABEL_NAME = "test-failure"
 def fingerprint_for(failure: UniqueFailure) -> str:
     """Stable dedup key for a failure: a hash of test name + file.
 
-    The identity is still ``test_name`` + ``test_file``, hashed via
-    :func:`scripts.common.incidents.compute_fingerprint`, mirroring the
-    fuzzer pipeline. Hashing yields a fixed-shape hex token that is safe in
-    both places.
+    The identity is ``test_name`` + ``test_file``, hashed via
+    :func:`scripts.common.incidents.compute_fingerprint` like the fuzzer
+    pipeline, into a fixed-shape hex token that is safe to embed in the marker
+    and the search query.
 
-    The name/file pair is the *identity*, so it goes in ``namespace`` (joined
-    in order, never normalized) rather than ``shapes`` — that keeps digits
-    significant so distinct tests like ``PSYNC2`` vs. ``PSYNC3`` stay separate,
-    and preserves order so a name/file swap can't collide.
+    The pair is the identity, so it goes in ``namespace`` (joined in order,
+    never normalized) rather than ``shapes``. That keeps digits significant so
+    PSYNC2 and PSYNC3 stay distinct, and preserves order so a name/file swap
+    cannot collide.
     """
     return compute_fingerprint(
         namespace=(MARKER_NAMESPACE, failure.test_name, failure.test_file),
@@ -45,11 +45,21 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     )
 
 
+def title_for(failure: UniqueFailure) -> str:
+    """Issue title for a failure.
+
+    Exposed rather than inlined in ``render_for`` so callers can pass the same
+    title to ``IssueDedupPublisher.upsert`` as ``title_fallback`` when
+    migrating issues off the old raw-fingerprint marker.
+    """
+    return _build_title(failure)
+
+
 def render_for(failure: UniqueFailure) -> Callable[[str, int], IssueContent]:
     """Return the render callable expected by ``IssueDedupPublisher.upsert``."""
     def _render(marker: str, occurrences: int) -> IssueContent:
         return IssueContent(
-            title=_build_title(failure),
+            title=title_for(failure),
             body=_build_body(failure, marker, occurrences=occurrences),
             comment=_build_comment(failure),
             labels=(_LABEL_NAME,),

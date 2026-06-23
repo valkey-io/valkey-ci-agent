@@ -93,7 +93,7 @@ def test_updates_reinjects_missing_marker():
 
 def test_search_failure_propagates_no_duplicate_issue():
     """A transient GitHub search failure must NOT silently fall through to
-    create_issue — that would generate duplicate issues until search recovered."""
+    create_issue, which would generate duplicate issues until search recovered."""
     mock_repo = MagicMock()
     mock_gh = MagicMock()
     mock_gh.get_repo.return_value = mock_repo
@@ -171,7 +171,7 @@ def test_idempotency_key_recorded_on_create():
 
 def test_idempotency_key_skips_duplicate_update():
     """A second upsert with the same idempotency_key must NOT bump the
-    counter or comment — same source event firing twice is a no-op.
+    counter or comment; the same source event firing twice is a no-op.
     """
     marker = f"<!-- {NAMESPACE}:fp1 -->"
     body = (
@@ -191,6 +191,107 @@ def test_idempotency_key_skips_duplicate_update():
     assert action == "skipped-duplicate"
     existing.edit.assert_not_called()
     existing.create_comment.assert_not_called()
+
+
+def test_title_fallback_adopts_legacy_issue_and_restamps_marker():
+    """When the marker search misses but an open issue has the exact fallback
+    title, adopt it (migration off an older fingerprint) and re-stamp the body
+    with the current marker so future runs dedupe on the marker."""
+    new_marker = f"<!-- {NAMESPACE}:newfp -->"
+    # Legacy issue: created under an old fingerprint, so its body carries a
+    # different marker and the marker search returns nothing.
+    legacy = MagicMock(
+        number=7, html_url="https://x/issues/7",
+        body=f"<!-- {NAMESPACE}:OLD raw::name -->\n<!-- {NAMESPACE}:occurrences:1 -->",
+        title="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    mock_repo = MagicMock()
+    mock_repo.get_issue.return_value = legacy
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    # First search (by marker) misses; second (by title) finds the legacy issue.
+    mock_gh.search_issues.side_effect = [iter([]), [legacy]]
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, url = publisher.upsert(
+        "o/r", fingerprint="newfp", render=_render_static(),
+        title_fallback="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    assert action == "updated"
+    assert url == "https://x/issues/7"
+    edited = legacy.edit.call_args.kwargs["body"]
+    assert new_marker in edited  # re-stamped so future runs match on marker
+    assert f"<!-- {NAMESPACE}:occurrences:2 -->" in edited
+
+
+def test_title_fallback_requires_exact_title_match():
+    """A near-miss title (search returned a noisy candidate) must not be
+    adopted; only an exact, case-sensitive title equals counts."""
+    candidate = MagicMock(number=8, body="x", title="[TEST-FAILURE] PSYNC2 in t.tcl EXTRA")
+    mock_repo = MagicMock()
+    mock_issue = MagicMock(number=1, html_url="https://x/issues/1")
+    mock_repo.create_issue.return_value = mock_issue
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.side_effect = [iter([]), [candidate]]
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, _ = publisher.upsert(
+        "o/r", fingerprint="newfp", render=_render_static(),
+        title_fallback="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    # No exact match -> falls through to create, not adopt.
+    assert action == "created"
+    mock_repo.create_issue.assert_called_once()
+
+
+def test_title_fallback_not_consulted_when_marker_matches():
+    """If the marker search already found the issue, the title fallback search
+    must not run at all (avoids a needless second API call)."""
+    marker = f"<!-- {NAMESPACE}:fp1 -->"
+    existing = MagicMock(
+        number=5, html_url="https://x/issues/5",
+        body=f"{marker}\n<!-- {NAMESPACE}:occurrences:1 -->", title="old",
+    )
+    mock_repo = MagicMock()
+    mock_repo.get_issue.return_value = existing
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.return_value = [existing]
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, _ = publisher.upsert(
+        "o/r", fingerprint="fp1", render=_render_static(), title_fallback="anything",
+    )
+    assert action == "updated"
+    # Exactly one search performed (marker), no fallback-by-title search.
+    assert mock_gh.search_issues.call_count == 1
+
+
+def test_title_fallback_query_tokenizes_unsafe_title():
+    """The fallback search query is built from word tokens, never raw title
+    text, so quotes/colons in the title can't break search syntax."""
+    captured = {}
+
+    def _capture(query):
+        captured.setdefault("queries", []).append(query)
+        return iter([])
+
+    mock_repo = MagicMock()
+    mock_repo.create_issue.return_value = MagicMock(number=1, html_url="https://x/issues/1")
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.side_effect = _capture
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    publisher.upsert(
+        "o/r", fingerprint="newfp", render=_render_static(),
+        title_fallback='[TEST-FAILURE] "evil" --> in: a:b.tcl',
+    )
+    title_query = captured["queries"][1]  # [0] is the marker search
+    assert '"' not in title_query
+    assert "-->" not in title_query
+    assert "in:title" in title_query
 
 
 def test_idempotency_key_different_value_still_updates():

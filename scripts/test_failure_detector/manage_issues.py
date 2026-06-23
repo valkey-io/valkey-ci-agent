@@ -49,6 +49,10 @@ def process_failures(
             render=issue_renderer.render_for(failure),
             idempotency_key=idempotency_key,
             body_transform=issue_renderer.merge_environments(failure),
+            # The title is unchanged by the switch to hashed fingerprints, so
+            # an exact title match adopts issues from the old raw-fingerprint
+            # scheme and re-stamps them instead of creating duplicates.
+            title_fallback=issue_renderer.title_for(failure),
         )
         if action == "created":
             logger.info("Created issue for %s: %s", failure.display_name, url)
@@ -56,9 +60,11 @@ def process_failures(
         elif action == "updated":
             logger.info("Updated issue for %s: %s", failure.display_name, url)
             summary["updated"] += 1
-        else:  # skipped-duplicate
+        elif action == "skipped-duplicate":
             logger.info("Skipped duplicate for %s: %s", failure.display_name, url)
             summary["skipped"] += 1
+        else:
+            raise RuntimeError(f"Unexpected upsert action: {action}")
 
     logger.info(
         "Done. Created %d, updated %d, skipped %d issue(s).",

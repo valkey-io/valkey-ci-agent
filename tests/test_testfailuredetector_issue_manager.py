@@ -19,6 +19,7 @@ try:
         fingerprint_for,
         merge_environments,
         render_for,
+        title_for,
     )
     from scripts.test_failure_detector.manage_issues import process_failures
     from scripts.test_failure_detector.parse_failures import JobReference, UniqueFailure
@@ -74,7 +75,7 @@ class TestFingerprint:
         assert fingerprint_for(_make_failure(test_file="other.tcl")) != base
 
     def test_digits_are_significant(self) -> None:
-        """PSYNC2 vs PSYNC3 must not collapse — the identity is not normalized."""
+        """PSYNC2 vs PSYNC3 must not collapse; the identity is not normalized."""
         assert (
             fingerprint_for(_make_failure(test_name="PSYNC2"))
             != fingerprint_for(_make_failure(test_name="PSYNC3"))
@@ -188,6 +189,9 @@ class TestProcessFailures:
         assert kwargs["idempotency_key"] == "12345"
         assert kwargs["fingerprint"] == fingerprint_for(_make_failure())
         assert callable(kwargs["body_transform"])
+        # The migration fallback title matches what render produces.
+        assert kwargs["title_fallback"] == title_for(_make_failure())
+        assert kwargs["title_fallback"] == _build_title(_make_failure())
 
     @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
     def test_no_run_id_means_no_idempotency_key(self, mock_publisher_cls) -> None:
