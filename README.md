@@ -12,6 +12,7 @@ scripts/
   backport/    Automated backports (active)
   fuzzer/      Fuzzer run monitoring (active)
   ci_fix/      On-demand CI test-fix bot (active)
+  release_notes/  Release cutter: AI notes + version bump (active)
   common/      Shared infrastructure (git auth, GitHub client, safety guards)
 .github/actions/setup-agent
               Shared workflow setup for Python deps and optional Claude Code
@@ -28,6 +29,7 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
 | CI Fix | Active | On-demand `@valkeyrie-bot fix <ci-link>` - diagnoses and fixes a failing test on a backport PR |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
+| Release Notes | Active | Cuts a release: AI-generates notes from labelled PRs, promotes them onto the release line, bumps `src/version.h`, opens a PR |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Additional Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
 
@@ -80,8 +82,90 @@ See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
 ### Setup and Usage
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for local setup, local validation commands,
-required GitHub Actions secrets, and manual workflow dispatch examples.
+#### Prerequisites
+
+- A GitHub App with:
+  - `contents:write` on each repo in the registry (for pushing branches)
+  - `pull-requests:write` on each repo (for opening PRs)
+  - `issues:write` on each repo (for backport status comments)
+  - `organization_projects:write` on the org (for querying and updating project boards)
+- An AWS account with Bedrock access to `us.anthropic.claude-opus-4-8`
+- An OIDC trust between GitHub Actions and your AWS account
+
+#### Step 1: Configure secrets and variables
+
+On `valkey-io/valkey-ci-agent`:
+
+| Type | Name | Value |
+|------|------|-------|
+| Secret | `AWS_ROLE_ARN` | OIDC role ARN with Bedrock `InvokeModel` permission |
+| Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie GitHub App ID |
+| Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | Valkeyrie GitHub App private key |
+| Variable | `AWS_REGION` | e.g., `us-east-1` |
+
+The workflows mint a short-lived installation token with `actions/create-github-app-token` and use that token for registry repository reads, branch pushes, PR creation, status comments, and project-board queries.
+
+#### Step 2: Edit `repos.yml`
+
+Add your repo(s) to the registry. No per-repo config files are needed - everything lives in `repos.yml`.
+
+#### Step 3: Enable the workflows
+
+The scheduled sweep runs automatically.
+
+### Usage
+
+#### Daily sweep (automatic)
+
+Runs daily at 09:00 UTC via cron. The preflight job reads `repos.yml` and fans out one job per `{repo, branch}`. Each produces one PR with up to five successfully applied backports for that branch; skipped or unresolved candidates do not count against that cap.
+
+#### Manual backport (on-demand)
+
+```bash
+gh workflow run manual-backport.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field pr_url=https://github.com/valkey-io/valkey/pull/3601 \
+  --field target_branch=9.0
+```
+
+Creates one PR named `[Backport 9.0] <original title>`.
+
+#### Mark merged backports done
+
+A scheduled poller reconciles each project board against branch reality and
+flips items from `To be backported` to `Done` once the backport actually lands.
+It runs hourly via `backport-mark-done-poll.yml` and reconciles every repo and
+branch in `repos.yml`. Because it reconciles the whole board on every run, it is
+self-healing: it picks up backports applied by the sweep, by an earlier run, or
+by a manual cherry-pick, without depending on a merge event.
+
+An item is marked `Done` only when the source PR's commit is genuinely on the
+target branch - verified by the cherry-pick's trailing `(#N)` subject, or by the
+PR appearing in a sweep commit's `## Applied` table. A backport PR body that
+merely claims a PR was applied can never mark it `Done` on its own.
+
+Run it manually for a single repo (omit `--target-branch` to reconcile every
+configured branch), and add `--dry-run` to report what would change without
+mutating the board:
+
+```bash
+python -m scripts.backport.mark_done \
+  --repo valkey-io/valkey \
+  --target-branch 9.1 \
+  --target-token "$TOKEN" \
+  --dry-run
+```
+
+#### Filtering the sweep
+
+To run only for a specific repo or branch:
+
+```bash
+gh workflow run backport-sweep.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field repo=valkey-io/valkey \
+  --field project_number=14
+```
 
 ## Fuzzer Monitor Workflow
 
@@ -265,9 +349,118 @@ Linux/Docker fix must pass the verify command before it is trusted (default 2,
 maximum 10). The build runs once regardless, so raising it only repeats the
 verify step. macOS verification runs once on its dedicated runner.
 
+## Release Notes Workflow
+
+Cuts a Valkey release in one shot. A maintainer dispatches the source branch, the
+target version, stage, and urgency; the agent generates the release notes from the
+labelled PRs in range (Claude via Bedrock), renders them onto the long-running
+release line as a dated section, bumps `src/version.h`, refreshes the running
+contributor list, and opens one PR for review. Nothing accumulates notes on a
+branch - the notes for a release are generated all at once. The source branch is
+never modified.
+
+Dispatch it from this agent repository:
+
+```bash
+gh workflow run release-notes-cut.yml \
+  --repo valkey-io/valkey-ci-agent \
+  --field source_ref=unstable \
+  --field version=9.1.0 \
+  --field stage=rc1 \
+  --field urgency=LOW
+```
+
+Optional inputs: `date` (defaults to today), `base_ref` (explicit baseline ref
+overriding tag resolution), `contrib_base_ref` (contributor range start),
+`security_fixes` (manual Security Fixes bullets, one `--security-fix` per entry),
+`security_from_advisories` (also render published GitHub security advisories
+fixed by this version into Security Fixes), and `dry_run` (compute and log the
+cut without pushing or opening a PR). Stage is `rc1..rcN` or `ga`,
+case-insensitive.
+
+**Branch model** (one long-running branch per minor line):
+
+| Dispatch | Target branch | Behavior |
+|----------|---------------|----------|
+| rc1 of M.m.p | `pre-release-M.m.p` | Create from the source branch |
+| rcN (N>1) | `pre-release-M.m.p` | Continue (keeps prior RCs' dated notes) |
+| ga of M.m.p | `M.m` | Create carrying the rc history, delete `pre-release-M.m.p` (a rename) |
+| later patches | `M.m` | Continue the existing minor line |
+
+### How it works
+
+The rendered commit lands on an agent-namespaced `agent/release-cut/...` prep
+branch that opens a PR into the release line, so the line only advances when a
+human merges.
+
+1. **Resolve the plan** (code) - map `(version, stage)` onto the branch model
+   above. The version is canonicalized once (`M.m.p`, no leading zeros / stray
+   whitespace) so `version.h`, the dated heading, the commit title, and the branch
+   names all agree.
+2. **Discover the range** (code) - resolve the baseline (the most recent reachable
+   RC tag, an explicit `--base-ref`, or rc1's derived previous release) and walk
+   `base..HEAD` by graph reachability, deduplicating to one entry per originating
+   PR number.
+3. **Classify** (code) - partition PRs by their `release-notes` / `no-release-notes`
+   labels into include / exclude / triage, mirroring valkey's `check_release_notes`.
+4. **Generate** (AI) - Claude writes one categorized, user-facing bullet per
+   included PR. The model never emits the `(#N)` reference or `by @handle` - code
+   appends those in `scripts/release_notes/render.py` (`format_bullet`), so the
+   bullet format stays fixed in one place.
+5. **Render + bump** (code) - render the categorized bullets into a new dated
+   section on the release line via `render_release_notes` (`release_format.py`) /
+   `set_version` (`version_bump.py`), prepend prior RCs' sections, append the
+   contributor list (`contributors.py`), and bump `src/version.h`. These format
+   primitives live in-repo rather than being imported from valkey, because upstream
+   `valkey-io/valkey` ships no such tooling - so a cut runs against unmodified
+   upstream `unstable` (a plaintext `00-RELEASENOTES` placeholder and a
+   `src/version.h` with the `VALKEY_VERSION*` macros).
+6. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
+   and open/update a PR into the release line with a body that explains the cut and
+   surfaces any advisories (below).
+
+### Edge-case handling
+
+Malformed dispatch inputs fail fast at argparse (exit 2), before the clone + AI
+run: a non-`M.m.p` or out-of-range version, a bad stage, an urgency outside
+`LOW/MODERATE/HIGH/CRITICAL/SECURITY`, or a non-ISO date. An explicit `--base-ref`
+that resolves to nothing aborts right after the clone with a clear error. GA
+dispatched when **both** `pre-release-M.m.p` and `M.m` exist is refused as an
+inconsistent state rather than silently orphaning the pre-release line.
+
+Non-blocking anomalies are surfaced as **warnings in the release PR body** so a
+reviewer can confirm the cut was intended before merging (the cut still proceeds):
+
+- **RC out of sequence** - a re-cut rc, a skipped rc, or rc2+ before rc1 exists.
+- **Release line state looks off** - an rc targeting a line that already went GA
+  (recreating a renamed-away pre-release branch), a repeat GA that would duplicate
+  a dated heading, or a GA continuation leaving a lingering `pre-release-M.m.p`.
+- **Unanchored baseline** - rc1 of `M.0.0` with no `--base-ref` fell back to the
+  nearest tag, which may over-broaden the range.
+- **Empty release notes** - no PRs in range, or every PR needs triage; the body
+  says which, so an empty dated section is not mistaken for a generation miss.
+- **Duplicate / security** - a PR credited in more than one bullet, a
+  `--security-fix` also noted as a normal bullet, or `SECURITY` urgency with no
+  security fixes.
+
+The body always shows the resolved notes range (`base..HEAD`) so an over-broad
+baseline is visible. `--dry-run` prints the same advisories to the log.
+
+### Configuration
+
+Reuses the same secrets and OIDC role as the other workflows (see
+[Step 1](#step-1-configure-secrets-and-variables)). The workflow mints one
+short-lived App token on `valkey-io/valkey` with `contents:write` (push the prep
+branch, create/delete release lines), `pull-requests:write` (open the release PR),
+and `metadata:read`. When `security_from_advisories` is set, it mints a token
+that additionally holds `repository-advisories:read`; that permission is
+requested only for an advisory cut, so an ordinary cut is never blocked when the
+App installation lacks it. The App installation must hold
+`repository-advisories:read` for an advisory cut to read the advisories.
+
 ## Safety
 
-- **Branch namespace** - the agent writes only `agent/backport/...` branches and opens PRs for maintainer review.
+- **Branch namespace** - the agent writes only `agent/backport/...` (backports) and `agent/release-cut/...` (release cuts) branches and opens PRs for maintainer review. It never force-pushes a release line directly.
 - **Credential isolation** - all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
 - **Claude Code env isolation** - `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
 - **Deterministic validation** - registry-configured build commands run before push. A validation failure blocks the push.
