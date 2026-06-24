@@ -225,13 +225,22 @@ def merge_failed_results(
 
 
 def parse_previous_applied(body: str) -> list[CandidateResult]:
-    return [
-        CandidateResult(
-            pr_number, cells[1], "applied", cells[2],
-            resolved_by_ai=cells[2] == DETAIL_RESOLVED_BY_AI,
+    results: list[CandidateResult] = []
+    for pr_number, cells in _parse_section_rows(body, "## Applied", min_cells=3):
+        detail = _markdown_link_label(cells[2])
+        results.append(
+            CandidateResult(
+                pr_number, cells[1], "applied", detail,
+                resolved_by_ai=detail == DETAIL_RESOLVED_BY_AI,
+            )
         )
-        for pr_number, cells in _parse_section_rows(body, "## Applied", min_cells=3)
-    ]
+    return results
+
+
+def _markdown_link_label(value: str) -> str:
+    text = value.strip()
+    match = re.fullmatch(r"\[([^\]]+)\]\([^)]+\)", text)
+    return match.group(1) if match else text
 
 
 def parse_previous_failed(body: str) -> list[CandidateResult]:

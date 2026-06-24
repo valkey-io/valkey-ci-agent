@@ -334,19 +334,33 @@ def reconcile_diff_comments(
     return {result.path: url for result in desired_results}
 
 
-def list_marked_source_prs(pr: Any, *, bot_login: str | None = None) -> set[int]:
-    """Return source PR numbers that have AI-diff comments on *pr*."""
+def marked_source_pr_urls(pr: Any, *, bot_login: str | None = None) -> dict[int, str]:
+    """Return source PR numbers mapped to their marked comment URLs on *pr*.
+
+    If both legacy per-file comments and a grouped comment exist for the same
+    source PR, prefer the grouped comment URL because that is the canonical
+    destination after migration.
+    """
     existing = retry_github_call(
         lambda: list(pr.get_issue_comments()),
         retries=3,
         description="list PR comments for AI-diff source-PR scan",
     )
-    found: set[int] = set()
+    found: dict[int, str] = {}
     for comment in existing:
         parsed = parse_marker(getattr(comment, "body", "") or "")
         if parsed is None:
             continue
         if bot_login is not None and _comment_author(comment) != bot_login:
             continue
-        found.add(parsed.source_pr)
+        url = getattr(comment, "html_url", None)
+        if not url:
+            continue
+        if parsed.source_pr not in found or parsed.path is None:
+            found[parsed.source_pr] = url
     return found
+
+
+def list_marked_source_prs(pr: Any, *, bot_login: str | None = None) -> set[int]:
+    """Return source PR numbers that have AI-diff comments on *pr*."""
+    return set(marked_source_pr_urls(pr, bot_login=bot_login))

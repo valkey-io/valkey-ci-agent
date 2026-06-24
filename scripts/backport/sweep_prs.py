@@ -8,7 +8,7 @@ from typing import Any
 
 from github.GithubException import GithubException
 
-from scripts.backport.diff_comments import list_marked_source_prs, reconcile_diff_comments
+from scripts.backport.diff_comments import marked_source_pr_urls, reconcile_diff_comments
 from scripts.backport.pr_creator import (
     build_pull_search_head_ref,
     create_pull_from_push_repo,
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # See scripts/backport/main.py: the comment author follows the token identity,
 # so a fork run with a personal PAT overrides the ownership-gate login.
-DIFF_COMMENT_LOGIN = os.environ.get("CI_AGENT_DIFF_COMMENT_LOGIN", BOT_NAME)
+DIFF_COMMENT_LOGIN = os.environ.get("CI_AGENT_DIFF_COMMENT_LOGIN") or BOT_NAME
 
 
 def find_existing_pr(gh: Any, base_repo: str, push_repo: str, branch: str) -> Any | None:
@@ -186,15 +186,21 @@ def _reconcile_sweep_diff_comments(
         )
 
     try:
-        prior = list_marked_source_prs(pr, bot_login=DIFF_COMMENT_LOGIN)
+        prior_urls = marked_source_pr_urls(pr, bot_login=DIFF_COMMENT_LOGIN)
+        prior = set(prior_urls)
     except Exception as exc:
         logger.warning("Could not list prior AI-diff comment groups on sweep PR: %s", exc)
+        prior_urls = {}
         prior = set()
 
     # Reconcile fresh resolutions; delete only groups whose source PR has left
     # the branch entirely.
     stale = {pr_num for pr_num in prior if pr_num not in on_branch and pr_num not in desired_by_pr}
-    comment_urls: dict[int, str] = {}
+    comment_urls: dict[int, str] = {
+        pr_num: url
+        for pr_num, url in prior_urls.items()
+        if pr_num in on_branch and pr_num not in desired_by_pr
+    }
     for source_pr in sorted(desired_by_pr.keys() | stale):
         candidate = desired_by_pr.get(source_pr)
         try:

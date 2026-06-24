@@ -47,9 +47,7 @@ BOT_EMAIL = "3692572+valkeyrie-bot[bot]@users.noreply.github.com"
 # Login that authors the AI-diff comments. Defaults to the bot, but the comment
 # author follows the token identity, so a fork run using a personal PAT sets
 # CI_AGENT_DIFF_COMMENT_LOGIN to that user so the ownership gate still matches.
-DIFF_COMMENT_LOGIN = os.environ.get("CI_AGENT_DIFF_COMMENT_LOGIN", BOT_NAME)
-
-
+DIFF_COMMENT_LOGIN = os.environ.get("CI_AGENT_DIFF_COMMENT_LOGIN") or BOT_NAME
 
 
 def build_summary(result: BackportResult) -> str:

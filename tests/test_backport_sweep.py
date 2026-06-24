@@ -601,11 +601,13 @@ def test_sweep_body_links_ai_row_to_comment_when_url_known():
         ],
     )
     url = "https://github.com/o/r/pull/9#issuecomment-123"
-    body = build_pr_body(result, comment_urls={50: url})
+    stray_url = "https://github.com/o/r/pull/9#issuecomment-999"
+    body = build_pr_body(result, comment_urls={50: url, 51: stray_url})
     # AI-resolved row's detail becomes a link to its comment.
     assert f"[conflicts resolved by Claude Code]({url})" in body
     # Clean row (no AI resolution) is not linked even if a stray URL existed.
     assert "| #51 | Clean fix | cherry-picked cleanly |" in body
+    assert stray_url not in body
 
 
 def test_sweep_body_preserves_ai_resolution_across_unprocessed_runs():
@@ -838,7 +840,7 @@ def test_sweep_reconcile_keeps_comments_for_branch_applied_membership_only():
     ]))
     pr = FakePR([kept])
 
-    _reconcile_sweep_diff_comments(
+    urls = _reconcile_sweep_diff_comments(
         pr,
         BranchSweepResult(target_branch="8.1", candidates_found=0, results=[]),
         branch_applied=[
@@ -853,6 +855,7 @@ def test_sweep_reconcile_keeps_comments_for_branch_applied_membership_only():
         if parse_marker(c.body)
     }
     assert live == {5}
+    assert urls == {5: kept.html_url}
 
 
 def test_clone_target_branch_invokes_git_clone_without_destination_cwd(
@@ -1745,6 +1748,26 @@ def test_build_pr_body_round_trips_applied_and_failed_detail():
     ]
     assert [(r.source_pr_number, r.detail) for r in parse_previous_failed(second)] == [
         (1826, "lacks src/lua/engine_lua.c"),
+    ]
+
+
+def test_parse_previous_applied_preserves_ai_detail_from_linked_row():
+    from scripts.backport.sweep_models import DETAIL_RESOLVED_BY_AI
+
+    body = "\n".join([
+        "## Applied",
+        "",
+        "| Source PR | Title | Detail |",
+        "|---|---|---|",
+        "| #2915 | Fix crash | "
+        f"[{DETAIL_RESOLVED_BY_AI}](https://github.com/o/r/pull/9#issuecomment-123) |",
+    ])
+
+    assert parse_previous_applied(body) == [
+        CandidateResult(
+            2915, "Fix crash", "applied", DETAIL_RESOLVED_BY_AI,
+            resolved_by_ai=True,
+        ),
     ]
 
 
