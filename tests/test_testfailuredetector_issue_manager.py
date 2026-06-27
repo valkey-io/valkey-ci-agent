@@ -15,10 +15,10 @@ try:
         _build_body,
         _build_title,
         _extract_environments_from_body,
+        _extract_error_from_body,
         _update_environments_in_body,
         fingerprint_for,
-        merge_environments,
-        render_for,
+        renderer_for,
         title_for,
     )
     from scripts.test_failure_detector.manage_issues import process_failures
@@ -145,15 +145,15 @@ class TestMergeEnvironments:
     """The body_transform hook that carries the running env list forward."""
 
     def test_adds_new_environment(self) -> None:
-        transform = merge_environments(_make_failure(jobs=[("new-job", "suite", "url")]))
-        result = transform("**Environments:** `old-job`")
+        renderer = renderer_for(_make_failure(jobs=[("new-job", "suite", "url")]))
+        result = renderer.merge_environments("**Environments:** `old-job`")
         assert "`old-job`" in result
         assert "`new-job`" in result
 
     def test_no_change_when_env_already_present(self) -> None:
         body = "**Environments:** `test-ubuntu-latest`"
-        transform = merge_environments(_make_failure())  # job is test-ubuntu-latest
-        assert transform(body) == body
+        renderer = renderer_for(_make_failure())  # job is test-ubuntu-latest
+        assert renderer.merge_environments(body) == body
 
 
 # --- Integration tests with a mocked publisher ---
@@ -176,7 +176,46 @@ class TestProcessFailures:
         ]
         result = process_failures(MagicMock(), "valkey-io/valkey", failures)
 
-        assert result == {"created": 1, "updated": 1, "skipped": 1}
+        assert result == {"created": 1, "updated": 1, "skipped": 1, "errors": 0}
+
+    @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
+    def test_one_failing_upsert_does_not_abort_the_batch(self, mock_publisher_cls) -> None:
+        """A raised exception on one failure is counted as an error and skipped;
+        the failures after it are still processed."""
+        publisher = mock_publisher_cls.return_value
+        publisher.upsert.side_effect = [
+            ("created", "https://x/issues/1"),
+            RuntimeError("boom"),  # failure b — must NOT kill the loop
+            ("updated", "https://x/issues/3"),
+        ]
+
+        failures = [
+            _make_failure(test_name="a"),
+            _make_failure(test_name="b"),
+            _make_failure(test_name="c"),
+        ]
+        result = process_failures(MagicMock(), "valkey-io/valkey", failures)
+
+        assert result == {"created": 1, "updated": 1, "skipped": 0, "errors": 1}
+        # All three were attempted despite the middle one raising.
+        assert publisher.upsert.call_count == 3
+
+    @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
+    def test_unexpected_action_is_isolated_as_error(self, mock_publisher_cls) -> None:
+        """An unexpected upsert action is contained as a single errored failure
+        rather than propagating and aborting the run."""
+        publisher = mock_publisher_cls.return_value
+        publisher.upsert.side_effect = [
+            ("bogus-action", "https://x/issues/1"),
+            ("created", "https://x/issues/2"),
+        ]
+
+        result = process_failures(
+            MagicMock(), "valkey-io/valkey",
+            [_make_failure(test_name="a"), _make_failure(test_name="b")],
+        )
+
+        assert result == {"created": 1, "updated": 0, "skipped": 0, "errors": 1}
 
     @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
     def test_passes_run_id_as_idempotency_key(self, mock_publisher_cls) -> None:
@@ -203,6 +242,93 @@ class TestProcessFailures:
         assert publisher.upsert.call_args.kwargs["idempotency_key"] is None
 
     def test_render_callable_produces_labelled_content(self) -> None:
-        content = render_for(_make_failure())("<!-- m -->", 1)
+        content = renderer_for(_make_failure()).render("<!-- m -->", 1)
         assert content.labels == ("test-failure",)
         assert content.title.startswith("[TEST-FAILURE]")
+
+
+class TestRecurrenceCommentNewlyFailing:
+    """The recurrence comment calls out environments failing for the first time
+    on this run (PR #24 review r3431750542)."""
+
+    def test_names_newly_failing_environments(self) -> None:
+        # New job 'test-arm64' is not in the prior body; the body_transform
+        # records it, then render names it in the recurrence comment.
+        renderer = renderer_for(_make_failure(jobs=[("test-arm64", "suite", "url")]))
+        renderer.merge_environments("**Environments:** `test-ubuntu-latest`")
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "**Newly failing in:** `test-arm64`" in comment
+        assert "Test failed again on" in comment
+
+    def test_omits_newly_failing_line_when_no_new_environment(self) -> None:
+        # The only job is already recorded, so there is nothing new to call out.
+        renderer = renderer_for(_make_failure())  # job is test-ubuntu-latest
+        renderer.merge_environments("**Environments:** `test-ubuntu-latest`")
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "Newly failing in" not in comment
+
+    def test_no_newly_failing_line_without_body_transform(self) -> None:
+        # On the create path body_transform never runs, so the comment (unused
+        # there) carries no newly-failing line rather than a spurious one.
+        comment = renderer_for(_make_failure()).render("<!-- m -->", 1).comment
+        assert "Newly failing in" not in comment
+
+
+class TestExtractErrorFromBody:
+    """Round-trips the Error stack trace section written by _build_body."""
+
+    def test_extracts_trace_written_by_build_body(self) -> None:
+        body = _build_body(
+            _make_failure(error="assertion failed at line 42"),
+            marker="<!-- m -->", occurrences=1,
+        )
+        assert _extract_error_from_body(body) == "assertion failed at line 42"
+
+    def test_returns_empty_when_no_error_section(self) -> None:
+        # Issues created before the Error stack trace section existed.
+        assert _extract_error_from_body("**Environments:** `job-a`") == ""
+
+
+class TestRecurrenceCommentNewError:
+    """The recurrence comment surfaces a changed error trace so a triager can
+    notice the failure mode shifted without diffing the issue body."""
+
+    def _body_with_error(self, error: str) -> str:
+        return _build_body(
+            _make_failure(error=error), marker="<!-- m -->", occurrences=1,
+        )
+
+    def test_calls_out_changed_trace(self) -> None:
+        # The issue recorded one trace; this run failed with a different one.
+        renderer = renderer_for(_make_failure(error="NEW: segfault in dictResize"))
+        renderer.merge_environments(self._body_with_error("OLD: timeout waiting for sync"))
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "**New error stack trace**" in comment
+        assert "NEW: segfault in dictResize" in comment
+
+    def test_stays_quiet_when_trace_unchanged(self) -> None:
+        renderer = renderer_for(_make_failure(error="same error every time"))
+        renderer.merge_environments(self._body_with_error("same error every time"))
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "New error stack trace" not in comment
+
+    def test_normalized_equal_trace_stays_quiet(self) -> None:
+        # Differs only in run-specific noise (port, timestamp, hex address);
+        # normalization treats these as the same trace.
+        old = "conn failed 2026-06-26 10:00:00 port=6379 at 0xdead"
+        new = "conn failed 2026-06-27 11:22:33 port=7000 at 0xbeef"
+        renderer = renderer_for(_make_failure(error=new))
+        renderer.merge_environments(self._body_with_error(old))
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "New error stack trace" not in comment
+
+    def test_empty_new_error_stays_quiet(self) -> None:
+        renderer = renderer_for(_make_failure(error=""))
+        renderer.merge_environments(self._body_with_error("OLD: some trace"))
+        comment = renderer.render("<!-- m -->", 2).comment
+        assert "New error stack trace" not in comment
+
+    def test_no_new_error_line_without_body_transform(self) -> None:
+        # Create path: body_transform never runs, so no spurious callout.
+        comment = renderer_for(_make_failure()).render("<!-- m -->", 1).comment
+        assert "New error stack trace" not in comment

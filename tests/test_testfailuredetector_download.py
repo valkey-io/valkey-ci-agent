@@ -262,6 +262,35 @@ class TestGetJobUrls:
         assert result["test-ubuntu-arm64"] == job.html_url
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_alias_does_not_overwrite_exact_job_name(self, mock_retry) -> None:
+        """A normalized alias of one job must not clobber another job's exact
+        name mapping (which would attach the wrong CI URL)."""
+        # job1's normalized form is "test-ubuntu-arm64", which is exactly job2's name.
+        job1 = MagicMock()
+        job1.name = "test ubuntu (arm64)"
+        job1.html_url = "https://example.com/job/1"
+
+        job2 = MagicMock()
+        job2.name = "test-ubuntu-arm64"
+        job2.html_url = "https://example.com/job/2"
+
+        mock_run = MagicMock()
+        mock_run.jobs.return_value = [job1, job2]
+
+        mock_repo = MagicMock()
+        mock_repo.get_workflow_run.return_value = mock_run
+
+        mock_retry.side_effect = lambda op, **kwargs: op()
+
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        result = get_job_urls(mock_gh, "owner/repo", 123)
+        # The exact job name keeps its own URL; the colliding alias is dropped.
+        assert result["test-ubuntu-arm64"] == job2.html_url
+        assert result["test ubuntu (arm64)"] == job1.html_url
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
     def test_empty_jobs_returns_empty_dict(self, mock_retry) -> None:
         mock_run = MagicMock()
         mock_run.jobs.return_value = []

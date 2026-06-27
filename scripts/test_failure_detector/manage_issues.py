@@ -35,39 +35,56 @@ def process_failures(
     occurrence counter or post a duplicate comment.
 
     Returns a summary dict with counts:
-    ``{created, updated, skipped}``.
+    ``{created, updated, skipped, errors}``. ``errors`` counts failures whose
+    issue could not be processed; they are logged and skipped so one bad
+    failure cannot abort the rest of the batch.
     """
     publisher = IssueDedupPublisher(gh, marker_namespace=issue_renderer.MARKER_NAMESPACE)
     idempotency_key = str(run_id) if run_id is not None else None
 
-    summary = {"created": 0, "updated": 0, "skipped": 0}
+    summary = {"created": 0, "updated": 0, "skipped": 0, "errors": 0}
 
     for failure in failures:
-        action, url = publisher.upsert(
-            repo_full_name,
-            fingerprint=issue_renderer.fingerprint_for(failure),
-            render=issue_renderer.render_for(failure),
-            idempotency_key=idempotency_key,
-            body_transform=issue_renderer.merge_environments(failure),
-            # The title is unchanged by the switch to hashed fingerprints, so
-            # an exact title match adopts issues from the old raw-fingerprint
-            # scheme and re-stamps them instead of creating duplicates.
-            title_fallback=issue_renderer.title_for(failure),
-        )
-        if action == "created":
-            logger.info("Created issue for %s: %s", failure.display_name, url)
-            summary["created"] += 1
-        elif action == "updated":
-            logger.info("Updated issue for %s: %s", failure.display_name, url)
-            summary["updated"] += 1
-        elif action == "skipped-duplicate":
-            logger.info("Skipped duplicate for %s: %s", failure.display_name, url)
-            summary["skipped"] += 1
-        else:
-            raise RuntimeError(f"Unexpected upsert action: {action}")
+        # Isolate each failure: a raised exception (e.g. a GitHub API error that
+        # outlasts retries, or an unexpected upsert action) must not abort the
+        # loop and silently drop every remaining failure. Log it, count it, and
+        # move on so the rest of the batch is still processed.
+        try:
+            # The render and body_transform hooks are coupled (they share the
+            # set of newly failing environments), so they come from one renderer.
+            renderer = issue_renderer.renderer_for(failure)
+            action, url = publisher.upsert(
+                repo_full_name,
+                fingerprint=issue_renderer.fingerprint_for(failure),
+                render=renderer.render,
+                idempotency_key=idempotency_key,
+                body_transform=renderer.merge_environments,
+                # The title is unchanged by the switch to hashed fingerprints, so
+                # an exact title match adopts issues from the old raw-fingerprint
+                # scheme and re-stamps them instead of creating duplicates.
+                title_fallback=issue_renderer.title_for(failure),
+            )
+            if action == "created":
+                logger.info("Created issue for %s: %s", failure.display_name, url)
+                summary["created"] += 1
+            elif action == "updated":
+                logger.info("Updated issue for %s: %s", failure.display_name, url)
+                summary["updated"] += 1
+            elif action == "skipped-duplicate":
+                logger.info("Skipped duplicate for %s: %s", failure.display_name, url)
+                summary["skipped"] += 1
+            else:
+                raise RuntimeError(f"Unexpected upsert action: {action}")
+        except Exception:
+            logger.warning(
+                "Failed to process failure %s; skipping it",
+                failure.display_name, exc_info=True,
+            )
+            summary["errors"] += 1
+            continue
 
     logger.info(
-        "Done. Created %d, updated %d, skipped %d issue(s).",
-        summary["created"], summary["updated"], summary["skipped"],
+        "Done. Created %d, updated %d, skipped %d, errored %d issue(s).",
+        summary["created"], summary["updated"], summary["skipped"], summary["errors"],
     )
     return summary

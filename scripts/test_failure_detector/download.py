@@ -144,14 +144,21 @@ def get_job_urls(
         description=f"list jobs for run {run_id}",
     )
 
-    job_url_map: dict[str, str] = {}
-    for job in jobs:
-        job_url_map[job.name] = job.html_url
+    # Materialize once: jobs may be a lazy paginated list, and we iterate twice.
+    job_list = list(jobs)
 
-        # Also store a normalized version for matching against artifact names
+    # First pass: exact job names. These are authoritative, so they take
+    # precedence over any normalized alias.
+    job_url_map: dict[str, str] = {job.name: job.html_url for job in job_list}
+
+    # Second pass: normalized variants for fuzzy matching against artifact
+    # names. Only add an alias when it does not collide with an exact job name,
+    # so a normalized alias of one job can never overwrite another job's exact
+    # mapping and attach the wrong CI URL.
+    for job in job_list:
         normalized = re.sub(r"\s*\(([^)]+)\)", r"-\1", job.name)
         normalized = re.sub(r"\s+", "-", normalized)
-        if normalized != job.name:
+        if normalized != job.name and normalized not in job_url_map:
             job_url_map[normalized] = job.html_url
 
     logger.info("Found %d job URL mappings for run %d", len(job_url_map), run_id)
