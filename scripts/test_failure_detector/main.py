@@ -98,7 +98,21 @@ def run(
         emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}))
         return 0
 
-    all_failures = json.loads(artifact_content)
+    try:
+        all_failures = json.loads(artifact_content)
+    except json.JSONDecodeError as exc:
+        # A malformed or truncated artifact must not crash the run before we
+        # report; surface it in the job summary and exit non-zero instead.
+        logger.error(
+            "Could not parse all-test-failures artifact from run %d: %s", run_id, exc,
+        )
+        emit_job_summary(
+            f"### ⚠️ Test Failure Detector\n\n"
+            f"Could not parse the `all-test-failures` artifact from "
+            f"[run #{run_id}](https://github.com/{repo_full_name}/actions/runs/{run_id}) "
+            f"— the artifact is malformed or truncated."
+        )
+        return 1
     logger.info("Loaded failures from %d job(s)", len(all_failures))
 
     # Step 3: Get job URLs for CI links
