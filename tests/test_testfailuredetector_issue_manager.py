@@ -175,7 +175,46 @@ class TestProcessFailures:
         ]
         result = process_failures(MagicMock(), "valkey-io/valkey", failures)
 
-        assert result == {"created": 1, "updated": 1, "skipped": 1}
+        assert result == {"created": 1, "updated": 1, "skipped": 1, "errors": 0}
+
+    @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
+    def test_one_failing_upsert_does_not_abort_the_batch(self, mock_publisher_cls) -> None:
+        """A raised exception on one failure is counted as an error and skipped;
+        the failures after it are still processed."""
+        publisher = mock_publisher_cls.return_value
+        publisher.upsert.side_effect = [
+            ("created", "https://x/issues/1"),
+            RuntimeError("boom"),  # failure b — must NOT kill the loop
+            ("updated", "https://x/issues/3"),
+        ]
+
+        failures = [
+            _make_failure(test_name="a"),
+            _make_failure(test_name="b"),
+            _make_failure(test_name="c"),
+        ]
+        result = process_failures(MagicMock(), "valkey-io/valkey", failures)
+
+        assert result == {"created": 1, "updated": 1, "skipped": 0, "errors": 1}
+        # All three were attempted despite the middle one raising.
+        assert publisher.upsert.call_count == 3
+
+    @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
+    def test_unexpected_action_is_isolated_as_error(self, mock_publisher_cls) -> None:
+        """An unexpected upsert action is contained as a single errored failure
+        rather than propagating and aborting the run."""
+        publisher = mock_publisher_cls.return_value
+        publisher.upsert.side_effect = [
+            ("bogus-action", "https://x/issues/1"),
+            ("created", "https://x/issues/2"),
+        ]
+
+        result = process_failures(
+            MagicMock(), "valkey-io/valkey",
+            [_make_failure(test_name="a"), _make_failure(test_name="b")],
+        )
+
+        assert result == {"created": 1, "updated": 0, "skipped": 0, "errors": 1}
 
     @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
     def test_passes_run_id_as_idempotency_key(self, mock_publisher_cls) -> None:

@@ -40,6 +40,7 @@ def _build_job_summary(
         f"| Issues created | {result.get('created', 0)} |",
         f"| Issues skipped (duplicate run) | {result.get('skipped', 0)} |",
         f"| Issues updated | {result.get('updated', 0)} |",
+        f"| MISC Errors | {result.get('errors', 0)} |",
         "",
     ]
     return "\n".join(lines)
