@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import argparse
 from types import SimpleNamespace
-
-import pytest
 
 from scripts.backport import poller
 from scripts.backport.registry import load_registry
@@ -37,13 +34,6 @@ def _branch(tmp_path):
 
 def _empty_result(branch: str) -> BranchSweepResult:
     return BranchSweepResult(target_branch=branch, candidates_found=0)
-
-
-def test_nonneg_int_rejects_negative():
-    assert poller._nonneg_int("0") == 0
-    assert poller._nonneg_int("3") == 3
-    with pytest.raises(argparse.ArgumentTypeError):
-        poller._nonneg_int("-1")
 
 
 def test_poll_branch_queries_correct_backport_branch(monkeypatch, tmp_path):

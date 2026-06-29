@@ -33,6 +33,12 @@ from github import Auth, Github
 from scripts.backport.registry import load_registry
 from scripts.backport.sweep import _BRANCH_PREFIX, run_backport_sweep
 from scripts.backport.sweep_prs import find_existing_pr
+from scripts.common.polling import (
+    add_poll_loop_args,
+    format_poll_results,
+    nonnegative_int,
+    run_poll_loop_from_args,
+)
 
 if TYPE_CHECKING:
     from scripts.backport.registry import BranchEntry, RepoEntry  # noqa: F401
@@ -120,13 +126,6 @@ def poll_branch(
     }
 
 
-def _nonneg_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be >= 0 (0 = unlimited)")
-    return parsed
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -147,7 +146,7 @@ def main() -> None:
     parser.add_argument("--target-token", required=True)
     parser.add_argument(
         "--max-candidates",
-        type=_nonneg_int,
+        type=nonnegative_int,
         default=2,
         help="Cap the number of applied cherry-picks per branch (0 = unlimited)",
     )
@@ -157,6 +156,7 @@ def main() -> None:
         help="Report the poll decision without running a sweep",
     )
     parser.add_argument("--verbose", action="store_true")
+    add_poll_loop_args(parser)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -167,21 +167,28 @@ def main() -> None:
     registry = load_registry(args.registry)
     repo_entry, branch_entry = registry.get_branch(args.repo, args.branch)
 
-    result = poll_branch(
-        repo_entry=repo_entry,
-        branch_entry=branch_entry,
-        github_token=args.target_token,
-        max_candidates=args.max_candidates,
-        dry_run=args.dry_run,
+    def _poll() -> dict:
+        return poll_branch(
+            repo_entry=repo_entry,
+            branch_entry=branch_entry,
+            github_token=args.target_token,
+            max_candidates=args.max_candidates,
+            dry_run=args.dry_run,
+        )
+
+    results = run_poll_loop_from_args(
+        _poll,
+        args,
+        logger=logger,
     )
+    print(json.dumps(format_poll_results(results), indent=2))
 
-    print(json.dumps(result, indent=2))
-
-    if result.get("error"):
+    failures = [result for result in results if result.get("error")]
+    if failures:
         logger.error(
             "Backport poll failure: %s: %s",
-            result["branch"],
-            result["error"],
+            failures[0]["branch"],
+            failures[0]["error"],
         )
         sys.exit(1)
 

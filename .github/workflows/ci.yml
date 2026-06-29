@@ -20,27 +20,35 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
         with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt && pip install -e ".[dev]"
+          python-version: ${{ matrix.python-version }}
+          install-mode: dev
 
       - name: Run ruff lint
+        if: matrix.python-version == '3.11'
         run: ruff check scripts/ tests/
 
+      - name: Run pytest
+        if: matrix.python-version != '3.11'
+        run: pytest -v
+
       - name: Run pytest with coverage
+        if: matrix.python-version == '3.11'
         run: pytest --cov=scripts --cov-report=term-missing --cov-report=xml --cov-fail-under=60 -v
 
       - name: Run mypy type checking
+        if: matrix.python-version == '3.11'
         run: mypy scripts/

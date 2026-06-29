@@ -50,17 +50,26 @@ def _rejected() -> ReviewVerdict:
     return ReviewVerdict(approved=False, reasoning="weakens assertion")
 
 
+def _reproduce_then_pass():
+    """Default run order: baseline fails, then build/verify calls pass."""
+    results = iter([_failed()])
+
+    def fake(*_a, **_k):
+        return next(results, _passed())
+
+    return fake
+
+
 def _loop(*, path: FixPath = FixPath.AUTHOR, patch: str = "the diff", **overrides):
     """run_fix_loop with safe fakes; override individual collaborators per test.
 
     Patches the shared ``build_approved_patch`` (the review loop calls it
-    directly) to return ``patch`` without needing a real git repo. Pass
-    ``patch=""`` is not allowed - use ``patch_raises=EmptyPatch`` semantics by
-    patching directly in the test.
+    directly) to return ``patch`` without needing a real git repo. The default
+    command fake makes the baseline reproduce fail, then lets the fix verify.
     """
     defaults = dict(
         apply_func=lambda *a, **k: (True, ("test.tcl",)),
-        run_command=lambda *a, **k: _passed(),
+        run_command=_reproduce_then_pass(),
         review_func=lambda *a, **k: _approved(),
         reset_func=MagicMock(),
     )
@@ -82,8 +91,8 @@ def test_refuse_proposal_short_circuits():
     assert "not applied" in result.detail
 
 
-def test_retries_when_test_fails_then_passes():
-    runs = [_failed(), _passed()]
+def test_retries_when_verify_fails_then_passes():
+    runs = [_failed(), _passed(), _failed(), _passed(), _passed(), _passed()]
     result = _loop(max_attempts=3, run_command=lambda *a, **k: runs.pop(0))
     assert result.success is True
     assert result.attempts == 2
@@ -134,7 +143,7 @@ def test_genuine_test_failure_does_not_hand_off():
     result = _loop(max_attempts=1, run_command=lambda *a, **k: _failed())
     assert result.success is False
     assert result.handoff is False
-    assert "test still failing" in result.detail
+    assert "check still failing" in result.detail
 
 
 def test_rejected_review_is_not_handed_off():
@@ -144,6 +153,7 @@ def test_rejected_review_is_not_handed_off():
     result = _loop(run_command=lambda *a, **k: unrunnable, review_func=lambda *a, **k: _rejected())
     assert result.handoff is False
     assert result.handoff_patch == ""
+    assert result.review == _rejected()
     assert "review rejected" in result.detail
 
 
@@ -183,10 +193,10 @@ def test_feedback_passed_to_apply_on_retry():
         seen_feedback.append(feedback)
         return True, ("test.tcl",)
 
-    runs = [_failed(), _passed()]
+    runs = [_failed(), _passed(), _failed(), _passed(), _passed(), _passed()]
     _loop(max_attempts=2, apply_func=fake_apply, run_command=lambda *a, **k: runs.pop(0))
     assert seen_feedback[0] == ""           # first attempt: no feedback
-    assert "did not make the test pass" in seen_feedback[1]
+    assert "did not make the check pass" in seen_feedback[1]
 
 
 def _stream_result(obj: dict) -> str:
@@ -280,8 +290,10 @@ def test_is_noop_command_catches_short_circuit_and_trailing():
     assert _is_noop_command("make; true") is True
     assert _is_noop_command("./runtest && true") is True
     assert _is_noop_command("make test || :") is True
+    assert _is_noop_command("make test | tee test.log") is True
     assert _is_noop_command("true") is True
     # Real commands whose failure can surface are not no-ops.
+    assert _is_noop_command("set -o pipefail; make test | tee test.log") is False
     assert _is_noop_command("make && ./runtest --single x") is False
     assert _is_noop_command("./runtest --single x") is False
     assert _is_noop_command("cc -o x x.c && ./x") is False
@@ -297,7 +309,7 @@ def test_oversized_patch_refuses():
         result = run_fix_loop(
             "/repo", _proposal(),
             apply_func=lambda *a, **k: (True, ("test.tcl",)),
-            run_command=lambda *a, **k: _passed(),
+            run_command=_reproduce_then_pass(),
             review_func=review_called,
             reset_func=MagicMock(),
         )
@@ -323,7 +335,7 @@ def test_empty_patch_refuses_instead_of_approving():
         result = run_fix_loop(
             "/repo", _proposal(),
             apply_func=lambda *a, **k: (True, ("test.tcl",)),
-            run_command=lambda *a, **k: _passed(),
+            run_command=_reproduce_then_pass(),
             review_func=review_called,
             reset_func=MagicMock(),
         )
@@ -331,6 +343,114 @@ def test_empty_patch_refuses_instead_of_approving():
     assert result.success is False
     assert "no change" in result.detail
     review_called.assert_not_called()
+
+
+# --- reproduce-before-fix and repeated verification ---
+
+def _calls_recorder():
+    calls = []
+
+    def make(results):
+        seq = list(results)
+
+        def fake(_repo, command, **_k):
+            calls.append(command)
+            return seq.pop(0)
+
+        return fake
+
+    return calls, make
+
+
+def test_reproduce_green_refuses_as_flaky():
+    apply_called = MagicMock()
+    result = _loop(
+        run_command=lambda *a, **k: _passed(),
+        apply_func=apply_called,
+    )
+    assert result.success is False
+    assert "did not reproduce" in result.detail
+    apply_called.assert_not_called()
+
+
+def test_verify_runs_k_times_and_builds_once():
+    calls, make = _calls_recorder()
+    run = make([_failed(), _passed(), _passed(), _passed(), _passed()])
+    result = _loop(verify_runs=3, run_command=run)
+    assert result.success is True
+    assert calls[0] == "make && ./runtest --single x"
+    assert calls[1] == "make"
+    assert calls[2:] == ["./runtest --single x"] * 3
+
+
+def test_one_of_k_verify_runs_fails_retries():
+    calls, make = _calls_recorder()
+    run = make([_failed(), _passed(), _passed(), _failed()])
+    result = _loop(verify_runs=2, max_attempts=1, run_command=run)
+    assert result.success is False
+    assert "still failing" in result.detail
+    assert calls == [
+        "make && ./runtest --single x",
+        "make",
+        "./runtest --single x",
+        "./runtest --single x",
+    ]
+
+
+def test_empty_build_runs_verify_command_k_times():
+    proposal = FixProposal(
+        path=FixPath.AUTHOR, failing_check="long enough check",
+        root_cause="rc", reasoning="w", confidence=0.9,
+        build_command="", verify_command="make && ./runtest x",
+    )
+    calls, make = _calls_recorder()
+    run = make([_failed(), _passed(), _passed()])
+    with patch_build_approved(lambda *a, **k: "diff"):
+        result = run_fix_loop(
+            "/repo", proposal, verify_runs=2,
+            apply_func=lambda *a, **k: (True, ("f",)),
+            run_command=run,
+            review_func=lambda *a, **k: _approved(),
+            reset_func=MagicMock(),
+        )
+    assert result.success is True
+    assert calls == ["make && ./runtest x", "make && ./runtest x", "make && ./runtest x"]
+
+
+def test_baseline_unrunnable_hands_off_even_if_post_fix_passes():
+    """A green post-fix run without a failing baseline is not enough to push."""
+    runs = [RunResult(False, False, -1, "c", "no cwd"), _passed(), _passed(), _passed()]
+    result = _loop(run_command=lambda *a, **k: runs.pop(0))
+    assert result.success is False
+    assert result.handoff is True
+    assert "baseline" in result.detail
+
+
+def test_reproduced_the_named_failure_matching():
+    from scripts.ci_fix.review import reproduced_the_named_failure
+
+    prop = FixProposal(
+        path=FixPath.AUTHOR, failing_check="zset listpack with NAN score",
+        root_cause="rc", reasoning="w", confidence=0.9,
+        build_command="make", verify_command="./runtest x",
+    )
+    hit = RunResult(
+        ran=True, passed=False, exit_code=1, command="c",
+        output_tail="[err]: zset listpack with NAN score in tests/x.tcl",
+    )
+    miss = RunResult(
+        ran=True, passed=False, exit_code=1, command="c",
+        output_tail="ld: symbol not found",
+    )
+    assert reproduced_the_named_failure(prop, hit) is True
+    assert reproduced_the_named_failure(prop, miss) is False
+
+    short = FixProposal(
+        path=FixPath.AUTHOR, failing_check="io",
+        root_cause="rc", reasoning="w", confidence=0.9,
+        build_command="m", verify_command="v",
+    )
+    assert reproduced_the_named_failure(short, RunResult(True, False, 1, "c", "io error")) is False
 
 
 # --- direct tests for the shared helpers ---

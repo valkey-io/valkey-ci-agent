@@ -5,6 +5,8 @@ All commits require DCO sign-off: `git commit -s`
 ## Tests
 
 ```bash
-pip install -r requirements.txt
-pytest
+python -m pip install -e ".[dev]"
+python -m pytest
+python -m ruff check .
+python -m mypy scripts
 ```

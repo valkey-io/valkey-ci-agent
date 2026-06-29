@@ -37,19 +37,13 @@ jobs:
       has_entries: ${{ steps.matrix.outputs.has_entries }}
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install pyyaml
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
 
       - name: Generate matrix from registry
         id: matrix
@@ -73,7 +67,7 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.has_entries == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 70
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.preflight.outputs.matrix) }}
@@ -83,21 +77,18 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      POLL_INTERVAL_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '0' }}
+      POLL_DURATION_SECONDS: ${{ github.event_name == 'schedule' && '3300' || '0' }}
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
 
       - name: Generate GitHub App token
         id: generate-token
@@ -106,6 +97,10 @@ jobs:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
+          permission-contents: read
+          permission-pull-requests: read
+          permission-organization-projects: write
+          permission-metadata: read
 
       - name: Reconcile board status against branch
         shell: bash
@@ -120,11 +115,13 @@ jobs:
             --repo "${REPO}" \
             --target-branch "${BRANCH}" \
             --target-token "${TARGET_TOKEN}" \
+            --poll-interval-seconds "${POLL_INTERVAL_SECONDS}" \
+            --poll-duration-seconds "${POLL_DURATION_SECONDS}" \
             --verbose | tee mark-done-result.json
 
       - name: Upload result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mark-done-result-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
           path: mark-done-result.json

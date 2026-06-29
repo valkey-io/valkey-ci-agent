@@ -27,6 +27,7 @@ from github import Auth, Github
 
 from scripts.ci_fix.gate import ParsedCommand, is_authorized, parse_command
 from scripts.common.github_client import retry_github_call
+from scripts.common.polling import env_int, env_seconds, run_poll_loop
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,9 @@ _MAX_LOOKBACK_MINUTES = 7 * 24 * 60
 # and is never seen. The reaction marker prevents reprocessing, so a generous
 # window only costs a slightly larger comment listing.
 _DEFAULT_LOOKBACK_MINUTES = 180
+# GitHub App installation tokens are short-lived. Sustained polling is capped
+# below an hour so a job does not keep sleeping past token expiry.
+_MAX_LOOP_SECONDS = 55 * 60
 
 DispatchFn = Callable[[str, int, ParsedCommand, str], None]
 """(repo_full_name, pr_number, command, commenter) -> None."""
@@ -246,12 +250,12 @@ def dispatch_ci_fix(
 
 
 def _lookback_minutes() -> int:
-    raw = os.environ.get("CI_FIX_POLL_LOOKBACK_MINUTES", "")
-    try:
-        value = int(raw)
-    except ValueError:
-        return _DEFAULT_LOOKBACK_MINUTES
-    return max(1, min(value, _MAX_LOOKBACK_MINUTES))
+    return env_int(
+        "CI_FIX_POLL_LOOKBACK_MINUTES",
+        _DEFAULT_LOOKBACK_MINUTES,
+        minimum=1,
+        maximum=_MAX_LOOKBACK_MINUTES,
+    )
 
 
 def _bot_login() -> str:
@@ -265,6 +269,19 @@ def _bot_login() -> str:
     if override:
         return override
     return f"{os.environ['CI_FIX_POLL_APP_SLUG']}[bot]"
+
+
+def _poll_interval_seconds() -> int:
+    return env_seconds("CI_FIX_POLL_INTERVAL_SECONDS", 0, minimum=0)
+
+
+def _poll_duration_seconds() -> int:
+    return env_seconds(
+        "CI_FIX_POLL_DURATION_SECONDS",
+        0,
+        minimum=0,
+        maximum=_MAX_LOOP_SECONDS,
+    )
 
 
 def main() -> int:
@@ -283,17 +300,31 @@ def main() -> int:
     bot_login = _bot_login()
 
     gh = Github(auth=Auth.Token(token))
-    dispatched = poll_once(
-        gh,
-        target_repo=target_repo,
-        org=org,
-        team_slug=team_slug,
-        bot_login=bot_login,
-        lookback_minutes=_lookback_minutes(),
-        dispatch=dispatch_ci_fix(gh, agent_repo=agent_repo, workflow=workflow, ref=ref),
-        claim=claim_via_status,
+    dispatch = dispatch_ci_fix(gh, agent_repo=agent_repo, workflow=workflow, ref=ref)
+
+    def _poll() -> int:
+        return poll_once(
+            gh,
+            target_repo=target_repo,
+            org=org,
+            team_slug=team_slug,
+            bot_login=bot_login,
+            lookback_minutes=_lookback_minutes(),
+            dispatch=dispatch,
+            claim=claim_via_status,
+        )
+
+    results = run_poll_loop(
+        _poll,
+        interval_seconds=_poll_interval_seconds(),
+        duration_seconds=_poll_duration_seconds(),
+        logger=logger,
     )
-    logger.info("CI fix comment poll dispatched %d fix(es)", dispatched)
+    logger.info(
+        "CI fix comment poll dispatched %d fix(es) across %d iteration(s)",
+        sum(results),
+        len(results),
+    )
     return 0
 
 

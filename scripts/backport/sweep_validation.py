@@ -7,7 +7,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Union
 
 from scripts.ai.runtime import run_agent
 from scripts.backport.main import _run_git as run_git_default
@@ -25,7 +25,7 @@ RunGit = Callable[..., Any]
 ValidateBranch = Callable[..., tuple[bool, str]]
 RunAgent = Callable[..., Any]
 ChangedPaths = Callable[[str], tuple[str, ...]]
-ChangedPathsSinceBase = Callable[[str, str], tuple[str, ...] | list[str]]
+ChangedPathsSinceBase = Callable[[str, str], Union[tuple[str, ...], list[str]]]
 HasStagedChanges = Callable[[str], bool]
 
 

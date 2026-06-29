@@ -1,9 +1,9 @@
 name: Backport Poll
 
-# Runs the backport poller on a short cron. For each registered {repo, branch}
-# the poller runs a sweep only when no sweep PR is currently open for that
-# branch, so a merged sweep PR is topped back up within one poll interval
-# instead of waiting for the daily Backport Sweep cron.
+# Runs the backport poller on a short cadence. For each registered
+# {repo, branch} the poller runs a sweep only when no sweep PR is currently
+# open for that branch, so a merged sweep PR is topped back up within one poll
+# interval instead of waiting for the daily Backport Sweep cron.
 
 on:
   schedule:
@@ -44,19 +44,13 @@ jobs:
       has_entries: ${{ steps.matrix.outputs.has_entries }}
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install pyyaml
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
 
       - name: Generate matrix from registry
         id: matrix
@@ -94,26 +88,22 @@ jobs:
       CLAUDE_CODE_USE_BEDROCK: "1"
       CI_AGENT_EVIDENCE_DIR: agent-evidence
       MAX_CANDIDATES: ${{ inputs.max_candidates || '2' }}
+      POLL_INTERVAL_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '0' }}
+      POLL_DURATION_SECONDS: ${{ github.event_name == 'schedule' && '3300' || '0' }}
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
         with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          npm install -g @anthropic-ai/claude-code@2.1.175
+          install-claude: "true"
 
       - name: Generate GitHub App token
         id: generate-token
@@ -122,9 +112,15 @@ jobs:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
+          permission-contents: write
+          permission-workflows: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-organization-projects: read
+          permission-metadata: read
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: backport-poll-${{ github.run_id }}-${{ matrix.branch }}
@@ -145,11 +141,13 @@ jobs:
             --branch "${{ matrix.branch }}" \
             --target-token "${TARGET_TOKEN}" \
             --max-candidates "${MAX_CANDIDATES}" \
+            --poll-interval-seconds "${POLL_INTERVAL_SECONDS}" \
+            --poll-duration-seconds "${POLL_DURATION_SECONDS}" \
             --verbose | tee backport-poll-result.json
 
       - name: Upload result
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: backport-poll-result-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
           path: backport-poll-result.json
@@ -157,7 +155,7 @@ jobs:
 
       - name: Upload agent evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: backport-poll-agent-evidence-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
           path: agent-evidence

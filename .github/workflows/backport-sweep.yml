@@ -44,19 +44,13 @@ jobs:
       has_entries: ${{ steps.matrix.outputs.has_entries }}
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install pyyaml
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
 
       - name: Generate matrix from registry
         id: matrix
@@ -98,21 +92,15 @@ jobs:
       id-token: write
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
         with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          npm install -g @anthropic-ai/claude-code
+          install-claude: "true"
 
       - name: Generate GitHub App token
         id: generate-token
@@ -121,9 +109,15 @@ jobs:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
+          permission-contents: write
+          permission-workflows: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-organization-projects: read
+          permission-metadata: read
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: backport-sweep-${{ github.run_id }}-${{ matrix.branch }}
@@ -156,7 +150,7 @@ jobs:
 
       - name: Upload result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: backport-sweep-result-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
           path: backport-sweep-result.json
@@ -164,7 +158,7 @@ jobs:
 
       - name: Upload agent evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: backport-sweep-agent-evidence-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
           path: agent-evidence

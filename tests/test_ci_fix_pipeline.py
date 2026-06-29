@@ -322,6 +322,7 @@ def _run_pipeline(monkeypatch, **overrides):
         run_loop_func=overrides.get("loop", lambda *a, **k: _loop_success()),
         push_func=overrides.get("push", lambda *a, **k: "deadbeef" * 5),
         port_push_func=overrides.get("port_push", lambda *a, **k: "deadbeef" * 5),
+        verify_runs=overrides.get("verify_runs", 2),
     )
 
 
@@ -501,6 +502,18 @@ def test_pipeline_docker_passes_image_to_loop(monkeypatch):
     assert outcome.kind is OutcomeKind.PUSHED
     assert seen["image"] == "almalinux:8"
     assert outcome.verify_backend == "docker:almalinux:8"
+
+
+def test_pipeline_passes_verify_runs_to_loop(monkeypatch):
+    seen = {}
+
+    def loop(repo_dir, proposal, **kwargs):
+        seen["verify_runs"] = kwargs.get("verify_runs")
+        return _loop_success()
+
+    outcome = _run_pipeline(monkeypatch, loop=loop, verify_runs=5)
+    assert outcome.kind is OutcomeKind.PUSHED
+    assert seen["verify_runs"] == 5
 
 
 def test_pipeline_unsupported_env_refuses(monkeypatch):

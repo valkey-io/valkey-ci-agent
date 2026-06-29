@@ -39,16 +39,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
         with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          npm install -g @anthropic-ai/claude-code@2.1.153
+          install-claude: "true"
 
       - name: Generate GitHub App token
         id: generate-token

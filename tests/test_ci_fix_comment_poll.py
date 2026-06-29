@@ -249,3 +249,21 @@ def test_bot_login_override_and_app_slug(monkeypatch):
 
     monkeypatch.setenv("CI_FIX_POLL_BOT_LOGIN", "sarthakaggarwal97")
     assert _bot_login() == "sarthakaggarwal97"
+
+
+def test_poll_loop_env_clamped_below_token_ttl(monkeypatch):
+    from scripts.ci_fix.comment_poll import (
+        _MAX_LOOP_SECONDS,
+        _poll_duration_seconds,
+        _poll_interval_seconds,
+    )
+
+    monkeypatch.delenv("CI_FIX_POLL_INTERVAL_SECONDS", raising=False)
+    monkeypatch.delenv("CI_FIX_POLL_DURATION_SECONDS", raising=False)
+    assert _poll_interval_seconds() == 0
+    assert _poll_duration_seconds() == 0
+
+    monkeypatch.setenv("CI_FIX_POLL_INTERVAL_SECONDS", "1800")
+    monkeypatch.setenv("CI_FIX_POLL_DURATION_SECONDS", str(_MAX_LOOP_SECONDS * 10))
+    assert _poll_interval_seconds() == 1800
+    assert _poll_duration_seconds() == _MAX_LOOP_SECONDS

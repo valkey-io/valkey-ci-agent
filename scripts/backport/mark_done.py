@@ -27,6 +27,11 @@ from typing import Any
 from scripts.backport.sweep_graphql import GitHubGraphQLClient
 from scripts.backport.utils import pr_numbers_from_commit_subjects
 from scripts.common.git_auth import GitAuth, github_https_url
+from scripts.common.polling import (
+    add_poll_loop_args,
+    format_poll_results,
+    run_poll_loop_from_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -534,6 +539,7 @@ def main() -> None:
         help="Report what would be marked Done without mutating the board.",
     )
     parser.add_argument("--verbose", action="store_true")
+    add_poll_loop_args(parser)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -546,12 +552,19 @@ def main() -> None:
     registry = load_registry(args.registry)
     gql = GitHubGraphQLClient(args.target_token)
 
-    results = _run_poll(
-        registry, gql, repo=args.repo, target_branch=args.target_branch,
-        status_field=args.status_field, from_status=args.from_status,
-        done_status=args.done_status, token=args.target_token, dry_run=args.dry_run,
+    def _poll() -> dict[str, Any]:
+        return _run_poll(
+            registry, gql, repo=args.repo, target_branch=args.target_branch,
+            status_field=args.status_field, from_status=args.from_status,
+            done_status=args.done_status, token=args.target_token, dry_run=args.dry_run,
+        )
+
+    results = run_poll_loop_from_args(
+        _poll,
+        args,
+        logger=logger,
     )
-    print(json.dumps(results, indent=2))
+    print(json.dumps(format_poll_results(results), indent=2))
 
 
 def _run_poll(

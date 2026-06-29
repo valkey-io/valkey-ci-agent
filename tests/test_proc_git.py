@@ -95,3 +95,32 @@ def test_build_approved_patch_treats_paths_literally(tmp_path):
     # The unrelated tracked edit must not be pulled in by the magic pathspec.
     assert "secret.txt" not in patch
     assert "leaked" not in patch
+
+
+def test_reset_worktree_removes_ignored_build_artifacts(tmp_path):
+    from scripts.ci_fix.review import _reset_worktree
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git(str(repo), "init", "-q")
+    (repo / ".gitignore").write_text("*.o\nbuild/\n")
+    (repo / "f.c").write_text("int main(){return 0;}\n")
+    run_git(str(repo), "add", ".gitignore", "f.c")
+    run_git(
+        str(repo),
+        "-c", "user.email=t@t",
+        "-c", "user.name=t",
+        "commit", "-qm", "init",
+    )
+
+    (repo / "f.o").write_text("object")
+    (repo / "build").mkdir()
+    (repo / "build" / "server").write_text("binary")
+    (repo / "scratch.txt").write_text("untracked")
+
+    _reset_worktree(str(repo))
+
+    assert not (repo / "f.o").exists()
+    assert not (repo / "build").exists()
+    assert not (repo / "scratch.txt").exists()
+    assert (repo / "f.c").exists()

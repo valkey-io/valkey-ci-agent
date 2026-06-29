@@ -55,21 +55,15 @@ jobs:
       CI_AGENT_EVIDENCE_DIR: agent-evidence
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
         with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          npm install -g @anthropic-ai/claude-code@2.1.153
+          install-claude: "true"
 
       - name: Generate GitHub App token
         id: generate-token
@@ -85,6 +79,7 @@ jobs:
           permission-members: read
           permission-actions: read
           permission-contents: write
+          permission-workflows: write
           permission-pull-requests: write
           permission-issues: write
           permission-metadata: read
@@ -119,6 +114,7 @@ jobs:
           CI_FIX_REPO: ${{ inputs.repo }}
           CI_FIX_PR: ${{ inputs.pr }}
           CI_FIX_RUN_URL: ${{ inputs.run_url }}
+          CI_FIX_VERIFY_RUNS: ${{ vars.CI_FIX_VERIFY_RUNS || '2' }}
           # The commenter input is honored only when the trusted poller App
           # dispatched this run; any other dispatcher (a human via the Actions
           # UI) falls back to github.actor, so a manual run cannot rewrite the

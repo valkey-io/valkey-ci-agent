@@ -45,8 +45,10 @@ upstream CI for verification.
 The daily sweep tops a rolling backport PR up to `--max-candidates` validated
 cherry-picks and then waits for the next cron tick, so a merged sweep PR is not
 topped back up until the following day. The poll workflow (`backport-poll.yml`)
-closes that gap by running hourly. For each registered `{repo, branch}` it runs
-the same sweep, but only when no sweep PR is currently open for that branch:
+closes that gap by starting hourly and polling immediately, then once more 30
+minutes later inside the same runner. For each registered `{repo, branch}` it
+runs the same sweep, but only when no sweep PR is currently open for that
+branch:
 
 ```text
 poller.py (short cron or manual dispatch)
@@ -60,7 +62,8 @@ The open-PR check is the entire state model: a merge closes the sweep PR, the
 next poll finds the gap and tops the board back up, and the new PR locks the
 branch again until it too merges. The poll job shares the
 `backport-sweep-{repo}-{branch}` concurrency group with the daily sweep so the
-two never race for the same branch.
+two never race for the same branch. Manual dispatches are one-shot; only
+scheduled runs use the sustained in-run cadence.
 
 ### Entry Points
 
@@ -145,11 +148,13 @@ ci_fix/main.py (workflow_dispatch event)
                                     committing; push and rely on this PR's
                                     normal CI as the verification authority
        local/docker:
-         review.run_fix_loop     -> apply (edit-only AI)
+         review.run_fix_loop     -> reproduce the failure on a clean checkout
+                                    -> apply (edit-only AI)
                                     -> runner.run_verification_command (code runs
                                        the AI command in a sanitized subprocess,
                                        inside the job's container for docker;
-                                       exit code is the verdict)
+                                       exit code is the verdict; build once,
+                                       verify K times)
                                     -> build_and_review_patch (skeptic AI)
                                     retry on feedback; needs pass AND approve
        macos:
@@ -179,16 +184,25 @@ port-discovery and verification logic resolve the default branch from the
 clone (so a repo whose default is `main`, like Valkey Search, works the same as
 Valkey core's `unstable`). The engine is repo-agnostic in principle.
 
-The deployment is not yet. `ci-fix.yml` and `ci-fix-comment-poll.yml` are
-operationally scoped to `valkey-io/valkey`: the workflow guards on the repo,
-mints a token for it, and the poller watches only it. Onboarding another repo
-(e.g. Valkey Search) still needs a registry-driven token/poll/dispatch path in
-the workflows; the Python engine being repo-agnostic is a precondition, not the
-whole job.
+The deployment is not yet fully registry-driven. `ci-fix.yml` and
+`ci-fix-comment-poll.yml` are operationally scoped to `valkey-io/valkey`: the
+workflow guards on the repo, mints a token for it, and the poller watches only
+it. The comment poller runs hourly but uses a shared in-run polling loop to scan
+immediately and again 30 minutes later, avoiding dependence on GitHub's
+scheduled-workflow queue for every half-hour tick. The loop is capped below the
+GitHub App token lifetime. Onboarding another repo (e.g. Valkey Search) still
+needs a registry-driven token/poll/dispatch path in the workflows; the Python
+engine being repo-agnostic is a precondition, not the whole job.
 
 Every failure mode - un-runnable variant, a real product bug, a flaky test, a
 moved branch, a non-member commenter - returns a `FixOutcome` that becomes an
 explanatory PR comment rather than a silent failure or an unsafe push.
+
+For local and Docker verification, a push requires a failing baseline first. If
+the command passes before the fix, the agent treats the CI failure as flaky or
+environment-specific and refuses. If the baseline cannot be established because
+the local verifier is missing setup dependencies, the agent may still author and
+skeptically review a patch, but it is returned as a handoff rather than pushed.
 
 ### Entry Points
 
@@ -238,6 +252,8 @@ Workflow-agnostic helpers in `scripts/common/`:
   shallow clone of a public repo at a specific commit, with input
   validation against argument injection. Gives the AI source access at the
   tested SHA in both the fuzzer and CI-fix flows.
+- `polling.py` - shared one-shot-or-sustained poll loop helpers for scheduled
+  pollers that need a predictable in-run cadence.
 - `proc.py` - `git_output(...)` (run a git command and return stdout) and
   `filter_env(allowlist)` (the single place that turns an env allowlist into
   a concrete, scrubbed subprocess environment).
@@ -250,6 +266,12 @@ Workflow-agnostic helpers in `scripts/common/`:
   issue keyed by a fingerprint marker. Workflows supply the rendered title,
   body, and comment via a small `render(marker, occurrences) -> IssueContent`
   callback; the publisher owns the dedup machinery.
+
+Workflow setup is centralized in `.github/actions/setup-agent`. Jobs still
+check out the agent repository explicitly, then use that local composite action
+to install the pinned Python toolchain, project dependencies, and optionally
+the pinned Claude Code CLI. The workflow standards tests scan both workflows
+and local action metadata so external actions and Claude installs do not drift.
 
 ## Repository Model
 

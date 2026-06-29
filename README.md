@@ -13,6 +13,8 @@ scripts/
   fuzzer/      Fuzzer run monitoring (active)
   ci_fix/      On-demand CI test-fix bot (active)
   common/      Shared infrastructure (git auth, GitHub client, safety guards)
+.github/actions/setup-agent
+              Shared workflow setup for Python deps and optional Claude Code
 repos.yml      Central registry of repos, branches, and project boards
 ```
 
@@ -130,10 +132,11 @@ Creates one PR named `[Backport 9.0] <original title>`.
 
 A scheduled poller reconciles each project board against branch reality and
 flips items from `To be backported` to `Done` once the backport actually lands.
-It runs hourly via `backport-mark-done-poll.yml` and reconciles every repo and
-branch in `repos.yml`. Because it reconciles the whole board on every run, it is
-self-healing: it picks up backports applied by the sweep, by an earlier run, or
-by a manual cherry-pick, without depending on a merge event.
+It starts hourly via `backport-mark-done-poll.yml`, reconciles immediately, and
+reconciles once more 30 minutes later inside the same runner. It covers every
+repo and branch in `repos.yml`. Because it reconciles the whole board on every
+run, it is self-healing: it picks up backports applied by the sweep, by an
+earlier run, or by a manual cherry-pick, without depending on a merge event.
 
 An item is marked `Done` only when the source PR's commit is genuinely on the
 target branch - verified by the cherry-pick's trailing `(#N)` subject, or by the
@@ -252,15 +255,12 @@ gh workflow run ci-fix.yml \
   --field run_url=https://github.com/valkey-io/valkey/actions/runs/<run_id>
 ```
 
-The workflow is dispatch-only today and is scoped to `valkey-io/valkey`,
-matching the GitHub App token it mints. A comment trigger
-(`@valkeyrie-bot fix <run-url>` on a `valkey-io/valkey` PR) needs a thin
-wrapper in `valkey-io/valkey` that forwards the `issue_comment` event here,
-because such events only fire in the repository where the comment is made; that
-wrapper is a planned follow-up. The invocation must start the comment, and the
-hint is only the rest of that line, so a conversational comment that merely
-quotes or mentions the command does not trigger a run. The intended comment
-shape is:
+The workflow is scoped to `valkey-io/valkey`, matching the GitHub App token it
+mints. Maintainers can dispatch it manually, or comment on a `valkey-io/valkey`
+PR and let `ci-fix-comment-poll.yml` dispatch it. The invocation must start the
+comment, and the hint is only the rest of that line, so a conversational comment
+that merely quotes or mentions the command does not trigger a run. The intended
+comment shape is:
 
 ```text
 @valkeyrie-bot fix https://github.com/valkey-io/valkey/actions/runs/<run_id>
@@ -297,10 +297,16 @@ owns every verdict.** The AI never runs a command and never pushes.
    - PORT: when the fix is an existing default-branch commit that cherry-picks
      cleanly, the bot may push the port and rely on this PR's normal CI as the
      authority. This exception is limited to already-merged upstream fixes.
-   - Linux/Docker: run the AI's targeted command in a **sanitized subprocess**
-     (scrubbed environment, locked working directory, timeout, output cap;
-     Docker adds no-network, dropped capabilities, non-root), where the real
-     exit code is the verdict. This path retries on failure.
+   - Linux/Docker: first run the AI's targeted build+verify recipe on the clean
+     checkout. If it passes before any fix, the bot treats the linked failure
+     as flaky or environment-specific and refuses. If the local environment
+     cannot establish a baseline because a setup dependency is missing, any
+     authored patch is handoff-only. Otherwise, apply the fix and run it in a
+     **sanitized subprocess** (scrubbed environment, locked working directory,
+     timeout, output cap; Docker adds no-network, dropped capabilities,
+     non-root), where the real exit code is the verdict. The build runs once
+     and the verify command must pass `CI_FIX_VERIFY_RUNS` times in a row
+     (default 2). This path retries on failure.
    - macOS: send the approved patch to a macOS runner the agent controls, which
      checks out the PR head, applies the patch, and runs the command; its CI
      conclusion is the verdict.
@@ -330,6 +336,17 @@ short-lived App tokens:
   `issues:write` (PR comments), `pull-requests:write` (PR metadata).
 - On `valkey-io/valkey-ci-agent`: `actions:write` (dispatch and read the
   macOS verification workflow). Used only for the macOS backend.
+
+`ci-fix-comment-poll.yml` runs hourly and polls twice inside the same runner,
+30 minutes apart. The in-run loop is capped below the GitHub App token lifetime,
+so the second tick does not depend on GitHub scheduling another workflow exactly
+on time. Optional poller tuning lives in `CI_FIX_POLL_INTERVAL_SECONDS` and
+`CI_FIX_POLL_DURATION_SECONDS`.
+
+Optional verification tuning: `CI_FIX_VERIFY_RUNS` sets how many times a
+Linux/Docker fix must pass the verify command before it is trusted (default 2).
+The build runs once regardless, so raising it only repeats the verify step.
+macOS verification runs once on its dedicated runner.
 
 ## Safety
 

@@ -7,7 +7,9 @@ name: CI Fix Comment Poll
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # One runner polls immediately and again 30 minutes later. This avoids
+    # relying on GitHub's scheduled-workflow queue for every 30-minute tick.
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       lookback_minutes:
@@ -23,24 +25,21 @@ jobs:
     name: "Poll for fix commands"
     if: github.repository == 'valkey-io/valkey-ci-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 70
+    concurrency:
+      group: ci-fix-comment-poll
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
       - name: Check out agent repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.0.0
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
 
       - name: Generate App token
         id: token
@@ -63,4 +62,6 @@ jobs:
           CI_FIX_POLL_TOKEN: ${{ steps.token.outputs.token }}
           CI_FIX_POLL_APP_SLUG: ${{ steps.token.outputs.app-slug }}
           CI_FIX_POLL_LOOKBACK_MINUTES: ${{ inputs.lookback_minutes || '180' }}
+          CI_FIX_POLL_INTERVAL_SECONDS: ${{ github.event_name == 'schedule' && '1800' || '0' }}
+          CI_FIX_POLL_DURATION_SECONDS: ${{ github.event_name == 'schedule' && '3300' || '0' }}
         run: python -m scripts.ci_fix.comment_poll

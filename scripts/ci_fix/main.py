@@ -30,6 +30,7 @@ from scripts.ci_fix.comment import render_comment
 from scripts.ci_fix.gate import ParsedCommand, parse_command
 from scripts.ci_fix.models import FixOutcome, OutcomeKind
 from scripts.ci_fix.pipeline import run_ci_fix
+from scripts.ci_fix.review import DEFAULT_VERIFY_RUNS
 from scripts.ci_fix.verify.macos import MacosVerifier
 from scripts.common.git_auth import GitAuth
 from scripts.common.github_client import retry_github_call
@@ -48,6 +49,17 @@ _AUTH_TEAM = os.environ.get("CI_FIX_AUTH_TEAM", "contributors")
 _MACOS_AGENT_REPO = os.environ.get("CI_FIX_MACOS_AGENT_REPO", "")
 _MACOS_AGENT_REF = os.environ.get("CI_FIX_MACOS_AGENT_REF", "main")
 _MACOS_TOKEN = os.environ.get("CI_FIX_MACOS_TOKEN", "")
+
+
+def _verify_runs() -> int:
+    """Return the local/Docker verification repeat count."""
+    raw = os.environ.get("CI_FIX_VERIFY_RUNS", "")
+    if not raw:
+        return DEFAULT_VERIFY_RUNS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_VERIFY_RUNS
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -109,6 +121,7 @@ def _run_and_comment(
                 artifact_client=artifact_client,
                 org=_AUTH_ORG,
                 auth_team=_AUTH_TEAM,
+                verify_runs=_verify_runs(),
                 macos_verifier=macos_verifier,
             )
     except Exception:  # noqa: BLE001 - never crash without telling the PR
