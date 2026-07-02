@@ -34,6 +34,7 @@ from scripts.ci_fix.review import DEFAULT_VERIFY_RUNS
 from scripts.ci_fix.verify.macos import MacosVerifier
 from scripts.common.git_auth import GitAuth
 from scripts.common.github_client import retry_github_call
+from scripts.common.polling import env_int
 from scripts.common.workflow_artifacts import ArtifactClient
 
 logger = logging.getLogger(__name__)
@@ -49,17 +50,17 @@ _AUTH_TEAM = os.environ.get("CI_FIX_AUTH_TEAM", "contributors")
 _MACOS_AGENT_REPO = os.environ.get("CI_FIX_MACOS_AGENT_REPO", "")
 _MACOS_AGENT_REF = os.environ.get("CI_FIX_MACOS_AGENT_REF", "main")
 _MACOS_TOKEN = os.environ.get("CI_FIX_MACOS_TOKEN", "")
+_MAX_VERIFY_RUNS = 10
 
 
 def _verify_runs() -> int:
     """Return the local/Docker verification repeat count."""
-    raw = os.environ.get("CI_FIX_VERIFY_RUNS", "")
-    if not raw:
-        return DEFAULT_VERIFY_RUNS
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return DEFAULT_VERIFY_RUNS
+    return env_int(
+        "CI_FIX_VERIFY_RUNS",
+        DEFAULT_VERIFY_RUNS,
+        minimum=1,
+        maximum=_MAX_VERIFY_RUNS,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

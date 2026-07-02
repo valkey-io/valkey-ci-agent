@@ -93,6 +93,7 @@ def run_poll_loop(
     next_start = start
     results: list[T] = []
     iteration = 0
+    last_error: BaseException | None = None
 
     while True:
         now = clock()
@@ -107,7 +108,12 @@ def run_poll_loop(
         iteration += 1
         if logger is not None:
             logger.info("Starting poll iteration %d", iteration)
-        results.append(poll_once())
+        try:
+            results.append(poll_once())
+        except Exception as exc:  # noqa: BLE001 - keep sustained polling alive
+            last_error = exc
+            if logger is not None:
+                logger.exception("Poll iteration %d raised; continuing to next interval", iteration)
 
         next_start += interval_seconds
         if next_start > deadline:
@@ -122,6 +128,8 @@ def run_poll_loop(
             if next_start > deadline:
                 break
 
+    if not results and last_error is not None:
+        raise last_error
     return results
 
 

@@ -139,7 +139,7 @@ def test_main_unexpected_error_still_posts_comment(tmp_path, monkeypatch):
 
 
 def test_verify_runs_env_parsing(monkeypatch):
-    from scripts.ci_fix.main import _verify_runs
+    from scripts.ci_fix.main import _MAX_VERIFY_RUNS, _verify_runs
     from scripts.ci_fix.review import DEFAULT_VERIFY_RUNS
 
     monkeypatch.delenv("CI_FIX_VERIFY_RUNS", raising=False)
@@ -150,6 +150,9 @@ def test_verify_runs_env_parsing(monkeypatch):
 
     monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "0")
     assert _verify_runs() == 1
+
+    monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "999")
+    assert _verify_runs() == _MAX_VERIFY_RUNS
 
     monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "not-a-number")
     assert _verify_runs() == DEFAULT_VERIFY_RUNS

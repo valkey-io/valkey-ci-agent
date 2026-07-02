@@ -55,6 +55,14 @@ def test_run_poll_loop_single_when_not_configured():
     assert calls == ["poll"]
 
 
+def test_run_poll_loop_single_propagates_exception_when_not_configured():
+    def poll():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_poll_loop(poll)
+
+
 def test_add_poll_loop_args_and_run_from_args():
     parser = argparse.ArgumentParser()
     add_poll_loop_args(parser)
@@ -100,6 +108,57 @@ def test_run_poll_loop_runs_on_interval_until_deadline():
     assert result == [0, 10, 20]
     assert starts == [0, 10, 20]
     assert sleeps == [10, 10]
+
+
+def test_run_poll_loop_continues_after_iteration_exception():
+    now = 0.0
+    attempts = []
+    sleeps = []
+
+    def clock():
+        return now
+
+    def sleep(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    def poll():
+        attempts.append(now)
+        if len(attempts) == 1:
+            raise RuntimeError("transient")
+        return int(now)
+
+    result = run_poll_loop(
+        poll, interval_seconds=10, duration_seconds=25,
+        clock=clock, sleep=sleep,
+    )
+    assert result == [10, 20]
+    assert attempts == [0, 10, 20]
+    assert sleeps == [10, 10]
+
+
+def test_run_poll_loop_reraises_when_every_iteration_fails():
+    now = 0.0
+    attempts = []
+
+    def clock():
+        return now
+
+    def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    def poll():
+        attempts.append(now)
+        raise RuntimeError(f"boom at {now:g}")
+
+    with pytest.raises(RuntimeError, match="boom at 20"):
+        run_poll_loop(
+            poll, interval_seconds=10, duration_seconds=25,
+            clock=clock, sleep=sleep,
+        )
+    assert attempts == [0, 10, 20]
 
 
 def test_run_poll_loop_skips_missed_intervals_instead_of_bursting():

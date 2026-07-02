@@ -344,9 +344,9 @@ on time. Optional poller tuning lives in `CI_FIX_POLL_INTERVAL_SECONDS` and
 `CI_FIX_POLL_DURATION_SECONDS`.
 
 Optional verification tuning: `CI_FIX_VERIFY_RUNS` sets how many times a
-Linux/Docker fix must pass the verify command before it is trusted (default 2).
-The build runs once regardless, so raising it only repeats the verify step.
-macOS verification runs once on its dedicated runner.
+Linux/Docker fix must pass the verify command before it is trusted (default 2,
+maximum 10). The build runs once regardless, so raising it only repeats the
+verify step. macOS verification runs once on its dedicated runner.
 
 ## Safety
 
