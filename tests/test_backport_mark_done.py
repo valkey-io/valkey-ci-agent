@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import sys
+
+import pytest
 
 import scripts.backport.mark_done as mark_done
 from scripts.backport.mark_done import (
@@ -8,6 +12,7 @@ from scripts.backport.mark_done import (
     mark_backport_items_done,
     reconcile_project_board,
 )
+from scripts.common.polling import PollLoopError
 
 
 def test_mark_backport_items_done_updates_matching_to_be_backported_items() -> None:
@@ -260,6 +265,50 @@ def test_dry_run_reports_without_mutating() -> None:
 
     assert result.updated == [101]
     assert gql.mutations == []
+
+
+def test_main_surfaces_sustained_poll_failure(monkeypatch, capsys) -> None:
+    class FakeRegistry:
+        pass
+
+    monkeypatch.setattr(
+        "scripts.backport.registry.load_registry",
+        lambda _path: FakeRegistry(),
+    )
+    monkeypatch.setattr(mark_done, "GitHubGraphQLClient", lambda _token: object())
+
+    def fail_after_success(*_args, **_kwargs):
+        raise PollLoopError(
+            results=[{"repo": "valkey-io/valkey", "action": "checked"}],
+            last_error=RuntimeError("transient graphql failure"),
+        )
+
+    monkeypatch.setattr(mark_done, "run_poll_loop_from_args", fail_after_success)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mark_done",
+            "--repo", "valkey-io/valkey",
+            "--target-branch", "9.1",
+            "--target-token", "tok",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        mark_done.main()
+
+    assert raised.value.code == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["runs"] == [
+        {"repo": "valkey-io/valkey", "action": "checked"},
+        {
+            "repo": "valkey-io/valkey",
+            "target_branch": "9.1",
+            "action": "error",
+            "error": "transient graphql failure",
+        },
+    ]
 
 
 class FakeGraphQLClient:

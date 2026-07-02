@@ -28,6 +28,7 @@ from scripts.backport.sweep_graphql import GitHubGraphQLClient
 from scripts.backport.utils import pr_numbers_from_commit_subjects
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.polling import (
+    PollLoopError,
     add_poll_loop_args,
     format_poll_results,
     run_poll_loop_from_args,
@@ -559,11 +560,24 @@ def main() -> None:
             done_status=args.done_status, token=args.target_token, dry_run=args.dry_run,
         )
 
-    results = run_poll_loop_from_args(
-        _poll,
-        args,
-        logger=logger,
-    )
+    try:
+        results = run_poll_loop_from_args(
+            _poll,
+            args,
+            logger=logger,
+        )
+    except PollLoopError as exc:
+        results = [
+            *exc.results,
+            {
+                "repo": args.repo,
+                "target_branch": args.target_branch,
+                "action": "error",
+                "error": str(exc.last_error),
+            },
+        ]
+        print(json.dumps(format_poll_results(results), indent=2))
+        raise SystemExit(1) from exc
     print(json.dumps(format_poll_results(results), indent=2))
 
 

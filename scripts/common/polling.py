@@ -12,6 +12,15 @@ from typing import Any, TypeVar
 T = TypeVar("T")
 
 
+class PollLoopError(RuntimeError):
+    """Raised after a sustained poll loop had one or more failed iterations."""
+
+    def __init__(self, *, results: list[Any], last_error: BaseException) -> None:
+        super().__init__(f"one or more poll iterations failed; last error: {last_error}")
+        self.results = results
+        self.last_error = last_error
+
+
 def nonnegative_int(value: str) -> int:
     """Argparse type for integer knobs where 0 is a meaningful value."""
     try:
@@ -128,8 +137,8 @@ def run_poll_loop(
             if next_start > deadline:
                 break
 
-    if not results and last_error is not None:
-        raise last_error
+    if last_error is not None:
+        raise PollLoopError(results=results, last_error=last_error) from last_error
     return results
 
 

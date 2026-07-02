@@ -5,6 +5,7 @@ import argparse
 import pytest
 
 from scripts.common.polling import (
+    PollLoopError,
     add_poll_loop_args,
     env_int,
     env_seconds,
@@ -129,11 +130,13 @@ def test_run_poll_loop_continues_after_iteration_exception():
             raise RuntimeError("transient")
         return int(now)
 
-    result = run_poll_loop(
-        poll, interval_seconds=10, duration_seconds=25,
-        clock=clock, sleep=sleep,
-    )
-    assert result == [10, 20]
+    with pytest.raises(PollLoopError) as raised:
+        run_poll_loop(
+            poll, interval_seconds=10, duration_seconds=25,
+            clock=clock, sleep=sleep,
+        )
+    assert str(raised.value.last_error) == "transient"
+    assert raised.value.results == [10, 20]
     assert attempts == [0, 10, 20]
     assert sleeps == [10, 10]
 
@@ -153,11 +156,13 @@ def test_run_poll_loop_reraises_when_every_iteration_fails():
         attempts.append(now)
         raise RuntimeError(f"boom at {now:g}")
 
-    with pytest.raises(RuntimeError, match="boom at 20"):
+    with pytest.raises(PollLoopError) as raised:
         run_poll_loop(
             poll, interval_seconds=10, duration_seconds=25,
             clock=clock, sleep=sleep,
         )
+    assert str(raised.value.last_error) == "boom at 20"
+    assert raised.value.results == []
     assert attempts == [0, 10, 20]
 
 
