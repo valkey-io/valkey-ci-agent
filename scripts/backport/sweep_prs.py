@@ -10,6 +10,7 @@ from github.GithubException import GithubException
 
 from scripts.backport.diff_comments import marked_source_pr_urls, reconcile_diff_comments
 from scripts.backport.pr_creator import (
+    _LABEL_DEFAULTS,
     build_pull_search_head_ref,
     create_pull_from_push_repo,
     pull_matches_push_repo,
@@ -67,6 +68,8 @@ def upsert_pr(
     existing_pr: Any | None,
     gql: GitHubGraphQLClient | None = None,
     branch_applied: list[CandidateResult] | None = None,
+    backport_label: str = "backport",
+    llm_conflict_label: str = "ai-resolved-conflicts",
 ) -> str:
     repo = retry_github_call(lambda: gh.get_repo(base_repo), retries=2, description=f"get {base_repo}")
     previous_body = getattr(existing_pr, "body", None) if existing_pr else None
@@ -77,8 +80,17 @@ def upsert_pr(
     )
     title = f"[backport] Backport sweep for {target_branch}"
 
+    # The AI-resolved signal is durable on each candidate, so scan this run's
+    # results and everything already applied to the branch; a PR that first
+    # gains an AI-resolved commit in a later top-up run still gets the label.
+    labels = [backport_label]
+    all_candidates = list(result.results) + list(branch_applied or [])
+    if any(getattr(c, "resolved_by_ai", False) for c in all_candidates):
+        labels.append(llm_conflict_label)
+
     if existing_pr:
         retry_github_call(lambda: existing_pr.edit(title=title, body=body), retries=2, description="update PR")
+        _apply_labels(repo, existing_pr, labels)
         # The sweep branch is always green, so any PR we update is ready for
         # review. Promote a leftover draft (e.g. from an older sweep) back to
         # ready. PyGithub does not expose this transition, so use GraphQL.
@@ -114,9 +126,66 @@ def upsert_pr(
         description="create PR",
     )
     logger.info("Created PR #%d on %s", pr.number, base_repo)
+    _apply_labels(repo, pr, labels)
     comment_urls = _reconcile_sweep_diff_comments(pr, result, branch_applied=branch_applied)
     _relink_body_to_comments(pr, result, branch_applied, comment_urls)
     return pr.html_url
+
+
+def _apply_labels(repo: Any, pr: Any, labels: list[str]) -> None:
+    """Apply *labels* to *pr*, creating any missing on *repo* first.
+
+    Best-effort and idempotent: ``add_to_labels`` re-adds existing labels
+    without error, so re-running the sweep on an already-labeled PR is a
+    no-op. A failure here is logged and swallowed so labeling never fails a
+    sweep whose branch is already green and pushed.
+    """
+    for label in labels:
+        _ensure_label_exists(repo, label)
+    try:
+        logger.info("Applying labels %s to PR #%d", labels, pr.number)
+        retry_github_call(
+            lambda: pr.add_to_labels(*labels),
+            retries=3,
+            description="apply labels to sweep PR",
+        )
+    except Exception as exc:  # noqa: BLE001 - labeling must not fail the sweep
+        logger.warning("Failed to apply labels to PR #%d: %s", pr.number, exc)
+
+
+def _ensure_label_exists(repo: Any, label: str) -> None:
+    """Create *label* on *repo* if it does not already exist. Best-effort."""
+    try:
+        retry_github_call(
+            lambda: repo.get_label(label),
+            retries=3,
+            description=f"check label {label!r}",
+        )
+        return
+    except GithubException as exc:
+        if exc.status != 404:
+            logger.warning("Could not verify label %r: %s", label, exc)
+            return
+    except Exception as exc:  # noqa: BLE001 - transport/parse failure is non-fatal
+        logger.warning("Could not verify label %r: %s", label, exc)
+        return
+
+    color, description = _LABEL_DEFAULTS.get(
+        label, ("ededed", f"Created by valkey-ci-agent for label {label!r}"),
+    )
+    try:
+        logger.info("Creating missing label %r", label)
+        retry_github_call(
+            lambda: repo.create_label(name=label, color=color, description=description),
+            retries=3,
+            description=f"create label {label!r}",
+        )
+    except GithubException as exc:
+        if exc.status == 422:  # created concurrently — fine
+            return
+        logger.error("Failed to create label %r: %s", label, exc)
+    except Exception as exc:  # noqa: BLE001 - transport/parse failure is non-fatal
+        logger.error("Failed to create label %r: %s", label, exc)
 
 
 def _relink_body_to_comments(

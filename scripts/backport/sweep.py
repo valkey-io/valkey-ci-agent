@@ -266,6 +266,8 @@ def run_backport_sweep(
         build_commands=list(repo_entry.build_commands) or None,
         validation_rules=validation_rules,
         repair_validation_failures=repo_entry.repair_validation_failures,
+        backport_label=repo_entry.backport_label,
+        llm_conflict_label=repo_entry.llm_conflict_label,
     )
     emit_job_summary(build_summary([result]))
     return result
@@ -286,6 +288,8 @@ def _process_branch(
     build_commands: list[str] | None = None,
     validation_rules: list[Any] | None = None,
     repair_validation_failures: bool = False,
+    backport_label: str = "backport",
+    llm_conflict_label: str = "ai-resolved-conflicts",
 ) -> BranchSweepResult:
     result = BranchSweepResult(
         target_branch=target_branch,
@@ -471,6 +475,8 @@ def _process_branch(
                         target_branch,
                         backport_branch,
                     ),
+                    backport_label=backport_label,
+                    llm_conflict_label=llm_conflict_label,
                 )
 
     except Exception as exc:

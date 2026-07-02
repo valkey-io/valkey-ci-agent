@@ -431,6 +431,81 @@ def test_upsert_pr_uses_direct_upstream_branch_by_default():
     # Sweep PRs are opened directly (not as drafts) so maintainers see
     # them in the active queue alongside other PRs.
     assert kwargs["draft"] is False
+    # A candidate with no AI resolution gets only the backport label.
+    mock_pr.add_to_labels.assert_called_once_with("backport")
+
+
+def test_upsert_pr_labels_ai_resolved_conflicts():
+    """A sweep PR carrying an AI-resolved candidate gets the conflict label."""
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_pr = MagicMock()
+    mock_pr.number = 777
+    mock_pr.html_url = "https://github.com/valkey-io/valkey/pull/777"
+    mock_repo.create_pull.return_value = mock_pr
+    result = BranchSweepResult(
+        target_branch="8.1",
+        candidates_found=1,
+        results=[
+            CandidateResult(
+                source_pr_number=11,
+                source_pr_title="Conflicting change",
+                outcome="applied",
+                detail="",
+                resolved_by_ai=True,
+            )
+        ],
+    )
+
+    upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "8.1",
+        "agent/backport/sweep/8.1",
+        result,
+        existing_pr=None,
+        backport_label="backport",
+        llm_conflict_label="ai-resolved-conflicts",
+    )
+
+    mock_pr.add_to_labels.assert_called_once_with("backport", "ai-resolved-conflicts")
+
+
+def test_upsert_pr_labels_ai_resolved_from_branch_applied():
+    """The conflict label is applied even when the AI-resolved candidate is
+    already on the branch (a later top-up run that re-resolves nothing)."""
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    existing_pr = MagicMock()
+    existing_pr.number = 888
+    existing_pr.html_url = "https://github.com/valkey-io/valkey/pull/888"
+    existing_pr.draft = False
+
+    result = BranchSweepResult(
+        target_branch="8.1",
+        candidates_found=0,
+        results=[],
+    )
+    branch_applied = [
+        CandidateResult(12, "Earlier AI-resolved PR", "applied", "", resolved_by_ai=True),
+    ]
+
+    upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "8.1",
+        "agent/backport/sweep/8.1",
+        result,
+        existing_pr=existing_pr,
+        branch_applied=branch_applied,
+        llm_conflict_label="ai-resolved-conflicts",
+    )
+
+    existing_pr.add_to_labels.assert_called_once_with("backport", "ai-resolved-conflicts")
 
 
 def test_upsert_pr_promotes_existing_draft_to_ready():
