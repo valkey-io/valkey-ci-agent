@@ -108,6 +108,25 @@ def test_dispatch_normalizes_root_src_object_make(monkeypatch):
     )
 
 
+def test_dispatch_does_not_normalize_when_workdir_is_set(monkeypatch):
+    monkeypatch.setattr("scripts.ci_fix.verify.macos.time.sleep", lambda *_: None)
+    gh, captured, set_token, _run = _gh_with_run(conclusion="success")
+    orig = gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect
+
+    def dispatch_then_token(ref, inputs):
+        result = orig(ref, inputs)
+        set_token()
+        return result
+
+    gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect = dispatch_then_token
+
+    command = "make src/unit/test_networking.o"
+    result = _verifier(gh).verify("/repo", _plan(command, workdir="src"), "diff --git a b\n")
+    assert result.verified is True
+    assert captured["inputs"]["workdir"] == "src"
+    assert captured["inputs"]["verify_command"] == command
+
+
 def test_failed_run_refuses(monkeypatch):
     monkeypatch.setattr("scripts.ci_fix.verify.macos.time.sleep", lambda *_: None)
     gh, captured, set_token, _run = _gh_with_run(conclusion="failure")

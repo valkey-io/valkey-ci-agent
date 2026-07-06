@@ -145,7 +145,9 @@ class MacosVerifier:
         )
 
     def _dispatch(self, plan: VerificationPlan, encoded_patch: str, token: str) -> bool:
-        command = normalize_macos_verify_command(plan.command)
+        command = plan.command
+        if not plan.workdir.strip():
+            command = normalize_macos_verify_command(plan.command)
         if command != plan.command:
             logger.info("Normalized macOS verification command: %s", command)
         inputs = {
