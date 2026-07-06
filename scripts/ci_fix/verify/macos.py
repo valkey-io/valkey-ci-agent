@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
+import shlex
 import time
 import uuid
 from typing import Any
@@ -33,6 +35,60 @@ VERIFY_MACOS_WORKFLOW = "ci-fix-verify-macos.yml"
 _MAX_PATCH_BYTES = (MAX_REVIEWABLE_PATCH_CHARS * 4) // 3 + 1024
 _POLL_INTERVAL_S = 20
 _DEFAULT_TIMEOUT_S = 60 * 60
+_MAKE_COMMAND_RE = re.compile(
+    r"(?P<prefix>(?:^|(?<=[;&|{}])\s*))"
+    r"(?P<command>make(?:\s+(?:\"[^\"]*\"|'[^']*'|[^\s;&|{}]+))*)"
+)
+_ROOT_SRC_OBJECT_RE = re.compile(r"^src/(?P<target>.+\.o)$")
+
+
+def normalize_macos_verify_command(command: str) -> str:
+    """Rewrite unsafe root-level Valkey object builds for macOS verification.
+
+    A command such as ``make src/unit/test_networking.o`` from the repo root
+    does not use Valkey's ``src/Makefile``; GNU make falls back to an implicit
+    compile rule and misses the project's include paths and generated
+    prerequisites. Run that targeted object build through ``make -C src``
+    instead, while leaving other commands unchanged.
+    """
+    return _MAKE_COMMAND_RE.sub(_rewrite_make_command, command)
+
+
+def _rewrite_make_command(match: re.Match[str]) -> str:
+    prefix = match.group("prefix")
+    make_command = match.group("command")
+    try:
+        tokens = shlex.split(make_command)
+    except ValueError:
+        return match.group(0)
+    if len(tokens) < 2 or tokens[0] != "make" or _has_make_directory(tokens):
+        return match.group(0)
+
+    rewritten = False
+    args: list[str] = []
+    for token in tokens[1:]:
+        target = _ROOT_SRC_OBJECT_RE.match(token)
+        if target:
+            args.append(target.group("target"))
+            rewritten = True
+        else:
+            args.append(token)
+    if not rewritten:
+        return match.group(0)
+    return f"{prefix}{shlex.join(['make', '-C', 'src', *args])}"
+
+
+def _has_make_directory(tokens: list[str]) -> bool:
+    for index, token in enumerate(tokens[1:], start=1):
+        if token == "-C" and index + 1 < len(tokens):
+            return True
+        if token.startswith("-C") and token != "-C":
+            return True
+        if token == "--directory" and index + 1 < len(tokens):
+            return True
+        if token.startswith("--directory="):
+            return True
+    return False
 
 
 class MacosVerifier:
@@ -89,11 +145,14 @@ class MacosVerifier:
         )
 
     def _dispatch(self, plan: VerificationPlan, encoded_patch: str, token: str) -> bool:
+        command = normalize_macos_verify_command(plan.command)
+        if command != plan.command:
+            logger.info("Normalized macOS verification command: %s", command)
         inputs = {
             "target_repo": plan.target_repo,
             "head_sha": plan.head_sha,
             "patch_b64": encoded_patch,
-            "verify_command": plan.command,
+            "verify_command": command,
             "workdir": plan.workdir,
             "correlation": token,
         }

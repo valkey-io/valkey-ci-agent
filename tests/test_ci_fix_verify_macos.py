@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from scripts.ci_fix.verify.base import VerificationPlan, VerifyEnv
-from scripts.ci_fix.verify.macos import MacosVerifier
+from scripts.ci_fix.verify.macos import MacosVerifier, normalize_macos_verify_command
 
 
 def _plan(command="make test", workdir=""):
@@ -84,6 +84,30 @@ def test_green_run_verifies(monkeypatch):
     assert captured["inputs"]["target_repo"] == "owner/target"
 
 
+def test_dispatch_normalizes_root_src_object_make(monkeypatch):
+    monkeypatch.setattr("scripts.ci_fix.verify.macos.time.sleep", lambda *_: None)
+    gh, captured, set_token, _run = _gh_with_run(conclusion="success")
+    orig = gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect
+
+    def dispatch_then_token(ref, inputs):
+        result = orig(ref, inputs)
+        set_token()
+        return result
+
+    gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect = dispatch_then_token
+
+    command = (
+        "{ export AR=/opt/homebrew/opt/llvm/bin/llvm-ar; "
+        "make -j3 src/unit/test_networking.o SERVER_CFLAGS='-Werror' USE_FAST_FLOAT=yes; }"
+    )
+    result = _verifier(gh).verify("/repo", _plan(command), "diff --git a b\n")
+    assert result.verified is True
+    assert captured["inputs"]["verify_command"] == (
+        "{ export AR=/opt/homebrew/opt/llvm/bin/llvm-ar; "
+        "make -C src -j3 unit/test_networking.o SERVER_CFLAGS=-Werror USE_FAST_FLOAT=yes; }"
+    )
+
+
 def test_failed_run_refuses(monkeypatch):
     monkeypatch.setattr("scripts.ci_fix.verify.macos.time.sleep", lambda *_: None)
     gh, captured, set_token, _run = _gh_with_run(conclusion="failure")
@@ -147,6 +171,41 @@ def test_stale_run_before_dispatch_is_ignored(monkeypatch):
     result = _verifier(gh).verify("/repo", _plan(), "diff\n")
     assert result.verified is False
     assert "did not complete" in result.detail
+
+
+def test_normalize_macos_verify_command_rewrites_root_src_object_targets():
+    command = (
+        "{\n"
+        "export AR=/opt/homebrew/opt/llvm/bin/llvm-ar; "
+        "export RANLIB=/opt/homebrew/opt/llvm/bin/llvm-ranlib; "
+        "make -j3 src/unit/test_networking.o SERVER_CFLAGS='-Werror' USE_FAST_FLOAT=yes\n"
+        "} && {\n"
+        "export AR=/opt/homebrew/opt/llvm/bin/llvm-ar; "
+        "export RANLIB=/opt/homebrew/opt/llvm/bin/llvm-ranlib; "
+        "make -j3 all-with-unit-tests SERVER_CFLAGS='-Werror' USE_FAST_FLOAT=yes\n"
+        "}"
+    )
+    assert normalize_macos_verify_command(command) == (
+        "{\n"
+        "export AR=/opt/homebrew/opt/llvm/bin/llvm-ar; "
+        "export RANLIB=/opt/homebrew/opt/llvm/bin/llvm-ranlib; "
+        "make -C src -j3 unit/test_networking.o SERVER_CFLAGS=-Werror USE_FAST_FLOAT=yes\n"
+        "} && {\n"
+        "export AR=/opt/homebrew/opt/llvm/bin/llvm-ar; "
+        "export RANLIB=/opt/homebrew/opt/llvm/bin/llvm-ranlib; "
+        "make -j3 all-with-unit-tests SERVER_CFLAGS='-Werror' USE_FAST_FLOAT=yes\n"
+        "}"
+    )
+
+
+def test_normalize_macos_verify_command_leaves_safe_make_commands():
+    assert normalize_macos_verify_command("make -C src unit/test_networking.o") == (
+        "make -C src unit/test_networking.o"
+    )
+    assert normalize_macos_verify_command("cd src && make unit/test_networking.o") == (
+        "cd src && make unit/test_networking.o"
+    )
+    assert normalize_macos_verify_command("make all-with-unit-tests") == "make all-with-unit-tests"
 
 
 def _advancing_clock(step):
