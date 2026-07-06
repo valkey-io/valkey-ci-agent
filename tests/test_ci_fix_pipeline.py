@@ -541,6 +541,7 @@ def _macos_pipeline(monkeypatch, verifier, *, apply_ok=True, review_ok=True):
     from scripts.ci_fix.verify.base import VerifyEnv
     from scripts.ci_fix.verify.workflow_env import JobEnvironment
     monkeypatch.setattr("scripts.ci_fix.pipeline.shallow_clone_at_sha", lambda *a, **k: True)
+    monkeypatch.setattr("scripts.ci_fix.pipeline.reset_worktree", lambda *a, **k: None)
     monkeypatch.setattr("scripts.ci_fix.pipeline._classify_failing_job",
                         lambda *a, **k: JobEnvironment(VerifyEnv.MACOS))
     monkeypatch.setattr("scripts.ci_fix.pipeline.apply_fix",
@@ -574,6 +575,43 @@ def test_pipeline_macos_green_pushes(monkeypatch):
     assert outcome.macos_run_url == "https://run/9"
 
 
+def test_pipeline_macos_cleanup_failure_preserves_push(monkeypatch):
+    from scripts.ci_fix.verify.base import VerificationResult, VerifyEnv
+    from scripts.ci_fix.verify.workflow_env import JobEnvironment
+
+    calls = {"n": 0}
+
+    def reset_ok_then_fail_on_cleanup(*_a, **_k):
+        # Succeed for the loop's own pre-attempt reset; fail only on the final
+        # cleanup reset that runs after the loop has already returned PUSHED.
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("git reset failed")
+
+    monkeypatch.setattr("scripts.ci_fix.pipeline.shallow_clone_at_sha", lambda *a, **k: True)
+    monkeypatch.setattr("scripts.ci_fix.pipeline.reset_worktree", reset_ok_then_fail_on_cleanup)
+    monkeypatch.setattr("scripts.ci_fix.pipeline._classify_failing_job",
+                        lambda *a, **k: JobEnvironment(VerifyEnv.MACOS))
+    monkeypatch.setattr("scripts.ci_fix.pipeline.apply_fix", lambda *a, **k: (True, ("test.tcl",)))
+    monkeypatch.setattr("scripts.ci_fix.pipeline.build_and_review_patch",
+                        lambda *a, **k: _patch_review(True))
+    verifier = MagicMock()
+    verifier.verify.return_value = VerificationResult(
+        verified=True, ran=True, detail="ok", run_url="https://run/9")
+
+    outcome = run_ci_fix(
+        _gh_authorized(), command=parse_command(f"@valkeyrie-bot fix {_RUN_URL}"),
+        pr_repo_full_name="valkey-io/valkey", pr_number=3988, commenter="alice",
+        git_env={}, artifact_client=_artifact_client({"1.txt": b"err"}),
+        diagnose_func=lambda *a, **k: _proposal(),
+        push_func=lambda *a, **k: "cafe" * 10,
+        macos_verifier=verifier,
+    )
+    # A cleanup failure must not mask the successful push.
+    assert outcome.kind is OutcomeKind.PUSHED
+    assert outcome.macos_run_url == "https://run/9"
+
+
 def test_pipeline_macos_red_refuses(monkeypatch):
     from scripts.ci_fix.verify.base import VerificationResult
     verifier = MagicMock()
@@ -581,6 +619,50 @@ def test_pipeline_macos_red_refuses(monkeypatch):
     outcome = _macos_pipeline(monkeypatch, verifier)
     assert outcome.kind is OutcomeKind.REFUSED
     assert "did not pass" in outcome.summary
+    from scripts.ci_fix.pipeline import _MACOS_FIX_MAX_ATTEMPTS
+    assert verifier.verify.call_count == _MACOS_FIX_MAX_ATTEMPTS
+
+
+def test_pipeline_macos_red_retries_with_feedback(monkeypatch):
+    from scripts.ci_fix.verify.base import VerificationResult, VerifyEnv
+    from scripts.ci_fix.verify.workflow_env import JobEnvironment
+    feedback_seen = []
+
+    monkeypatch.setattr("scripts.ci_fix.pipeline.shallow_clone_at_sha", lambda *a, **k: True)
+    monkeypatch.setattr("scripts.ci_fix.pipeline.reset_worktree", lambda *a, **k: None)
+    monkeypatch.setattr("scripts.ci_fix.pipeline._classify_failing_job",
+                        lambda *a, **k: JobEnvironment(VerifyEnv.MACOS))
+
+    def apply(_repo, _proposal, *, feedback=""):
+        feedback_seen.append(feedback)
+        return True, ("test.tcl",)
+
+    monkeypatch.setattr("scripts.ci_fix.pipeline.apply_fix", apply)
+    monkeypatch.setattr("scripts.ci_fix.pipeline.build_and_review_patch",
+                        lambda *a, **k: _patch_review(True))
+    verifier = MagicMock()
+    verifier.verify.side_effect = [
+        VerificationResult(
+            verified=False, ran=True, detail="did not pass", run_url="https://run/1",
+            output_tail="unit/test_vset.c:137:25: error: variable length array folded",
+        ),
+        VerificationResult(verified=True, ran=True, detail="ok", run_url="https://run/2"),
+    ]
+
+    outcome = run_ci_fix(
+        _gh_authorized(), command=parse_command(f"@valkeyrie-bot fix {_RUN_URL}"),
+        pr_repo_full_name="valkey-io/valkey", pr_number=3988, commenter="alice",
+        git_env={}, artifact_client=_artifact_client({"1.txt": b"err"}),
+        diagnose_func=lambda *a, **k: _proposal(),
+        push_func=lambda *a, **k: "cafe" * 10,
+        macos_verifier=verifier,
+    )
+
+    assert outcome.kind is OutcomeKind.PUSHED
+    assert feedback_seen[0] == ""
+    assert "unit/test_vset.c:137" in feedback_seen[1]
+    assert "https://run/1" in feedback_seen[1]
+    assert verifier.verify.call_count == 2
 
 
 def test_pipeline_macos_unavailable_refuses(monkeypatch):

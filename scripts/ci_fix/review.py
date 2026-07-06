@@ -114,7 +114,7 @@ def review_fix(repo_dir: str, proposal: FixProposal, diff: str) -> ReviewVerdict
     )
 
 
-def _reset_worktree(repo_dir: str) -> None:
+def reset_worktree(repo_dir: str) -> None:
     """Discard all working-tree changes back to HEAD, including ignored files.
 
     ``reset --hard`` alone leaves untracked files behind, and ``clean -fd``
@@ -310,13 +310,13 @@ def run_fix_loop(
     repo_dir: str,
     proposal: FixProposal,
     *,
-    max_attempts: int = 3,
+    max_attempts: int = 5,
     verify_runs: int = DEFAULT_VERIFY_RUNS,
     container_image: str = "",
     apply_func: ApplyFix = apply_fix,
     run_command: RunCommand = run_verification_command,
     review_func: ReviewFix = review_fix,
-    reset_func: Callable[[str], None] = _reset_worktree,
+    reset_func: Callable[[str], None] = reset_worktree,
 ) -> LoopResult:
     """Reproduce, apply, verify, and review the fix up to N times.
 

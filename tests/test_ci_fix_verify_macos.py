@@ -144,6 +144,85 @@ def test_failed_run_refuses(monkeypatch):
     assert "did not pass" in result.detail
 
 
+def test_failed_run_includes_log_tail(monkeypatch):
+    monkeypatch.setattr("scripts.ci_fix.verify.macos.time.sleep", lambda *_: None)
+    gh, captured, set_token, run = _gh_with_run(conclusion="failure")
+    orig = gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect
+
+    def dispatch_then_token(ref, inputs):
+        r = orig(ref, inputs)
+        set_token()
+        return r
+
+    gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect = dispatch_then_token
+
+    artifact_client = MagicMock()
+    artifact_client.download_run_logs.return_value = {
+        "verify-macos/1_Check out target repo.txt": b"checkout log\n",
+        "verify-macos/5_Run targeted verification.txt":
+            b"unit/test_vset.c:137:25: error: variable length array folded\n",
+    }
+    verifier = MacosVerifier(
+        gh, agent_repo_full_name="owner/agent", ref="main", timeout=5,
+        artifact_client=artifact_client,
+    )
+
+    result = verifier.verify("/repo", _plan(), "diff\n")
+    assert result.verified is False
+    assert "unit/test_vset.c:137" in result.output_tail
+    # Only the verify step's log is surfaced; unrelated steps are excluded.
+    assert "checkout log" not in result.output_tail
+    artifact_client.download_run_logs.assert_called_once_with("owner/agent", run.id)
+
+
+def test_failed_run_tail_keeps_verify_step_over_large_other_logs(monkeypatch):
+    monkeypatch.setattr("scripts.ci_fix.verify.macos.time.sleep", lambda *_: None)
+    gh, captured, set_token, _run = _gh_with_run(conclusion="failure")
+    orig = gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect
+
+    def dispatch_then_token(ref, inputs):
+        r = orig(ref, inputs)
+        set_token()
+        return r
+
+    gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect = dispatch_then_token
+
+    # A later step emits a log far larger than the tail cap; the verify step's
+    # failure must still survive because we tail that step's log directly.
+    artifact_client = MagicMock()
+    artifact_client.download_run_logs.return_value = {
+        "verify-macos/5_Run targeted verification.txt":
+            b"unit/test_vset.c:137:25: error: variable length array folded\n",
+        "verify-macos/9_Upload artifacts.txt": b"noise\n" * 5000,
+    }
+    verifier = MacosVerifier(
+        gh, agent_repo_full_name="owner/agent", ref="main", timeout=5,
+        artifact_client=artifact_client,
+    )
+
+    result = verifier.verify("/repo", _plan(), "diff\n")
+    assert result.verified is False
+    assert "unit/test_vset.c:137" in result.output_tail
+    assert "noise" not in result.output_tail
+
+
+def test_failed_run_without_artifact_client_has_empty_tail(monkeypatch):
+    monkeypatch.setattr("scripts.ci_fix.verify.macos.time.sleep", lambda *_: None)
+    gh, captured, set_token, _run = _gh_with_run(conclusion="failure")
+    orig = gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect
+
+    def dispatch_then_token(ref, inputs):
+        r = orig(ref, inputs)
+        set_token()
+        return r
+
+    gh.get_repo.return_value.get_workflow.return_value.create_dispatch.side_effect = dispatch_then_token
+
+    result = _verifier(gh).verify("/repo", _plan(), "diff\n")
+    assert result.verified is False
+    assert result.output_tail == ""
+
+
 def test_oversized_patch_refuses_without_dispatch():
     gh = MagicMock()
     result = _verifier(gh).verify("/repo", _plan(), "x" * (200 * 1024))

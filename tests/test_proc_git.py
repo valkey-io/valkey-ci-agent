@@ -98,7 +98,7 @@ def test_build_approved_patch_treats_paths_literally(tmp_path):
 
 
 def test_reset_worktree_removes_ignored_build_artifacts(tmp_path):
-    from scripts.ci_fix.review import _reset_worktree
+    from scripts.ci_fix.review import reset_worktree
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -118,7 +118,7 @@ def test_reset_worktree_removes_ignored_build_artifacts(tmp_path):
     (repo / "build" / "server").write_text("binary")
     (repo / "scratch.txt").write_text("untracked")
 
-    _reset_worktree(str(repo))
+    reset_worktree(str(repo))
 
     assert not (repo / "f.o").exists()
     assert not (repo / "build").exists()

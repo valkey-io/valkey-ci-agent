@@ -109,6 +109,7 @@ def _run_and_comment(
         agent_gh = Github(auth=Auth.Token(_MACOS_TOKEN))
         macos_verifier = MacosVerifier(
             agent_gh, agent_repo_full_name=_MACOS_AGENT_REPO, ref=_MACOS_AGENT_REF,
+            artifact_client=ArtifactClient(agent_gh, token=_MACOS_TOKEN),
         )
     try:
         with GitAuth(token=token) as auth:
