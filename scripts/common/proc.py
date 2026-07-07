@@ -31,7 +31,9 @@ def git_output(repo_dir: str, *args: str, timeout: int = _GIT_TIMEOUT_S) -> str:
     (``core.sshCommand``, ``core.fsmonitor``, a diff/filter driver) must never
     execute with the parent's credentials in scope. ``LOCKED_GIT_CONFIG``
     disables hooks; the scrubbed env removes the secrets such config could
-    otherwise read. Every caller is a local operation that needs no credentials.
+    otherwise read. Callers are local operations or unauthenticated remote
+    queries (``ls-remote``, ``remote show`` against a public repo), so none
+    needs credentials.
     """
     result = subprocess.run(
         ["git", *LOCKED_GIT_CONFIG, *args],

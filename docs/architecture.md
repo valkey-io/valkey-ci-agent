@@ -1,8 +1,9 @@
 # Architecture
 
 The Valkey CI Agent runs workflows that act on Valkey repositories defined in
-the central `repos.yml` registry. Three workflows are active today: backports
-and fuzzer monitoring (scheduled), and the CI test-fix bot (on-demand).
+the central `repos.yml` registry. Five workflows are active today: backports,
+fuzzer monitoring, and the test-failure detector (scheduled), and the CI
+test-fix bot and release-notes cut (on-demand).
 
 ## Layers
 
@@ -12,6 +13,7 @@ scripts/
   fuzzer/      Fuzzer monitor workflow
   test_failure_detector/ Test Failure Detector workflow
   ci_fix/      CI test-fix bot
+  release_notes/ Release-notes cutter: AI notes + version bump
   ai/          Claude Code subprocess orchestration
   common/      Shared infrastructure
 repos.yml      Registry of repos, release branches, and project boards
@@ -302,6 +304,56 @@ main.py (daily cron or manual dispatch)
 - `scripts/test_failure_detector/parse_failures.py` - JSON parsing and deduplication
 - `scripts/test_failure_detector/manage_issues.py` - orchestration over the shared dedup publisher to create/update issues
 - `scripts/test_failure_detector/issue_renderer.py` - test-failure-specific title/body/comment rendering and label assignment
+
+## Release Notes Flow
+
+```text
+main.py (manual dispatch: source_ref, version, stage, urgency)
+  -> validate + canonicalize inputs (fail fast, exit 2 on malformed)
+  -> clone valkey (full depth + tags), validate --base-ref
+  -> release_cut.cut()
+       -> resolve_branch_plan()      maps (version, stage) onto the branch model
+       -> pipeline.regenerate_unreleased()
+            -> discover()  labelled PRs over base..HEAD, deduped by PR number
+            -> classify()  include / exclude / triage from labels
+            -> generate()  AI: one categorized bullet per included PR
+            -> dedup bullets by PR number (pipeline; surfaces duplicate_prs)
+            -> group_bullets()  {category: [canonical bullet line, ...]}
+       -> promote_and_bump()  render_release_notes(): dated section + version.h bump
+       -> _commit_push_release_pr()  prep branch (force-with-lease) + PR into the line
+       -> GA rename: delete the old pre-release branch
+```
+
+The branch model is one long-running branch per minor line: rc1 creates
+`pre-release-M.m.p`, rcN continues it, ga creates/renames to `M.m`. The cut lands
+on an agent-namespaced `agent/release-cut/...` prep branch and opens a PR into the
+release line, so the line only advances when a human merges. The notes/version
+format is fixed in one place - `render_release_notes` (`release_format.py`),
+`set_version` (`version_bump.py`), and `list_contributors` (`contributors.py`).
+They live in-repo because `valkey-io/valkey` ships no release tooling of its own,
+so a cut runs against unmodified upstream `unstable` (a plaintext `00-RELEASENOTES`
+placeholder and a `src/version.h` with the `VALKEY_VERSION*` macros).
+
+Non-blocking anomalies (out-of-sequence rc, GA duplicate/orphan, rc-after-GA,
+unanchored baseline, empty/duplicate notes, security correlations) are surfaced as
+warnings in the PR body rather than blocking the cut; malformed inputs and
+inconsistent branch state (ie GA with both `pre-release-M.m.p` and `M.m`) are hard
+errors.
+
+### Entry Points
+
+- `scripts/release_notes/main.py` - CLI entry point, input validation, clone
+- `scripts/release_notes/release_cut.py` - branch-plan resolution, notes rendering, PR body + warnings
+- `scripts/release_notes/pipeline.py` - discover -> classify -> generate -> render orchestration
+- `scripts/release_notes/discover.py` - range resolution and PR discovery by graph reachability
+- `scripts/release_notes/classify.py` - label-based include / exclude / triage partition
+- `scripts/release_notes/generate.py` - Claude bullet generation (read-only tools)
+- `scripts/release_notes/security.py` - Security Fixes from published GitHub advisories (never AI-authored)
+- `scripts/release_notes/render.py` - canonical `00-RELEASENOTES` rendering
+- `scripts/release_notes/publish.py` - find/open/update the release PR
+- `scripts/release_notes/release_format.py` - `00-RELEASENOTES` dated-section rendering
+- `scripts/release_notes/version_bump.py` - `src/version.h` macro rewriting
+- `scripts/release_notes/contributors.py` - deduplicated contributor list
 
 ## Planned Workflows
 

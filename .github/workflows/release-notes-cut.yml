@@ -1,0 +1,246 @@
+# Cut a Valkey release: generate notes all at once + bump version + carry prior RCs.
+#
+# A maintainer dispatches this with the source branch (e.g. unstable), the target
+# version, stage, and urgency. The agent generates the release notes in one shot
+# from the labelled PRs in range (Claude via Bedrock). Nothing accumulates notes
+# on a branch. It then renders them onto the long-running release branch as a dated
+# section, bumps src/version.h, and refreshes the running contributor list, using the
+# release-format primitives in scripts/release_notes (release_format.py,
+# version_bump.py, contributors.py). valkey-io/valkey ships no release tooling, so
+# these own the format here. It opens one PR for the release branch for review;
+# the source branch is never modified.
+#
+# Branch model (one long-running branch per minor line):
+#   rc1 of M.m.p -> create  pre-release-M.m.p
+#   rcN (N>1)     -> continue pre-release-M.m.p (keeps prior RCs' dated notes;
+#                    dedup is by graph range back to the last reachable RC tag)
+#   ga of M.m.p   -> create  M.m carrying the rc history, delete pre-release-M.m.p
+name: Cut Release Notes
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Source branch whose merged PRs are cut into the release, e.g. unstable or 9.1"
+        required: true
+        type: string
+      version:
+        description: "Target version MAJOR.MINOR.PATCH, e.g. 9.1.0"
+        required: true
+        type: string
+      stage:
+        description: "Release stage: rc1..rcN or ga (rc1 has no prior RC tag, so it
+          defaults base_ref to the previous release: prior patch M.m.(p-1), or previous
+          minor M.(m-1).0 for a .0; M.0.0 has none, so set base_ref yourself)"
+        required: true
+        type: string
+      urgency:
+        description: "Upgrade urgency"
+        required: true
+        type: choice
+        options:
+          - LOW
+          - MODERATE
+          - HIGH
+          - CRITICAL
+          - SECURITY
+      date:
+        description: "Release date YYYY-MM-DD (default: today)"
+        required: false
+        type: string
+      contrib_base_ref:
+        description: "Contributor range start (default: last tag, else root commit)"
+        required: false
+        type: string
+      base_ref:
+        description: "Explicit baseline ref overriding tag resolution (branch/tag/SHA).
+          Leave empty for rc2+/ga (uses the nearest RC tag); for rc1 it auto-defaults to
+          the previous release (prior patch, or previous minor for a .0), except M.0.0
+          which has no derivable baseline and needs this set."
+        required: false
+        type: string
+      security_fixes:
+        description: "Manual Security Fixes bullets. One per line, or separate with ';;'
+          since this field is single-line in the UI. E.g. (CVE-2026-1) UAF in unblock
+          flow;;(CVE-2026-2) overflow in parser. Merged with --security-from-advisories;
+          a manual bullet wins on CVE/GHSA collision."
+        required: false
+        type: string
+      security_from_advisories:
+        description: "Auto-render PUBLISHED GitHub security advisories fixed by this version
+          into Security Fixes (merged with any manual bullets; the PR body disclaims that
+          embargoed/draft CVEs must be added by hand)."
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: "Compute and log the cut without pushing or opening PRs"
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      # One cut per version+stage; a re-run replaces the release branch tip.
+      # NOTE: stage is interpolated raw here (GitHub expressions have no lower()),
+      # so a dispatch of "RC1" and one of "rc1" land in different groups. The cut
+      # step lowercases stage, so both still cut the same line, same prep branch,
+      # and same PR; nothing duplicates or corrupts. The only edge is that these
+      # two won't serialize against each other, so if they somehow overlap in time
+      # (same version, case-variant stage, dispatched seconds apart) the second's
+      # force-with-lease push just loses the race and that run fails; re-running it
+      # picks up the winner's PR cleanly. Not worth normalizing for.
+      group: release-cut-${{ inputs.version }}-${{ inputs.stage }}
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      CLAUDE_CODE_USE_BEDROCK: "1"
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent (Python deps + Claude Code)
+        uses: ./.github/actions/setup-agent
+        with:
+          install-claude: "true"
+
+      # Two token steps, selected by whether this cut reads advisories, so a
+      # normal cut never depends on the advisory grant. repository-advisories:read
+      # is only requested when --security-from-advisories is on; create-github-app-token
+      # fails if the App installation lacks a requested permission, so requesting it
+      # unconditionally would break EVERY cut (including ones that never touch
+      # advisories) whenever the grant is absent. Exactly one step runs; the token
+      # is read as (default || advisory) below, and a skipped step yields "".
+      - name: Generate GitHub App token
+        id: generate-token
+        if: ${{ !inputs.security_from_advisories }}
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          # contents:write to push the prep branch and create/delete release lines;
+          # pull-requests:write to open the release PR; metadata:read is always required.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-metadata: read
+
+      - name: Generate GitHub App token (with advisories)
+        id: generate-token-advisories
+        if: ${{ inputs.security_from_advisories }}
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          # Same as above plus repository-advisories:read, which --security-from-advisories
+          # needs to list published advisories. This step only runs for an advisory
+          # cut, so a plain cut is never blocked when the App lacks this grant. The
+          # App installation must still hold repository-advisories:read for an
+          # advisory cut to work. (Published advisories on a public repo are broadly
+          # readable, but the explicit grant guarantees the token sees them.)
+          permission-contents: write
+          permission-pull-requests: write
+          permission-metadata: read
+          permission-repository-advisories: read
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: release-cut-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Cut release notes
+        shell: bash
+        env:
+          # Exactly one token step ran (gated by security_from_advisories); the
+          # skipped one yields "", so this resolves to whichever produced a token.
+          RELEASE_NOTES_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token || steps.generate-token-advisories.outputs.token }}
+          RELEASE_NOTES_REPO: valkey-io/valkey
+          RELEASE_NOTES_HEAD_REF: ${{ inputs.source_ref }}
+          RELEASE_NOTES_VERSION: ${{ inputs.version }}
+          RELEASE_NOTES_STAGE: ${{ inputs.stage }}
+          RELEASE_NOTES_URGENCY: ${{ inputs.urgency }}
+          RELEASE_NOTES_DATE: ${{ inputs.date || '' }}
+          RELEASE_NOTES_CONTRIB_BASE: ${{ inputs.contrib_base_ref || '' }}
+          RELEASE_NOTES_BASE_REF: ${{ inputs.base_ref || '' }}
+          RELEASE_NOTES_SECURITY_FIXES: ${{ inputs.security_fixes || '' }}
+          RELEASE_NOTES_SECURITY_FROM_ADVISORIES: ${{ inputs.security_from_advisories && 'true' || 'false' }}
+          RELEASE_NOTES_DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_NOTES_HEAD_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "Invalid source_ref: ${RELEASE_NOTES_HEAD_REF}" >&2
+            exit 1
+          fi
+          # No leading zeros: "09.1.0" would otherwise pass the gate but canonicalize
+          # to "9.1.0" in Python, and a raw value leaking past would desync version.h
+          # from the branch name. Match single-zero or no-leading-zero components only.
+          if [[ ! "${RELEASE_NOTES_VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Invalid version (want MAJOR.MINOR.PATCH, no leading zeros): ${RELEASE_NOTES_VERSION}" >&2
+            exit 1
+          fi
+          # Stage is case-insensitive: lowercase it (RC1/GA/Rc2 -> rc1/ga/rc2)
+          # before the gate, and re-export so Python reads one canonical form.
+          # The Python layer also lowercases, but normalizing here keeps the gate
+          # and every downstream value (version.h, branch names, titles) aligned.
+          stage_lc="${RELEASE_NOTES_STAGE,,}"
+          if [[ ! "${stage_lc}" =~ ^(ga|rc[1-9][0-9]*)$ ]]; then
+            echo "Invalid stage (want ga or rcN): ${RELEASE_NOTES_STAGE}" >&2
+            exit 1
+          fi
+          export RELEASE_NOTES_STAGE="${stage_lc}"
+          # base_ref and contrib_base_ref are optional and flow into git ref
+          # positions (rev-parse / compare), so gate them with the same ref
+          # charset as source_ref. Both may be empty (their default), which skips
+          # the check; a non-empty value must be a plausible branch/tag/SHA.
+          for ref_var in RELEASE_NOTES_BASE_REF RELEASE_NOTES_CONTRIB_BASE; do
+            ref_val="${!ref_var}"
+            if [[ -n "${ref_val}" && ! "${ref_val}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+              echo "Invalid ${ref_var}: ${ref_val}" >&2
+              exit 1
+            fi
+          done
+          args=(-m scripts.release_notes.main)
+          # Manual Security Fixes: the UI field is single-line, so a maintainer
+          # separates bullets with ';;'; the gh/API path may also use real
+          # newlines. Split on both into one --security-fix per non-empty bullet
+          # (the Python arg is action="append"). Values are passed as separate
+          # array elements, never concatenated into the command string, so a
+          # bullet's contents can never be read as a shell token. Whitespace-only
+          # bullets are dropped here; Python re-sanitizes (collapses any stray
+          # newline within a bullet, drops empties) as a second line of defense.
+          if [[ -n "${RELEASE_NOTES_SECURITY_FIXES}" ]]; then
+            nl=$'\n'  # a var, so ${//} expands it in the replacement; $'\n' inline does not
+            fixes="${RELEASE_NOTES_SECURITY_FIXES//;;/${nl}}"
+            while IFS= read -r fix; do
+              [[ -n "${fix//[[:space:]]/}" ]] && args+=(--security-fix "${fix}")
+            done <<< "${fixes}"
+          fi
+          # Read dry_run from env like every other input, not a raw workflow
+          # expression interpolated into the script body: an expression is
+          # substituted before the shell parses the line, so a value would land in
+          # the code itself, whereas an env var is only ever a string the shell
+          # reads. (Even in a comment, a literal expression is evaluated by the
+          # Actions parser, so we describe it in prose rather than writing one.)
+          if [[ "${RELEASE_NOTES_DRY_RUN}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python "${args[@]}"
