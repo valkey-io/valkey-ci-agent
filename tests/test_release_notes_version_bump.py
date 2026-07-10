@@ -79,3 +79,16 @@ class TestSetVersion:
         without_num = '#define VALKEY_VERSION "1.0.0"\n#define VALKEY_RELEASE_STAGE "dev"\n'
         with pytest.raises(ValueError, match="VALKEY_VERSION_NUM"):
             set_version(without_num, "9.1.0", "rc1")
+
+    def test_duplicated_macro_raises(self) -> None:
+        # Two definitions of the same macro (count > 1) is as much a problem as a
+        # missing one: an ambiguous version.h must be rejected, not have both
+        # copies rewritten. The error names the duplicated macro.
+        doubled = (
+            '#define VALKEY_VERSION "1.0.0"\n'
+            "#define VALKEY_VERSION_NUM 0x00010000\n"
+            '#define VALKEY_RELEASE_STAGE "dev"\n'
+            '#define VALKEY_RELEASE_STAGE "ga"\n'  # stray second definition
+        )
+        with pytest.raises(ValueError, match="VALKEY_RELEASE_STAGE"):
+            set_version(doubled, "9.1.0", "rc1")

@@ -96,9 +96,9 @@ def is_reserved_category(category: str, fmt: Any) -> bool:
     """Whether *category* names a reserved section ``group_bullets`` will drop.
 
     Mirrors the refusal test in :func:`group_bullets` (single-lined, case-folded)
-    so a caller that must know *before* grouping whether a bullet will render --
-    the pipeline's per-PR dedup, which must not let a to-be-dropped reserved
-    bullet shadow a renderable one -- shares one definition with the grouping.
+    so a caller that must know *before* grouping whether a bullet will render
+    (the pipeline's per-PR dedup, which must not let a to-be-dropped reserved
+    bullet shadow a renderable one) shares one definition with the grouping.
     """
     return _one_line(category).casefold() in _reserved_sections(fmt)
 

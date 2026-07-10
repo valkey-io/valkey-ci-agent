@@ -51,8 +51,8 @@ _VALID_URGENCIES = ("LOW", "MODERATE", "HIGH", "CRITICAL", "SECURITY")
 # Config via env so the workflow can pass GitHub Actions context directly; the
 # RELEASE_NOTES_ prefix mirrors the CI_FIX_/FUZZER_ convention. These are read at
 # argparse-build time inside main() (not captured as import-time module
-# constants), so a test can monkeypatch the environment before calling main() --
-# an import-time read would freeze the value at first import, out of any test's
+# constants), so a test can monkeypatch the environment before calling main().
+# An import-time read would freeze the value at first import, out of any test's
 # reach and dependent on the ambient env when the module first loaded.
 _DEFAULT_REPO = "valkey-io/valkey"
 

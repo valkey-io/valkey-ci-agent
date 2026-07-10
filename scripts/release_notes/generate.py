@@ -57,7 +57,7 @@ it to exactly one category.
   are added automatically. Write the description text ONLY.
 - Choose the single best-fitting category from the list above, copied verbatim.
   The list is exhaustive: every user-facing change has a home. Use "Other
-  Changes" only when a change genuinely fits none of the specific categories.
+  Changes" only when a change fits none of the specific categories.
   Do NOT invent a new category name. If you feel the list is missing one, still
   pick "Other Changes", set "uncertain": true, and name the category you would
   have wanted in "uncertain_reason", which a maintainer sees. Any category not in

@@ -18,7 +18,12 @@ from scripts.release_notes import discover as discover_mod
 from scripts.release_notes import generate as generate_mod
 from scripts.release_notes import render as render_mod
 from scripts.release_notes.classify import classify
-from scripts.release_notes.models import MergedPR, UncertainNote
+from scripts.release_notes.models import (
+    MergedPR,
+    UncertainNote,
+    UnresolvedBackport,
+    UnresolvedCommit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,8 @@ class RegenResult:
     had_prs: bool               # whether the range contained any PR at all
     duplicate_prs: tuple[int, ...] = ()  # PR numbers the model emitted more than once (extra bullets dropped)
     uncertain: tuple[UncertainNote, ...] = ()  # low-confidence notes the model flagged, for the PR body
+    unresolved: tuple[UnresolvedCommit, ...] = ()  # range commits that resolved to no PR (shipped un-noted)
+    unresolved_backports: tuple[UnresolvedBackport, ...] = ()  # credited backports whose original source was unreachable
 
 
 def regenerate_unreleased(
@@ -61,9 +68,14 @@ def regenerate_unreleased(
         repo, clone_dir, head_ref, tag_glob=tag_glob, base_ref=base_ref
     )
     if not discovery.prs:
+        # A range with no resolvable PRs can still carry unresolved commits (a
+        # rewritten hand-applied cherry-pick); surface them even when there is
+        # nothing to note, so a shipped-but-un-noted change is never invisible.
         return RegenResult(
             base_tag=discovery.base_tag, grouped={},
             included=0, bullet_count=0, skipped=(), triage=(), had_prs=False,
+            unresolved=discovery.unresolved,
+            unresolved_backports=discovery.unresolved_backports,
         )
 
     include, _exclude, triage = classify(discovery.prs)
@@ -130,6 +142,8 @@ def regenerate_unreleased(
         included=len(include), bullet_count=promoted_count, skipped=skipped,
         triage=tuple(triage), had_prs=True,
         duplicate_prs=duplicate_prs, uncertain=uncertain,
+        unresolved=discovery.unresolved,
+        unresolved_backports=discovery.unresolved_backports,
     )
 
 
@@ -142,7 +156,7 @@ def _dedup_bullets_by_pr(bullets, fmt):
     ``Contributors``) that grouping drops. Without this preference, a reserved
     bullet the model emitted first for a PR would shadow the PR's real note: the
     real note is discarded here as a duplicate, the reserved one is dropped by
-    grouping, and the PR -- which had a perfectly good note -- renders nowhere and
+    grouping, and the PR, which had a perfectly good note, renders nowhere and
     is misreported as declined. When every bullet for a PR is reserved, the first
     is kept (grouping drops it and the pipeline folds the PR into ``skipped``).
 

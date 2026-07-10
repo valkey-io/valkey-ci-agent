@@ -61,6 +61,26 @@ def test_triage_surfaced(monkeypatch, clone):
     assert r.included == 0
 
 
+def test_unresolved_backports_passthrough(monkeypatch, clone):
+    # An unresolved backport flagged by hydrate_prs must reach RegenResult so the
+    # release-cut PR body can surface the suspect credit to a reviewer.
+    from scripts.release_notes.models import UnresolvedBackport
+    prs = (MergedPR(number=500, title="[Backport 9.1] Fix", author="bot", url="u",
+                    labels=("backport",)),)
+    unresolved_backports = (UnresolvedBackport(number=500, title="[Backport 9.1] Fix"),)
+    monkeypatch.setattr(
+        pipeline_mod.discover_mod, "discover",
+        lambda *a, **k: DiscoveryResult(
+            base_tag="9.1.0-rc1", head_ref="9.1", prs=prs,
+            unresolved_backports=unresolved_backports,
+        ),
+    )
+    monkeypatch.setattr(pipeline_mod.generate_mod, "generate",
+                        lambda *a, **k: GenerationResult(bullets=(), skipped=()))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert [b.number for b in r.unresolved_backports] == [500]
+
+
 def test_no_usable_bullets_yields_empty_grouped(monkeypatch, clone):
     # Included PRs but generate produces nothing: bullet_count is 0 and grouped is
     # empty, which is what the cut's blank-cut guard (included and not bullet_count)

@@ -44,6 +44,12 @@ class MergedPR:
     discovery pipeline always fills it with ``pull.merge_commit_sha`` or the
     range commit's SHA (see :func:`discover.hydrate_prs`), so it is non-empty
     for a PR built there.
+
+    When discovery resolves a backport to its original PR, ``number``, ``title``,
+    ``author``, ``body``, and ``labels`` are the **original** PR's (so the note
+    credits the change's author and the original labels drive classification),
+    while ``merge_commit_sha`` stays the **range (backport)** commit: the point
+    on *this* release line where the change actually landed.
     """
 
     number: int
@@ -101,13 +107,56 @@ class GenerationResult:
 
 
 @dataclass(frozen=True)
+class UnresolvedCommit:
+    """A range commit that resolved to no PR, for the cut's triage surface.
+
+    Discovery keys notes on the *original* PR number. A commit whose subject
+    carries no trailing ``(#N)``, whose body has no ``## Applied`` table or
+    ``-x`` cherry-pick trailer, and whose SHA the API associates with no PR
+    (a rewritten hand-applied cherry-pick, an unusual merge) cannot be keyed.
+    Rather than drop it silently (which would ship the change un-noted and
+    invisible, past valkey's label-only gate), it is carried here so the cut
+    can surface it for a maintainer. ``subject`` is the commit subject (for a
+    human to recognize the change); ``sha`` locates it in the line's history.
+    """
+
+    sha: str
+    subject: str
+
+
+@dataclass(frozen=True)
+class UnresolvedBackport:
+    """A backport PR that was credited because its original source was unreachable.
+
+    Discovery prefers the *original* PR that introduced a change. When a range
+    commit resolves to a PR that is itself a backport (``[Backport ...]`` title or
+    ``backport`` label) and none of the origin markers (an ``## Applied`` table, a
+    ``-x`` trailer, the backport PR's ``## Backport Summary``, its own commits, or
+    its ``backport/<n>-to-<branch>`` head) name the source, the change is still
+    noted, but credited to the *backport* PR, not the change's author. The note
+    reads normally, so a maintainer has no in-PR cue the credit is suspect; this
+    carries the backport PR (number, title, url) so the cut can flag it for review
+    with a clickable link.
+    """
+
+    number: int
+    title: str
+    url: str = ""
+
+
+@dataclass(frozen=True)
 class DiscoveryResult:
     """Factual summary of the release range, from discover.py.
 
     ``prs`` is deduplicated to one entry per originating PR number, so a change
-    cherry-picked across the range collapses to a single PR.
+    cherry-picked across the range collapses to a single PR. ``unresolved``
+    lists range commits that resolved to no PR (see :class:`UnresolvedCommit`).
+    ``unresolved_backports`` lists PRs in ``prs`` that are themselves backports
+    whose original source could not be recovered (see :class:`UnresolvedBackport`).
     """
 
     base_tag: str
     head_ref: str
     prs: tuple[MergedPR, ...] = field(default_factory=tuple)
+    unresolved: tuple[UnresolvedCommit, ...] = field(default_factory=tuple)
+    unresolved_backports: tuple[UnresolvedBackport, ...] = field(default_factory=tuple)

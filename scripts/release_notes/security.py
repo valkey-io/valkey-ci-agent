@@ -223,7 +223,7 @@ def _render_summary(advisory: Any) -> str:
 
 # Sentinel distinguishing "read the advisory, it does not fix this version" (None)
 # from "could not read the advisory's patched versions at all" (_UNREADABLE). The
-# two must not collapse: a genuine non-match is safely reported as "did not match
+# two must not collapse: a real non-match is safely reported as "did not match
 # this version", but an unread advisory MIGHT fix this version and is surfaced as
 # a separate "could not read" warning so a maintainer checks it by hand.
 _UNREADABLE = object()

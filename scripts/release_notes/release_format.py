@@ -122,7 +122,7 @@ def unrecognized_categories(notes: "Dict[str, List[str]]") -> List[str]:
     or invented (``Networking``) category. Such bullets are still rendered
     verbatim in the dated section (nothing is dropped), but they fall outside
     :data:`CATEGORIES`, so callers warn on them and ask a maintainer to
-    recategorize. Reserved sections (:data:`RESERVED_SECTIONS`) are excluded --
+    recategorize. Reserved sections (:data:`RESERVED_SECTIONS`) are excluded:
     ``group_bullets`` already refuses those. Categories with no bullets are
     ignored. Order follows *notes*.
     """
@@ -337,7 +337,7 @@ def render_release_notes(
     """Render the release line's frozen changelog with a new dated section on top.
 
     *notes* is the ``{category: [bullet, ...]}`` map for this cut (from
-    :func:`render.group_bullets`); it is rendered straight into a dated section --
+    :func:`render.group_bullets`); it is rendered straight into a dated section:
     there is no intermediate "unreleased" block. *prior_text* is the destination
     release line's existing changelog (the ``pre-release-M.m.p`` / ``M.m`` branch,
     which carries the earlier dated sections); an empty string on a first cut.

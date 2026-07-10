@@ -8,6 +8,7 @@ in step with whatever label gate the ``release-notes`` workflow enforces.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Sequence
 
 from scripts.release_notes.models import MergedPR, PRDisposition
@@ -39,22 +40,16 @@ def classify(prs: Sequence[MergedPR]) -> tuple[list[MergedPR], list[MergedPR], l
 
     Each returned :class:`MergedPR` is re-stamped with its computed
     disposition (the dataclass is frozen, so a new instance is produced).
+    ``dataclasses.replace`` copies every other field, so a field added to
+    :class:`MergedPR` is carried through here automatically rather than silently
+    reverting to its default.
     """
     include: list[MergedPR] = []
     exclude: list[MergedPR] = []
     triage: list[MergedPR] = []
     for pr in prs:
         disposition = disposition_for(pr.labels)
-        stamped = MergedPR(
-            number=pr.number,
-            title=pr.title,
-            author=pr.author,
-            url=pr.url,
-            body=pr.body,
-            labels=pr.labels,
-            merge_commit_sha=pr.merge_commit_sha,
-            disposition=disposition,
-        )
+        stamped = replace(pr, disposition=disposition)
         if disposition is PRDisposition.INCLUDE:
             include.append(stamped)
         elif disposition is PRDisposition.EXCLUDE:

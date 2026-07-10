@@ -59,3 +59,14 @@ class TestClassify:
 
     def test_empty_input(self) -> None:
         assert classify([]) == ([], [], [])
+
+    def test_backport_remapped_pr_classified_by_source_labels(self) -> None:
+        # After discovery remaps a backport to its original PR, the MergedPR carries
+        # the *source* PR's labels. A source labelled release-notes must INCLUDE,
+        # even though the backport PR itself would have carried only "backport"
+        # (which triages). This pins that identity, not the on-line PR, gates the note.
+        remapped = MergedPR(number=7, title="Fix a leak", author="alice",
+                            url="https://x/7", labels=("release-notes",))
+        include, _, triage = classify([remapped])
+        assert [p.number for p in include] == [7]
+        assert triage == []

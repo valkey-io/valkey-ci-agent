@@ -58,7 +58,6 @@ VERSION_FILE = os.path.join("src", "version.h")
 # the line. The source branch is never modified.
 PREP_BRANCH_PREFIX = "agent/release-cut"
 
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _RC_STAGE_RE = re.compile(r"^rc([1-9]\d*)$")
 # Matches "Valkey M.m.p-rcN" headings in a running pre-release changelog, to
 # tell which rc numbers already shipped on it.
@@ -115,17 +114,12 @@ class _NotesMeta:
 
 
 def _split_version(version: str) -> tuple[int, int, int]:
-    m = _VERSION_RE.match(version.strip())
-    if not m:
-        raise ValueError(f"version must be MAJOR.MINOR.PATCH (e.g. 9.1.0), got {version!r}")
-    parts = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    # Each component must fit one byte of VALKEY_VERSION_NUM (valkey's parse_version
-    # enforces the same 0-255 bound). Reject here so a too-large version fails at the
-    # input boundary, not deep inside rendering after a wasted clone + AI run.
-    for name, value in zip(("major", "minor", "patch"), parts):
-        if not 0 <= value <= 255:
-            raise ValueError(f"{name} version {value} is out of range 0-255 (got {version!r})")
-    return parts
+    # Delegate to release_format.parse_version (the single authoritative M.m.p
+    # parser + 0-255 bound, also behind version_num/set_version), so the version
+    # validation the cut applies at the input boundary cannot drift from the
+    # validation the format primitives apply when writing version.h. Rejecting a
+    # malformed/too-large version here fails fast, before the wasted clone + AI run.
+    return rn.parse_version(version)
 
 
 def canonical_version(version: str) -> str:
@@ -178,7 +172,7 @@ def resolve_branch_plan(repo_dir: str, *, version: str, stage: str, source_ref: 
             # M.m was created out of band while the rc line still exists. The GA
             # continue path below would base on M.m and silently leave pre_branch
             # orphaned (the delete is gated on rename_from); worse, M.m may not
-            # carry pre_branch's rc history. Refuse rather than orphan/diverge --
+            # carry pre_branch's rc history. Refuse rather than orphan/diverge:
             # a PR-body note cannot undo a base_ref already chosen wrong.
             raise ValueError(
                 f"GA of {version} found BOTH {pre_branch} and {ga_branch} on origin. "
@@ -200,9 +194,9 @@ def resolve_branch_plan(repo_dir: str, *, version: str, stage: str, source_ref: 
     if _remote_branch_exists(repo_dir, pre_branch):
         warning = _warn_rc_sequence(repo_dir, pre_branch, stage_lc, major, minor, patch)
         return BranchPlan(stage_lc, pre_branch, pre_branch, True, None, warning)
-    # No pre-release line yet. Either this is the genuine first cut (rc1), or the
-    # line already went GA and its pre-release branch was deleted by the rename --
-    # in which case recreating it from source is almost certainly a mis-dispatch.
+    # No pre-release line yet. Either this is the first cut (rc1), or the line
+    # already went GA and its pre-release branch was deleted by the rename, in
+    # which case recreating it from source is almost certainly a mis-dispatch.
     branch_warning = _warn_rc_after_ga(repo_dir, ga_branch, pre_branch, version)
     rc_warning = _warn_rc_first_cut(stage_lc, pre_branch) if branch_warning is None else None
     return BranchPlan(stage_lc, pre_branch, source_ref, False, None, rc_warning, branch_warning)
@@ -342,7 +336,7 @@ def _warn_rc_after_ga(
     The rc path keys only on ``pre-release-M.m.p``. After a GA rename deleted that
     branch, dispatching a further rc finds it absent and recreates it from source,
     ignoring that ``M.m`` already shipped. Returns ``None`` when ``M.m`` does not
-    exist (the genuine first-cut case, handled by :func:`_warn_rc_first_cut`).
+    exist (the first-cut case, handled by :func:`_warn_rc_first_cut`).
     """
     if not _remote_branch_exists(repo_dir, ga_branch):
         return None
@@ -686,9 +680,31 @@ def cut(
         plan.stage, plan.target, plan.base_ref, plan.continuing, plan.rename_from or "<none>",
     )
 
+    # A continuing cut (rc2+, or a GA draining the rc line) has no reachable RC
+    # tag to anchor discovery on: this workflow never pushes RC tags and the fork
+    # carries none, so the rc2+ default `--match <version>-rc*` glob makes
+    # `git describe` fail with "no tag reachable" and aborts the cut. The branch
+    # plan already knows the continuing baseline (pre-release-M.m.p, or M.m for a
+    # GA continuation), which resolves as origin/<name> in the clone, so use it as
+    # the range baseline and drop the glob. A wider walk here is corrected
+    # downstream: any PR the line already shipped is removed against the
+    # destination changelog (see already_credited below). An explicit --base-ref
+    # always wins, and it is the only way base_ref is non-None on a continuing cut
+    # (the rc1 default fires only when the line does not yet exist), so rc1 first
+    # cuts keep their derived-base / nearest-tag fallback untouched.
+    notes_base_ref, notes_tag_glob = base_ref, tag_glob
+    if base_ref is None and plan.continuing:
+        notes_base_ref, notes_tag_glob = plan.base_ref, None
+        logger.info(
+            "Continuing cut with no explicit --base-ref; anchoring discovery to the "
+            "release line base %r (no RC tag is reachable on the fork).",
+            plan.base_ref,
+        )
+
     # 1. Generate the categorized bullets for the range from labelled PRs.
     regen = pipeline_mod.regenerate_unreleased(
-        repo, source_clone_dir, head_ref=source_ref, tag_glob=tag_glob, base_ref=base_ref
+        repo, source_clone_dir, head_ref=source_ref,
+        tag_glob=notes_tag_glob, base_ref=notes_base_ref,
     )
     if regen.included and not regen.bullet_count:
         logger.error(
@@ -780,33 +796,74 @@ def cut(
         # 4. Ensure the release line exists to PR into. When starting a new line
         #    (rc1, first GA, or a GA rename carrying the rc history), create it at
         #    origin/<base_ref> with a non-force push so a race can't clobber it.
+        created_line = False
+        created_line_oid = ""
         if not _remote_branch_exists(source_clone_dir, plan.target):
+            # Record the OID we create the line at (the tip of origin/<base_ref>,
+            # which the non-force push copies onto the new ref). A rollback below
+            # deletes the line only under a lease on this OID, so it can never
+            # remove a commit a concurrent writer advanced the line to after we
+            # created it. If we cannot read the OID, the rollback refuses to delete
+            # (see _rollback_created_line) rather than risk a blind delete.
+            try:
+                created_line_oid = git_output(
+                    source_clone_dir, "rev-parse", "--verify",
+                    f"origin/{plan.base_ref}^{{commit}}",
+                ).strip()
+            except Exception:  # noqa: BLE001 - no OID -> rollback stays conservative
+                created_line_oid = ""
             run_git(source_clone_dir, "push", "origin",
                     f"origin/{plan.base_ref}:refs/heads/{plan.target}", env=git_env)
-            logger.info("Created release line %s at origin/%s", plan.target, plan.base_ref)
+            created_line = True
+            logger.info("Created release line %s at origin/%s (%s)",
+                        plan.target, plan.base_ref, created_line_oid[:12] or "unknown-oid")
 
-        # 5. Commit the rendered notes + bumped version on the prep branch, push
-        #    it (agent-namespaced, force-with-lease), and PR it into the line. The
-        #    source branch is never modified, so no companion PR. Each cut
-        #    rediscovers PRs from the last RC tag, so prior RCs' PRs are excluded
-        #    by the graph range.
-        _write(dest_notes_path, new_dest_notes)
-        _write(os.path.join(dest_dir, VERSION_FILE), new_version)
-        release_url = _commit_push_release_pr(
-            repo, dest_dir, repo_full_name=repo_full_name, plan=plan,
-            version=version, prep_branch=prep_branch, notes_meta=notes_meta,
-            git_env=git_env,
-        )
-        # Log the PR before the rename cleanup so a delete failure below still
-        # leaves the created PR's URL in the CI log.
-        logger.info("Release PR: %s", release_url)
+        try:
+            # 5. Commit the rendered notes + bumped version on the prep branch, push
+            #    it (agent-namespaced, force-with-lease), and PR it into the line. The
+            #    source branch is never modified, so no companion PR. Each cut
+            #    rediscovers PRs from the last RC tag, so prior RCs' PRs are excluded
+            #    by the graph range.
+            _write(dest_notes_path, new_dest_notes)
+            _write(os.path.join(dest_dir, VERSION_FILE), new_version)
+            release_url = _commit_push_release_pr(
+                repo, dest_dir, repo_full_name=repo_full_name, plan=plan,
+                version=version, prep_branch=prep_branch, notes_meta=notes_meta,
+                git_env=git_env,
+            )
+            # Log the PR before the rename cleanup so a delete failure below still
+            # leaves the created PR's URL in the CI log.
+            logger.info("Release PR: %s", release_url)
 
-        # 6. GA rename: delete the old pre-release branch. The M.m line was created
-        #    from it above, so its history is already carried. A branch already
-        #    gone is fine; a delete that fails with the branch still on origin
-        #    raises (both branches present is what the next GA hard-refuses).
-        if plan.rename_from:
-            _delete_remote_branch(source_clone_dir, plan.rename_from, git_env)
+            # 6. GA rename: delete the old pre-release branch. The M.m line was created
+            #    from it above, so its history is already carried. A branch already
+            #    gone is fine; a delete that fails with the branch still on origin
+            #    raises (both branches present is what the next GA hard-refuses).
+            if plan.rename_from:
+                _delete_remote_branch(source_clone_dir, plan.rename_from, git_env)
+        except Exception:
+            # The release line is mutated (step 4) before the prep branch, PR, and
+            # GA-rename delete are known-good (steps 5-6). If any of those fail, a
+            # line THIS run just created would be left stranded: for a GA rename,
+            # stranding M.m alongside pre-release-M.m.p, exactly the inconsistent
+            # state resolve_branch_plan hard-refuses on the next GA, forcing a
+            # manual reconcile. Roll back only a line we created (a pre-existing or
+            # continued line is never touched), restoring the single-branch state a
+            # retry expects. A rollback delete that itself fails is logged; we
+            # re-raise the original failure regardless so the run still exits
+            # non-zero.
+            if created_line:
+                logger.warning(
+                    "Release cut failed after creating %s; rolling it back so the "
+                    "release line is not left inconsistent.", plan.target,
+                )
+                try:
+                    _rollback_created_line(
+                        source_clone_dir, plan.target, created_line_oid, git_env
+                    )
+                except Exception:  # noqa: BLE001 - surface the original failure, not the rollback's
+                    logger.exception("Rollback of %s failed; delete it manually.", plan.target)
+            raise
 
         return 0
     finally:
@@ -857,6 +914,11 @@ def _print_dry_run(plan, version, dest_notes, version_h, notes_meta: "_NotesMeta
         print("⚠️  urgency SECURITY but no security-fix entries")
     if regen.triage:
         print(f"triage PRs (untagged): {[p.number for p in regen.triage]}")
+    if regen.unresolved:
+        print(f"⚠️  commits with no resolvable PR: {[c.sha[:12] for c in regen.unresolved]}")
+    if regen.unresolved_backports:
+        print("⚠️  notes credited to a backport (original PR not recovered): "
+              f"{[bp.number for bp in regen.unresolved_backports]}")
     print(f"\n===== {NOTES_FILE} (release branch, dry run) =====\n{dest_notes}")
     print(f"\n===== {VERSION_FILE} (dry run) =====\n{version_h}")
 
@@ -933,6 +995,8 @@ def _build_pr_body(plan: BranchPlan, version: str, notes_meta: "_NotesMeta") -> 
         + _advisory_section(notes_meta)
         + _security_warning_section(notes_meta)
         + _triage_section(regen.triage)
+        + _unresolved_section(regen.unresolved)
+        + _unresolved_backports_section(regen.unresolved_backports)
         + "\n*Generated by valkey-ci-agent. Review before merging into the release line.*"
     )
 
@@ -994,7 +1058,7 @@ def _empty_notes_section(notes_meta: "_NotesMeta", plan: BranchPlan) -> str:
 
     The cut renders only the dated heading + version bump when no bullet survives.
     The already-credited cause has its own section (:func:`_no_new_prs_section`);
-    this covers the other two silent causes: a genuinely empty range (no PRs), and
+    this covers the other two silent causes: an empty range (no PRs), and
     a range whose every PR needs triage (so none were included). Skipped when the
     section actually carries bullets, or when the already-credited drop explains it.
     """
@@ -1042,7 +1106,7 @@ def _skipped_section(skipped: Sequence[int]) -> str:
     skipped as "what was dropped." Either way the PR is absent from the dated
     section. valkey's ``check_release_notes`` gate is label-only, so a PR the model
     wrongly declined has no other signal; surface it here for a maintainer to
-    confirm each is genuinely not user-facing (or was mislabelled) before merging.
+    confirm each is truly not user-facing (or was mislabelled) before merging.
     """
     if not skipped:
         return ""
@@ -1053,7 +1117,7 @@ def _skipped_section(skipped: Sequence[int]) -> str:
         f"bullet for them, so they are **absent** from the dated section: {refs}. It "
         "judged them purely internal / not user-facing (or its output for them was "
         "lost). Because the label gate is label-only, this is the only signal a "
-        "declined PR gets. Confirm each is genuinely not user-facing (or was "
+        "declined PR gets. Confirm each is truly not user-facing (or was "
         "mislabelled); if one should be noted, re-cut after correcting it.\n"
     )
 
@@ -1219,6 +1283,123 @@ def _triage_section(triage: Sequence[Any]) -> str:
         lines.append(f"| [#{pr.number}]({pr.url}) | {publish_mod.escape_cell(pr.title)} | {author} |")
     lines.append("")
     return "\n".join(lines)
+
+
+def _unresolved_section(unresolved: Sequence[Any]) -> str:
+    """Flag range commits that resolved to no PR, so a shipped change can't vanish.
+
+    Each entry is an :class:`~scripts.release_notes.models.UnresolvedCommit`: a
+    commit in range whose original PR could not be recovered from its subject
+    ``(#N)``, an ``## Applied`` table, a ``-x`` cherry-pick trailer, or the
+    commit->PR API (a hand-applied cherry-pick whose message was rewritten, or an
+    unusual merge). It carries a real change but no PR reference, so it is absent
+    from both the dated notes and the triage table above. valkey's gate is
+    label-only and keys on PRs, so nothing else surfaces it; list it here for a
+    maintainer to identify the change and note it by hand if it is user-facing.
+    """
+    if not unresolved:
+        return ""
+    lines = [
+        "",
+        "### ⚠️ Commits with no resolvable PR",
+        "",
+        "These commits are in range but could not be tied to a PR (rewritten "
+        "cherry-pick, unusual merge, or pre-dating PR history), so they are "
+        "**absent** from the notes and the triage table. Confirm whether any is "
+        "user-facing and note it by hand if so:",
+        "",
+        "| Commit | Subject |",
+        "|--------|---------|",
+    ]
+    for commit in unresolved:
+        sha = (commit.sha or "")[:12]
+        lines.append(f"| `{sha}` | {publish_mod.escape_cell(commit.subject)} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _unresolved_backports_section(unresolved_backports: Sequence[Any]) -> str:
+    """Flag notes credited to a backport PR whose original source was unreachable.
+
+    Each entry is an :class:`~scripts.release_notes.models.UnresolvedBackport`: a
+    range commit resolved to a PR that is itself a backport, and discovery could
+    not walk it back to the original (no ``## Applied`` table, ``-x`` trailer,
+    ``## Backport Summary`` row, recoverable PR-commit ``(#N)``, or
+    ``backport/<n>-to-<branch>`` head). The change *is* noted, but credited to the
+    backport PR, not the change's author, and the note reads normally, so nothing
+    else in the PR would tip off a reviewer. List it here so a maintainer can find
+    the original PR and correct the credit (author and ``(#N)``) before merging.
+    """
+    if not unresolved_backports:
+        return ""
+    lines = [
+        "",
+        "### ⚠️ Notes credited to a backport (original PR not recovered)",
+        "",
+        "These notes are credited to a **backport** PR because the original PR "
+        "that introduced the change could not be recovered. The `(#N)` and author "
+        "shown for them are the backport's, not the change's author. Confirm the "
+        "original PR and correct the credit before merging:",
+        "",
+        "| Backport PR | Title |",
+        "|-------------|-------|",
+    ]
+    for bp in unresolved_backports:
+        ref = f"[#{bp.number}]({bp.url})" if bp.url else f"#{bp.number}"
+        lines.append(f"| {ref} | {publish_mod.escape_cell(bp.title)} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _rollback_created_line(
+    repo_dir: str, branch: str, expected_oid: str, git_env: dict[str, str]
+) -> None:
+    """Delete a release line this run created, but only if it still points at *expected_oid*.
+
+    The rollback fires when a cut failed after creating the line (step 4) but
+    before the prep branch / PR / GA-rename were known-good. Between the create
+    and this rollback another writer may have advanced the line (a human merge, a
+    concurrent cut); a plain ``push --delete`` would then destroy their commit.
+    Guard the delete with ``--force-with-lease=<ref>:<oid>`` pinned to the OID we
+    created the line at, so the delete is accepted only while the line is still
+    exactly the commit we put there, and is rejected (leaving the branch intact) if
+    it moved. When *expected_oid* is empty (we could not read it at create time),
+    refuse to delete at all rather than delete blind: a stranded line the next GA
+    flags is recoverable, a wrongly deleted commit is not.
+    """
+    if not expected_oid:
+        logger.warning(
+            "Not rolling back %s: the OID it was created at is unknown, so a delete "
+            "could remove a commit added after creation. Delete it manually if it is "
+            "the stray line this run created.", branch,
+        )
+        return
+    try:
+        run_git(repo_dir, "push",
+                f"--force-with-lease=refs/heads/{branch}:{expected_oid}",
+                "origin", "--delete", branch, env=git_env)
+        logger.info("Rolled back run-created release line %s (was at %s)",
+                    branch, expected_oid[:12])
+        return
+    except Exception as exc:  # noqa: BLE001
+        # A lease rejection ("stale info") means the line advanced past the commit
+        # we created it at: another writer owns the current tip, so leaving it in
+        # place is correct. Distinguish that (branch still present, but not ours to
+        # delete) from a delete that simply did not happen.
+        try:
+            still_present = _remote_branch_exists(repo_dir, branch)
+        except Exception:  # noqa: BLE001
+            still_present = True
+        if still_present:
+            logger.warning(
+                "Did not roll back %s: it no longer points at the commit this run "
+                "created (%s), so it was advanced by another writer and is left "
+                "intact (%s). Reconcile manually if needed.",
+                branch, expected_oid[:12], exc,
+            )
+        else:
+            logger.info("Release line %s already gone; rollback was a no-op: %s", branch, exc)
+        return
 
 
 def _delete_remote_branch(repo_dir: str, branch: str, git_env: dict[str, str]) -> None:

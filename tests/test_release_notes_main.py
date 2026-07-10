@@ -18,8 +18,8 @@ from scripts.release_notes.main import main
 # Every RELEASE_NOTES_* env var main() reads as an argparse default. The
 # validation tests assert that a *missing* CLI flag triggers a usage error, which
 # only holds if the corresponding env default is empty. main() reads these at
-# call time (not import time), so clearing them here reaches the real defaults --
-# an ambient value (CI, a dev shell, another test) would otherwise supply the
+# call time (not import time), so clearing them here reaches the real defaults.
+# An ambient value (CI, a dev shell, another test) would otherwise supply the
 # "missing" argument and make a validation test pass for the wrong reason.
 _RELEASE_NOTES_ENV = (
     "RELEASE_NOTES_REPO", "RELEASE_NOTES_HEAD_REF", "RELEASE_NOTES_VERSION",
