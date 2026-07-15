@@ -8,7 +8,6 @@ import shutil
 import pytest
 
 from scripts.release_notes import pipeline as pipeline_mod
-from scripts.release_notes import render as render_mod
 from scripts.release_notes.models import (
     CategorizedBullet,
     DiscoveryResult,
@@ -79,6 +78,26 @@ def test_unresolved_backports_passthrough(monkeypatch, clone):
                         lambda *a, **k: GenerationResult(bullets=(), skipped=()))
     r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
     assert [b.number for b in r.unresolved_backports] == [500]
+
+
+def test_unresolved_cherry_picks_passthrough(monkeypatch, clone):
+    # A cherry-pick suspect flagged by discover() must reach RegenResult so the
+    # release-cut PR body can surface the unconfirmed credit to a reviewer.
+    from scripts.release_notes.models import UnresolvedCherryPick
+    prs = (MergedPR(number=80, title="port fix", author="dev", url="u", labels=()),)
+    unresolved_cherry_picks = (UnresolvedCherryPick(
+        number=80, sha="rangesha", source_shas=("deadbeefdeadbeef",), subject="port fix (#80)"),)
+    monkeypatch.setattr(
+        pipeline_mod.discover_mod, "discover",
+        lambda *a, **k: DiscoveryResult(
+            base_tag="9.1.0-rc1", head_ref="9.1", prs=prs,
+            unresolved_cherry_picks=unresolved_cherry_picks,
+        ),
+    )
+    monkeypatch.setattr(pipeline_mod.generate_mod, "generate",
+                        lambda *a, **k: GenerationResult(bullets=(), skipped=()))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert [c.number for c in r.unresolved_cherry_picks] == [80]
 
 
 def test_no_usable_bullets_yields_empty_grouped(monkeypatch, clone):
@@ -216,13 +235,12 @@ def test_uncertain_dropped_bullet_not_surfaced(monkeypatch, clone):
 
 
 def test_dedup_bullets_by_pr_keeps_first_preserves_order(monkeypatch):
-    fmt = render_mod.load_format_module()
     bl = [
         CategorizedBullet(pr_number=1, author="a", category="Bug Fixes", text="one"),
         CategorizedBullet(pr_number=2, author="b", category="Bug Fixes", text="two"),
         CategorizedBullet(pr_number=1, author="a", category="New Features", text="dup"),
     ]
-    kept, dups = pipeline_mod._dedup_bullets_by_pr(bl, fmt)
+    kept, dups = pipeline_mod._dedup_bullets_by_pr(bl)
     assert [b.pr_number for b in kept] == [1, 2]
     assert [b.text for b in kept] == ["one", "two"]
     assert dups == (1,)
@@ -233,12 +251,11 @@ def test_dedup_prefers_renderable_over_reserved_bullet(monkeypatch):
     # First-seen dedup would keep the reserved one (dropped by group_bullets) and
     # discard the real note, so the PR renders nowhere and is misreported as
     # declined. Dedup must prefer the renderable bullet regardless of order.
-    fmt = render_mod.load_format_module()
     bl = [
         CategorizedBullet(pr_number=1, author="a", category="Security Fixes", text="reserved"),
         CategorizedBullet(pr_number=1, author="a", category="Bug Fixes", text="real note"),
     ]
-    kept, dups = pipeline_mod._dedup_bullets_by_pr(bl, fmt)
+    kept, dups = pipeline_mod._dedup_bullets_by_pr(bl)
     assert [b.text for b in kept] == ["real note"]
     assert dups == (1,)
 
@@ -246,11 +263,10 @@ def test_dedup_prefers_renderable_over_reserved_bullet(monkeypatch):
 def test_dedup_all_reserved_keeps_first(monkeypatch):
     # When every bullet for a PR is reserved there is nothing renderable to prefer;
     # keep the first so the pipeline still folds the PR into skipped (not credited).
-    fmt = render_mod.load_format_module()
     bl = [
         CategorizedBullet(pr_number=1, author="a", category="Security Fixes", text="one"),
         CategorizedBullet(pr_number=1, author="a", category="Contributors", text="two"),
     ]
-    kept, dups = pipeline_mod._dedup_bullets_by_pr(bl, fmt)
+    kept, dups = pipeline_mod._dedup_bullets_by_pr(bl)
     assert [b.text for b in kept] == ["one"]
     assert dups == (1,)

@@ -334,23 +334,31 @@ They live in-repo because `valkey-io/valkey` ships no release tooling of its own
 so a cut runs against unmodified upstream `unstable` (a plaintext `00-RELEASENOTES`
 placeholder and a `src/version.h` with the `VALKEY_VERSION*` macros).
 
-Non-blocking anomalies (out-of-sequence rc, GA duplicate/orphan, rc-after-GA,
-unanchored baseline, empty/duplicate notes, security correlations) are surfaced as
-warnings in the PR body rather than blocking the cut; malformed inputs and
-inconsistent branch state (ie GA with both `pre-release-M.m.p` and `M.m`) are hard
-errors.
+A cut's signals fall into three tiers. Malformed inputs and inconsistent branch
+state (ie GA with both `pre-release-M.m.p` and `M.m`) are hard errors that
+abort before any PR. Anything a maintainer should address first (out-of-sequence
+rc, GA duplicate/orphan, rc-after-GA, unanchored baseline, empty/duplicate notes,
+declined/low-confidence notes, security mismatches, triage PRs, and the three
+unresolved kinds: a commit with no resolvable PR, an unfetchable PR ref, or a note
+credited to a backport whose original PR could not be recovered) holds the
+merge: `_hold_reasons` collects them, the PR opens as a draft, and the PR body gives
+a banner naming them. Draft state reconciles on re-dispatch (`_reconcile_draft`
+via GitHub's `convert_to_draft` / `mark_ready_for_review`), so a re-cut with the
+flags cleared flips the PR ready and one that introduces flags re-holds it;
+`force_ready` opens ready despite the flags. A clean advisory match is purely
+informational and does not hold.
 
 ### Entry Points
 
 - `scripts/release_notes/main.py` - CLI entry point, input validation, clone
-- `scripts/release_notes/release_cut.py` - branch-plan resolution, notes rendering, PR body + warnings
+- `scripts/release_notes/release_cut.py` - branch-plan resolution, notes rendering, PR body + `_hold_reasons` (draft-hold decision)
 - `scripts/release_notes/pipeline.py` - discover -> classify -> generate -> render orchestration
 - `scripts/release_notes/discover.py` - range resolution and PR discovery by graph reachability
 - `scripts/release_notes/classify.py` - label-based include / exclude / triage partition
 - `scripts/release_notes/generate.py` - Claude bullet generation (read-only tools)
 - `scripts/release_notes/security.py` - Security Fixes from published GitHub advisories (never AI-authored)
 - `scripts/release_notes/render.py` - canonical `00-RELEASENOTES` rendering
-- `scripts/release_notes/publish.py` - find/open/update the release PR
+- `scripts/release_notes/publish.py` - find/open/update the release PR; `_reconcile_draft` flips draft state on re-dispatch
 - `scripts/release_notes/release_format.py` - `00-RELEASENOTES` dated-section rendering
 - `scripts/release_notes/version_bump.py` - `src/version.h` macro rewriting
 - `scripts/release_notes/contributors.py` - deduplicated contributor list

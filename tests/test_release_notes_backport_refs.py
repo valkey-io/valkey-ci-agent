@@ -13,7 +13,9 @@ from scripts.release_notes.backport_refs import (
     cherry_pick_source_shas,
     is_backport_title,
     source_pr_from_branch,
+    source_title_from_backport_title,
     summary_source_pr_from_body,
+    summary_source_title_from_body,
 )
 
 
@@ -168,3 +170,72 @@ class TestSourcePrFromBranch:
     def test_unrelated_branch(self) -> None:
         assert source_pr_from_branch("feature/my-change") is None
         assert source_pr_from_branch("") is None
+
+
+class TestSourceTitleFromBackportTitle:
+    # build_pr_title embeds the source title verbatim after "[Backport <branch>] ".
+    def test_extracts_embedded_source_title(self) -> None:
+        assert source_title_from_backport_title(
+            "[Backport 9.1] Fix a memory leak"
+        ) == "Fix a memory leak"
+
+    def test_case_and_whitespace_tolerant(self) -> None:
+        # Same leniency as is_backport_title's anchor; extra spaces are trimmed.
+        assert source_title_from_backport_title(
+            "  [backport 9.0]   Port the fix  "
+        ) == "Port the fix"
+
+    def test_not_a_backport_title(self) -> None:
+        assert source_title_from_backport_title("Fix a memory leak (#10)") is None
+
+    def test_bare_prefix_no_title(self) -> None:
+        # A "[Backport 9.1]" with nothing after it has no source title to give.
+        assert source_title_from_backport_title("[Backport 9.1]") is None
+        assert source_title_from_backport_title("[Backport 9.1] ") is None
+
+    def test_empty(self) -> None:
+        assert source_title_from_backport_title("") is None
+
+
+class TestSummarySourceTitleFromBody:
+    def test_reads_source_title_row(self) -> None:
+        body = (
+            "## Backport Summary\n\n"
+            "| Field | Value |\n|---|---|\n"
+            "| Source PR | [#123](https://x/123) |\n"
+            "| Source title | Fix a memory leak in cluster failover |\n"
+            "| Target branch | `9.1` |\n"
+        )
+        assert summary_source_title_from_body(body) == "Fix a memory leak in cluster failover"
+
+    def test_no_source_title_row(self) -> None:
+        # A summary that carries only the Source PR row (an older/drifted format).
+        body = (
+            "## Backport Summary\n\n"
+            "| Field | Value |\n|---|---|\n"
+            "| Source PR | #77 |\n"
+        )
+        assert summary_source_title_from_body(body) is None
+
+    def test_title_with_escaped_pipe_is_unescaped(self) -> None:
+        # The emitter escapes | as \| inside cells. The parser must unescape so
+        # the title cross-check in discover.py sees the real title, not a truncation.
+        body = (
+            "## Backport Summary\n\n"
+            "| Field | Value |\n|---|---|\n"
+            "| Source PR | #100 |\n"
+            "| Source title | Fix a\\|b parsing in config |\n"
+        )
+        assert summary_source_title_from_body(body) == "Fix a|b parsing in config"
+
+    def test_title_with_multiple_escaped_pipes(self) -> None:
+        body = (
+            "## Backport Summary\n\n"
+            "| Field | Value |\n|---|---|\n"
+            "| Source title | a \\| b \\| c |\n"
+        )
+        assert summary_source_title_from_body(body) == "a | b | c"
+
+    def test_no_summary_section(self) -> None:
+        assert summary_source_title_from_body("a normal PR body (#5)") is None
+        assert summary_source_title_from_body("") is None

@@ -228,10 +228,10 @@ def render_version_section(
     def emit_category(name: str, bullets: Sequence[str]) -> None:
         out.append("### {}".format(name))
         for bullet in bullets:
-            bullet = bullet.strip()
-            if not bullet.startswith(("* ", "- ")):
-                bullet = "* " + bullet
-            out.append(bullet)
+            # Normalize every bullet to the "* " marker: strip any leading "* "/"- "
+            # and re-emit with "* ", so the rendered section is uniform regardless of
+            # which marker the input carried.
+            out.append("* " + _strip_bullet(bullet))
         out.append("")
 
     # Security Fixes come only from *security_fixes* (the embargo CVE list), never
@@ -308,7 +308,9 @@ def render_contributors_footer(contributors: Sequence[str]) -> str:
             unique.append(name)
     if not unique:
         return ""
-    unique.sort(key=lambda e: e.split(" @", 1)[0].casefold())
+    # Split on the last " @" so a display name containing " @" keeps its full name
+    # and only the trailing @handle is dropped (matches contributors._sort_key).
+    unique.sort(key=lambda e: e.rsplit(" @", 1)[0].casefold())
     out = ["### Contributors"]
     out.extend("* {}".format(name) for name in unique)
     return "\n".join(out)

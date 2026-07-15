@@ -20,12 +20,21 @@ from scripts.common.github_client import retry_github_call
 logger = logging.getLogger(__name__)
 
 
-def find_existing_pr(repo: Any, *, base_repo: str, push_repo: str | None, branch: str) -> Any | None:
-    """Return the open PR whose head is *branch*, or None."""
+def find_existing_pr(
+    repo: Any, *, base_repo: str, push_repo: str | None, branch: str, base_branch: str
+) -> Any | None:
+    """Return the open PR whose head is *branch* and base is *base_branch*, or None.
+
+    The head is already unique per cut (the prep branch is
+    ``agent/release-cut/{version}-{stage}``), so scoping on *base_branch* too is
+    belt-and-suspenders: it guarantees a reused PR targets the same release line
+    even in the unlikely event a same-named branch had an open PR on a different
+    base, so :func:`open_or_update_pr` never edits a PR pointed at the wrong line.
+    """
     head_ref = build_pull_search_head_ref(base_repo, push_repo, branch)
     pulls = retry_github_call(
-        lambda: list(repo.get_pulls(state="open", head=head_ref)),
-        retries=3, description=f"search open PR for {head_ref}",
+        lambda: list(repo.get_pulls(state="open", head=head_ref, base=base_branch)),
+        retries=3, description=f"search open PR for {head_ref} into {base_branch}",
     )
     return pulls[0] if pulls else None
 
@@ -40,22 +49,55 @@ def open_or_update_pr(
     title: str,
     body: str,
     existing: Any | None,
+    draft: bool = False,
 ) -> str:
-    """Update *existing* PR in place, or create a new one. Returns the PR URL."""
+    """Update *existing* PR in place, or create a new one. Returns the PR URL.
+
+    *draft* is the cut's hold decision (see :func:`release_cut._hold_reasons`): a
+    draft PR cannot be merged, so opening the release PR as a draft holds the
+    release line until a maintainer resolves what was flagged and marks it ready
+    (or re-cuts with the hold cleared / overridden). On an update, the existing
+    PR's draft state is reconciled to *draft*: each cut replaces the prep-branch
+    content wholesale, so the draft flag always reflects the current cut's signals
+    rather than a stale earlier decision.
+    """
     if existing is not None:
         retry_github_call(
             lambda: existing.edit(title=title, body=body),
             retries=3, description=f"update PR #{existing.number}",
         )
-        logger.info("Updated release PR #%s", existing.number)
+        _reconcile_draft(existing, draft)
+        logger.info("Updated release PR #%s (draft=%s)", existing.number, draft)
         return existing.html_url
     head_ref = build_pull_create_head_ref(base_repo, push_repo, branch)
     pr = retry_github_call(
-        lambda: repo.create_pull(title=title, body=body, head=head_ref, base=base_branch, draft=False),
+        lambda: repo.create_pull(title=title, body=body, head=head_ref, base=base_branch, draft=draft),
         retries=3, description="create release PR",
     )
-    logger.info("Opened release PR #%s", pr.number)
+    logger.info("Opened release PR #%s (draft=%s)", pr.number, draft)
     return pr.html_url
+
+
+def _reconcile_draft(existing: Any, draft: bool) -> None:
+    """Flip *existing*'s draft state to *draft* if it differs.
+
+    GitHub's draft toggle is two one-way transitions (``convert_to_draft`` /
+    ``mark_ready_for_review``), each valid only from the opposite state, so guard
+    on the current ``draft`` flag rather than calling unconditionally. A cut that
+    re-runs with the same state is a no-op here.
+    """
+    if bool(existing.draft) == draft:
+        return
+    if draft:
+        retry_github_call(
+            lambda: existing.convert_to_draft(),
+            retries=3, description=f"convert PR #{existing.number} to draft",
+        )
+    else:
+        retry_github_call(
+            lambda: existing.mark_ready_for_review(),
+            retries=3, description=f"mark PR #{existing.number} ready",
+        )
 
 
 _LINEBREAK_RE = re.compile(r"[\r\n]+")

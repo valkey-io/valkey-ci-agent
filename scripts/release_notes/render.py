@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Sequence
+from typing import Sequence
 
 from scripts.release_notes import release_format as _release_format
 from scripts.release_notes.models import CategorizedBullet
@@ -40,16 +40,6 @@ def _one_line(text: str) -> str:
     ``str.splitlines()`` recognizes, then join with single spaces.
     """
     return " ".join(text.splitlines()).strip()
-
-
-def load_format_module(valkey_clone_dir: str | None = None) -> Any:
-    """Return the release-notes format module.
-
-    The format lives in :mod:`scripts.release_notes.release_format`, so no clone
-    is consulted. The optional *valkey_clone_dir* argument is retained for the
-    existing call sites and is ignored.
-    """
-    return _release_format
 
 
 def format_bullet(bullet: CategorizedBullet) -> str:
@@ -79,20 +69,17 @@ def format_bullet(bullet: CategorizedBullet) -> str:
     return " ".join(parts)
 
 
-def _reserved_sections(fmt: Any) -> set[str]:
+def _reserved_sections() -> set[str]:
     """Case-folded reserved section names ``group_bullets`` refuses to render.
 
     ``Security Fixes`` / ``Contributors`` are populated at release-cut time from a
     factual source, so a model-assigned bullet under either is dropped. Folded to
     a case-insensitive set so a lowercase ``security fixes`` is refused too.
     """
-    return {
-        r.casefold()
-        for r in getattr(fmt, "RESERVED_SECTIONS", ("Security Fixes", "Contributors"))
-    }
+    return {r.casefold() for r in _release_format.RESERVED_SECTIONS}
 
 
-def is_reserved_category(category: str, fmt: Any) -> bool:
+def is_reserved_category(category: str) -> bool:
     """Whether *category* names a reserved section ``group_bullets`` will drop.
 
     Mirrors the refusal test in :func:`group_bullets` (single-lined, case-folded)
@@ -100,23 +87,23 @@ def is_reserved_category(category: str, fmt: Any) -> bool:
     (the pipeline's per-PR dedup, which must not let a to-be-dropped reserved
     bullet shadow a renderable one) shares one definition with the grouping.
     """
-    return _one_line(category).casefold() in _reserved_sections(fmt)
+    return _one_line(category).casefold() in _reserved_sections()
 
 
 def group_bullets(
-    bullets: Sequence[CategorizedBullet], fmt: Any
+    bullets: Sequence[CategorizedBullet],
 ) -> dict[str, list[str]]:
     """Group bullets into ``{category: [rendered line, ...]}``.
 
-    Only canonical categories (``fmt.CATEGORIES``) are ever emitted as headers, in
-    their canonical order. The model never creates a new ``### <name>`` header: a
-    category it returns that is not canonical is a *suggestion*, so the bullet is
-    coerced into the catch-all (``fmt.CATCH_ALL_CATEGORY``, "Other Changes") rather
-    than rendered under an invented header. The suggestion is surfaced separately
-    for review (:mod:`generate` flags the bullet uncertain with the suggested name;
-    the cut lists it in the PR body). This also closes an injection vector: an
-    attacker-controlled category string can no longer emit a raw ``### ``/``## ``
-    header line into the changelog.
+    Only canonical categories (``release_format.CATEGORIES``) are ever emitted as
+    headers, in their canonical order. The model never creates a new ``### <name>``
+    header: a category it returns that is not canonical is a *suggestion*, so the
+    bullet is coerced into the catch-all (``CATCH_ALL_CATEGORY``, "Other Changes")
+    rather than rendered under an invented header. The suggestion is surfaced
+    separately for review (:mod:`generate` flags the bullet uncertain with the
+    suggested name; the cut lists it in the PR body). This also closes an injection
+    vector: an attacker-controlled category string can no longer emit a raw
+    ``### ``/``## `` header line into the changelog.
 
     Bullets the model placed under the reserved ``Security Fixes`` /
     ``Contributors`` sections are refused and logged; those are generated at
@@ -124,16 +111,15 @@ def group_bullets(
     """
     # Case-folded so a lowercase "security fixes" is refused too, not coerced into
     # the catch-all and shipped alongside the real auto-generated section.
-    reserved = _reserved_sections(fmt)
-    canonical = set(fmt.CATEGORIES)
-    # The catch-all must be a canonical category; if the resolved name is not
-    # canonical (a format module that names a non-canonical catch-all, or the
-    # "Other Changes" default when that is somehow off-list), fall back to the
-    # last canonical name so an off-list bullet always has a valid home rather
-    # than resurrecting an invented header.
-    catch_all = getattr(fmt, "CATCH_ALL_CATEGORY", "Other Changes")
+    reserved = _reserved_sections()
+    canonical = set(_release_format.CATEGORIES)
+    # The catch-all must be a canonical category; keep a cheap consistency guard so
+    # that if release_format's CATCH_ALL_CATEGORY were ever edited off-list, an
+    # off-list bullet still lands under a valid canonical header (the last one)
+    # rather than resurrecting an invented one.
+    catch_all = _release_format.CATCH_ALL_CATEGORY
     if catch_all not in canonical:
-        catch_all = fmt.CATEGORIES[-1]
+        catch_all = _release_format.CATEGORIES[-1]
     grouped: dict[str, list[str]] = {}
     for bullet in bullets:
         category = _one_line(bullet.category)
@@ -155,7 +141,7 @@ def group_bullets(
 
     # Emit in canonical order; every key is canonical by construction.
     ordered: dict[str, list[str]] = {}
-    for name in fmt.CATEGORIES:
+    for name in _release_format.CATEGORIES:
         if grouped.get(name):
             ordered[name] = grouped[name]
     return ordered

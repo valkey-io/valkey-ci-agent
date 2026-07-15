@@ -72,21 +72,27 @@ def _api_get(url: str, token: Optional[str]) -> object:
 
 def _compare_logins(
     repo: str, base_ref: str, head_ref: str, token: Optional[str]
-) -> "tuple[List[str], bool]":
-    """Return ``(logins, truncated)`` for commits in ``base..head`` (compare API).
+) -> "tuple[List[str], bool, List[str]]":
+    """Return ``(logins, truncated, git_names)`` for commits in ``base..head``.
 
     ``logins`` is the unique, bot-filtered author logins; ``truncated`` is True
-    when the API reported more commits than it returned. The compare endpoint
-    paginates commits; we walk pages until fewer than the page size are returned.
+    when the API reported more commits than it returned. ``git_names`` is the
+    unique git-level author names (``commit.commit.author.name``) from the same
+    commits, used to dedup the shortlog supplement against API-covered authors
+    whose profile display name differs from their git author name.
 
-    The compare endpoint returns at most 250 commits total (``total_commits`` can
-    exceed that), so a range wider than 250 commits credits only the first 250.
-    We log a warning when that cap is hit and return ``truncated=True`` so the
-    caller can supplement the tail from ``git shortlog`` rather than shipping a
-    contributor list that silently drops authors on a wide GA cut.
+    The compare endpoint paginates commits; we walk pages until fewer than the
+    page size are returned. It returns at most 250 commits total
+    (``total_commits`` can exceed that), so a range wider than 250 commits
+    credits only the first 250. We log a warning when that cap is hit and return
+    ``truncated=True`` so the caller can supplement the tail from ``git
+    shortlog`` rather than shipping a contributor list that silently drops
+    authors on a wide GA cut.
     """
     logins: List[str] = []
+    git_names: List[str] = []
     seen = set()
+    seen_git_names: "set[str]" = set()
     page = 1
     # GitHub caps per_page at 100 and clamps larger values down. A higher number
     # would make the "short page" termination check below fire after page 1 and
@@ -120,6 +126,21 @@ def _compare_logins(
                 continue
             author = commit.get("author") or {}
             login = author.get("login") if isinstance(author, dict) else None
+            # Collect the git-level author name (commit.commit.author.name) for
+            # dedup: shortlog produces this value, which may differ from the
+            # profile display name the API path resolves the login to. Recording
+            # it lets the shortlog supplement match API-covered authors even when
+            # their display name diverges from their git config user.name.
+            inner = commit.get("commit")
+            if isinstance(inner, dict):
+                git_author = inner.get("author")
+                if isinstance(git_author, dict):
+                    git_name = git_author.get("name")
+                    if isinstance(git_name, str) and git_name.strip():
+                        key = git_name.strip().casefold()
+                        if key not in seen_git_names and not _is_bot(git_name):
+                            seen_git_names.add(key)
+                            git_names.append(git_name.strip())
             # A non-string login (a malformed payload) would raise on .endswith and
             # abort the cut; treat anything but a non-empty str as no login.
             if not isinstance(login, str) or not login or login in seen or _is_bot(login):
@@ -136,7 +157,7 @@ def _compare_logins(
             "returned only %d; supplementing the tail from git shortlog.",
             base_ref, head_ref, total_commits, seen_commits,
         )
-    return logins, truncated
+    return logins, truncated, git_names
 
 
 def _display_name(repo_login: str, token: Optional[str]) -> Optional[str]:
@@ -242,8 +263,14 @@ def _coauthors_in_range(base_ref: str, head_ref: str, repo_dir: str) -> List[str
 
 
 def _sort_key(entry: str) -> str:
-    """Case-insensitive sort key on the display name portion."""
-    name = entry.split(" @", 1)[0]
+    """Case-insensitive sort key on the display name portion.
+
+    Splits on the *last* ``" @"`` so a display name that itself contains ``" @"``
+    (e.g. ``"Foo @ Bar @foobar"``) keeps its full name and only the trailing
+    ``@handle`` is stripped; splitting on the first ``" @"`` would truncate the
+    name and collapse two distinct people onto the same key.
+    """
+    name = entry.rsplit(" @", 1)[0]
     return name.casefold()
 
 
@@ -261,8 +288,9 @@ def list_contributors(
     logins (e.g. no token, network error, or unknown range).
     """
     truncated = False
+    git_names: List[str] = []
     try:
-        logins, truncated = _compare_logins(repo, base_ref, head_ref, token)
+        logins, truncated, git_names = _compare_logins(repo, base_ref, head_ref, token)
     except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError):
         # OSError covers socket read timeouts, which are not URLError subclasses;
         # any of these degrade to the git-shortlog fallback below.
@@ -282,13 +310,20 @@ def list_contributors(
                 entries.append(name)
 
     have = {_sort_key(e) for e in entries}
+    # Also seed with git-level author names from the compare API. Shortlog
+    # produces git author names, which may differ from the profile display name
+    # the API resolved the login to. Without this, an author whose display name
+    # is "Bob Developer" but whose git user.name is "Bob Dev" would pass the
+    # display-name dedup and be added a second time by the shortlog supplement.
+    for gn in git_names:
+        have.add(gn.casefold())
 
     # The compare API caps at 250 commits, so a wide GA range (a minor GA can
     # span many hundreds) credits only the first 250 logins. Supplement the tail
     # from git shortlog (name-only, no @handle) so authors past the cap are still
-    # listed rather than silently dropped. Dedup by display name against what the
-    # API already credited, so an author present in both paths is not doubled;
-    # this only adds the ones the API's window missed.
+    # listed rather than silently dropped. Dedup by display name AND git author
+    # name against what the API already credited, so an author present in both
+    # paths is not doubled; this only adds the ones the API's window missed.
     if truncated:
         for name in _git_shortlog_names(base_ref, head_ref, repo_dir):
             if name.casefold() not in have:

@@ -9,6 +9,12 @@ the ``(cherry picked from commit <sha>)`` trailer ``git cherry-pick -x`` appends
 so :mod:`scripts.release_notes.discover` can credit the original PR and its
 author rather than the backport.
 
+Note on the trailer: only ``git cherry-pick -x`` writes it, and this repo's
+*backport* tooling (:mod:`scripts.backport`) picks without ``-x`` (so a tool-made
+backport keeps its source subject ``(#N)`` and is recovered by that instead). The
+trailer therefore comes from a ``-x`` pick made elsewhere: a maintainer's
+hand-applied pick, or the ci-fix port path (:mod:`scripts.ci_fix.push`).
+
 The ``## Applied`` parser is a second copy of the one in
 :mod:`scripts.backport.mark_done`; keep it in step with the table
 :mod:`scripts.backport.sweep_reporting` emits (a ``Source PR`` column) if that
@@ -34,6 +40,14 @@ _CHERRY_PICK_TRAILER_RE = re.compile(
 # than the original.
 _BACKPORT_TITLE_RE = re.compile(r"^\s*\[Backport\b", re.IGNORECASE)
 
+# The same "[Backport <branch>] " prefix, but matched through the closing bracket
+# and trailing space so the *source title* that follows can be captured. Anchored
+# with the same "^\s*\[Backport\b" as _BACKPORT_TITLE_RE so the two never disagree
+# on what a backport title looks like; "[^\]]*" spans the "<branch>" part up to the
+# first "]". scripts.backport.utils.build_pr_title embeds the source PR's title
+# verbatim after this prefix, so what remains is the source title.
+_BACKPORT_TITLE_PREFIX_RE = re.compile(r"^\s*\[Backport\b[^\]]*\]\s*", re.IGNORECASE)
+
 # A table cell holding a PR reference: "#123" or a markdown link "[#123](url)".
 _PR_CELL_RE = re.compile(r"^(?:\[)?#(\d+)(?:\]\([^)]*\))?$")
 
@@ -54,6 +68,24 @@ def is_backport_title(title: str) -> bool:
     the note would credit the backport, not the change's author.
     """
     return bool(_BACKPORT_TITLE_RE.match(title))
+
+
+def source_title_from_backport_title(title: str) -> str | None:
+    """The source PR title embedded after a ``[Backport <branch>] `` prefix, or ``None``.
+
+    :func:`scripts.backport.utils.build_pr_title` builds a backport title as
+    ``[Backport <branch>] <source_pr_title>``, copying the source title verbatim.
+    Stripping the prefix therefore recovers the title the backport *claims* it
+    carried, which discovery cross-checks against the actual title of the recovered
+    source PR (an independent witness to the recovered ``#N``). Returns ``None`` for
+    a title with no ``[Backport ...]`` prefix, or one whose remainder is empty (a
+    bare ``[Backport 9.1]`` with no title after it).
+    """
+    stripped = _BACKPORT_TITLE_PREFIX_RE.sub("", title or "")
+    if stripped == (title or ""):  # no prefix matched: not a "[Backport ...]" title
+        return None
+    stripped = stripped.strip()
+    return stripped or None
 
 
 def cherry_pick_source_shas(commit_message: str) -> list[str]:
@@ -138,6 +170,39 @@ def summary_source_pr_from_body(body: str) -> int | None:
     a body whose format has drifted). Only the ``Source PR`` row's value cell is
     read, so a ``#N`` in the ``Source title`` cell or elsewhere is never counted.
     """
+    cell = _summary_value_cell(body, "source pr")
+    if cell is None:
+        return None
+    match = _PR_CELL_RE.match(cell)
+    return int(match.group(1)) if match else None
+
+
+def summary_source_title_from_body(body: str) -> str | None:
+    """Source title named by the ``## Backport Summary`` table's ``Source title`` row.
+
+    :mod:`scripts.backport.pr_creator` writes a ``| Source title | <title> |`` row
+    beside the ``Source PR`` row, copying the source PR's title verbatim. It is a
+    witness to the recovered source PR that is independent of the ``#N`` in the
+    ``Source PR`` row, so discovery can cross-check the recovered PR's actual title
+    against it. Returns the value cell verbatim (not parsed), or ``None`` when there
+    is no ``## Backport Summary`` section or no ``Source title`` row.
+    """
+    cell = _summary_value_cell(body, "source title")
+    return cell or None
+
+
+def _summary_value_cell(body: str, label: str) -> str | None:
+    """The value cell of the ``## Backport Summary`` row whose label cell is *label*.
+
+    The summary is a transposed ``| Field | Value |`` table, so a field is a row
+    label in the first cell with its value in the second. Returns ``cells[1]``
+    (stripped) for the first row whose first cell equals *label* (case-insensitive),
+    or ``None`` when there is no ``## Backport Summary`` section or no such row.
+    Cells wrapped across newlines are reassembled first. Pipe characters inside
+    cell content are escaped as ``\\|`` by the emitter
+    (:func:`scripts.backport.pr_creator._escape_table_cell`), so splitting must
+    honour that escape and unescape after extraction.
+    """
     summary = _markdown_section(body, "Backport Summary")
     if not summary:
         return None
@@ -149,13 +214,42 @@ def summary_source_pr_from_body(body: str) -> int | None:
             # A cell wrapped across newlines: fold the continuation into the row.
             rows[-1] += " " + line.strip()
     for row in rows:
-        cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-        if len(cells) < 2 or cells[0].strip().lower() != "source pr":
+        cells = _split_table_row(row)
+        if len(cells) < 2 or cells[0].strip().lower() != label:
             continue
-        match = _PR_CELL_RE.match(cells[1])
-        if match:
-            return int(match.group(1))
+        return cells[1]
     return None
+
+
+def _split_table_row(row: str) -> list[str]:
+    """Split a markdown table row on unescaped ``|`` delimiters and unescape cells.
+
+    A literal pipe inside cell content is stored as ``\\|`` (the emitter's escape).
+    A naive ``.split("|")`` truncates such cells. This splits character-by-character,
+    skipping escaped pipes, then unescapes each cell. Mirrors the approach in
+    :func:`scripts.backport.sweep_reporting._split_markdown_table_row`.
+    """
+    text = row.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in text:
+        if char == "\\" and not escaped:
+            escaped = True
+            current.append(char)
+            continue
+        if char == "|" and not escaped:
+            cells.append("".join(current).strip().replace("\\|", "|"))
+            current = []
+            continue
+        current.append(char)
+        escaped = False
+    cells.append("".join(current).strip().replace("\\|", "|"))
+    return cells
 
 
 def source_pr_from_branch(head_ref: str) -> int | None:

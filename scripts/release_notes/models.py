@@ -125,6 +125,33 @@ class UnresolvedCommit:
 
 
 @dataclass(frozen=True)
+class CollidedCommit:
+    """A distinct range commit dropped because another commit already claimed its PR number.
+
+    Discovery keys notes on PR number and keeps the first commit seen per number.
+    That is correct when a change is cherry-picked or backported across the range,
+    or when a multi-commit PR maps to one number (the API associates several commits
+    with one merge). But when two *different* changes resolve to the same number via
+    the ambiguous subject ``(#N)`` tier (a backport reused a source PR's ``(#N)`` on
+    an unrelated follow-up commit, e.g. a feature commit and a later comment-wording
+    fixup both ending ``(#3380)``), the second commit is dropped and, having resolved
+    to a number, is not carried in ``unresolved`` or ``unresolved_prs`` either: it
+    would vanish past valkey's label-only gate.
+
+    This carries the dropped commit (``sha``, ``subject``), the reused ``number``, and
+    the ``kept_sha`` that won the dedup, so a maintainer can compare the two commits
+    and note the dropped change by hand if it is a separate user-facing change. Only
+    subject-tier collisions between non-matching subjects are recorded; ``## Applied``
+    and commit->PR API collisions collapse correctly and are left silent.
+    """
+
+    number: int
+    sha: str
+    subject: str
+    kept_sha: str = ""
+
+
+@dataclass(frozen=True)
 class UnresolvedBackport:
     """A backport PR that was credited because its original source was unreachable.
 
@@ -145,6 +172,53 @@ class UnresolvedBackport:
 
 
 @dataclass(frozen=True)
+class UnresolvedPR:
+    """A range commit whose PR reference could not be fetched from the API.
+
+    Discovery resolved a range commit to a PR ``number`` (from its subject
+    ``(#N)``, an ``## Applied`` table, a ``-x`` trailer, or the commit->PR API),
+    but fetching that PR returned not-found (a moved/deleted PR, an issue number,
+    or a ``(#N)`` from a different repo). Unlike :class:`UnresolvedCommit` (a
+    commit that resolved to no number at all), a number *was* found, so this
+    carries the ``number`` alongside the range ``sha``. The change still shipped,
+    so rather than drop it silently (invisible past valkey's label-only gate) it
+    is surfaced here for a maintainer to identify and note by hand.
+    """
+
+    number: int
+    sha: str
+
+
+@dataclass(frozen=True)
+class UnresolvedCherryPick:
+    """A note whose credit could not be verified against its ``-x`` cherry-pick source.
+
+    A range commit carried a ``(cherry picked from commit <sha>)`` trailer, but
+    none of the trailer's source SHAs resolved to a PR through the API: the source
+    commit is not in this repo (a hand-applied pick from a fork, or history that
+    predates PR association). Discovery therefore credited the note from a
+    lower-confidence signal, the commit's subject ``(#N)`` or the commit->PR API,
+    which for a *rewritten* pick names the PR that landed the change on this line,
+    not the change's author.
+
+    Distinct from :class:`UnresolvedBackport`: the credited PR carries none of the
+    backport markers (no ``[Backport ...]`` title, ``backport`` label,
+    ``## Backport Summary``, or ``backport/<n>-to-<branch>`` head), so
+    :func:`discover.hydrate_prs` never flags it and the note reads normally. It
+    also differs from a preserved-message pick that is credited correctly only in
+    that the source is unreachable, so the credit cannot be confirmed either way;
+    the flag says "verify", not "wrong". Carries the credited PR ``number``, the
+    range ``sha``, the unresolvable ``source_shas``, and the commit ``subject`` so a
+    maintainer can trace the origin and confirm the credit before merging.
+    """
+
+    number: int
+    sha: str
+    source_shas: tuple[str, ...] = ()
+    subject: str = ""
+
+
+@dataclass(frozen=True)
 class DiscoveryResult:
     """Factual summary of the release range, from discover.py.
 
@@ -153,6 +227,13 @@ class DiscoveryResult:
     lists range commits that resolved to no PR (see :class:`UnresolvedCommit`).
     ``unresolved_backports`` lists PRs in ``prs`` that are themselves backports
     whose original source could not be recovered (see :class:`UnresolvedBackport`).
+    ``unresolved_prs`` lists range commits whose resolved PR number could not be
+    fetched from the API (see :class:`UnresolvedPR`). ``unresolved_cherry_picks``
+    lists notes credited past an unresolvable ``-x`` trailer to a PR with no
+    backport markers, whose origin therefore could not be confirmed (see
+    :class:`UnresolvedCherryPick`). ``collided`` lists distinct range commits
+    dropped when another commit already claimed the same PR number via the
+    ambiguous subject ``(#N)`` tier (see :class:`CollidedCommit`).
     """
 
     base_tag: str
@@ -160,3 +241,6 @@ class DiscoveryResult:
     prs: tuple[MergedPR, ...] = field(default_factory=tuple)
     unresolved: tuple[UnresolvedCommit, ...] = field(default_factory=tuple)
     unresolved_backports: tuple[UnresolvedBackport, ...] = field(default_factory=tuple)
+    unresolved_prs: tuple[UnresolvedPR, ...] = field(default_factory=tuple)
+    unresolved_cherry_picks: tuple[UnresolvedCherryPick, ...] = field(default_factory=tuple)
+    collided: tuple[CollidedCommit, ...] = field(default_factory=tuple)

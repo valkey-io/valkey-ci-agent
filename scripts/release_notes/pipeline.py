@@ -16,13 +16,17 @@ from typing import Any
 
 from scripts.release_notes import discover as discover_mod
 from scripts.release_notes import generate as generate_mod
+from scripts.release_notes import release_format as release_format_mod
 from scripts.release_notes import render as render_mod
 from scripts.release_notes.classify import classify
 from scripts.release_notes.models import (
+    CollidedCommit,
     MergedPR,
     UncertainNote,
     UnresolvedBackport,
+    UnresolvedCherryPick,
     UnresolvedCommit,
+    UnresolvedPR,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +51,9 @@ class RegenResult:
     uncertain: tuple[UncertainNote, ...] = ()  # low-confidence notes the model flagged, for the PR body
     unresolved: tuple[UnresolvedCommit, ...] = ()  # range commits that resolved to no PR (shipped un-noted)
     unresolved_backports: tuple[UnresolvedBackport, ...] = ()  # credited backports whose original source was unreachable
+    unresolved_prs: tuple[UnresolvedPR, ...] = ()  # range commits whose resolved PR number could not be fetched (shipped un-noted)
+    unresolved_cherry_picks: tuple[UnresolvedCherryPick, ...] = ()  # notes credited past an unresolvable -x trailer (origin unconfirmed)
+    collided: tuple[CollidedCommit, ...] = ()  # distinct commits dropped by a reused subject (#N) (shipped un-noted)
 
 
 def regenerate_unreleased(
@@ -69,13 +76,17 @@ def regenerate_unreleased(
     )
     if not discovery.prs:
         # A range with no resolvable PRs can still carry unresolved commits (a
-        # rewritten hand-applied cherry-pick); surface them even when there is
-        # nothing to note, so a shipped-but-un-noted change is never invisible.
+        # rewritten hand-applied cherry-pick) or unfetchable PR refs; surface them
+        # even when there is nothing to note, so a shipped-but-un-noted change is
+        # never invisible.
         return RegenResult(
             base_tag=discovery.base_tag, grouped={},
             included=0, bullet_count=0, skipped=(), triage=(), had_prs=False,
             unresolved=discovery.unresolved,
             unresolved_backports=discovery.unresolved_backports,
+            unresolved_prs=discovery.unresolved_prs,
+            unresolved_cherry_picks=discovery.unresolved_cherry_picks,
+            collided=discovery.collided,
         )
 
     include, _exclude, triage = classify(discovery.prs)
@@ -84,18 +95,19 @@ def regenerate_unreleased(
         len(discovery.prs) - len(include) - len(triage), len(triage),
     )
 
-    fmt = render_mod.load_format_module(clone_dir)
-    gen = generate_mod.generate(include, repo_dir=clone_dir, categories=fmt.CATEGORIES)
+    gen = generate_mod.generate(
+        include, repo_dir=clone_dir, categories=release_format_mod.CATEGORIES
+    )
     # The prompt asks for at most one bullet per PR, but nothing enforces it and
     # neither group_bullets nor render_release_notes dedups by PR number, so a model
     # that emits two bullets for the same PR would credit it twice (possibly under
     # different categories). Keep one bullet per PR and surface the rest. The dedup
-    # is reserved-aware (needs fmt): among a PR's bullets it prefers one that will
-    # render over a reserved-section one group_bullets would drop, so a stray
+    # is reserved-aware: among a PR's bullets it prefers one that will render over a
+    # reserved-section one group_bullets would drop, so a stray
     # "Security Fixes"/"Contributors" bullet emitted before the real note can't
     # shadow it into a dropped-and-declined PR.
-    bullets, duplicate_prs = _dedup_bullets_by_pr(gen.bullets, fmt)
-    grouped = render_mod.group_bullets(bullets, fmt)
+    bullets, duplicate_prs = _dedup_bullets_by_pr(gen.bullets)
+    grouped = render_mod.group_bullets(bullets)
 
     # Collect the model's low-confidence flags so the cut can surface them in the
     # PR body. Only bullets that survive into `grouped` are reported: a bullet
@@ -144,10 +156,13 @@ def regenerate_unreleased(
         duplicate_prs=duplicate_prs, uncertain=uncertain,
         unresolved=discovery.unresolved,
         unresolved_backports=discovery.unresolved_backports,
+        unresolved_prs=discovery.unresolved_prs,
+        unresolved_cherry_picks=discovery.unresolved_cherry_picks,
+        collided=discovery.collided,
     )
 
 
-def _dedup_bullets_by_pr(bullets, fmt):
+def _dedup_bullets_by_pr(bullets):
     """Keep one bullet per PR number; return ``(kept, duplicate_pr_numbers)``.
 
     Among a PR's bullets, prefer the first that :func:`render.group_bullets` will
@@ -180,7 +195,7 @@ def _dedup_bullets_by_pr(bullets, fmt):
         # First renderable bullet wins; fall back to the first bullet only when
         # every one of the PR's bullets is reserved (grouping will drop it).
         chosen = next(
-            (b for b in group if not render_mod.is_reserved_category(b.category, fmt)),
+            (b for b in group if not render_mod.is_reserved_category(b.category)),
             group[0],
         )
         kept.append(chosen)

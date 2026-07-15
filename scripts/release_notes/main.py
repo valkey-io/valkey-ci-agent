@@ -37,7 +37,8 @@ from github import Auth, Github
 
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.github_client import retry_github_call
-from scripts.common.proc import run_git
+from scripts.common.proc import git_output, run_git
+from scripts.release_notes import discover as discover_mod
 from scripts.release_notes import release_cut as cut_mod
 
 logger = logging.getLogger(__name__)
@@ -79,60 +80,37 @@ def _env_flag(name: str) -> bool:
 def _default_tag_glob(version: str, stage: str) -> str | None:
     """Derive the baseline-tag match glob for this cut, or None.
 
-    ``git describe`` returns the tag with the shortest graph distance to HEAD
-    regardless of release line, so a glob is needed to pin the baseline to the
-    intended boundary. The boundary depends on the stage:
+    Baseline tag resolution picks the highest-version reachable tag, but without
+    a glob it considers tags from *every* release line, so after a cross-line
+    merge a sibling line's tag can win. A glob pins candidates to the intended
+    line. The boundary depends on the stage:
 
     * rc2+: the prior RC of this version, ``<version>-rc*`` (so a cut of
       9.1.0-rc3 walks back only to 9.1.0-rc2).
-    * rc1 / ga / anything else: ``None``. rc1 has no prior same-version RC to
-      anchor to (there is no rc0), and its true baseline is the previous
-      release, which is not reachable from the source branch in valkey's
-      fork-at-freeze model. So rc1 cannot resolve a tag automatically and must
-      use ``--base-ref`` (see :func:`_default_base_ref_for_rc1`); ga continues an
-      existing release line where the no-glob nearest tag is already correct.
+    * ga: this line's tags, ``M.m.*`` (so a patch GA of 8.1.9 walks back to the
+      last 8.1.x tag and can never pick up a concurrent 8.2.x line's tag). A
+      first GA of a new minor/major is anchored to its pre-release branch instead
+      and drops this glob (see release_cut.py), so scoping it here is safe.
+    * rc1 / anything else: ``None``. rc1 has no prior same-version RC to anchor
+      to (there is no rc0), and its true baseline is the previous release, which
+      is not reachable from the source branch in valkey's fork-at-freeze model.
+      So rc1 does not resolve a tag from the source branch; it anchors to the
+      previous release tag resolved from the repo's tags instead (see
+      :func:`discover.resolve_previous_release_tag`, invoked from
+      :func:`_run_cut`).
 
     A version that is not ``M.m.p`` also returns None.
     """
     m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version.strip())
     if not m:
         return None
-    rc = re.fullmatch(r"rc([1-9]\d*)", stage.strip().lower())
+    stage_lc = stage.strip().lower()
+    rc = re.fullmatch(r"rc([1-9]\d*)", stage_lc)
     if rc and int(rc.group(1)) >= 2:
         return f"{version.strip()}-rc*"
+    if stage_lc == "ga":
+        return f"{m.group(1)}.{m.group(2)}.*"
     return None
-
-
-def _default_base_ref_for_rc1(version: str) -> str | None:
-    """Best-effort previous-release baseline for an rc1 cut, e.g. 9.1.0 -> 9.0.0.
-
-    The baseline depends on which component is being incremented, so the derived
-    previous release differs by shape:
-
-    * patch (``p > 0``, e.g. ``9.2.3``) -> the prior patch GA ``M.m.(p-1)``
-      (``9.2.2``). A patch cut covers only the changes since the previous patch;
-      deriving the previous *minor* (``9.1.0``) would re-credit the whole
-      ``9.2.0``/``.1``/``.2`` patch history.
-    * new minor (``p == 0``, ``m > 0``, e.g. ``9.2.0``) -> the previous minor's GA
-      ``M.(m-1).0`` (``9.1.0``).
-    * ``M.0.0`` -> None: the first release of a major has no previous release on
-      this major to derive, and the prior major's final release is not derivable
-      from the version alone; the user must supply ``--base-ref`` explicitly.
-
-    We can only guess the tag's name; whether it is actually reachable as a range
-    base is checked after the clone (see :func:`_validate_base_ref`), where a
-    missing ref aborts with a clear error. Returns None when the version is not
-    ``M.m.p`` or is ``M.0.0``.
-    """
-    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version.strip())
-    if not m:
-        return None
-    major, minor, patch = (int(g) for g in m.groups())
-    if patch > 0:
-        return f"{major}.{minor}.{patch - 1}"  # prior patch on the same line
-    if minor > 0:
-        return f"{major}.{minor - 1}.0"  # previous minor's GA
-    return None  # M.0.0: first release of a major, no derivable previous release
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -166,6 +144,12 @@ def main(argv: list[str] | None = None) -> int:
                              "version into Security Fixes (merged with any --security-fix bullets)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute and print the cut without pushing or opening a PR")
+    parser.add_argument("--force-ready", action="store_true",
+                        default=_env_flag("RELEASE_NOTES_FORCE_READY"),
+                        help="Open the release PR ready for review even when the cut raised "
+                             "reviewer-facing signals. By default such a cut opens as a draft "
+                             "(the merge is held) until a maintainer resolves the flagged items "
+                             "and marks it ready.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -199,44 +183,29 @@ def main(argv: list[str] | None = None) -> int:
     base_ref = args.base_ref or None
 
     # rc1 has no prior same-version RC tag and, in valkey's fork-at-freeze model,
-    # no reachable release tag from the source branch, so tag resolution can't
-    # find its baseline. rc1's true baseline is the previous release. If the user
-    # did not pass --base-ref, warn loudly and default to the derived previous
-    # release (M.(m-1).0); the cut still fails clearly at clone time if that ref
-    # is absent, but most cuts get a sensible default instead of a hard error.
-    # When no previous minor exists (M.0.0), there is nothing to derive: the cut
-    # falls back to the nearest reachable tag, which may be over-broad, so flag it
-    # in the PR body too (baseline_unanchored).
-    baseline_unanchored = False
-    base_ref_derived = False
-    # An explicit --tag-glob means the user chose glob-based tag resolution, so
-    # don't override it with the rc1 derived base (which would make base_ref
-    # truthy and silently discard the glob below).
-    if stage == "rc1" and base_ref is None and not args.tag_glob:
-        derived = _default_base_ref_for_rc1(version)
-        if derived:
-            logger.warning(
-                "rc1 of %s has no reachable baseline tag (there is no rc0, and release "
-                "tags are not reachable from %r). Defaulting --base-ref to the previous "
-                "release %r. Pass --base-ref explicitly to override (e.g. the previous "
-                "release tag or its branch).",
-                version, args.head_ref, derived,
-            )
-            base_ref = derived
-            base_ref_derived = True
-        else:
-            baseline_unanchored = True
-            logger.warning(
-                "rc1 of %s has no reachable baseline tag and no previous-minor release "
-                "could be derived. The cut will fall back to the nearest reachable tag, "
-                "which may span a whole extra minor of history. Pass --base-ref explicitly "
-                "(the previous release tag or branch) to anchor it.",
-                version,
-            )
+    # no release tag reachable from the source branch (tags live on the release
+    # branches, never on unstable), so tag resolution from the source branch cannot
+    # find rc1's baseline. rc1's true baseline is the previous release. When the
+    # user passed neither --base-ref nor --tag-glob, defer to a repo-driven lookup
+    # after the clone: resolve_previous_release_tag picks the highest release tag
+    # strictly below <version> across all tags in the repo (reachable or not). It is
+    # version-aware, works across a skipped minor (9.1.0 with no 9.0 line resolves
+    # to the 8.2 line's last tag) and across a new major (9.0.0 -> the prior major's
+    # last tag), and never trusts a guessed tag name. The resolution runs in
+    # _run_cut once the tags are fetched; flag it here.
+    resolve_rc1_baseline = stage == "rc1" and base_ref is None and not args.tag_glob
 
-    # An explicit (or rc1-defaulted) base_ref overrides tag resolution, so don't
-    # also derive a glob.
+    # An explicit base_ref overrides tag resolution, so don't also derive a glob.
+    # For an rc1 with resolve_rc1_baseline set, base_ref is still None here and the
+    # glob stays None (rc1 has no same-version rc glob), so discovery uses the
+    # previous-release baseline _run_cut resolves.
     tag_glob = None if base_ref else (args.tag_glob or _default_tag_glob(version, stage))
+    # Whether the glob was *derived* (rc2+/ga default) rather than passed by the
+    # maintainer. cut() rewrites a derived glob to the previous-release baseline for
+    # a non-continuing first cut (a mis-dispatch, or a first GA of a new minor) so
+    # it does not abort on an unreachable tag; an explicit --tag-glob is the
+    # maintainer's intent and is left to resolve or fail loudly.
+    tag_glob_derived = bool(tag_glob) and not args.tag_glob and not base_ref
 
     try:
         return _run_cut(
@@ -248,13 +217,14 @@ def main(argv: list[str] | None = None) -> int:
             urgency=urgency,
             date=args.date or None,
             tag_glob=tag_glob,
+            tag_glob_derived=tag_glob_derived,
             base_ref=base_ref,
             contrib_base_ref=args.contrib_base_ref or None,
             security_fixes=args.security_fixes,
             security_from_advisories=args.security_from_advisories,
             dry_run=args.dry_run,
-            baseline_unanchored=baseline_unanchored,
-            base_ref_derived=base_ref_derived,
+            force_ready=args.force_ready,
+            resolve_rc1_baseline=resolve_rc1_baseline,
         )
     except subprocess.CalledProcessError as exc:  # surface git's stderr, not just the exit code
         # CalledProcessError.__str__ reports only the command and exit status;
@@ -311,6 +281,76 @@ def _validate_base_ref(clone_dir: str, base_ref: str) -> None:
         )
 
 
+def _recredited_commit_count(
+    clone_dir: str, base_ref: str, head_ref: str, prev_release_ref: str
+) -> int | None:
+    """How many commits in ``base_ref..head_ref`` are already reachable from the previous release.
+
+    The discovery range is ``base_ref..head_ref``, which means "reachable from
+    head, not from base". That is exactly the line's new history only when base
+    is at/after the previous release on head's own history. If ``base_ref`` is
+    too old (a typo landing on an older tag) or on a divergent branch, git walks
+    back to the merge-base and the range re-includes commits the previous release
+    already shipped, re-crediting old PRs into the notes and contributor list.
+
+    We do not test ancestry of base against head directly: under valkey's
+    fork-at-freeze model the correct base (the previous release tag) is not an
+    ancestor of ``unstable`` (it sits on its own release branch), so an
+    ``is_ancestor(base, head)`` guard would reject legitimate cuts. Instead we
+    measure the actual damage: the count of range commits also reachable from
+    *prev_release_ref*, which is 0 for any correct base (including the divergent
+    previous-release tag) and positive only when the range reaches back past the
+    previous release. Computed as ``|base..head| - |head ^base ^prev|``.
+
+    Returns the re-credited count, or ``None`` if any ref does not resolve (the
+    guard then does not fire; existence of base_ref is checked separately
+    by :func:`_validate_base_ref`).
+    """
+    try:
+        total = int(git_output(clone_dir, "rev-list", "--count", f"{base_ref}..{head_ref}").strip())
+        new_only = int(
+            git_output(
+                clone_dir, "rev-list", "--count", head_ref, "--not", base_ref, prev_release_ref
+            ).strip()
+        )
+    except subprocess.CalledProcessError:
+        return None
+    return max(0, total - new_only)
+
+
+def _warn_if_base_ref_reaches_past_previous_release(
+    clone_dir: str, base_ref: str, head_ref: str, version: str
+) -> None:
+    """Warn (do not block) when an explicit --base-ref widens the range past the previous release.
+
+    An explicit ``--base-ref`` is validated only for existence (see
+    :func:`_validate_base_ref`); nothing checks it is actually behind head on the
+    line's own history. A too-old or divergent ref silently produces a range that
+    re-credits already-released PRs (in the notes and the contributor list). This
+    surfaces that as a loud warning so it is not silent, while still cutting:
+    ``--base-ref`` is an intentional override and an unusual-but-valid base must
+    remain possible.
+
+    The check is skipped when the repo carries no release tag below *version*
+    (the first release ever, or a tagless fork): there is no previous release to
+    measure against, so there is nothing to compare and no warning to give.
+    """
+    resolved = discover_mod.resolve_previous_release_tag(clone_dir, version)
+    if resolved is None:
+        return
+    prev_tag, _prev_sha = resolved
+    recredited = _recredited_commit_count(clone_dir, base_ref, head_ref, prev_tag)
+    if recredited:
+        logger.warning(
+            "--base-ref %r reaches back past the previous release %r: the range "
+            "%s..%s re-includes %d commit(s) already shipped in %r, which will "
+            "re-credit already-released PRs in the notes and contributor list. "
+            "Cutting anyway (--base-ref is an explicit override); pass the previous "
+            "release tag/branch if this is a mistake.",
+            base_ref, prev_tag, base_ref, head_ref, recredited, prev_tag,
+        )
+
+
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -356,14 +396,16 @@ def _run_cut(
     security_fixes: list[str] | None,
     security_from_advisories: bool,
     dry_run: bool,
-    baseline_unanchored: bool = False,
-    base_ref_derived: bool = False,
+    force_ready: bool = False,
+    resolve_rc1_baseline: bool = False,
+    tag_glob_derived: bool = False,
 ) -> int:
     gh = Github(auth=Auth.Token(token))
     repo = retry_github_call(
         lambda: gh.get_repo(repo_full_name), retries=3, description=f"get repo {repo_full_name}",
     )
     resolved_date = date or datetime.date.today().isoformat()
+    baseline_unanchored = False
     with GitAuth(token, prefix="release-cut-git-askpass-") as auth:
         git_env = auth.env()
         clone_dir = tempfile.mkdtemp(prefix="release-cut-")
@@ -371,22 +413,45 @@ def _run_cut(
             run_git(None, "clone", "--branch", source_ref, github_https_url(repo_full_name),
                     clone_dir, env=git_env)
             run_git(clone_dir, "fetch", "--tags", "origin", env=git_env)
-            # Validate an explicit/derived baseline now, while the error can still
-            # name what the maintainer typed (discovery would later only see the
-            # origin/<name> form). An explicit --base-ref that is missing aborts.
-            # A *derived* rc1 default that is missing (a tagless fork) instead
-            # degrades to the nearest-tag fallback, matching the M.0.0 path, so a
-            # guessed tag never hard-fails a cut the user did not ask to anchor.
-            if base_ref and base_ref_derived and not _base_ref_exists(clone_dir, base_ref):
-                logger.warning(
-                    "Derived rc1 baseline %r is not present; falling back to the nearest "
-                    "reachable tag. Pass --base-ref explicitly to anchor the range.",
-                    base_ref,
-                )
-                base_ref = None
-                baseline_unanchored = True
-            elif base_ref:
+            if base_ref:
+                # An explicit --base-ref that resolves to nothing aborts now, while
+                # the error can still name what the maintainer typed (discovery
+                # would later only see the origin/<name> form).
                 _validate_base_ref(clone_dir, base_ref)
+                # Existence is not enough: a too-old or divergent --base-ref widens
+                # the range past the previous release and silently re-credits
+                # already-shipped PRs. Discovery walks base_ref..source_ref for an
+                # explicit base, so measure re-credited commits against that head
+                # and warn (never block: --base-ref is an intentional override).
+                _warn_if_base_ref_reaches_past_previous_release(
+                    clone_dir, base_ref, source_ref, version
+                )
+            elif resolve_rc1_baseline:
+                # rc1's true baseline is the previous release. Resolve it from the
+                # tags actually in the repo (all tags, reachable or not): the
+                # highest release tag strictly below this version. This spans a
+                # skipped minor and a new major, and never trusts a guessed name.
+                # When the repo carries no release below the target (the very first
+                # release ever), there is nothing to anchor to: flag the baseline
+                # unanchored and let the cut degrade to the full history (root..head)
+                # so the PR body warns the range may be over-broad.
+                resolved = discover_mod.resolve_previous_release_tag(clone_dir, version)
+                if resolved is not None:
+                    base_ref, _base_sha = resolved
+                    logger.info(
+                        "rc1 of %s: anchored discovery to the previous release tag %r.",
+                        version, base_ref,
+                    )
+                else:
+                    baseline_unanchored = True
+                    logger.warning(
+                        "rc1 of %s has no earlier release tag in the repo to anchor to "
+                        "(first release ever, or a tagless fork). The cut will discover "
+                        "over the full history to the head, which may span extra "
+                        "history. Pass --base-ref explicitly (the previous release tag "
+                        "or branch) to narrow it.",
+                        version,
+                    )
             return cut_mod.cut(
                 repo,
                 repo_full_name=repo_full_name,
@@ -394,9 +459,11 @@ def _run_cut(
                 valkey_clone_dir=clone_dir,
                 source_ref=source_ref,
                 version=version, stage=stage, urgency=urgency, date=resolved_date,
-                tag_glob=tag_glob, base_ref=base_ref, contrib_base_ref=contrib_base_ref,
+                tag_glob=tag_glob, tag_glob_derived=tag_glob_derived,
+                base_ref=base_ref, contrib_base_ref=contrib_base_ref,
                 security_fixes=security_fixes, security_from_advisories=security_from_advisories,
                 token=token, git_env=git_env, dry_run=dry_run,
+                force_ready=force_ready,
                 baseline_unanchored=baseline_unanchored,
             )
         finally:

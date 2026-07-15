@@ -15,7 +15,7 @@ from scripts.backport.pr_creator import (
     create_pull_from_push_repo,
     pull_matches_push_repo,
 )
-from scripts.backport.utils import build_branch_name
+from scripts.backport.utils import build_branch_name, build_pr_title
 
 # ── Shared strategies ─────────────────────────────────────────────────
 
@@ -776,3 +776,63 @@ class TestDuplicateDetectionProperty:
 
         # Closed-unmerged PR should NOT be treated as a duplicate
         assert result is None
+
+
+# ── Producer→consumer contract: the release-notes discovery parsers must be able
+# to read back the provenance pr_creator stamps onto a backport PR. These parsers
+# live in scripts.release_notes.backport_refs and are what discovery uses to credit
+# the original PR (and author) of a backport. If pr_creator renames the
+# "## Backport Summary" heading, the "Source PR"/"Source title" row labels, the
+# "[Backport <branch>] " title prefix, or the "backport/<n>-to-<branch>" branch
+# shape, discovery silently stops recovering the origin and credits the backport
+# instead. Pinning the round-trip here fails the moment the emitted format drifts. ──
+def test_backport_summary_roundtrips_through_release_notes_parsers() -> None:
+    from scripts.release_notes.backport_refs import (
+        is_backport_title,
+        source_pr_from_branch,
+        source_title_from_backport_title,
+        summary_source_pr_from_body,
+        summary_source_title_from_body,
+    )
+
+    context = BackportPRContext(
+        source_pr_number=4242,
+        source_pr_title="Fix a memory leak in cluster failover",
+        source_pr_url="https://github.com/valkey-io/valkey/pull/4242",
+        source_pr_diff="diff",
+        target_branch="9.1",
+        commits=["abc1234"],
+    )
+    title = build_pr_title(context.source_pr_title, context.target_branch)
+    branch = build_branch_name(context.source_pr_number, context.target_branch)
+    body = BackportPRCreator.build_pr_body(
+        context, had_conflicts=False, resolution_results=None,
+    )
+
+    # The consumer recovers the source PR number and title from the body table,
+    # the source title from the title prefix, and the source PR from the branch.
+    assert summary_source_pr_from_body(body) == 4242
+    assert summary_source_title_from_body(body) == "Fix a memory leak in cluster failover"
+    assert is_backport_title(title)
+    assert source_title_from_backport_title(title) == "Fix a memory leak in cluster failover"
+    assert source_pr_from_branch(branch) == 4242
+
+
+def test_backport_summary_roundtrips_with_pipe_in_source_title() -> None:
+    # pr_creator escapes a literal '|' in a title so it does not break the markdown
+    # table. The number recovery (the identity discovery keys on) must survive that
+    # escaping; assert it round-trips even for a pipe-bearing title.
+    from scripts.release_notes.backport_refs import summary_source_pr_from_body
+
+    context = BackportPRContext(
+        source_pr_number=77,
+        source_pr_title="Guard against a|b overflow in the parser",
+        source_pr_url="https://github.com/valkey-io/valkey/pull/77",
+        source_pr_diff="diff",
+        target_branch="8.1",
+        commits=["abc1234"],
+    )
+    body = BackportPRCreator.build_pr_body(
+        context, had_conflicts=False, resolution_results=None,
+    )
+    assert summary_source_pr_from_body(body) == 77

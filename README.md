@@ -29,7 +29,7 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
 | CI Fix | Active | On-demand `@valkeyrie-bot fix <ci-link>` - diagnoses and fixes a failing test on a backport PR |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
-| Release Notes | Active | Cuts a release: AI-generates notes from labelled PRs, promotes them onto the release line, bumps `src/version.h`, opens a PR |
+| Release Notes | Active | Cuts a release: AI-generates notes from labelled PRs, promotes them onto a release line branch, bumps `src/version.h`, opens a PR (held as a draft when the cut flags issues) |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Additional Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
 
@@ -355,11 +355,12 @@ Cuts a Valkey release in one shot. A maintainer dispatches the source branch, th
 target version, stage, and urgency; the agent generates the release notes from the
 labelled PRs in range (Claude via Bedrock), renders them onto the long-running
 release line as a dated section, bumps `src/version.h`, refreshes the running
-contributor list, and opens one PR for review. Nothing accumulates notes on a
-branch - the notes for a release are generated all at once. The source branch is
-never modified.
+contributor list, and opens one PR for review (as a draft, holding the merge, when
+the cut flags anything a maintainer should address first; see [Edge-case
+handling](#edge-case-handling)). Nothing accumulates notes on a branch; the notes
+for a release are generated all at once. The source branch is never modified.
 
-Dispatch it from this agent repository:
+Dispatch it from this agent repository (rc1 of a new minor line):
 
 ```bash
 gh workflow run release-notes-cut.yml \
@@ -370,13 +371,31 @@ gh workflow run release-notes-cut.yml \
   --field urgency=LOW
 ```
 
+The other stages differ only in `stage` (and, for a patch GA, `source_ref`); see
+[Common recipes](#common-recipes) for how each baseline resolves:
+
+```bash
+# Next RC on the same line (continues pre-release-9.1.0)
+gh workflow run release-notes-cut.yml --repo valkey-io/valkey-ci-agent \
+  --field source_ref=unstable --field version=9.1.0 --field stage=rc2 --field urgency=LOW
+
+# GA after the final RC (renames pre-release-9.1.0 to the 9.1 line)
+gh workflow run release-notes-cut.yml --repo valkey-io/valkey-ci-agent \
+  --field source_ref=unstable --field version=9.1.0 --field stage=ga --field urgency=LOW
+
+# Patch GA from an existing release branch (cut from 9.1, not unstable)
+gh workflow run release-notes-cut.yml --repo valkey-io/valkey-ci-agent \
+  --field source_ref=9.1 --field version=9.1.1 --field stage=ga --field urgency=LOW
+```
+
 Optional inputs: `date` (defaults to today), `base_ref` (explicit baseline ref
 overriding tag resolution), `contrib_base_ref` (contributor range start),
 `security_fixes` (manual Security Fixes bullets, one `--security-fix` per entry),
 `security_from_advisories` (also render published GitHub security advisories
-fixed by this version into Security Fixes), and `dry_run` (compute and log the
-cut without pushing or opening a PR). Stage is `rc1..rcN` or `ga`,
-case-insensitive.
+fixed by this version into Security Fixes), `force_ready` (open the PR ready even
+when the cut flags issues, instead of holding it as a draft; see [Edge-case
+handling](#edge-case-handling)), and `dry_run` (compute and log the cut without
+pushing or opening a PR). Stage is `rc1..rcN` or `ga`, case-insensitive.
 
 **Branch model** (one long-running branch per minor line):
 
@@ -386,6 +405,38 @@ case-insensitive.
 | rcN (N>1) | `pre-release-M.m.p` | Continue (keeps prior RCs' dated notes) |
 | ga of M.m.p | `M.m` | Create carrying the rc history, delete `pre-release-M.m.p` (a rename) |
 | later patches | `M.m` | Continue the existing minor line |
+
+### Common recipes
+
+Only `source_ref`, `version`, `stage`, and `urgency` are ever required. The
+baseline resolves itself for every case except rc1 of an `M.0.0` (first release of
+a new major), so leave `base_ref` empty unless a recipe below sets it. 
+
+| Cutting | `source_ref` | `version` | `stage` | `base_ref` | Baseline the notes span |
+|---------|-------------|-----------|---------|-----------|--------------------------|
+| First RC of a new minor | `unstable` | `9.2.0` | `rc1` | *(empty)* | Auto: previous minor's GA (`9.1.0`) |
+| Next RC on the same line | `unstable` | `9.2.0` | `rc2` | *(empty)* | Auto: walks the `pre-release-9.2.0` line itself, from its fork point off `unstable` up to its tip (no RC tags are pushed) |
+| GA after the final RC | `unstable` | `9.2.0` | `ga` | *(empty)* | Auto: walks the `pre-release-9.2.0` line itself, fork point to tip (same as rc2+) |
+| Patch GA from a release branch | `9.1` | `9.1.9` | `ga` | *(empty)* | Auto: the previous patch tag (`9.1.8`) |
+| First RC of a new **major** | `unstable` | `9.0.0` | `rc1` | *(set it)* | You must pass the prior major's final release |
+
+Distinctions that are easy to get wrong:
+
+- **`source_ref` is `unstable` for a new minor line (rc/GA), but the release**
+  **branch itself for a patch GA.** A patch (`9.1.9`) is cut from `9.1` because the
+  fixes were backported onto that branch; a new minor is cut from `unstable` where
+  its work landed.
+- **`version` is the target you are cutting, always `M.m.p`** - use `9.2.0` for
+  every RC of that release (`rc1`, `rc2`, ...) and its GA, not `9.2.0-rc2`. The
+  `-rcN` suffix comes from `stage`, not `version`.
+- **`base_ref` stays empty except for rc1 of `M.0.0`.** For every other case, the
+  tool derives or resolves the baseline (and shows the resolved range in the PR
+  body, so you can confirm it). Setting `base_ref` by hand on those cases is how a
+  wrong range gets cut; only use it when a cut's PR body flags an unanchored
+  or over-broad baseline.
+
+When unsure, dispatch with `dry_run` first: it logs the resolved plan and the exact
+`base..head` range (both refs and their SHAs) without pushing or opening a PR.
 
 ### How it works
 
@@ -397,10 +448,22 @@ human merges.
    above. The version is canonicalized once (`M.m.p`, no leading zeros / stray
    whitespace) so `version.h`, the dated heading, the commit title, and the branch
    names all agree.
-2. **Discover the range** (code) - resolve the baseline (the most recent reachable
-   RC tag, an explicit `--base-ref`, or rc1's derived previous release) and walk
-   `base..HEAD` by graph reachability, deduplicating to one entry per originating
-   PR number.
+2. **Discover the range** (code) - resolve `base..head` and walk it by graph
+   reachability, deduplicating to one entry per originating PR number. For a first
+   cut the head is the dispatched `source_ref`; the base is an explicit
+   `--base-ref`, else the previous release (rc1, a first GA of a new minor, or a
+   mis-dispatched rc2+ all anchor here, since no same-version RC tag is reachable
+   on `source_ref` under fork-at-freeze), else a patch GA's previous patch tag. A
+   continuing rc2+/GA cut instead walks the release line: the head is
+   the `pre-release-M.m.p` line tip and the base is the fork point where the line
+   left `source_ref`. This matters under valkey's fork-at-freeze model, where
+   `source_ref` (`unstable`) advances into the next minor after the freeze while
+   the RC fixes land only on the line; walking to `source_ref` would note the next
+   minor's PRs and miss the RC fixes. No RC tag is reachable to anchor on (this
+   workflow pushes none; the fork carries none), so the base is the `merge-base`
+   fork point, guarded to be an ancestor of the line tip. A mis-dispatch (rc2+ or a
+   GA with no line yet) still cuts a (draft) PR carrying the warning, rather than
+   aborting on an unreachable tag before a human sees it.
 3. **Classify** (code) - partition PRs by their `release-notes` / `no-release-notes`
    labels into include / exclude / triage, mirroring valkey's `check_release_notes`.
 4. **Generate** (AI) - Claude writes one categorized, user-facing bullet per
@@ -417,7 +480,9 @@ human merges.
    `src/version.h` with the `VALKEY_VERSION*` macros).
 6. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
    and open/update a PR into the release line with a body that explains the cut and
-   surfaces any advisories (below).
+   surfaces any advisories (below). When the cut flags anything a maintainer should
+   address first, the PR opens as a draft to hold the merge (see [Edge-case
+   handling](#edge-case-handling)).
 
 ### Edge-case handling
 
@@ -425,11 +490,17 @@ Malformed dispatch inputs fail fast at argparse (exit 2), before the clone + AI
 run: a non-`M.m.p` or out-of-range version, a bad stage, an urgency outside
 `LOW/MODERATE/HIGH/CRITICAL/SECURITY`, or a non-ISO date. An explicit `--base-ref`
 that resolves to nothing aborts right after the clone with a clear error. GA
-dispatched when **both** `pre-release-M.m.p` and `M.m` exist is refused as an
+dispatched when both `pre-release-M.m.p` and `M.m` exist is refused as an
 inconsistent state rather than silently orphaning the pre-release line.
 
-Non-blocking anomalies are surfaced as **warnings in the release PR body** so a
-reviewer can confirm the cut was intended before merging (the cut still proceeds):
+When the cut raises anything a maintainer should address before merging, the
+release PR opens as a draft (GitHub refuses to merge a draft) so a shipped
+change can never be released while a warning goes unread. The body leads with a
+banner naming the held items, and each has its own section below. Resolve them and
+click **Ready for review** to release, re-dispatch with the flag cleared (a re-cut
+with no flags flips the draft ready on its own), or dispatch `force_ready` to open
+ready anyway (the banner then records that N items were overridden). `--dry-run`
+prints the same hold decision without opening a PR. The signals that hold:
 
 - **RC out of sequence** - a re-cut rc, a skipped rc, or rc2+ before rc1 exists.
 - **Release line state looks off** - an rc targeting a line that already went GA
@@ -439,12 +510,23 @@ reviewer can confirm the cut was intended before merging (the cut still proceeds
   nearest tag, which may over-broaden the range.
 - **Empty release notes** - no PRs in range, or every PR needs triage; the body
   says which, so an empty dated section is not mistaken for a generation miss.
-- **Duplicate / security** - a PR credited in more than one bullet, a
-  `--security-fix` also noted as a normal bullet, or `SECURITY` urgency with no
-  security fixes.
+- **Duplicate / declined / low-confidence** - a PR credited in more than one
+  bullet, a labelled PR the model declined to note, or a note the model flagged
+  as low-confidence.
+- **Security** - a `--security-fix` also noted as a normal bullet, `SECURITY`
+  urgency with no security fixes, or advisories that could not be read (a clean
+  advisory match is informational and does not hold).
+- **Unresolved changes** - a shipped change that would otherwise slip past
+  valkey's label-only gate: a range commit with no resolvable PR (absent from the
+  notes entirely), a commit whose resolved PR could not be fetched, or a note
+  credited to a backport PR because the original author's PR could not be recovered.
+- **Triage** - PRs in range that are untagged or double-labelled.
 
-The body always shows the resolved notes range (`base..HEAD`) so an over-broad
-baseline is visible. `--dry-run` prints the same advisories to the log.
+The body always shows the resolved notes range so an over-broad baseline is
+visible: the resolved mode (e.g. `rc2 continuation`), the source and target
+branches, and both ends as `ref @ <sha>`, so a reviewer can audit the exact
+commits the notes were computed over, not just the branch-model names.
+`--dry-run` prints the same range and advisories to the log.
 
 ### Configuration
 

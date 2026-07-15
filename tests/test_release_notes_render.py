@@ -11,11 +11,11 @@ from __future__ import annotations
 import os
 import re
 
+from scripts.release_notes import release_format
 from scripts.release_notes.models import CategorizedBullet
 from scripts.release_notes.render import (
     format_bullet,
     group_bullets,
-    load_format_module,
 )
 
 _FIXTURE_CLONE = os.path.join(os.path.dirname(__file__), "fixtures", "valkey_clone")
@@ -27,7 +27,7 @@ _AUTHOR_RE = re.compile(r"by @([\w-]+)")
 
 
 def _fmt():
-    return load_format_module()
+    return release_format
 
 
 def _bullet(pr, author, category, text):
@@ -81,7 +81,7 @@ class TestGroupBullets:
             _bullet(3, "a", "Bug Fixes", "b"),
             _bullet(1, "a", "Behavior Changes", "c"),
         ]
-        grouped = group_bullets(bullets, fmt)
+        grouped = group_bullets(bullets)
         keys = list(grouped.keys())
         # Behavior Changes precedes Bug Fixes (canonical order).
         assert keys.index("Behavior Changes") < keys.index("Bug Fixes")
@@ -90,7 +90,7 @@ class TestGroupBullets:
         # The model never creates a new header: an off-list category is a
         # suggestion, so the bullet lands in the catch-all, not under "Networking".
         fmt = _fmt()
-        grouped = group_bullets([_bullet(9, "a", "Networking", "n")], fmt)
+        grouped = group_bullets([_bullet(9, "a", "Networking", "n")])
         assert "Networking" not in grouped
         assert grouped == {fmt.CATCH_ALL_CATEGORY: ["* n by @a (#9)"]}
 
@@ -103,13 +103,13 @@ class TestGroupBullets:
             _bullet(2, "a", "Networking", "y"),
             _bullet(3, "a", "## Injected", "z"),
         ]
-        grouped = group_bullets(bullets, fmt)
+        grouped = group_bullets(bullets)
         assert set(grouped).issubset(set(fmt.CATEGORIES))
 
     def test_reserved_sections_refused(self) -> None:
         fmt = _fmt()
         grouped = group_bullets(
-            [_bullet(1, "a", "Security Fixes", "x"), _bullet(2, "a", "Contributors", "y")], fmt
+            [_bullet(1, "a", "Security Fixes", "x"), _bullet(2, "a", "Contributors", "y")]
         )
         assert grouped == {}
 
@@ -118,14 +118,14 @@ class TestGroupBullets:
         # catch-all where it would ship next to the real auto-generated section.
         fmt = _fmt()
         grouped = group_bullets(
-            [_bullet(1, "a", "security fixes", "x"), _bullet(2, "a", "CONTRIBUTORS", "y")], fmt
+            [_bullet(1, "a", "security fixes", "x"), _bullet(2, "a", "CONTRIBUTORS", "y")]
         )
         assert grouped == {}
 
     def test_multiple_bullets_same_category(self) -> None:
         fmt = _fmt()
         grouped = group_bullets(
-            [_bullet(1, "a", "Bug Fixes", "one"), _bullet(2, "b", "Bug Fixes", "two")], fmt
+            [_bullet(1, "a", "Bug Fixes", "one"), _bullet(2, "b", "Bug Fixes", "two")]
         )
         assert len(grouped["Bug Fixes"]) == 2
 
@@ -133,7 +133,7 @@ class TestGroupBullets:
         # A category like "## Injected" must not survive as a block-terminating
         # header; it is coerced into the catch-all like any other off-list value.
         fmt = _fmt()
-        grouped = group_bullets([_bullet(1, "a", "## Injected", "x")], fmt)
+        grouped = group_bullets([_bullet(1, "a", "## Injected", "x")])
         assert all(not k.startswith("#") for k in grouped)
         assert grouped == {fmt.CATCH_ALL_CATEGORY: ["* x by @a (#1)"]}
 
@@ -147,7 +147,7 @@ class TestMaliciousBulletCannotBreakSection:
             _bullet(40, "a", "Bug Fixes", "fixed\n## Injected\n### Bug Fixes\n* fake (#1)"),
             _bullet(41, "b", "Build and Tooling", "later category still rendered"),
         ]
-        grouped = group_bullets(bullets, fmt)
+        grouped = group_bullets(bullets)
         assert len(grouped["Bug Fixes"]) == 1
         assert "\n" not in grouped["Bug Fixes"][0]
         section = fmt.render_version_section("9.1.0", "rc1", "LOW", "2026-06-25", grouped)
@@ -167,7 +167,7 @@ class TestRenderVersionSection:
             _bullet(41, "jdoe", "New Features and Enhanced Behavior", "new opt"),
         ]
         section = fmt.render_version_section(
-            "9.1.0", "rc1", "LOW", "2026-06-25", group_bullets(bullets, fmt)
+            "9.1.0", "rc1", "LOW", "2026-06-25", group_bullets(bullets)
         )
         assert "* fix crash by @BChan-0 (#40)" in section
         assert "* new opt by @jdoe (#41)" in section
@@ -178,7 +178,7 @@ class TestRenderVersionSection:
         # Every rendered bullet keeps its trailing (#N), the form the label gate wants.
         fmt = _fmt()
         grouped = group_bullets(
-            [_bullet(40, "BChan-0", "Bug Fixes", "a"), _bullet(41, "", "Bug Fixes", "b")], fmt
+            [_bullet(40, "BChan-0", "Bug Fixes", "a"), _bullet(41, "", "Bug Fixes", "b")]
         )
         section = fmt.render_version_section("9.1.0", "rc1", "LOW", "2026-06-25", grouped)
         for line in section.splitlines():

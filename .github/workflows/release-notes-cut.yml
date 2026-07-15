@@ -13,7 +13,8 @@
 # Branch model (one long-running branch per minor line):
 #   rc1 of M.m.p -> create  pre-release-M.m.p
 #   rcN (N>1)     -> continue pre-release-M.m.p (keeps prior RCs' dated notes;
-#                    dedup is by graph range back to the last reachable RC tag)
+#                    walks the line from its fork point to its tip, and drops PRs
+#                    the line's changelog already credits so RCs don't double-note)
 #   ga of M.m.p   -> create  M.m carrying the rc history, delete pre-release-M.m.p
 name: Cut Release Notes
 
@@ -54,9 +55,12 @@ on:
         type: string
       base_ref:
         description: "Explicit baseline ref overriding tag resolution (branch/tag/SHA).
-          Leave empty for rc2+/ga (uses the nearest RC tag); for rc1 it auto-defaults to
-          the previous release (prior patch, or previous minor for a .0), except M.0.0
-          which has no derivable baseline and needs this set."
+          Leave empty for rc2+/ga: a continuing cut walks the pre-release-M.m.p line
+          itself, from its fork point off the source branch up to its tip, not an RC tag
+          (this workflow pushes none). For rc1 it auto-defaults to the previous release
+          (prior patch, or previous minor for a .0). Set this only for rc1 of M.0.0 (no
+          derivable baseline), or to correct an over-broad range the PR body flags as
+          unanchored."
         required: false
         type: string
       security_fixes:
@@ -70,6 +74,15 @@ on:
         description: "Auto-render PUBLISHED GitHub security advisories fixed by this version
           into Security Fixes (merged with any manual bullets; the PR body disclaims that
           embargoed/draft CVEs must be added by hand)."
+        required: false
+        type: boolean
+        default: false
+      force_ready:
+        description: "Open the release PR ready for review even when the cut flags issues.
+          By default a cut that raises any reviewer-facing signal (out-of-sequence rc,
+          unanchored baseline, empty/duplicate notes, triage/unresolved PRs, security
+          mismatches, ...) opens as a draft so the merge is held until a maintainer
+          resolves the flagged items and marks it ready. Set this to open ready anyway."
         required: false
         type: boolean
         default: false
@@ -183,13 +196,32 @@ jobs:
           RELEASE_NOTES_BASE_REF: ${{ inputs.base_ref || '' }}
           RELEASE_NOTES_SECURITY_FIXES: ${{ inputs.security_fixes || '' }}
           RELEASE_NOTES_SECURITY_FROM_ADVISORIES: ${{ inputs.security_from_advisories && 'true' || 'false' }}
+          RELEASE_NOTES_FORCE_READY: ${{ inputs.force_ready && 'true' || 'false' }}
           RELEASE_NOTES_DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          if [[ ! "${RELEASE_NOTES_HEAD_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-            echo "Invalid source_ref: ${RELEASE_NOTES_HEAD_REF}" >&2
-            exit 1
-          fi
+          # Validate a value used in a git ref position. These inputs flow into git
+          # commands as bare arguments (`git clone --branch <ref>`, `<ref>^{commit}`,
+          # push refspecs, `git compare` ends), so the gate must reject shapes that
+          # subvert those calls even if a downstream call forgets to be defensive:
+          #   * a leading '-' would be parsed as an option, not a ref (e.g.
+          #     `--upload-pack=...`, or `-foo^{commit}` starting with '-');
+          #   * a leading '.' is an illegal refname component (git forbids it);
+          #   * '..' (and '...') is git range syntax that would turn a `base..head`
+          #     walk into an attacker-chosen range.
+          # `git check-ref-format` is not enough on its own: it accepts a leading
+          # '-' (a legal refname) yet that is the bare-arg option-injection hazard
+          # here, so an explicit shape gate is required. First char excludes '-'/'.'
+          # (alnum, '_' or '/'); the rest allow '.-'; '..' is rejected separately.
+          reject_bad_ref() {
+            # $1 = human label, $2 = value. Empty is caller's business.
+            local label="$1" val="$2"
+            if [[ ! "${val}" =~ ^[A-Za-z0-9_/][A-Za-z0-9._/-]*$ || "${val}" == *".."* ]]; then
+              echo "Invalid ${label}: ${val}" >&2
+              exit 1
+            fi
+          }
+          reject_bad_ref "source_ref" "${RELEASE_NOTES_HEAD_REF}"
           # No leading zeros: "09.1.0" would otherwise pass the gate but canonicalize
           # to "9.1.0" in Python, and a raw value leaking past would desync version.h
           # from the branch name. Match single-zero or no-leading-zero components only.
@@ -208,15 +240,12 @@ jobs:
           fi
           export RELEASE_NOTES_STAGE="${stage_lc}"
           # base_ref and contrib_base_ref are optional and flow into git ref
-          # positions (rev-parse / compare), so gate them with the same ref
-          # charset as source_ref. Both may be empty (their default), which skips
-          # the check; a non-empty value must be a plausible branch/tag/SHA.
+          # positions (rev-parse / compare), so gate them with the same rule as
+          # source_ref. Both may be empty (their default), which skips the check; a
+          # non-empty value must be a plausible branch/tag/SHA with no option/range shape.
           for ref_var in RELEASE_NOTES_BASE_REF RELEASE_NOTES_CONTRIB_BASE; do
             ref_val="${!ref_var}"
-            if [[ -n "${ref_val}" && ! "${ref_val}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
-              echo "Invalid ${ref_var}: ${ref_val}" >&2
-              exit 1
-            fi
+            [[ -n "${ref_val}" ]] && reject_bad_ref "${ref_var}" "${ref_val}"
           done
           args=(-m scripts.release_notes.main)
           # Manual Security Fixes: the UI field is single-line, so a maintainer

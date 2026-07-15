@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from scripts.common.proc import git_output, run_git
 from scripts.release_notes import main as main_mod
 from scripts.release_notes.main import main
 
@@ -25,7 +26,7 @@ _RELEASE_NOTES_ENV = (
     "RELEASE_NOTES_REPO", "RELEASE_NOTES_HEAD_REF", "RELEASE_NOTES_VERSION",
     "RELEASE_NOTES_STAGE", "RELEASE_NOTES_URGENCY", "RELEASE_NOTES_DATE",
     "RELEASE_NOTES_TAG_GLOB", "RELEASE_NOTES_BASE_REF", "RELEASE_NOTES_CONTRIB_BASE",
-    "RELEASE_NOTES_SECURITY_FROM_ADVISORIES",
+    "RELEASE_NOTES_SECURITY_FROM_ADVISORIES", "RELEASE_NOTES_FORCE_READY",
     "RELEASE_NOTES_GITHUB_TOKEN", "TARGET_TOKEN", "GITHUB_TOKEN",
 )
 
@@ -48,6 +49,11 @@ def patched(monkeypatch, tmp_path):
     monkeypatch.setattr(main_mod, "run_git", lambda *a, **k: MagicMock())
     monkeypatch.setattr(main_mod.tempfile, "mkdtemp", lambda *a, **k: str(tmp_path / "clone"))
     monkeypatch.setattr(main_mod.shutil, "rmtree", lambda *a, **k: None)
+    # Default the rc1 previous-release resolver to a no-op (no earlier release), so
+    # a generic rc1 test does not shell out to real git against the fake clone dir.
+    # Tests that exercise the resolver override this with their own stub.
+    monkeypatch.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
+                        lambda clone_dir, version: None)
     return monkeypatch
 
 
@@ -154,22 +160,70 @@ def test_valid_iso_date_accepted(patched):
     assert rc == 0
 
 
-def test_rc1_first_minor_marks_baseline_unanchored(patched, caplog):
-    # rc1 of M.0.0 with no derivable previous minor: the flag reaches cut() so the
-    # PR body can warn the baseline is unanchored.
+def test_rc1_no_prior_release_marks_baseline_unanchored(patched, caplog):
+    # rc1 whose repo carries no earlier release tag (first release ever, or a
+    # tagless fork): resolve_previous_release_tag returns None, so the cut falls
+    # back to nearest-tag resolution and the flag reaches cut() so the PR body can
+    # warn the baseline is unanchored. base_ref stays None (tag resolution).
     captured = _capture_cut(patched)
+    patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
+                    lambda clone_dir, version: None)
     import logging
     with caplog.at_level(logging.WARNING):
         main(["--token", "t", "--head-ref", "unstable",
               "--version", "9.0.0", "--stage", "rc1", "--urgency", "LOW"])
     assert captured["baseline_unanchored"] is True
+    assert captured["base_ref"] is None
 
 
-def test_baseline_anchored_when_base_ref_derived(patched):
+def test_rc1_anchors_to_resolved_previous_release(patched):
+    # rc1 with an earlier release tag in the repo: the resolver picks it, it reaches
+    # cut() as base_ref, and the baseline is anchored (not flagged). The resolver is
+    # repo-driven, so a skipped-minor jump (9.1.0 -> the 8.2 line's tag) threads the
+    # same way; here we just prove the resolved tag is what cut() receives.
     captured = _capture_cut(patched)
+    patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
+                    lambda clone_dir, version: ("8.2.0", "a" * 40))
     main(["--token", "t", "--head-ref", "unstable",
           "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
+    assert captured["base_ref"] == "8.2.0"
     assert captured["baseline_unanchored"] is False
+    # rc1 never resolves a same-version glob; it uses the previous-release base.
+    assert captured["tag_glob"] is None
+
+
+def test_rc1_explicit_base_ref_not_overridden_by_resolver(patched):
+    # An explicit --base-ref for rc1 wins: the previous-release resolver must never
+    # override the maintainer's choice. The resolver may now be *read* by the
+    # range-widening guard, so we don't forbid the call; instead we return a
+    # sentinel tag and assert it never becomes the base. base_ref stays as given.
+    captured = _capture_cut(patched)
+
+    patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
+                    lambda clone_dir, version: ("SENTINEL-NOT-THE-BASE", "deadbeef"))
+    # The range-widening guard shells out via git_output against the (fake) clone;
+    # neutralize it so this test stays about "explicit base wins", not git behavior.
+    patched.setattr(main_mod, "_recredited_commit_count",
+                    lambda *a, **k: None)
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc1", "--urgency", "LOW", "--base-ref", "my-baseline"])
+    assert captured["base_ref"] == "my-baseline"  # explicit value wins, not the sentinel
+    assert captured["baseline_unanchored"] is False
+
+
+def test_rc1_explicit_tag_glob_skips_resolver(patched):
+    # An explicit --tag-glob for rc1 means the maintainer chose glob-based tag
+    # resolution; the previous-release resolver must not run and base_ref stays None.
+    captured = _capture_cut(patched)
+
+    def _boom(*a, **k):
+        raise AssertionError("resolver must not run when --tag-glob is explicit")
+
+    patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag", _boom)
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc1", "--urgency", "LOW", "--tag-glob", "9.0.*"])
+    assert captured["base_ref"] is None
+    assert captured["tag_glob"] == "9.0.*"
 
 
 def test_missing_base_ref_aborts_before_cut(patched):
@@ -209,6 +263,38 @@ def test_dry_run_threads_through(patched):
     main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
           "--stage", "rc1", "--urgency", "LOW", "--dry-run"])
     assert captured["dry_run"] is True
+
+
+def test_force_ready_defaults_false(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["force_ready"] is False
+
+
+def test_force_ready_flag_threads_through(patched):
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW", "--force-ready"])
+    assert captured["force_ready"] is True
+
+
+def test_force_ready_env_default_reaches_cut(patched, monkeypatch):
+    # The workflow passes this input only as RELEASE_NOTES_FORCE_READY
+    # ('true'/'false'), never as a CLI flag, so the env default must reach cut().
+    captured = _capture_cut(patched)
+    monkeypatch.setenv("RELEASE_NOTES_FORCE_READY", "true")
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["force_ready"] is True
+
+
+def test_force_ready_env_false_is_false(patched, monkeypatch):
+    captured = _capture_cut(patched)
+    monkeypatch.setenv("RELEASE_NOTES_FORCE_READY", "false")
+    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["force_ready"] is False
 
 
 def test_security_from_advisories_defaults_false(patched):
@@ -300,12 +386,19 @@ class TestDefaultTagGlob:
         # rc1 has no rc0 to anchor to -> no glob (uses base_ref instead).
         assert main_mod._default_tag_glob("9.1.0", "rc1") is None
 
-    def test_ga_has_no_glob(self) -> None:
-        # GA continues an existing line; the no-glob nearest tag is correct.
-        assert main_mod._default_tag_glob("9.1.0", "ga") is None
+    def test_ga_scopes_glob_to_line(self) -> None:
+        # A patch GA resolves its baseline by tag; the M.m.* glob keeps a
+        # concurrent sibling line's tag out of the candidate set. (A first GA of a
+        # new minor anchors to its pre-release branch and drops this glob.)
+        assert main_mod._default_tag_glob("8.1.9", "ga") == "8.1.*"
+        assert main_mod._default_tag_glob("9.1.0", "ga") == "9.1.*"
+
+    def test_ga_case_insensitive(self) -> None:
+        assert main_mod._default_tag_glob("8.1.9", "GA") == "8.1.*"
 
     def test_non_version_is_none(self) -> None:
         assert main_mod._default_tag_glob("9.1", "rc2") is None
+        assert main_mod._default_tag_glob("9.1", "ga") is None
 
     def test_case_insensitive(self) -> None:
         # A maintainer dispatching "RC2" must still get the rc glob; "RC1" still
@@ -313,32 +406,6 @@ class TestDefaultTagGlob:
         assert main_mod._default_tag_glob("9.1.0", "RC2") == "9.1.0-rc*"
         assert main_mod._default_tag_glob("9.1.0", "Rc10") == "9.1.0-rc*"
         assert main_mod._default_tag_glob("9.1.0", "RC1") is None
-
-
-class TestDefaultBaseRefForRc1:
-    def test_new_minor_uses_previous_minor_ga(self) -> None:
-        # A new minor (patch 0) covers changes since the previous minor's GA.
-        assert main_mod._default_base_ref_for_rc1("9.1.0") == "9.0.0"
-
-    def test_patch_uses_prior_patch_not_previous_minor(self) -> None:
-        # A patch cut covers only changes since the prior patch, so the baseline is
-        # M.m.(p-1), NOT the previous minor. Deriving 9.1.0 here would re-credit
-        # the entire 9.2.0/.1/.2 patch line.
-        assert main_mod._default_base_ref_for_rc1("9.2.3") == "9.2.2"
-        assert main_mod._default_base_ref_for_rc1("9.2.1") == "9.2.0"
-
-    def test_patch_of_first_minor_uses_prior_patch(self) -> None:
-        # 9.0.5 has patch>0, so its baseline is the prior patch 9.0.4. The old
-        # minor==0 guard wrongly returned None (unanchored) for this.
-        assert main_mod._default_base_ref_for_rc1("9.0.5") == "9.0.4"
-        assert main_mod._default_base_ref_for_rc1("9.0.1") == "9.0.0"
-
-    def test_first_release_of_major_has_none(self) -> None:
-        # 9.0.0 has no previous release on this major to derive.
-        assert main_mod._default_base_ref_for_rc1("9.0.0") is None
-
-    def test_non_version_is_none(self) -> None:
-        assert main_mod._default_base_ref_for_rc1("9.1") is None
 
 
 def test_rc2_default_glob_passed_to_cut(patched):
@@ -349,65 +416,30 @@ def test_rc2_default_glob_passed_to_cut(patched):
     assert captured["base_ref"] is None
 
 
-def test_rc1_without_base_ref_warns_and_defaults(patched, caplog):
+def test_rc1_defers_baseline_to_post_clone_resolver(patched):
+    # rc1 with no --base-ref / --tag-glob does not compute a baseline at parse time
+    # (the old arithmetic guess). It flags resolve_rc1_baseline and lets _run_cut
+    # resolve the previous release from the repo's tags after the clone. Here the
+    # resolver is stubbed; assert the resolved value reaches cut() and no glob is set.
     captured = _capture_cut(patched)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        main(["--token", "t", "--head-ref", "unstable",
-              "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
-    # Defaults base_ref to the previous release, and suppresses the doomed glob.
-    assert captured["base_ref"] == "9.0.0"
-    assert captured["tag_glob"] is None
-    assert any("rc1" in r.message and "9.0.0" in r.message for r in caplog.records)
-
-
-def test_rc1_patch_defaults_base_ref_to_prior_patch(patched, caplog):
-    # rc1 of a patch (9.2.3) must anchor to the prior patch 9.2.2, not the previous
-    # minor 9.1.0, which silently re-credits the whole 9.2.x patch line. The
-    # anchored value must reach cut() (baseline stays anchored, not unanchored).
-    captured = _capture_cut(patched)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        main(["--token", "t", "--head-ref", "unstable",
-              "--version", "9.2.3", "--stage", "rc1", "--urgency", "LOW"])
-    assert captured["base_ref"] == "9.2.2"
-    assert captured["tag_glob"] is None
-    assert captured["baseline_unanchored"] is False
-
-
-def test_rc1_uppercase_stage_still_defaults_base_ref(patched, caplog):
-    # The rc1 base-ref default keys on a lowercased stage, so "RC1" must trigger
-    # the previous-release default and suppress the doomed glob just like "rc1".
-    captured = _capture_cut(patched)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        main(["--token", "t", "--head-ref", "unstable",
-              "--version", "9.1.0", "--stage", "RC1", "--urgency", "LOW"])
+    patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
+                    lambda clone_dir, version: ("9.0.0", "a" * 40))
+    main(["--token", "t", "--head-ref", "unstable",
+          "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
     assert captured["base_ref"] == "9.0.0"
     assert captured["tag_glob"] is None
 
 
-def test_rc1_with_explicit_base_ref_no_override(patched, caplog):
+def test_rc1_uppercase_stage_still_resolves_previous_release(patched):
+    # resolve_rc1_baseline keys on the normalized stage, so "RC1" defers to the
+    # post-clone resolver just like "rc1".
     captured = _capture_cut(patched)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
-              "--stage", "rc1", "--urgency", "LOW", "--base-ref", "9.0.4"])
-    assert captured["base_ref"] == "9.0.4"  # user value wins, not the derived default
+    patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
+                    lambda clone_dir, version: ("9.0.0", "a" * 40))
+    main(["--token", "t", "--head-ref", "unstable",
+          "--version", "9.1.0", "--stage", "RC1", "--urgency", "LOW"])
+    assert captured["base_ref"] == "9.0.0"
     assert captured["tag_glob"] is None
-    # No rc1 baseline warning when the user supplied one.
-    assert not any("Defaulting --base-ref" in r.message for r in caplog.records)
-
-
-def test_rc1_first_minor_warns_without_default(patched, caplog):
-    captured = _capture_cut(patched)
-    import logging
-    with caplog.at_level(logging.WARNING):
-        main(["--token", "t", "--head-ref", "unstable",
-              "--version", "9.0.0", "--stage", "rc1", "--urgency", "LOW"])
-    # No previous-minor could be derived -> base_ref stays None, loud warning.
-    assert captured["base_ref"] is None
-    assert any("no previous-minor release" in r.message for r in caplog.records)
 
 
 def test_explicit_base_ref_overrides_glob(patched):
@@ -429,28 +461,22 @@ def test_rc1_explicit_tag_glob_not_overridden_by_derived_base(patched):
     assert captured["tag_glob"] == "9.1.*"
 
 
-def test_rc1_derived_base_absent_degrades_not_aborts(patched, caplog):
-    # On a tagless fork, rc1 of 9.1.0 derives 9.0.0, which is absent. A *derived*
-    # (not user-supplied) base that resolves to nothing must degrade to the
-    # nearest-tag fallback (like the M.0.0 path), not hard-fail the cut.
+def test_rc1_no_previous_release_degrades_not_aborts(patched, caplog):
+    # On a tagless fork (or the very first release), the previous-release resolver
+    # returns None. rc1 must degrade to nearest-tag resolution and flag the baseline
+    # unanchored, not hard-fail the cut.
     import logging
-    import subprocess
 
     captured = _capture_cut(patched)
-
-    def _run_git(repo_dir, *args, **kwargs):
-        if args[:1] == ("rev-parse",):
-            raise subprocess.CalledProcessError(1, ["git", *args])  # derived tag absent
-        return MagicMock()
-
-    patched.setattr(main_mod, "run_git", _run_git)
+    patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
+                    lambda clone_dir, version: None)
     with caplog.at_level(logging.WARNING):
         rc = main(["--token", "t", "--head-ref", "unstable",
                    "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
     assert rc == 0                              # cut ran; did not abort
-    assert captured["base_ref"] is None         # derived value dropped
+    assert captured["base_ref"] is None         # no anchor; falls to tag resolution
     assert captured["baseline_unanchored"] is True
-    assert any("falling back to the nearest" in r.message for r in caplog.records)
+    assert any("no earlier release tag" in r.message for r in caplog.records)
 
 
 def test_rc2_explicit_missing_base_still_aborts(patched):
@@ -470,3 +496,93 @@ def test_rc2_explicit_missing_base_still_aborts(patched):
                "--stage", "rc2", "--urgency", "LOW", "--base-ref", "no-such-ref"])
     assert rc == 1
     assert captured == {}  # cut() never reached
+
+
+# --- explicit --base-ref range-widening guard (real git graphs) ---
+
+def _init_repo(path) -> str:
+    repo = str(path)
+    run_git(repo, "init", "-q", "-b", "unstable")
+    run_git(repo, "config", "user.email", "t@t")
+    run_git(repo, "config", "user.name", "t")
+    return repo
+
+
+def _commit(repo: str, subject: str) -> str:
+    run_git(repo, "commit", "-q", "--allow-empty", "-m", subject)
+    return git_output(repo, "rev-parse", "HEAD").strip()
+
+
+def _fork_at_freeze_repo(tmp_path):
+    """A repo mirroring valkey's fork-at-freeze shape.
+
+    ``unstable`` advances past a freeze point; the previous release ``9.0.0`` is
+    tagged on its own branch off that freeze point (so it is not an ancestor of
+    ``unstable``). An older release ``8.1.0`` is tagged further back on unstable's
+    own history. Returns the repo path.
+    """
+    repo = _init_repo(tmp_path)
+    _commit(repo, "old base (#1)")
+    run_git(repo, "tag", "8.1.0")              # older release, on unstable's history
+    _commit(repo, "shipped in 9.0 line (#2)")  # freeze point for the 9.0 line
+    _commit(repo, "more pre-freeze (#3)")
+    # 9.0.0 tagged on its own branch off the freeze point (fork-at-freeze).
+    run_git(repo, "checkout", "-q", "-b", "pre-release-9.0.0")
+    _commit(repo, "9.0.0 release commit (#4)")
+    run_git(repo, "tag", "9.0.0")
+    run_git(repo, "checkout", "-q", "unstable")
+    _commit(repo, "new work A (#5)")
+    _commit(repo, "new work B (#6)")
+    return repo
+
+
+class TestBaseRefRangeGuard:
+    def test_legit_previous_release_base_no_warning(self, tmp_path, caplog):
+        # The correct base (previous release 9.0.0) is not an ancestor of unstable
+        # under fork-at-freeze, yet its range re-credits nothing. The guard must
+        # stay silent (an is_ancestor(base, head) guard would wrongly fire here).
+        import logging
+        repo = _fork_at_freeze_repo(tmp_path)
+        with caplog.at_level(logging.WARNING):
+            main_mod._warn_if_base_ref_reaches_past_previous_release(
+                repo, "9.0.0", "unstable", "9.1.0"
+            )
+        assert not any("reaches back past" in r.message for r in caplog.records)
+
+    def test_too_old_base_warns(self, tmp_path, caplog):
+        # A base older than the previous release (8.1.0 instead of 9.0.0) drags the
+        # range back and re-credits already-shipped commits -> loud warning.
+        import logging
+        repo = _fork_at_freeze_repo(tmp_path)
+        with caplog.at_level(logging.WARNING):
+            main_mod._warn_if_base_ref_reaches_past_previous_release(
+                repo, "8.1.0", "unstable", "9.1.0"
+            )
+        assert any("reaches back past" in r.message for r in caplog.records)
+
+    def test_recredited_count_zero_for_clean_base(self, tmp_path):
+        repo = _fork_at_freeze_repo(tmp_path)
+        # base=9.0.0, prev=9.0.0: nothing already-released is re-included.
+        assert main_mod._recredited_commit_count(repo, "9.0.0", "unstable", "9.0.0") == 0
+
+    def test_recredited_count_positive_for_old_base(self, tmp_path):
+        repo = _fork_at_freeze_repo(tmp_path)
+        # base=8.1.0 with prev=9.0.0: the 9.0-line pre-freeze commits (#2,#3) are
+        # reachable from 9.0.0 but re-appear in 8.1.0..unstable.
+        assert main_mod._recredited_commit_count(repo, "8.1.0", "unstable", "9.0.0") > 0
+
+    def test_unresolvable_ref_returns_none(self, tmp_path):
+        repo = _fork_at_freeze_repo(tmp_path)
+        assert main_mod._recredited_commit_count(repo, "no-such-ref", "unstable", "9.0.0") is None
+
+    def test_no_previous_release_skips_guard(self, tmp_path, caplog):
+        # First release ever (no tag below target): nothing to compare, no warning.
+        import logging
+        repo = _init_repo(tmp_path)
+        _commit(repo, "only (#1)")
+        _commit(repo, "two (#2)")
+        with caplog.at_level(logging.WARNING):
+            main_mod._warn_if_base_ref_reaches_past_previous_release(
+                repo, "HEAD~1", "unstable", "9.1.0"
+            )
+        assert not any("reaches back past" in r.message for r in caplog.records)
