@@ -77,239 +77,54 @@ class TestResolveBranchPlan:
         monkeypatch.setattr(rc, "_remote_branch_exists",
                             lambda repo_dir, branch: branch in present)
 
-    def test_rc1_creates_pre_release(self, monkeypatch) -> None:
-        self._exists(monkeypatch, set())
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc1", source_ref="unstable")
-        assert plan == BranchPlan("rc1", "pre-release-9.1.0", "unstable", False, None)
+    def test_rc1_targets_minor_branch(self, monkeypatch) -> None:
+        self._exists(monkeypatch, {"9.1"})
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc1")
+        assert plan == BranchPlan("rc1", "9.1", "9.1")
 
-    def test_uppercase_rc1_normalizes_and_routes_to_pre_release(self, monkeypatch) -> None:
-        # A maintainer dispatching "RC1" must resolve exactly like "rc1": the
-        # plan's stage is the lowercased value, so every downstream name is too.
-        self._exists(monkeypatch, set())
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="RC1", source_ref="unstable")
-        assert plan == BranchPlan("rc1", "pre-release-9.1.0", "unstable", False, None)
+    def test_rcN_targets_minor_branch(self, monkeypatch) -> None:
+        self._exists(monkeypatch, {"9.1"})
+        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc2")
+        assert plan == BranchPlan("rc2", "9.1", "9.1")
 
-    def test_uppercase_ga_normalizes_and_fires_rename(self, monkeypatch) -> None:
-        # "GA" must route to the M.m line and fire the pre-release rename, not be
-        # compared raw (which would skip the ga branch and cut onto the rc line).
-        self._exists(monkeypatch, {"pre-release-9.1.0"})
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="GA", source_ref="unstable")
+    def test_ga_targets_minor_branch(self, monkeypatch) -> None:
+        self._exists(monkeypatch, {"9.1"})
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="ga")
+        assert plan == BranchPlan("ga", "9.1", "9.1")
+
+    def test_uppercase_rc1_normalizes(self, monkeypatch) -> None:
+        self._exists(monkeypatch, {"9.1"})
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="RC1")
+        assert plan.stage == "rc1"
+        assert plan.target == "9.1"
+
+    def test_uppercase_ga_normalizes(self, monkeypatch) -> None:
+        self._exists(monkeypatch, {"9.1"})
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="GA")
         assert plan.stage == "ga"
         assert plan.target == "9.1"
-        assert plan.rename_from == "pre-release-9.1.0"
 
-    def test_rcN_continues_pre_release(self, monkeypatch) -> None:
-        self._exists(monkeypatch, {"pre-release-9.1.0"})
-        # Avoid the sequence-warning fetch by stubbing it.
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc2", source_ref="unstable")
-        assert plan.target == "pre-release-9.1.0"
-        assert plan.base_ref == "pre-release-9.1.0"
-        assert plan.continuing is True
-        assert plan.rename_from is None
-
-    def test_ga_renames_pre_release(self, monkeypatch) -> None:
-        self._exists(monkeypatch, {"pre-release-9.1.0"})
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="ga", source_ref="unstable")
-        assert plan.target == "9.1"
-        assert plan.base_ref == "pre-release-9.1.0"
-        assert plan.continuing is True
-        assert plan.rename_from == "pre-release-9.1.0"
-
-    def test_ga_continues_existing_minor(self, monkeypatch) -> None:
-        self._exists(monkeypatch, {"9.1"})
-        plan = resolve_branch_plan("/d", version="9.1.1", stage="ga", source_ref="unstable")
-        assert plan.target == "9.1"
-        assert plan.rename_from is None
-
-    def test_ga_first_release_from_source(self, monkeypatch) -> None:
+    def test_missing_branch_raises(self, monkeypatch) -> None:
         self._exists(monkeypatch, set())
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="ga", source_ref="unstable")
-        assert plan.target == "9.1"
-        assert plan.base_ref == "unstable"
-        assert plan.continuing is False
-
-    def test_rc1_first_cut_has_no_warning(self, monkeypatch) -> None:
-        self._exists(monkeypatch, set())
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc1", source_ref="unstable")
-        assert plan.rc_warning is None
-
-    def test_rcN_first_cut_warns_no_prior_line(self, monkeypatch) -> None:
-        # rc2 dispatched but pre-release-9.1.0 does not exist yet: rc1 was skipped.
-        self._exists(monkeypatch, set())
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc2", source_ref="unstable")
-        assert plan.target == "pre-release-9.1.0"
-        assert plan.continuing is False
-        assert plan.rc_warning is not None
-        assert "rc1" in plan.rc_warning
-        assert "does not exist" in plan.rc_warning
-
-    def test_rcN_continuation_carries_sequence_warning(self, monkeypatch) -> None:
-        self._exists(monkeypatch, {"pre-release-9.1.0"})
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: "out-of-seq detail")
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc3", source_ref="unstable")
-        assert plan.rc_warning == "out-of-seq detail"
-
-    def test_ga_both_branches_raises(self, monkeypatch) -> None:
-        # pre-release-9.1.0 AND 9.1 both present is an inconsistent state: refuse
-        # rather than orphan the pre-release line / drop its rc history.
-        self._exists(monkeypatch, {"pre-release-9.1.0", "9.1"})
-        with pytest.raises(ValueError, match="inconsistent state"):
-            resolve_branch_plan("/d", version="9.1.0", stage="ga", source_ref="unstable")
-
-    def test_ga_continuation_carries_branch_warning(self, monkeypatch) -> None:
-        # GA continues an existing 9.1; the continuation warning (dup heading /
-        # lingering pre-release) is plumbed onto branch_warning.
-        self._exists(monkeypatch, {"9.1"})
-        monkeypatch.setattr(rc, "_warn_ga_continuation", lambda *a, **k: "dup heading detail")
-        plan = resolve_branch_plan("/d", version="9.1.1", stage="ga", source_ref="unstable")
-        assert plan.target == "9.1"
-        assert plan.rename_from is None
-        assert plan.branch_warning == "dup heading detail"
-
-    def test_rc_after_ga_warns_and_suppresses_first_cut(self, monkeypatch) -> None:
-        # 9.1 exists (already went GA) but pre-release-9.1.0 was deleted by the
-        # rename. A further rc recreates it; warn on branch_warning, and the rc1
-        # first-cut wording must not also fire.
-        self._exists(monkeypatch, {"9.1"})
-        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc1", source_ref="unstable")
-        assert plan.target == "pre-release-9.1.0"
-        assert plan.continuing is False
-        assert plan.branch_warning is not None
-        assert "9.1" in plan.branch_warning
-        assert plan.rc_warning is None
+        with pytest.raises(ValueError, match="does not exist"):
+            resolve_branch_plan("/d", version="9.1.0", stage="rc1")
 
     def test_bad_stage_raises(self, monkeypatch) -> None:
-        self._exists(monkeypatch, set())
+        self._exists(monkeypatch, {"9.1"})
         with pytest.raises(ValueError):
-            resolve_branch_plan("/d", version="9.1.0", stage="beta", source_ref="unstable")
+            resolve_branch_plan("/d", version="9.1.0", stage="beta")
 
     def test_bad_version_raises(self, monkeypatch) -> None:
-        self._exists(monkeypatch, set())
+        self._exists(monkeypatch, {"9.1"})
         with pytest.raises(ValueError):
-            resolve_branch_plan("/d", version="9.1", stage="rc1", source_ref="unstable")
+            resolve_branch_plan("/d", version="9.1", stage="rc1")
 
-
-class TestDeleteRemoteBranch:
-    """The GA-rename branch delete must not report success when it fails.
-
-    A failed delete that leaves pre-release-M.m.p on origin alongside the M.m
-    line is exactly the state the next GA of that line hard-refuses, so it must
-    surface as a non-zero signal rather than being swallowed.
-    """
-
-    def test_delete_success(self, monkeypatch) -> None:
-        calls = []
-        monkeypatch.setattr(rc, "run_git", lambda *a, **k: calls.append(a) or None)
-        # _remote_branch_exists must not even be consulted on success.
-        monkeypatch.setattr(rc, "_remote_branch_exists",
-                            lambda *a, **k: pytest.fail("should not check on success"))
-        rc._delete_remote_branch("/d", "pre-release-9.1.0", {})
-        assert any("--delete" in c for c in calls)
-
-    def test_delete_failure_but_branch_gone_is_tolerated(self, monkeypatch) -> None:
-        # Push failed, yet the branch is confirmed absent -> desired end state, no raise.
-        def _boom(*a, **k):
-            raise RuntimeError("push rejected")
-        monkeypatch.setattr(rc, "run_git", _boom)
-        monkeypatch.setattr(rc, "_remote_branch_exists", lambda *a, **k: False)
-        rc._delete_remote_branch("/d", "pre-release-9.1.0", {})  # no exception
-
-    def test_delete_failure_branch_still_present_raises(self, monkeypatch) -> None:
-        def _boom(*a, **k):
-            raise RuntimeError("protected ref")
-        monkeypatch.setattr(rc, "run_git", _boom)
-        monkeypatch.setattr(rc, "_remote_branch_exists", lambda *a, **k: True)
-        with pytest.raises(RuntimeError) as exc:
-            rc._delete_remote_branch("/d", "pre-release-9.1.0", {})
-        assert "pre-release-9.1.0" in str(exc.value)
-
-    def test_delete_failure_existence_check_also_fails_raises(self, monkeypatch) -> None:
-        # If we cannot even confirm the branch is gone, assume the worst and raise.
-        def _boom(*a, **k):
-            raise RuntimeError("push rejected")
-        def _boom_exists(*a, **k):
-            raise RuntimeError("ls-remote failed")
-        monkeypatch.setattr(rc, "run_git", _boom)
-        monkeypatch.setattr(rc, "_remote_branch_exists", _boom_exists)
-        with pytest.raises(RuntimeError):
-            rc._delete_remote_branch("/d", "pre-release-9.1.0", {})
-
-    def test_expected_oid_leases_the_delete(self, monkeypatch) -> None:
-        # With an expected_oid the delete is pinned to that commit via
-        # --force-with-lease, so it cannot remove a branch a concurrent writer
-        # advanced past the OID carried into the release line.
-        calls = []
-        monkeypatch.setattr(rc, "run_git", lambda *a, **k: calls.append(a) or None)
-        monkeypatch.setattr(rc, "_remote_branch_exists",
-                            lambda *a, **k: pytest.fail("should not check on success"))
-        rc._delete_remote_branch("/d", "pre-release-9.1.0", {}, expected_oid="b" * 40)
-        assert (
-            "/d", "push", "--force-with-lease=refs/heads/pre-release-9.1.0:" + "b" * 40,
-            "origin", "--delete", "pre-release-9.1.0",
-        ) in calls, calls
-
-    def test_lease_rejected_branch_advanced_raises_with_hint(self, monkeypatch) -> None:
-        # The lease is rejected (the pre-release branch advanced past the OID
-        # carried into M.m: a concurrent push after the rename branched). The
-        # branch is still present, so deleting it would lose that commit; raise
-        # with a reconcile hint rather than force it away.
-        def _boom(*a, **k):
-            raise RuntimeError("stale info")
-        monkeypatch.setattr(rc, "run_git", _boom)
-        monkeypatch.setattr(rc, "_remote_branch_exists", lambda *a, **k: True)
-        with pytest.raises(RuntimeError) as exc:
-            rc._delete_remote_branch("/d", "pre-release-9.1.0", {}, expected_oid="c" * 40)
-        assert "advanced past" in str(exc.value)
-        assert "would lose that commit" in str(exc.value)
-
-
-class TestRollbackCreatedLine:
-    """The rollback of a run-created release line is lease-guarded on the OID the
-    line was created at, so a line another writer advanced is never blindly
-    deleted."""
-
-    _OID = "a" * 40
-
-    def test_deletes_with_lease_on_created_oid(self, monkeypatch) -> None:
-        # Normal rollback: the line still points at the OID we created it at, so
-        # the delete goes through, pinned to that OID via --force-with-lease.
-        calls = []
-        monkeypatch.setattr(rc, "run_git", lambda *a, **k: calls.append(a) or None)
-        rc._rollback_created_line("/d", "9.1", self._OID, {})
-        assert (
-            "/d", "push", f"--force-with-lease=refs/heads/9.1:{self._OID}",
-            "origin", "--delete", "9.1",
-        ) in calls, calls
-
-    def test_empty_oid_refuses_to_delete(self, monkeypatch) -> None:
-        # The OID could not be read at create time: refuse to delete blind (a
-        # stranded line is recoverable; a wrongly deleted commit is not).
-        monkeypatch.setattr(rc, "run_git",
-                            lambda *a, **k: pytest.fail("must not push when OID unknown"))
-        rc._rollback_created_line("/d", "9.1", "", {})  # no raise, no push
-
-    def test_stale_lease_leaves_branch_intact(self, monkeypatch, caplog) -> None:
-        # The line advanced past the OID we created it at (another writer): the
-        # lease rejects the delete. The branch is still present, so we leave it
-        # intact and warn rather than force it away.
-        def _boom(*a, **k):
-            raise RuntimeError("stale info")
-        monkeypatch.setattr(rc, "run_git", _boom)
-        monkeypatch.setattr(rc, "_remote_branch_exists", lambda *a, **k: True)
-        with caplog.at_level("WARNING"):
-            rc._rollback_created_line("/d", "9.1", self._OID, {})  # no raise
-        assert any("no longer points at the commit" in r.message for r in caplog.records)
-
-    def test_already_gone_is_a_noop(self, monkeypatch) -> None:
-        # The delete failed but the branch is confirmed absent (someone else
-        # removed it): the desired end state, so no raise and no warning-worthy
-        # inconsistency.
-        def _boom(*a, **k):
-            raise RuntimeError("remote ref does not exist")
-        monkeypatch.setattr(rc, "run_git", _boom)
-        monkeypatch.setattr(rc, "_remote_branch_exists", lambda *a, **k: False)
-        rc._rollback_created_line("/d", "9.1", self._OID, {})  # no raise
+    def test_rc_sequence_warning_plumbed(self, monkeypatch) -> None:
+        self._exists(monkeypatch, {"9.1"})
+        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: "out-of-seq detail")
+        plan = resolve_branch_plan("/d", version="9.1.0", stage="rc3")
+        assert plan.rc_warning == "out-of-seq detail"
 
 
 class TestRcSequenceWarning:
@@ -322,7 +137,7 @@ class TestRcSequenceWarning:
 
     def _warn(self, monkeypatch, stage_lc, notes):
         self._stub_notes(monkeypatch, notes)
-        return rc._warn_rc_sequence("/d", "pre-release-9.1.0", stage_lc, 9, 1, 0)
+        return rc._warn_rc_sequence("/d", "9.1", stage_lc, 9, 1, 0)
 
     def test_in_sequence_returns_none(self, monkeypatch) -> None:
         # Line records up to rc1; rc2 is exactly next.
@@ -356,20 +171,10 @@ class TestRcSequenceWarning:
         def _boom(*a, **k):
             raise RuntimeError("no such branch")
         monkeypatch.setattr(rc, "run_git", _boom)
-        assert rc._warn_rc_sequence("/d", "pre-release-9.1.0", "rc2", 9, 1, 0) is None
+        assert rc._warn_rc_sequence("/d", "9.1", "rc2", 9, 1, 0) is None
 
-    def test_first_cut_rc1_no_warning(self) -> None:
-        assert rc._warn_rc_first_cut("rc1", "pre-release-9.1.0") is None
 
-    def test_first_cut_rcN_warns(self) -> None:
-        msg = rc._warn_rc_first_cut("rc2", "pre-release-9.1.0")
-        assert msg is not None
-        assert "rc1" in msg
-        assert "pre-release-9.1.0" in msg
 
-    def test_first_cut_ga_no_warning(self) -> None:
-        # Non-rc stages never go through this helper's warning.
-        assert rc._warn_rc_first_cut("ga", "pre-release-9.1.0") is None
 
 
 class TestCanonicalVersion:
@@ -397,44 +202,6 @@ class TestCanonicalVersion:
             rc.canonical_version(bad)
 
 
-class TestGaAndRcAfterGaWarnings:
-    """Branch-model warnings for GA continuation and rc-after-GA."""
-
-    def _stub(self, monkeypatch, *, pre_exists, ga_notes):
-        monkeypatch.setattr(rc, "_remote_branch_exists",
-                            lambda repo_dir, branch: pre_exists if branch.startswith("pre-release") else True)
-        monkeypatch.setattr(rc, "run_git", lambda *a, **k: None)
-        monkeypatch.setattr(rc, "git_output", lambda *a, **k: ga_notes)
-
-    def test_ga_continuation_warns_on_lingering_pre_release(self, monkeypatch) -> None:
-        self._stub(monkeypatch, pre_exists=True, ga_notes="")
-        msg = rc._warn_ga_continuation("/d", "9.1", "pre-release-9.1.1", "9.1.1")
-        assert msg is not None
-        assert "pre-release-9.1.1" in msg
-        assert "NOT be carried" in msg
-
-    def test_ga_continuation_warns_on_duplicate_heading(self, monkeypatch) -> None:
-        notes = "Valkey 9.1 release notes\n====\n\nValkey 9.1.0 GA  -  Released 2026-06-30\n----\n"
-        self._stub(monkeypatch, pre_exists=False, ga_notes=notes)
-        msg = rc._warn_ga_continuation("/d", "9.1", "pre-release-9.1.0", "9.1.0")
-        assert msg is not None
-        assert "SECOND dated heading" in msg
-
-    def test_ga_continuation_clean_returns_none(self, monkeypatch) -> None:
-        # No lingering pre-release, no prior same-version GA heading: normal patch.
-        notes = "Valkey 9.1 release notes\n====\n\nValkey 9.1.0 GA  -  Released 2026-06-30\n----\n"
-        self._stub(monkeypatch, pre_exists=False, ga_notes=notes)
-        assert rc._warn_ga_continuation("/d", "9.1", "pre-release-9.1.1", "9.1.1") is None
-
-    def test_rc_after_ga_warns_when_ga_exists(self, monkeypatch) -> None:
-        monkeypatch.setattr(rc, "_remote_branch_exists", lambda repo_dir, branch: branch == "9.1")
-        msg = rc._warn_rc_after_ga("/d", "9.1", "pre-release-9.1.0", "9.1.0")
-        assert msg is not None
-        assert "9.1" in msg and "recreates" in msg
-
-    def test_rc_after_ga_none_when_no_ga(self, monkeypatch) -> None:
-        monkeypatch.setattr(rc, "_remote_branch_exists", lambda repo_dir, branch: False)
-        assert rc._warn_rc_after_ga("/d", "9.1", "pre-release-9.1.0", "9.1.0") is None
 
 
 class TestSecurityHelpers:
@@ -590,7 +357,7 @@ class TestPromoteAndBump:
             clone, grouped=grouped, dest_notes_text=prior,
             dest_version_text=version_text, version="9.1.0", stage_lc="rc2",
             urgency="LOW", date="2026-06-25", repo_full_name="valkey-io/valkey",
-            contrib_base=None, contrib_head="origin/pre-release-9.1.0",
+            contrib_base=None, contrib_head="9.1",
             token=None, security_fixes=None,
         )
         assert "Valkey 9.1.0-rc2" in new_notes
@@ -638,7 +405,7 @@ class TestPromoteAndBump:
         monkeypatch.setattr(
             rc, "_compare_ref",
             lambda repo_dir, ref: {
-                "origin/unstable": "base_sha", "origin/pre-release-9.1.0": "head_sha"
+                "origin/unstable": "base_sha", "origin/9.1": "head_sha"
             }[ref],
         )
         promote_and_bump(
@@ -646,7 +413,7 @@ class TestPromoteAndBump:
             dest_version_text=version_text, version="9.1.0", stage_lc="rc2",
             urgency="LOW", date="2026-06-25", repo_full_name="valkey-io/valkey",
             contrib_base="origin/unstable",
-            contrib_head="origin/pre-release-9.1.0", token="t", security_fixes=None,
+            contrib_head="origin/9.1", token="t", security_fixes=None,
         )
         assert captured["base"] == "base_sha"
         assert captured["head"] == "head_sha"  # the resolved head SHA, not a raw ref
@@ -731,9 +498,9 @@ class TestCutOrchestration:
             monkeypatch.setattr(rc, "_contrib_base", lambda *a, **k: None)
         return calls
 
-    def test_rc1_creates_line_and_prs_prep_branch_into_it(self, monkeypatch, clone):
+    def test_rc1_prs_prep_branch_into_target(self, monkeypatch, clone):
         from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={})
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True})
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -747,23 +514,14 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
-        # The release line was created (it did not exist), and exactly one PR is
-        # opened: the prep branch into the release line. No companion reset PR;
-        # the source branch is never modified.
-        pushed = [c for c in calls if c[:1] == ("push",)]
-        assert any("refs/heads/pre-release-9.1.0" in " ".join(c) for c in pushed), pushed
+        # Exactly one PR is opened: the prep branch into the target M.m branch.
         assert len(created) == 1
         assert created[0]["head"].startswith("agent/release-cut/")
-        assert created[0]["base"] == "pre-release-9.1.0"
-        # The source branch is never pushed to.
-        assert not any("HEAD:unstable" in " ".join(c) or ":refs/heads/unstable" in " ".join(c)
-                       for c in pushed)
-        # rc1 is not a rename (plan.rename_from is None), so no branch is deleted.
-        assert not any("--delete" in c for c in pushed), pushed
+        assert created[0]["base"] == "9.1"
 
     def test_included_prs_but_no_bullets_aborts_without_pr(self, monkeypatch, clone):
         # The cut()-level guard: PRs were included but generation produced no
@@ -775,7 +533,7 @@ class TestCutOrchestration:
         from scripts.release_notes import pipeline as pipeline_mod
         from scripts.release_notes.pipeline import RegenResult
 
-        calls = self._setup(monkeypatch, clone, line_exists={})
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True})
         monkeypatch.setattr(
             pipeline_mod, "regenerate_unreleased",
             lambda *a, **k: RegenResult(
@@ -791,7 +549,7 @@ class TestCutOrchestration:
 
         rc_code = rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -840,36 +598,7 @@ class TestCutOrchestration:
         rc.cut(repo, **base)
         return captured
 
-    def test_patch_ga_does_not_walk_empty_minor_range(self, monkeypatch, clone):
-        # Regression: a patch GA (8.1.9 ga) continuing the existing 8.1 line must
-        # not pass base_ref="8.1" to discovery (that would walk origin/8.1..8.1, an
-        # empty range, and ship a notes-less PR). The plan base for a patch GA is
-        # the M.m branch itself, not a pre-release-* branch, so the continuing-cut
-        # override must be skipped and discovery left to resolve the previous patch
-        # tag (8.1.8..8.1).
-        captured = self._capture_discovery_range(
-            monkeypatch, clone, line_exists={"8.1": True},
-            cut_kwargs={"source_ref": "8.1", "version": "8.1.9", "stage": "ga"},
-        )
-        assert captured["base_ref"] is None, captured  # tag resolution, not origin/8.1..8.1
-        assert captured["tag_glob"] is None, captured
 
-    def test_rc_continuation_walks_the_line_not_source_ref(self, monkeypatch, clone):
-        # An rc2 continuing pre-release-9.1.0 must discover the line itself, not
-        # source_ref (unstable). In fork-at-freeze, unstable has advanced into the
-        # next minor while the RC fixes live only on the line; walking
-        # pre-release..unstable would note the next minor's PRs and miss the RC
-        # fixes. So head = origin/pre-release-9.1.0 (the line tip) and base = the
-        # fork point (stubbed to "a"*40 by _setup's git_output), with the glob
-        # dropped since no RC tag is reachable on the fork.
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
-        captured = self._capture_discovery_range(
-            monkeypatch, clone, line_exists={"pre-release-9.1.0": True},
-            cut_kwargs={"source_ref": "unstable", "version": "9.1.0", "stage": "rc2"},
-        )
-        assert captured["head_ref"] == "origin/pre-release-9.1.0", captured
-        assert captured["base_ref"] == "a" * 40, captured  # fork point, not the line name
-        assert captured["tag_glob"] is None, captured
 
     def test_uppercase_ga_cuts_minor_line_with_lowercased_names(self, monkeypatch, clone):
         # End-to-end: a dispatch of "GA" must route to the M.m line and emit the
@@ -877,7 +606,7 @@ class TestCutOrchestration:
         # stage_release_name do not normalize their own argument, so this proves
         # resolve_branch_plan's normalization holds across the whole cut() path.
         from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True})
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True})
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -891,7 +620,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="GA",
+            valkey_clone_dir=clone, version="9.1.0", stage="GA",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -900,97 +629,16 @@ class TestCutOrchestration:
         assert created[0]["title"] == "Add release notes entry for Valkey 9.1.0 GA"
         # No raw "-GA" leaks into the prep-branch push refspec.
         assert not any("9.1.0-GA" in " ".join(c) for c in calls if c[:1] == ("push",))
-        # The GA rename must delete the old pre-release branch on origin (destructive):
-        # leaving it alongside the new 9.1 line is the inconsistent state the next GA
-        # hard-refuses, so assert the delete fired and targeted exactly that branch.
-        # The delete is lease-guarded on the OID carried into 9.1 (created_line_oid,
-        # stubbed to "a"*40 by _setup), so a concurrent push onto pre-release-9.1.0
-        # after the rename branched is not silently lost.
-        assert (
-            "push", "--force-with-lease=refs/heads/pre-release-9.1.0:" + "a" * 40,
-            "origin", "--delete", "pre-release-9.1.0",
-        ) in calls, calls
 
-    def test_ga_rename_delete_leases_on_the_oid_carried_into_the_line(self, monkeypatch, clone):
-        # Provenance guard: the delete lease must be pinned to the OID that M.m was
-        # actually created from (origin/pre-release-M.m.p), not some other ref. Make
-        # rev-parse of that ref return a distinct OID from every other git_output, so
-        # a regression that leased on the wrong commit would fail here.
-        from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True})
-        carried_oid = "b" * 40
 
-        def _git_output(_d, *a, **k):
-            if a == ("rev-parse", "--verify", "origin/pre-release-9.1.0^{commit}"):
-                return carried_oid + "\n"
-            return "a" * 40 + "\n"
 
-        monkeypatch.setattr(rc, "git_output", _git_output)
-        repo = MagicMock()
-        repo.get_pulls.return_value = []
-        repo.create_pull.side_effect = lambda **kw: MagicMock(number=1, html_url="https://x/1")
-        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
-
-        rc.cut(
-            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="ga",
-            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
-            security_fixes=None, token="t", git_env={}, dry_run=False,
-        )
-        # The pre-release line is created at carried_oid, so the delete leases on it.
-        assert (
-            "push", f"--force-with-lease=refs/heads/pre-release-9.1.0:{carried_oid}",
-            "origin", "--delete", "pre-release-9.1.0",
-        ) in calls, calls
-
-    def test_ga_rename_refuses_blind_delete_when_line_created_out_of_band(self, monkeypatch, clone):
-        # Residual-hole guard: the plan resolves as a rename (only pre-release exists),
-        # but M.m appears out of band (a racing GA) between plan resolution and the
-        # create step. This run then neither creates M.m nor holds a lease OID, so it
-        # must not blind-delete pre-release-M.m.p (which could silently drop a commit
-        # pushed onto it). It raises for manual reconcile and leaves the branch intact.
-        from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True})
-
-        # Stateful: "9.1" is absent at plan time (-> rename plan) but present at the
-        # step-4 create check (-> this run does not create it, created_line_oid="").
-        ga_seen = {"n": 0}
-
-        def _exists(_d, b):
-            if b == "9.1":
-                ga_seen["n"] += 1
-                return ga_seen["n"] > 1  # False at plan time, True at step 4
-            return b == "pre-release-9.1.0"
-
-        monkeypatch.setattr(rc, "_remote_branch_exists", _exists)
-        repo = MagicMock()
-        repo.get_pulls.return_value = []
-        repo.create_pull.side_effect = lambda **kw: MagicMock(number=1, html_url="https://x/1")
-        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
-
-        with pytest.raises(RuntimeError, match="was not created by this run"):
-            rc.cut(
-                repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-                valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="ga",
-                urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
-                contrib_base_ref=None, security_fixes=None, token="t", git_env={}, dry_run=False,
-            )
-        # No delete of pre-release-9.1.0 fired (neither leased nor unconditional): the
-        # branch is left intact for the operator to reconcile.
-        assert not any(
-            c[:1] == ("push",) and "--delete" in c and c[-1] == "pre-release-9.1.0"
-            for c in calls
-        ), calls
-        # The worktree is still cleaned up on the way out (finally).
-        self._assert_worktree_removed(calls, clone)
 
     def test_triage_listed_in_release_pr_body(self, monkeypatch, clone):
         from unittest.mock import MagicMock
 
         from scripts.release_notes.models import MergedPR
         triage = (MergedPR(number=7, title="Untagged | thing", author="bob", url="https://x/7"),)
-        calls = self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True}, triage=triage)
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True}, triage=triage)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -1004,7 +652,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc2",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1022,9 +670,8 @@ class TestCutOrchestration:
         unresolved = (
             UnresolvedCommit(sha="abcdef1234567890", subject="rewritten pick | thing"),
         )
-        self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True},
+        self._setup(monkeypatch, clone, line_exists={"9.1": True},
                     unresolved=unresolved)
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -1038,7 +685,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc2",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1058,9 +705,8 @@ class TestCutOrchestration:
             UnresolvedBackport(number=512, title="[Backport 9.1] port fix | thing",
                                url="https://github.com/valkey-io/valkey/pull/512"),
         )
-        self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True},
+        self._setup(monkeypatch, clone, line_exists={"9.1": True},
                     unresolved_backports=unresolved_backports)
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -1074,7 +720,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc2",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1091,9 +737,8 @@ class TestCutOrchestration:
 
         from scripts.release_notes.models import UnresolvedPR
         unresolved_prs = (UnresolvedPR(number=777, sha="abcdef1234567890"),)
-        self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True},
+        self._setup(monkeypatch, clone, line_exists={"9.1": True},
                     unresolved_prs=unresolved_prs)
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -1107,7 +752,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc2",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1117,10 +762,10 @@ class TestCutOrchestration:
         assert "#777" in body          # the PR number as referenced
 
     def test_rc_out_of_sequence_warned_in_pr_body(self, monkeypatch, clone):
-        # rc2 dispatched with no pre-release line yet: the first-cut warning must
-        # surface in the release PR body for the reviewer.
+        # rc2 dispatched: the sequence warning must surface in the PR body.
         from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={})
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True})
+        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: "rc2 out-of-seq: expected rc1")
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -1134,7 +779,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc2",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1145,7 +790,7 @@ class TestCutOrchestration:
     def test_in_sequence_rc_has_no_warning_in_pr_body(self, monkeypatch, clone):
         # rc1 first cut is in sequence: no warning section in the body.
         from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={})
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True})
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -1159,7 +804,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1180,7 +825,7 @@ class TestCutOrchestration:
         monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
         base = dict(
             repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
             contrib_base_ref=None, security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1193,39 +838,21 @@ class TestCutOrchestration:
         # branches, and both ends as `ref @ <sha>` so a reviewer can audit the
         # exact commits, not just the branch-model names. _setup stubs git_output
         # to a deterministic 40-char SHA, abbreviated to 12 here.
-        body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={})
-        assert "computed over the range below (`9.0.0..unstable`)" in body
-        assert "mode: rc1" in body
-        assert "source_ref: unstable" in body
-        assert "target_branch: pre-release-9.1.0" in body
-        assert "base: 9.0.0 @ aaaaaaaaaaaa" in body
-        assert "head: unstable @ aaaaaaaaaaaa" in body
-
-    def test_body_range_mode_labels_continuation(self, monkeypatch, clone):
-        # A continued cut (rc2 onto an existing pre-release line) must label the
-        # mode as a continuation and target that line, so the range block reflects
-        # the resolved branch plan, not a fresh cut.
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
-        body = self._cut_body(
-            monkeypatch, clone, line_exists={"pre-release-9.1.0": True},
-            cut_kwargs={"stage": "rc2"},
-        )
-        assert "mode: rc2 continuation" in body
-        assert "target_branch: pre-release-9.1.0" in body
-
-    def test_rc_after_ga_warned_in_body(self, monkeypatch, clone):
-        # 9.1 exists; rc1 of 9.1.0 recreates a deleted pre-release line.
         body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={})
-        assert "Release line state looks off" in body
-        assert "already exists as a GA line" in body
+        assert "computed over the range below" in body
+        assert "mode: rc1" in body
+        assert "target_branch: 9.1" in body
+        assert "base: 9.0.0 @ aaaaaaaaaaaa" in body
+
+
 
     def test_baseline_unanchored_warned_in_body(self, monkeypatch, clone):
-        body = self._cut_body(monkeypatch, clone, line_exists={},
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.0": True},
                               cut_kwargs={"version": "9.0.0", "baseline_unanchored": True})
         assert "baseline is unanchored" in body
 
     def test_empty_range_explained_in_body(self, monkeypatch, clone):
-        body = self._cut_body(monkeypatch, clone, line_exists={},
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True},
                               cut_kwargs={}, bullets=False, had_prs=False)
         assert "Empty release notes" in body
         assert "No merged PRs were found" in body
@@ -1233,14 +860,14 @@ class TestCutOrchestration:
     def test_all_triage_empty_notes_explained_in_body(self, monkeypatch, clone):
         from scripts.release_notes.models import MergedPR
         triage = (MergedPR(number=7, title="thing", author="bob", url="https://x/7"),)
-        body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={},
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
                               bullets=False, had_prs=True, triage=triage)
         assert "Empty release notes" in body
         assert "unlabelled or double-labelled" in body
         assert "Needs triage" in body  # the table is still rendered
 
     def test_duplicate_pr_warned_in_body(self, monkeypatch, clone):
-        body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={},
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
                               duplicate_prs=(40,))
         assert "noted more than once" in body
         assert "#40" in body
@@ -1248,7 +875,7 @@ class TestCutOrchestration:
     def test_uncertain_notes_flagged_in_body(self, monkeypatch, clone):
         from scripts.release_notes.models import UncertainNote
         body = self._cut_body(
-            monkeypatch, clone, line_exists={}, cut_kwargs={},
+            monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
             uncertain=(UncertainNote(pr_number=40, category="Other Changes",
                                      reason="unclear if user-facing"),),
         )
@@ -1261,7 +888,7 @@ class TestCutOrchestration:
         # The fixture bullet credits #40; a --security-fix naming #40 would list it
         # twice. Instead of warning, the cut drops the generated bullet so #40
         # appears only under Security Fixes, and the body explains the exclusion.
-        body = self._cut_body(monkeypatch, clone, line_exists={},
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True},
                               cut_kwargs={"security_fixes": ["Fix CVE (#40)"]})
         assert "Excluded from generated notes" in body
         assert "#40" in body
@@ -1275,14 +902,14 @@ class TestCutOrchestration:
         # wrote, not just the PR body.
         from unittest.mock import MagicMock
         writes: dict[str, str] = {}
-        self._setup(monkeypatch, clone, line_exists={}, writes=writes)
+        self._setup(monkeypatch, clone, line_exists={"9.1": True}, writes=writes)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         repo.create_pull.return_value = MagicMock(number=1, html_url="https://x/1")
         monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="SECURITY", date="2026-06-25", tag_glob=None, base_ref=None,
             contrib_base_ref=None, security_fixes=["(CVE-2026-1) UAF in unblock (#40)"],
             token="t", git_env={}, dry_run=False,
@@ -1296,7 +923,7 @@ class TestCutOrchestration:
         assert "* fix" not in notes
 
     def test_security_urgency_without_fixes_warned_in_body(self, monkeypatch, clone):
-        body = self._cut_body(monkeypatch, clone, line_exists={},
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True},
                               cut_kwargs={"urgency": "SECURITY", "security_fixes": None})
         assert "Security fixes need a look" in body
         assert "no security content" in body
@@ -1314,7 +941,7 @@ class TestCutOrchestration:
         """
         from unittest.mock import MagicMock
         writes: dict[str, str] = {}
-        calls = self._setup(monkeypatch, clone, line_exists={}, writes=writes)
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True}, writes=writes)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         repo.get_repository_advisories.return_value = advisories
@@ -1358,7 +985,7 @@ class TestCutOrchestration:
         repo, created, writes, calls = self._advisory_repo(monkeypatch, clone, advisories=[adv])
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="SECURITY", date="2026-06-25", tag_glob=None, base_ref=None,
             contrib_base_ref=None, security_fixes=None, token="t", git_env={},
             dry_run=False, security_from_advisories=True,
@@ -1384,7 +1011,7 @@ class TestCutOrchestration:
         repo.get_repository_advisories.side_effect = RuntimeError("no advisory permission")
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
             contrib_base_ref=None, security_fixes=None, token="t", git_env={},
             dry_run=False, security_from_advisories=True,
@@ -1402,7 +1029,7 @@ class TestCutOrchestration:
         repo, created, _writes, _calls = self._advisory_repo(monkeypatch, clone, advisories=[adv])
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
             contrib_base_ref=None, security_fixes=None, token="t", git_env={},
             dry_run=False, security_from_advisories=True,
@@ -1422,7 +1049,7 @@ class TestCutOrchestration:
         repo, created, writes, calls = self._advisory_repo(monkeypatch, clone, advisories=[adv])
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="SECURITY", date="2026-06-25", tag_glob=None, base_ref=None,
             contrib_base_ref=None,
             security_fixes=["CVE-2026-23479: hand-written wording"],
@@ -1434,7 +1061,7 @@ class TestCutOrchestration:
         self._assert_worktree_removed(calls, clone)
 
     def test_clean_cut_has_no_warning_sections(self, monkeypatch, clone):
-        body = self._cut_body(monkeypatch, clone, line_exists={}, cut_kwargs={})
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={})
         assert "⚠️" not in body
         assert "Empty release notes" not in body
 
@@ -1457,7 +1084,7 @@ class TestCutOrchestration:
         monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
         base = dict(
             repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
             contrib_base_ref=None, security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1467,15 +1094,15 @@ class TestCutOrchestration:
 
     def test_clean_cut_opens_ready(self, monkeypatch, clone):
         # No flagged signals: the PR opens ready (not a draft) with no hold banner.
-        kw = self._cut_created(monkeypatch, clone, line_exists={}, cut_kwargs={})
+        kw = self._cut_created(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={})
         assert kw["draft"] is False
         assert "Held as a draft" not in kw["body"]
 
     def test_flagged_cut_held_as_draft(self, monkeypatch, clone):
         # A cut with a flagged signal (unanchored baseline) opens as a draft and
         # leads the body with the hold banner naming the reason.
-        kw = self._cut_created(monkeypatch, clone, line_exists={},
-                               cut_kwargs={"version": "9.0.0", "baseline_unanchored": True})
+        kw = self._cut_created(monkeypatch, clone, line_exists={"9.0": True},
+                              cut_kwargs={"version": "9.0.0", "baseline_unanchored": True})
         assert kw["draft"] is True
         assert "Held as a draft" in kw["body"]
         assert "baseline is unanchored" in kw["body"]
@@ -1485,8 +1112,8 @@ class TestCutOrchestration:
     def test_force_ready_opens_flagged_cut_ready(self, monkeypatch, clone):
         # force_ready overrides the hold: the same flagged cut opens ready, and the
         # banner records that the flags were overridden rather than held.
-        kw = self._cut_created(monkeypatch, clone, line_exists={},
-                               cut_kwargs={"version": "9.0.0", "baseline_unanchored": True,
+        kw = self._cut_created(monkeypatch, clone, line_exists={"9.0": True},
+                              cut_kwargs={"version": "9.0.0", "baseline_unanchored": True,
                                            "force_ready": True})
         assert kw["draft"] is False
         assert "Opened ready despite" in kw["body"]
@@ -1500,7 +1127,7 @@ class TestCutOrchestration:
         # holds: any reviewer-facing signal opens the PR as a draft.
         from scripts.release_notes.models import MergedPR
         triage = (MergedPR(number=7, title="thing", author="bob", url="https://x/7"),)
-        kw = self._cut_created(monkeypatch, clone, line_exists={}, cut_kwargs={},
+        kw = self._cut_created(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
                                triage=triage)
         assert kw["draft"] is True
         assert "PRs need triage" in kw["body"]
@@ -1508,11 +1135,11 @@ class TestCutOrchestration:
     def test_dry_run_previews_hold(self, monkeypatch, clone, capsys):
         # --dry-run shows the hold decision the real cut would make.
         from unittest.mock import MagicMock
-        self._setup(monkeypatch, clone, line_exists={})
+        self._setup(monkeypatch, clone, line_exists={"9.0": True})
         repo = MagicMock()
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.0.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.0.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=True, baseline_unanchored=True,
         )
@@ -1520,25 +1147,6 @@ class TestCutOrchestration:
         assert "PR would open: DRAFT (held)" in out
         assert "baseline is unanchored" in out
 
-    def test_existing_line_not_recreated(self, monkeypatch, clone):
-        from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True})
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
-        repo = MagicMock()
-        repo.get_pulls.return_value = []
-        repo.create_pull.return_value = MagicMock(number=2, html_url="https://x/2")
-        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
-
-        rc.cut(
-            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
-            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
-            security_fixes=None, token="t", git_env={}, dry_run=False,
-        )
-        # No create-line push (branch already exists); only the prep-branch push.
-        line_create = [c for c in calls
-                       if c[:1] == ("push",) and "refs/heads/pre-release-9.1.0" in " ".join(c)]
-        assert line_create == []
 
     def test_recut_fetches_prep_branch_before_force_with_lease(self, monkeypatch, clone):
         # A re-cut of the same stage finds the agent-namespaced prep branch already
@@ -1546,12 +1154,11 @@ class TestCutOrchestration:
         # no basis and would reject with "stale info". Assert the prep branch is
         # fetched (populating the tracking ref) immediately before the lease push.
         from unittest.mock import MagicMock
-        prep = "agent/release-cut/9.1.0-rc2"
+        prep = "agent/release-cut/9.1.0-rc1"
         calls = self._setup(
             monkeypatch, clone,
-            line_exists={"pre-release-9.1.0": True, prep: True},
+            line_exists={"9.1": True, prep: True},
         )
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         repo.create_pull.return_value = MagicMock(number=2, html_url="https://x/2")
@@ -1559,7 +1166,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1581,7 +1188,7 @@ class TestCutOrchestration:
         # On a first cut the prep branch is absent, so there is no tracking ref to
         # refresh; the push creates it. No prep-branch fetch should be issued.
         from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={})
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True})
         repo = MagicMock()
         repo.get_pulls.return_value = []
         repo.create_pull.return_value = MagicMock(number=1, html_url="https://x/1")
@@ -1589,7 +1196,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1599,11 +1206,11 @@ class TestCutOrchestration:
 
     def test_dry_run_pushes_nothing(self, monkeypatch, clone):
         from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={})
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True})
         repo = MagicMock()
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc1",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc1",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=True,
         )
@@ -1617,9 +1224,8 @@ class TestCutOrchestration:
         # leaves the real _contrib_base in place here so the wiring is exercised;
         # promote_and_bump is captured to read what it received.
         from unittest.mock import MagicMock
-        self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True},
+        self._setup(monkeypatch, clone, line_exists={"9.1": True},
                     stub_contrib_base=False)
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
 
         captured = {}
 
@@ -1635,7 +1241,7 @@ class TestCutOrchestration:
 
         rc.cut(
             repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
+            valkey_clone_dir=clone, version="9.1.0", stage="rc2",
             urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
             security_fixes=None, token="t", git_env={}, dry_run=False,
         )
@@ -1643,121 +1249,24 @@ class TestCutOrchestration:
         # notes_base_ref branch), never reaching git describe.
         assert captured["contrib_base"] == "9.0.0"
 
-    def test_contrib_head_on_ga_drain_is_the_line_tip_not_source_ref(self, monkeypatch, clone):
-        # Regression: on a GA that drains a pre-release line, the contributor list
-        # must be collected over the release line (fork_point..origin/pre-release-M.m.p),
-        # not contrib_base..source_ref. source_ref (unstable) has advanced into the
-        # next minor at freeze; crediting to its tip would list unstable's post-freeze
-        # authors instead of the RC-fix authors on the line. cut() feeds the same head
-        # discovery walked (notes_head_ref = the line tip) as contrib_head, so the
-        # credits span exactly the notes range. Reverting contrib_head back to HEAD/
-        # source_ref must fail this test.
-        from unittest.mock import MagicMock
-        # GA drain: pre-release line exists, M.m does not -> rename/drain plan whose
-        # base_ref is the pre-release branch, so _continuing_line_range fires.
-        self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True})
 
-        captured = {}
 
-        def _promote(valkey_clone_dir, **kw):
-            captured["contrib_head"] = kw["contrib_head"]
-            return "NOTES", "VERSION"
-
-        monkeypatch.setattr(rc, "promote_and_bump", _promote)
-        repo = MagicMock()
-
-        rc.cut(
-            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="ga",
-            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
-            contrib_base_ref=None, security_fixes=None, token="t", git_env={}, dry_run=True,
-        )
-        # The line tip _continuing_line_range resolved, not "unstable".
-        assert captured["contrib_head"] == "origin/pre-release-9.1.0"
-
-    def test_failed_pr_rolls_back_a_run_created_line(self, monkeypatch, clone):
-        # The release line is created (step 4) before the prep branch + PR are
-        # known-good (step 5). A GA rename where 9.1 does not yet exist creates it,
-        # then must delete pre-release-9.1.0. If step 5 raises, the freshly created
-        # 9.1 must be rolled back, or 9.1 and pre-release-9.1.0 both sit on
-        # origin, the inconsistent state the next GA hard-refuses.
-        from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True})
-
-        def _boom(*a, **k):
-            raise RuntimeError("prep push / create_pull failed")
-
-        monkeypatch.setattr(rc, "_commit_push_release_pr", _boom)
-        repo = MagicMock()
-
-        with pytest.raises(RuntimeError, match="prep push"):
-            rc.cut(
-                repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-                valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="ga",
-                urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
-                security_fixes=None, token="t", git_env={}, dry_run=False,
-            )
-        # 9.1 was created this run, so the failure rolls it back, with a lease
-        # pinned to the OID it was created at so a concurrently-advanced line is
-        # never blindly deleted.
-        assert (
-            "push", "--force-with-lease=refs/heads/9.1:" + "a" * 40, "origin", "--delete", "9.1"
-        ) in calls, calls
-        # The GA-rename delete of the pre-release branch is never reached (step 6),
-        # so pre-release-9.1.0 is left intact for the retry.
-        assert not any(
-            c[:1] == ("push",) and c[-1] == "pre-release-9.1.0" and "--delete" in c
-            for c in calls
-        ), calls
-        self._assert_worktree_removed(calls, clone)
-
-    def test_failed_pr_leaves_a_preexisting_line_untouched(self, monkeypatch, clone):
-        # A continued cut (the line already exists) never created the line, so a
-        # step-5 failure must NOT delete it: that would destroy a line carrying
-        # prior RCs' history. No rollback delete should fire.
-        from unittest.mock import MagicMock
-        calls = self._setup(monkeypatch, clone, line_exists={"pre-release-9.1.0": True})
-        monkeypatch.setattr(rc, "_warn_rc_sequence", lambda *a, **k: None)
-
-        def _boom(*a, **k):
-            raise RuntimeError("prep push / create_pull failed")
-
-        monkeypatch.setattr(rc, "_commit_push_release_pr", _boom)
-        repo = MagicMock()
-
-        with pytest.raises(RuntimeError, match="prep push"):
-            rc.cut(
-                repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-                valkey_clone_dir=clone, source_ref="unstable", version="9.1.0", stage="rc2",
-                urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None, contrib_base_ref=None,
-                security_fixes=None, token="t", git_env={}, dry_run=False,
-            )
-        # The line pre-existed, so nothing is deleted (neither a plain nor a
-        # lease-guarded delete push fires).
-        assert not [c for c in calls if c[:1] == ("push",) and "--delete" in c], calls
-        self._assert_worktree_removed(calls, clone)
 
 
 class TestNotesRange:
     """The precise base/head-ref + SHA range surfaced in the PR body / dry-run."""
 
     _RANGE = rc._NotesRange(
-        mode="rc2 continuation", source_ref="unstable",
-        target_branch="pre-release-9.2.0", base_ref="origin/pre-release-9.2.0",
-        base_sha="a" * 40, head_ref="unstable", head_sha="b" * 40,
+        mode="rc2", source_ref="9.1",
+        target_branch="9.1", base_ref="9.1.0-rc1",
+        base_sha="a" * 40, head_ref="9.1", head_sha="b" * 40,
     )
 
     def test_plan_mode_fresh_rc1(self) -> None:
-        plan = BranchPlan("rc1", "pre-release-9.1.0", "unstable", False, None)
+        plan = BranchPlan("rc1", "9.1", "9.1")
         assert rc._plan_mode(plan) == "rc1"
 
-    def test_plan_mode_continuation(self) -> None:
-        plan = BranchPlan("rc2", "pre-release-9.1.0", "pre-release-9.1.0", True, None)
-        assert rc._plan_mode(plan) == "rc2 continuation"
 
-    def test_plan_mode_ga_rename(self) -> None:
-        plan = BranchPlan("ga", "9.1", "pre-release-9.1.0", True, "pre-release-9.1.0")
-        assert rc._plan_mode(plan) == "ga rename"
 
     def test_short_sha_abbreviates_full_sha(self) -> None:
         assert rc._short_sha("a" * 40) == "a" * 12
@@ -1772,18 +1281,18 @@ class TestNotesRange:
     def test_range_lines_show_mode_refs_and_shas(self) -> None:
         lines = rc._notes_range_lines(self._RANGE)
         assert lines == [
-            "mode: rc2 continuation",
-            "source_ref: unstable",
-            "target_branch: pre-release-9.2.0",
-            "base: origin/pre-release-9.2.0 @ aaaaaaaaaaaa",
-            "head: unstable @ bbbbbbbbbbbb",
+            "mode: rc2",
+            "source_ref: 9.1",
+            "target_branch: 9.1",
+            "base: 9.1.0-rc1 @ aaaaaaaaaaaa",
+            "head: 9.1 @ bbbbbbbbbbbb",
         ]
 
     def test_body_section_renders_fenced_block(self) -> None:
         section = rc._notes_range_body_section(self._RANGE, regen=None)
-        assert "`origin/pre-release-9.2.0..unstable`" in section
-        assert "mode: rc2 continuation" in section
-        assert "base: origin/pre-release-9.2.0 @ aaaaaaaaaaaa" in section
+        assert "`9.1.0-rc1..9.1`" in section
+        assert "mode: rc2" in section
+        assert "base: 9.1.0-rc1 @ aaaaaaaaaaaa" in section
         assert section.count("```") == 2  # fenced code block
 
     def test_body_section_falls_back_when_range_missing(self) -> None:
@@ -1810,15 +1319,15 @@ class TestNotesRange:
         sha = git_output(repo, "rev-parse", "HEAD").strip()
 
         from unittest.mock import MagicMock
-        plan = BranchPlan("rc2", "pre-release-9.1.0", "pre-release-9.1.0", True, None)
+        plan = BranchPlan("rc2", "9.1", "9.1")
         regen = MagicMock(base_tag="unstable")  # a resolvable ref for this fixture repo
         # head_ref is the ref discovery actually walked (the line tip on a
         # continuing cut); here both ends point at the fixture's single commit.
         rng = rc._resolve_notes_range(
-            repo, plan, source_ref="unstable", head_ref="unstable", regen=regen
+            repo, plan, head_ref="unstable", regen=regen
         )
-        assert rng.mode == "rc2 continuation"
-        assert rng.target_branch == "pre-release-9.1.0"
+        assert rng.mode == "rc2"
+        assert rng.target_branch == "9.1"
         assert rng.base_sha == sha
         assert rng.head_sha == sha
 
@@ -1880,7 +1389,7 @@ class TestDedupAgainstDestination:
     the final RC. These cover the dedup that keeps promotion idempotent anyway.
     """
 
-    _GA_PLAN = BranchPlan("ga", "9.1", "pre-release-9.1.0", True, "pre-release-9.1.0")
+    _GA_PLAN = BranchPlan("ga", "9.1", "9.1")
 
     @staticmethod
     def _meta(already_credited, noted_bullet_count):
@@ -1979,14 +1488,9 @@ class TestDedupAgainstDestination:
         # Drive cut() with git/GitHub/promote stubbed; assert the dedup + warning.
         from scripts.release_notes import release_cut as rcmod
         monkeypatch.setattr(rcmod, "resolve_branch_plan", lambda *a, **k: self._GA_PLAN)
-        monkeypatch.setattr(rcmod, "_remote_branch_exists", lambda d, b: True)
+        monkeypatch.setattr(rcmod, "_remote_branch_exists", lambda d, b: b == "9.1")
         monkeypatch.setattr(rcmod, "run_git", lambda *a, **k: None)
-        # This test targets the already-credited dedup, not the topology walk;
-        # stub _continuing_line_range so no real merge-base runs against the clone.
-        monkeypatch.setattr(
-            rcmod, "_continuing_line_range",
-            lambda repo_dir, pln, *, source_ref, git_env: ("forksha", f"origin/{pln.base_ref}"),
-        )
+        monkeypatch.setattr(rcmod, "git_output", lambda *a, **k: "a" * 40)
         monkeypatch.setattr(rcmod, "_read",
                             lambda p: dest_notes if p.endswith("00-RELEASENOTES")
                             else open(os.path.join(clone, "src", "version.h")).read())
@@ -2000,7 +1504,7 @@ class TestDedupAgainstDestination:
 
         rcmod.cut(
             object(), repo_full_name="valkey-io/valkey", source_clone_dir=clone,
-            valkey_clone_dir=clone, source_ref="unstable", version="9.1.0",
+            valkey_clone_dir=clone, version="9.1.0",
             stage="ga", urgency="LOW", date="2026-06-29", tag_glob=None,
             base_ref=None, contrib_base_ref=None, security_fixes=None,
             token="t", git_env={}, dry_run=True,
@@ -2011,443 +1515,18 @@ class TestDedupAgainstDestination:
         assert captured["already"] == [44]
 
 
-class TestContinuingCutBaseline:
-    """A continuing cut (rc2+, GA drain) anchors discovery to the release line.
-
-    The rc2+ default is a `<version>-rc*` tag glob, but this workflow never pushes
-    RC tags and the fork carries none, so `git describe --match` would fail with
-    "no tag reachable" and abort the cut. cut() must instead anchor discovery to
-    plan.base_ref (the pre-release / M.m line) and drop the doomed glob, while
-    leaving an explicit --base-ref and rc1 first cuts untouched.
-    """
-
-    _RC_CONTINUE_PLAN = BranchPlan("rc2", "pre-release-9.1.0", "pre-release-9.1.0", True, None)
-    _RC_FIRST_PLAN = BranchPlan("rc1", "pre-release-9.1.0", "unstable", False, None)
-
-    @staticmethod
-    def _capture_regen(monkeypatch, captured):
-        # Stub the whole cut() surface below discovery; record exactly what
-        # regenerate_unreleased was handed, then abort the run so no worktree /
-        # PR machinery has to be mocked.
-        from scripts.release_notes import pipeline as pipeline_mod
-
-        def _regen(repo, clone_dir, *, head_ref, tag_glob, base_ref):
-            captured["head_ref"] = head_ref
-            captured["tag_glob"] = tag_glob
-            captured["base_ref"] = base_ref
-            raise _StopCut
-
-        monkeypatch.setattr(pipeline_mod, "regenerate_unreleased", _regen)
-
-    def _run(self, monkeypatch, *, plan, base_ref, tag_glob, tag_glob_derived=False,
-             prev_release=None, root="rootsha", baseline_unanchored=False):
-        captured = {}
-        self._capture_regen(monkeypatch, captured)
-        monkeypatch.setattr(rc, "resolve_branch_plan", lambda *a, **k: plan)
-        # Stub the git topology walk: this class tests the base/head wiring, not
-        # merge-base itself (covered by TestContinuingLineRange). Return a fixed
-        # fork point + line ref so no real repo is needed.
-        monkeypatch.setattr(
-            rc, "_continuing_line_range",
-            lambda repo_dir, pln, *, source_ref, git_env: ("forksha", f"origin/{pln.base_ref}"),
-        )
-        # Stub previous-release resolution (a non-continuing first cut with a
-        # derived glob consults it); prev_release=None models the first-release-ever
-        # fallback, a ("tag", "sha") tuple models a resolvable previous release.
-        monkeypatch.setattr(
-            rc.discover_mod, "resolve_previous_release_tag",
-            lambda repo_dir, version: prev_release,
-        )
-        # Stub the root-commit resolution the unanchored guard uses so no real repo
-        # is needed; root=None models an unreadable history (guard cannot degrade).
-        monkeypatch.setattr(rc, "_root_commit", lambda repo_dir, ref="HEAD": root)
-        with pytest.raises(_StopCut):
-            rc.cut(
-                object(), repo_full_name="valkey-io/valkey", source_clone_dir="/d",
-                valkey_clone_dir="/d", source_ref="unstable", version="9.1.0",
-                stage=plan.stage, urgency="LOW", date="2026-06-29",
-                tag_glob=tag_glob, tag_glob_derived=tag_glob_derived, base_ref=base_ref,
-                contrib_base_ref=None,
-                security_fixes=None, token="t", git_env={}, dry_run=True,
-                baseline_unanchored=baseline_unanchored,
-            )
-        return captured
-
-    def test_rc2_no_base_ref_walks_the_line_and_drops_glob(self, monkeypatch) -> None:
-        # rc2+ arrives with base_ref=None and tag_glob="9.1.0-rc*". cut() must
-        # discover the line itself: head = origin/pre-release-9.1.0 (the line tip,
-        # from _continuing_line_range), base = the fork point (stubbed "forksha"),
-        # glob cleared. Not pre-release-9.1.0..unstable (which would note the next
-        # minor's PRs and miss the RC fixes), and not a describe --match with no tag.
-        captured = self._run(
-            monkeypatch, plan=self._RC_CONTINUE_PLAN,
-            base_ref=None, tag_glob="9.1.0-rc*",
-        )
-        assert captured["head_ref"] == "origin/pre-release-9.1.0"
-        assert captured["base_ref"] == "forksha"
-        assert captured["tag_glob"] is None
-
-    def test_explicit_base_ref_on_continuing_cut_is_not_overridden(self, monkeypatch) -> None:
-        # A maintainer-supplied --base-ref always wins, glob stays cleared as passed.
-        captured = self._run(
-            monkeypatch, plan=self._RC_CONTINUE_PLAN,
-            base_ref="8.0.0", tag_glob=None,
-        )
-        assert captured["base_ref"] == "8.0.0"
-        assert captured["tag_glob"] is None
-
-    def test_rc1_first_cut_baseline_untouched(self, monkeypatch) -> None:
-        # rc1 first cut does not continue a line (plan.continuing is False), so the
-        # derived-base / nearest-tag inputs pass through verbatim.
-        captured = self._run(
-            monkeypatch, plan=self._RC_FIRST_PLAN,
-            base_ref="9.0.0", tag_glob=None,
-        )
-        assert captured["base_ref"] == "9.0.0"
-        assert captured["tag_glob"] is None
-
-    def test_rc1_unanchored_degrades_to_root_not_abort(self, monkeypatch) -> None:
-        # The claim's scenario: rc1 whose repo has no previous release (first release
-        # ever / tagless fork). main.py resolved no baseline (base_ref None, glob None)
-        # and set baseline_unanchored=True. Handing None/None to discovery would call
-        # resolve_last_tag(unstable), which finds no reachable tag in the fork-at-freeze
-        # model and raises, aborting the cut before the unanchored banner renders. The
-        # guard must instead degrade to root..head so the cut proceeds as a draft PR.
-        captured = self._run(
-            monkeypatch, plan=self._RC_FIRST_PLAN,
-            base_ref=None, tag_glob=None, baseline_unanchored=True, root="rootsha",
-        )
-        assert captured["base_ref"] == "rootsha"   # degraded to root, not None -> no abort
-        assert captured["tag_glob"] is None
-        assert captured["head_ref"] == "unstable"  # first cut still walks source_ref
-
-    def test_explicit_glob_on_first_cut_is_preserved(self, monkeypatch) -> None:
-        # A non-continuing first cut carrying an *explicit* --tag-glob (tag_glob_derived
-        # False, the _run default) is the maintainer's intent: it is passed straight to
-        # discovery, not rewritten to a previous-release baseline. Resolve-or-fail-loud
-        # is the explicit-override contract, same as --base-ref.
-        captured = self._run(
-            monkeypatch, plan=self._RC_FIRST_PLAN,
-            base_ref=None, tag_glob="9.1.0-rc*",
-        )
-        assert captured["base_ref"] is None
-        assert captured["tag_glob"] == "9.1.0-rc*"
-
-    # A mis-dispatched rc2 (no pre-release line yet) resolves to a non-continuing
-    # plan carrying the rc_warning, but based on source_ref with a *derived* rc glob.
-    _RC2_MISDISPATCH_PLAN = BranchPlan(
-        "rc2", "pre-release-9.1.0", "unstable", False, None,
-        rc_warning="rc2 dispatched but pre-release-9.1.0 does not exist yet",
-    )
-
-    def test_misdispatched_rc2_derived_glob_anchors_to_prev_release(self, monkeypatch) -> None:
-        # The fix: a mis-dispatched rc2 (non-continuing, derived "9.1.0-rc*" glob)
-        # would otherwise abort in resolve_last_tag (no such tag on unstable in the
-        # fork-at-freeze model), swallowing the rc_warning. Instead the derived glob
-        # is swapped for the resolved previous-release tag so the cut proceeds and
-        # the warning reaches the (draft) PR.
-        captured = self._run(
-            monkeypatch, plan=self._RC2_MISDISPATCH_PLAN,
-            base_ref=None, tag_glob="9.1.0-rc*", tag_glob_derived=True,
-            prev_release=("9.0.0", "sha0"),
-        )
-        assert captured["base_ref"] == "9.0.0"  # previous release, not the doomed glob
-        assert captured["tag_glob"] is None
-        assert captured["head_ref"] == "unstable"  # first cut still walks source_ref
-
-    def test_first_release_ever_derived_glob_degrades_to_root(self, monkeypatch) -> None:
-        # No earlier release resolves (first release ever / tagless fork): drop the
-        # derived glob and flag the baseline unanchored, then the unanchored guard
-        # degrades to the root commit so discovery walks root..head instead of
-        # handing None/None to resolve_last_tag (which would find no reachable tag on
-        # unstable in the fork-at-freeze model and abort the cut).
-        captured = self._run(
-            monkeypatch, plan=self._RC2_MISDISPATCH_PLAN,
-            base_ref=None, tag_glob="9.1.0-rc*", tag_glob_derived=True,
-            prev_release=None, root="rootsha",
-        )
-        assert captured["base_ref"] == "rootsha"  # degraded to root, not None
-        assert captured["tag_glob"] is None
-        assert captured["head_ref"] == "unstable"
-
-    def test_unanchored_without_readable_root_stays_none(self, monkeypatch) -> None:
-        # If even the root cannot be read (an empty or corrupt clone), the guard
-        # cannot degrade: base_ref stays None and the original resolve_last_tag path
-        # runs (and would abort). Documents that the guard is best-effort, not a
-        # guarantee the cut always proceeds.
-        captured = self._run(
-            monkeypatch, plan=self._RC2_MISDISPATCH_PLAN,
-            base_ref=None, tag_glob="9.1.0-rc*", tag_glob_derived=True,
-            prev_release=None, root=None,
-        )
-        assert captured["base_ref"] is None
-        assert captured["tag_glob"] is None
 
 
-class _StopCut(Exception):
-    """Sentinel to abort cut() right after the discovery call in baseline tests."""
 
 
-class TestContinuingLineRange:
-    """The fork-at-freeze range fix: a continuing cut walks the release line.
 
-    Builds a real fork-at-freeze topology and drives _continuing_line_range +
-    list_range_commits so the assertions are on the actual commits discovery would
-    see, not on mocked refs. This is the regression guard for the high-severity bug
-    where a continuing cut walked pre-release..unstable, noting the next minor's
-    PRs and missing the RC fixes that live only on the line.
-    """
-
-    @staticmethod
-    def _fork_at_freeze_repo(tmp_path):
-        # A single repo standing in for the clone. The pre-release line is
-        # registered under `origin/<name>`, matching how _continuing_line_range /
-        # _resolve_base_ref reach it (the real clone is --branch source_ref, so the
-        # line exists only as origin/<name>). `run_git fetch origin <line>` is a
-        # harmless no-op against a local repo that already has the ref.
-        from scripts.common.proc import git_output, run_git
-        repo = str(tmp_path / "r")
-        os.makedirs(repo)
-        run_git(repo, "init", "-q", "-b", "unstable")
-        run_git(repo, "config", "user.email", "t@t")
-        run_git(repo, "config", "user.name", "t")
-
-        def commit(subject):
-            run_git(repo, "commit", "-q", "--allow-empty", "-m", subject)
-            return git_output(repo, "rev-parse", "HEAD").strip()
-
-        commit("prev GA 9.0.0 (#100)")
-        run_git(repo, "tag", "9.0.0")
-        commit("work before freeze (#150)")
-        # Freeze: the line forks from unstable here. Build it as a real
-        # pre-release-9.1.0 branch first, then expose it as a remote-tracking ref
-        # (origin/pre-release-9.1.0) via a self-remote, so _continuing_line_range's
-        # `fetch origin <line>` succeeds exactly as it would against the real clone.
-        run_git(repo, "branch", "pre-release-9.1.0")
-        # unstable advances into the next minor (9.2 dev) after the freeze.
-        commit("9.2 dev work (#300)")
-        commit("more 9.2 dev (#301)")
-        # RC fixes land only on the pre-release line.
-        run_git(repo, "checkout", "-q", "pre-release-9.1.0")
-        commit("rc fix a (#200)")
-        commit("rc fix b (#201)")
-        run_git(repo, "checkout", "-q", "unstable")
-        # Register the repo as its own origin and fetch, so origin/pre-release-9.1.0
-        # exists as a remote-tracking ref (the clone's real shape).
-        run_git(repo, "remote", "add", "origin", repo)
-        run_git(repo, "fetch", "-q", "origin")
-        return repo
-
-    def test_range_covers_rc_fixes_and_excludes_next_minor(self, tmp_path) -> None:
-        from scripts.release_notes.discover import list_range_commits
-
-        repo = self._fork_at_freeze_repo(tmp_path)
-        plan = BranchPlan("rc2", "pre-release-9.1.0", "pre-release-9.1.0", True, None)
-        fork_point, line_ref = rc._continuing_line_range(
-            repo, plan, source_ref="unstable", git_env={}
-        )
-        assert line_ref == "origin/pre-release-9.1.0"
-
-        # The commits discovery would actually resolve over the fixed range.
-        commits = list_range_commits(repo, fork_point, line_ref)
-        subjects = " ".join(subj for _sha, subj, _body in commits)
-        # RC fixes on the line are present...
-        assert "#200" in subjects and "#201" in subjects
-        # ...and the next minor's post-freeze unstable PRs are not.
-        assert "#300" not in subjects and "#301" not in subjects
-
-    def test_old_buggy_range_would_have_been_exactly_wrong(self, tmp_path) -> None:
-        # Pin the bug the fix corrects: the prior range (pre-release..unstable) is
-        # wrong in both directions. Documents why the fix is needed and fails if
-        # someone reverts to walking source_ref as the head.
-        from scripts.release_notes.discover import list_range_commits
-
-        repo = self._fork_at_freeze_repo(tmp_path)
-        buggy = list_range_commits(repo, "origin/pre-release-9.1.0", "unstable")
-        buggy_subjects = " ".join(subj for _sha, subj, _body in buggy)
-        assert "#300" in buggy_subjects and "#301" in buggy_subjects  # noted wrongly
-        assert "#200" not in buggy_subjects and "#201" not in buggy_subjects  # missed
-
-    def test_guard_rejects_non_ancestor_fork_point(self, tmp_path, monkeypatch) -> None:
-        # The ancestor guard fails closed: if merge-base resolves something that is
-        # not an ancestor of the line tip (a mis-wire, a rewritten line), refuse
-        # rather than cut a wrong/empty range.
-        from scripts.common.proc import git_output
-        repo = self._fork_at_freeze_repo(tmp_path)
-        plan = BranchPlan("rc2", "pre-release-9.1.0", "pre-release-9.1.0", True, None)
-        # Force merge-base to return an unrelated commit (the unstable tip), which
-        # is not an ancestor of the line tip; the real --is-ancestor check runs.
-        unstable_tip = git_output(repo, "rev-parse", "unstable").strip()
-        real_git_output = rc.git_output
-
-        def _fake(repo_dir, *a, **k):
-            if a[:1] == ("merge-base",) and "--is-ancestor" not in a:
-                return unstable_tip + "\n"
-            return real_git_output(repo_dir, *a, **k)
-
-        monkeypatch.setattr(rc, "git_output", _fake)
-        with pytest.raises(ValueError, match="not an ancestor"):
-            rc._continuing_line_range(repo, plan, source_ref="unstable", git_env={})
-
-
-class TestMisdispatchSurfacesWarning:
-    """A mis-dispatched rc2+/GA must reach a human, not abort opaquely.
-
-    Regression for the finding: a non-continuing rc2+ (no pre-release line yet)
-    arrives with a derived `<version>-rc*` glob; in valkey's fork-at-freeze model
-    unstable carries no such tag, so resolve_last_tag would raise and abort the cut
-    before any PR opened, swallowing the rc-out-of-sequence warning resolve_branch_plan
-    built. These tests do not mock discovery: real resolve_branch_plan +
-    regenerate_unreleased + discover run against a real clone. Only the AI generate
-    step and the GitHub API are stubbed.
-    """
-
-    @staticmethod
-    def _repo_no_prerelease_line(tmp_path):
-        # A real clone with the release files the worktree step reads (00-RELEASENOTES,
-        # src/version.h), copied from the shared fixture, plus real history: a 9.0.0
-        # release tag (so resolve_previous_release_tag resolves for real) and an
-        # unstable branch with post-release work, but no pre-release-9.1.0 line.
-        # Registered as its own origin so _remote_branch_exists (ls-remote) and the
-        # worktree's origin/<name> refs behave as in a real clone.
-        from scripts.common.proc import run_git
-        repo = str(tmp_path / "r")
-        shutil.copytree(_FIXTURE_CLONE, repo)
-        run_git(repo, "init", "-q", "-b", "unstable")
-        run_git(repo, "config", "user.email", "t@t")
-        run_git(repo, "config", "user.name", "t")
-        run_git(repo, "add", "-A")
-        run_git(repo, "commit", "-q", "-m", "prev GA (#100)")
-        run_git(repo, "tag", "9.0.0")
-        run_git(repo, "commit", "-q", "--allow-empty", "-m", "post-release work (#150)")
-        run_git(repo, "remote", "add", "origin", repo)
-        run_git(repo, "fetch", "-q", "origin")
-        return repo
-
-    def test_misdispatched_rc2_opens_held_draft_with_warning(self, tmp_path, monkeypatch, capsys):
-        # rc2 with no pre-release-9.1.0 line yet: a mis-dispatch. The cut must not
-        # abort in resolve_last_tag; it resolves the previous-release baseline, runs
-        # discovery for real, and the dry-run shows a held draft naming the rc
-        # warning, so a human sees the mis-dispatch.
-        from unittest.mock import MagicMock
-
-        from github.GithubException import UnknownObjectException
-
-        repo = self._repo_no_prerelease_line(tmp_path)
-        # Real discovery runs (9.0.0..unstable finds the #150 commit). The GitHub
-        # API is the only external boundary: 404 the PR lookup so the commit lands
-        # in unresolved and the range carries no included PR -> generate is never
-        # reached, no model runs. The cut still proceeds to the hold decision.
-        gh_repo = MagicMock()
-        gh_repo.get_pull.side_effect = UnknownObjectException(404, {"message": "Not Found"}, {})
-        rc.cut(
-            gh_repo, repo_full_name="valkey-io/valkey", source_clone_dir=repo,
-            valkey_clone_dir=repo, source_ref="unstable", version="9.1.0", stage="rc2",
-            urgency="LOW", date="2026-06-25", tag_glob="9.1.0-rc*", tag_glob_derived=True,
-            base_ref=None, contrib_base_ref=None, security_fixes=None,
-            token="t", git_env={}, dry_run=True,
-        )
-        out = capsys.readouterr().out
-        # The cut proceeded to the hold decision (did not abort), and the draft-hold
-        # names the mis-dispatch warning.
-        assert "DRAFT (held)" in out
-        assert "rc out of sequence" in out
-        # Discovery anchored to the previous release, not a doomed rc glob.
-        assert "9.0.0" in out
-
-    @staticmethod
-    def _labelled_pull(number, *, title, labels):
-        # A minimal PyGithub-shaped pull for the range PR: enough fields for
-        # hydrate_prs/_build_merged_pr and _is_backport_pull to read real strings
-        # (never MagicMock auto-vivified attrs, which crash the regex paths).
-        from unittest.mock import MagicMock
-        pull = MagicMock()
-        pull.number = number
-        pull.title = title
-        pull.user.login = "alice"
-        pull.html_url = f"https://x/{number}"
-        pull.body = "the PR description"
-        pull.merge_commit_sha = ""
-        pull.head.ref = "feature/x"
-        label_mocks = []
-        for name in labels:
-            m = MagicMock()
-            m.name = name
-            label_mocks.append(m)
-        pull.labels = label_mocks
-        return pull
-
-    def test_misdispatched_rc2_generates_notes_and_holds(self, tmp_path, monkeypatch, capsys):
-        # The full path with real discovery + classify + render: the range PR
-        # resolves to a real release-noted PR, only the AI `generate` step is
-        # stubbed. The rendered dated section must carry the generated bullet and
-        # the cut must still open a held draft naming the mis-dispatch warning, so
-        # a real note is produced without swallowing the warning.
-        from scripts.release_notes import pipeline as pipeline_mod
-        from scripts.release_notes.models import CategorizedBullet, GenerationResult
-
-        repo = self._repo_no_prerelease_line(tmp_path)
-        # The range commit (#150) now resolves to a real labelled PR, so classify
-        # INCLUDEs it and generation runs. get_pull returns that PR for #150.
-        pull = self._labelled_pull(
-            150, title="Add a useful cluster feature", labels=("release-notes",)
-        )
-        gh_repo = self._gh_repo_serving({150: pull})
-        # Stub only the AI boundary: return one bullet for #150. Everything below
-        # (discover, hydrate, classify) and above (dedup, group, render) is real.
-        # author mirrors the factual re-stamp the real generate applies from the PR
-        # (never model-supplied), so render appends the "by @alice" credit.
-        monkeypatch.setattr(
-            pipeline_mod.generate_mod, "generate",
-            lambda include, **k: GenerationResult(
-                bullets=(CategorizedBullet(
-                    pr_number=150, author="alice", category="Bug Fixes",
-                    text="Add a useful cluster feature",
-                ),),
-                skipped=(),
-            ),
-        )
-        rc.cut(
-            gh_repo, repo_full_name="valkey-io/valkey", source_clone_dir=repo,
-            valkey_clone_dir=repo, source_ref="unstable", version="9.1.0", stage="rc2",
-            urgency="LOW", date="2026-06-25", tag_glob="9.1.0-rc*", tag_glob_derived=True,
-            base_ref=None, contrib_base_ref=None, security_fixes=None,
-            token="t", git_env={}, dry_run=True,
-        )
-        out = capsys.readouterr().out
-        # A real dated section was rendered with the generated bullet (render
-        # appends the "(#150)" ref and "by @alice" credit, proving the full
-        # generate -> dedup -> group -> render path ran).
-        assert "Valkey 9.1.0-rc2" in out
-        assert "Add a useful cluster feature by @alice (#150)" in out
-        # ...and the mis-dispatch still holds the PR as a draft with its warning.
-        assert "DRAFT (held)" in out
-        assert "rc out of sequence" in out
-
-    @staticmethod
-    def _gh_repo_serving(pulls):
-        # A GitHub repo mock whose get_pull serves the given {number: pull} and
-        # 404s anything else (an unknown number is a cross-repo / issue ref).
-        from unittest.mock import MagicMock
-
-        from github.GithubException import UnknownObjectException
-
-        repo = MagicMock()
-
-        def _get_pull(number):
-            if number in pulls:
-                return pulls[number]
-            raise UnknownObjectException(404, {"message": "Not Found"}, {})
-
-        repo.get_pull.side_effect = _get_pull
-        return repo
 
 
 class TestSecurityOnlyCutNotEmpty:
     """A cut carrying only security_fixes must not be flagged empty or held."""
 
-    _RC_PLAN = BranchPlan("rc1", "9.1", "unstable", False, "unstable")
-    _GA_PLAN = BranchPlan("ga", "9.1", "pre-release-9.1.0", True, "pre-release-9.1.0")
+    _RC_PLAN = BranchPlan("rc1", "9.1", "9.1")
+    _GA_PLAN = BranchPlan("ga", "9.1", "9.1")
 
     @staticmethod
     def _regen(bullet_count=0, had_prs=False, triage=()):

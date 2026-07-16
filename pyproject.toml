@@ -5,7 +5,7 @@ description = "CI automation agent for the Valkey project"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "PyGithub>=2.1.0",
+    "PyGithub>=2.6.0",
     "PyYAML>=6.0",
 ]
 

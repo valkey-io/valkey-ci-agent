@@ -1,16 +1,8 @@
 """Render the 00-RELEASENOTES dated release sections.
 
-Owns valkey's release-notes format. A cut hands this module the categorized
-bullets for the range (a ``{category: [bullet, ...]}`` map produced by
-:mod:`render`) and it renders a dated release section, prepends the release
-line's prior dated sections, and appends the cumulative contributor footer.
-Upstream ``valkey-io/valkey`` ships no release tooling of its own, so this is
-the single authoritative place the dated-section format lives.
-
-The bullets are always carried as an in-memory map and rendered straight into a
-dated section: nothing is ever written to a branch as an "unreleased" block.
-The render/measure helpers are pure (no I/O, no network) so they are cheap to
-unit test.
+Owns valkey's release-notes format: renders categorized bullets into a dated
+section, prepends the release line's prior sections, and appends the cumulative
+contributor footer. All helpers are pure (no I/O).
 """
 
 from __future__ import annotations
@@ -19,15 +11,7 @@ import datetime
 import re
 from typing import Dict, List, Optional, Sequence
 
-# Canonical category order. The generator assigns each bullet to one of these;
-# dated sections render them in this order. The set is intentionally exhaustive:
-# every release-notes-labelled PR should have a natural home, and "Other Changes"
-# is the catch-all so a change that fits none of the specific buckets still lands
-# somewhere rather than forcing the model to invent a header. The specific
-# categories beyond the original eight (Cluster and Replication, Configuration,
-# CLI and Tools) cover surfaces valkey release notes have historically used that
-# the eight did not (cluster/replication changes, config option changes, and the
-# valkey-cli / valkey-benchmark family), so the model rarely needs the catch-all.
+# Canonical category order; dated sections render in this order.
 CATEGORIES: List[str] = [
     "Behavior Changes",
     "New Features and Enhanced Behavior",
@@ -43,24 +27,16 @@ CATEGORIES: List[str] = [
     "Other Changes",        # catch-all: a user-facing change fitting none of the above
 ]
 
-# The catch-all bucket. A category the generator returns that is not in
-# CATEGORIES is treated as a suggestion, not a new header: the bullet lands here
-# (see render.group_bullets) and the suggestion is surfaced in the PR body. Must
-# be one of CATEGORIES.
+# Catch-all for bullets with non-canonical categories. Must be in CATEGORIES.
 CATCH_ALL_CATEGORY = "Other Changes"
 
-# Security fixes are supplied at release-cut time from the embargo CVE list
-# (--security-fix) and render first, ahead of the canonical categories.
+# Renders first, ahead of canonical categories.
 SECURITY_CATEGORY = "Security Fixes"
 
-# The contributor list is generated from the commit authors of the release
-# range (contributors.py), deduplicated and alpha-sorted, not hand-edited.
+# Generated from commit authors of the release range, deduped and alpha-sorted.
 CONTRIBUTORS_SECTION = "Contributors"
 
-# Sections that are populated automatically at release time from a factual
-# source (the CVE list / the range's commit authors), so a bullet the generator
-# assigns to one of these is refused rather than rendered (:mod:`render`'s
-# ``group_bullets`` drops it and warns), keeping them the sole source of truth.
+# Auto-populated at release time; model-assigned bullets under these are refused.
 RESERVED_SECTIONS = (SECURITY_CATEGORY, CONTRIBUTORS_SECTION)
 
 # Upgrade urgency legend rendered at the top of a release-branch notes file.
@@ -91,8 +67,7 @@ _ORDINALS = [
 def parse_version(version: str) -> "tuple[int, int, int]":
     """Split ``"M.m.p"`` into integer ``(major, minor, patch)``.
 
-    Each component must be an integer in the inclusive range 0-255 so it fits
-    a single byte of ``VALKEY_VERSION_NUM`` (see version_bump.py).
+    Each component must be 0-255 (one byte of VALKEY_VERSION_NUM).
     """
     match = _VERSION_RE.match(version.strip())
     if not match:
@@ -116,15 +91,9 @@ def ordinal(n: int) -> str:
 
 
 def unrecognized_categories(notes: "Dict[str, List[str]]") -> List[str]:
-    """Return the names of bullet-bearing categories that are not canonical.
+    """Return category names in *notes* that are not in CATEGORIES.
 
-    The generator may assign a bullet to a typo'd (``Bug Fix`` for ``Bug Fixes``)
-    or invented (``Networking``) category. Such bullets are still rendered
-    verbatim in the dated section (nothing is dropped), but they fall outside
-    :data:`CATEGORIES`, so callers warn on them and ask a maintainer to
-    recategorize. Reserved sections (:data:`RESERVED_SECTIONS`) are excluded:
-    ``group_bullets`` already refuses those. Categories with no bullets are
-    ignored. Order follows *notes*.
+    Reserved sections are excluded. Empty categories are ignored.
     """
     known = set(CATEGORIES) | set(RESERVED_SECTIONS)
     return [
@@ -135,11 +104,7 @@ def unrecognized_categories(notes: "Dict[str, List[str]]") -> List[str]:
 
 
 def _format_date(date: str) -> str:
-    """Render *date* as ``"Tue 02 June 2026"``.
-
-    Accepts an ISO ``YYYY-MM-DD`` string (reformatted) or any other string
-    (returned unchanged, so callers may pass a pre-formatted display date).
-    """
+    """Render *date* as ``"Tue 02 June 2026"``. Passes non-ISO strings unchanged."""
     try:
         parsed = datetime.date.fromisoformat(date.strip())
     except ValueError:
@@ -197,22 +162,9 @@ def render_version_section(
 ) -> str:
     """Render one dated release section in release-branch markdown form.
 
-    *notes* maps category name to a list of bullet strings (already including
-    the leading ``* ``). Only non-empty categories are emitted, in
-    :data:`CATEGORIES` order, with ``Security Fixes`` (from *security_fixes*)
-    rendered first. Any non-canonical category (a typo'd or invented header) is
-    rendered verbatim *after* the canonical ones so its bullets are never dropped;
-    callers warn on them via :func:`unrecognized_categories`. The reserved
-    sections (:data:`RESERVED_SECTIONS`) are never read from *notes*: a
-    ``Security Fixes`` or ``Contributors`` section a contributor hand-added to the
-    block is ignored here, since *security_fixes* is the source of truth for the
-    former and the latter is rendered once for the whole file (not per section).
-    *security_fixes* is an optional list of CVE bullet strings.
-
-    Contributors are deliberately *not* rendered here: a single cumulative
-    ``### Contributors`` footer for the whole file is rendered by
-    :func:`render_contributors_footer` and assembled in
-    :func:`render_release_notes`.
+    Emits Security Fixes (from *security_fixes*) first, then canonical
+    categories in order, then any non-canonical categories last. Contributors
+    are rendered separately as a cumulative file footer.
     """
     stage = _normalize_stage(stage)
     urgency = urgency.strip().upper()
@@ -228,24 +180,16 @@ def render_version_section(
     def emit_category(name: str, bullets: Sequence[str]) -> None:
         out.append("### {}".format(name))
         for bullet in bullets:
-            # Normalize every bullet to the "* " marker: strip any leading "* "/"- "
-            # and re-emit with "* ", so the rendered section is uniform regardless of
-            # which marker the input carried.
             out.append("* " + _strip_bullet(bullet))
         out.append("")
 
-    # Security Fixes come only from *security_fixes* (the embargo CVE list), never
-    # from *notes*: group_bullets refuses a bullet the model assigned to a reserved
-    # section, so this header cannot be duplicated.
     if security_fixes:
         emit_category(SECURITY_CATEGORY, list(security_fixes))
     for category in CATEGORIES:
         bullets = notes.get(category)
         if bullets:
             emit_category(category, bullets)
-    # Non-canonical categories (typo'd or invented headers) are rendered last,
-    # verbatim and in their original order, so a miscategorized note is never
-    # silently dropped; unrecognized_categories() lets callers warn about them.
+    # Non-canonical categories rendered last so nothing is silently dropped.
     for category in unrecognized_categories(notes):
         emit_category(category, notes[category])
 
@@ -267,11 +211,7 @@ def _split_contributors_footer(text: str) -> "tuple[str, List[str]]":
     """Split *text* at its trailing ``### Contributors`` section.
 
     Returns ``(body, contributors)`` where *body* is everything before the last
-    ``### Contributors`` header (right-stripped) and *contributors* is the list of
-    display names parsed from that section (bullet markers removed). When no such
-    header exists, returns ``(text, [])``. Using the *last* header means a legacy
-    per-section ``### Contributors`` is folded into the cumulative footer on the
-    next cut, migrating old files to the single-footer layout.
+    such header and *contributors* is the list of display names from that section.
     """
     matches = list(_CONTRIBUTORS_HEADER_RE.finditer(text))
     if not matches:
@@ -291,10 +231,7 @@ def _split_contributors_footer(text: str) -> "tuple[str, List[str]]":
 def render_contributors_footer(contributors: Sequence[str]) -> str:
     """Render the cumulative ``### Contributors`` footer, deduped and alpha-sorted.
 
-    *contributors* is a list of display strings (``"Jane Doe @jdoe"``), possibly
-    with duplicates carried across cuts. They are de-duplicated case-insensitively
-    (first spelling wins) and sorted by the display-name portion before ``@``,
-    matching :mod:`contributors`. Returns ``""`` when the list is empty.
+    Returns ``""`` when the list is empty.
     """
     seen: set = set()
     unique: List[str] = []
@@ -308,8 +245,6 @@ def render_contributors_footer(contributors: Sequence[str]) -> str:
             unique.append(name)
     if not unique:
         return ""
-    # Split on the last " @" so a display name containing " @" keeps its full name
-    # and only the trailing @handle is dropped (matches contributors._sort_key).
     unique.sort(key=lambda e: e.rsplit(" @", 1)[0].casefold())
     out = ["### Contributors"]
     out.extend("* {}".format(name) for name in unique)
@@ -317,8 +252,7 @@ def render_contributors_footer(contributors: Sequence[str]) -> str:
 
 
 def _existing_dated_sections(text: str) -> str:
-    """Return the dated-section region of a prior changelog (from the first
-    ``Valkey M.m.p`` heading onward)."""
+    """Return text from the first ``Valkey M.m.p`` heading onward."""
     match = _DATED_SECTION_RE.search(text)
     if not match:
         return ""
@@ -336,26 +270,14 @@ def render_release_notes(
     contributors: Optional[Sequence[str]] = None,
     security_fixes: Optional[Sequence[str]] = None,
 ) -> str:
-    """Render the release line's frozen changelog with a new dated section on top.
+    """Render the full changelog with a new dated section prepended.
 
-    *notes* is the ``{category: [bullet, ...]}`` map for this cut (from
-    :func:`render.group_bullets`); it is rendered straight into a dated section:
-    there is no intermediate "unreleased" block. *prior_text* is the destination
-    release line's existing changelog (the ``pre-release-M.m.p`` / ``M.m`` branch,
-    which carries the earlier dated sections); an empty string on a first cut.
-
-    The result is: title + urgency legend, the new dated section, then
-    *prior_text*'s previously dated sections, then one cumulative
-    ``### Contributors`` footer, and never an "unreleased" block, because the
-    release line only ever holds frozen dated sections.
+    Assembles: title + urgency legend, the new section, prior dated sections,
+    and a cumulative Contributors footer.
     """
     major, minor, _ = parse_version(version)
     dated = render_version_section(version, stage, urgency, date, notes, security_fixes)
 
-    # Peel off any existing ``### Contributors`` footer from the prior changelog so
-    # (a) it is not swept into the dated region below, and (b) its names roll into
-    # the new cumulative footer, which is what dedups the roll-up across
-    # rc1..rcN..GA.
     before_contrib, prior_contributors = _split_contributors_footer(prior_text)
     existing = _existing_dated_sections(before_contrib)
 
@@ -363,10 +285,7 @@ def render_release_notes(
     if existing:
         parts += ["", existing]
 
-    # One cumulative ``### Contributors`` footer for the whole file: this cut's
-    # contributors (commit authors over the release range, so everyone whose code
-    # shipped is credited even without a release-note bullet) merged with those
-    # carried on the prior changelog, deduped and alpha-sorted.
+    # Merge this cut's contributors with prior ones for the cumulative footer.
     merged = list(prior_contributors) + list(contributors or [])
     footer = render_contributors_footer(merged)
     if footer:

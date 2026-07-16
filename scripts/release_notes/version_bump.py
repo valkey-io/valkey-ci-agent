@@ -1,18 +1,7 @@
 """Set the Valkey version macros in src/version.h.
 
-Rewrites three macros in place:
-
-    #define VALKEY_VERSION "M.m.p"
-    #define VALKEY_VERSION_NUM 0x00MMmmpp
-    #define VALKEY_RELEASE_STAGE "dev"|"rcN"|"ga"
-
-``VALKEY_VERSION_NUM`` packs major/minor/patch into one byte each, matching the
-documented ``0x00MMmmpp`` scheme used by ``VM_GetServerVersion`` (src/module.c)
-and parsed by ``version2num`` (src/util.c). Other macros (SERVER_NAME,
-REDIS_VERSION, ...) are left untouched.
-
-Upstream ``valkey-io/valkey`` ships no equivalent tool, so this module owns the
-``src/version.h`` format and :mod:`release_cut` drives it against a clone.
+Rewrites VALKEY_VERSION, VALKEY_VERSION_NUM (0x00MMmmpp), and
+VALKEY_RELEASE_STAGE in place. Other macros are left untouched.
 """
 
 from __future__ import annotations
@@ -25,10 +14,7 @@ _VERSION_DEFINE_RE = re.compile(r'^(#define\s+VALKEY_VERSION\s+)"[^"]*"', re.MUL
 _VERSION_NUM_DEFINE_RE = re.compile(r"^(#define\s+VALKEY_VERSION_NUM\s+)0x[0-9A-Fa-f]+", re.MULTILINE)
 _STAGE_DEFINE_RE = re.compile(r'^(#define\s+VALKEY_RELEASE_STAGE\s+)"[^"]*"', re.MULTILINE)
 
-# dev/ga plus rcN, N starting at 1 with no leading zeros ("rc1", "rc12" but not
-# "rc0"/"rc01"). The rc sub-pattern matches _RC_STAGE_RE in release_format /
-# release_cut; "dev" (the unstable-branch stage) is accepted here but nowhere
-# else, so this stays a superset of that regex rather than reusing it.
+# dev/ga/rcN. Superset of release_format's _RC_STAGE_RE (also accepts "dev").
 _STAGE_RE = re.compile(r"^(dev|ga|rc[1-9]\d*)$")
 
 
@@ -49,10 +35,7 @@ def _validate_stage(stage: str) -> str:
 
 def set_version(version_h_text: str, version: str, stage: str) -> str:
     """Return *version_h_text* with the three Valkey version macros updated."""
-    # parse_version validates the M.m.p range and raises on bad input. Derive the
-    # canonical string from the parsed tuple (not the raw input) so VALKEY_VERSION
-    # and VALKEY_VERSION_NUM can never disagree: writing the raw string would leave
-    # "09.1.0" in VALKEY_VERSION while VALKEY_VERSION_NUM normalized to 0x00090100.
+    # Derive canonical string from parsed tuple so VERSION and VERSION_NUM agree.
     major, minor, patch = parse_version(version)
     canonical = "{}.{}.{}".format(major, minor, patch)
     stage = _validate_stage(stage)
@@ -66,9 +49,7 @@ def set_version(version_h_text: str, version: str, stage: str) -> str:
     text, n3 = _STAGE_DEFINE_RE.subn(
         lambda m: '{}"{}"'.format(m.group(1), stage), text
     )
-    # re.subn returns the substitution count, so count == 1 means the macro was
-    # found and rewritten exactly once; count == 0 means it is absent. A count
-    # above 1 indicates a duplicated macro definition, which is also a problem.
+    # Each macro must appear exactly once.
     missing = [
         name
         for name, count in (

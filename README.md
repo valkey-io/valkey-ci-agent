@@ -82,90 +82,8 @@ See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 
 ### Setup and Usage
 
-#### Prerequisites
-
-- A GitHub App with:
-  - `contents:write` on each repo in the registry (for pushing branches)
-  - `pull-requests:write` on each repo (for opening PRs)
-  - `issues:write` on each repo (for backport status comments)
-  - `organization_projects:write` on the org (for querying and updating project boards)
-- An AWS account with Bedrock access to `us.anthropic.claude-opus-4-8`
-- An OIDC trust between GitHub Actions and your AWS account
-
-#### Step 1: Configure secrets and variables
-
-On `valkey-io/valkey-ci-agent`:
-
-| Type | Name | Value |
-|------|------|-------|
-| Secret | `AWS_ROLE_ARN` | OIDC role ARN with Bedrock `InvokeModel` permission |
-| Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie GitHub App ID |
-| Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | Valkeyrie GitHub App private key |
-| Variable | `AWS_REGION` | e.g., `us-east-1` |
-
-The workflows mint a short-lived installation token with `actions/create-github-app-token` and use that token for registry repository reads, branch pushes, PR creation, status comments, and project-board queries.
-
-#### Step 2: Edit `repos.yml`
-
-Add your repo(s) to the registry. No per-repo config files are needed - everything lives in `repos.yml`.
-
-#### Step 3: Enable the workflows
-
-The scheduled sweep runs automatically.
-
-### Usage
-
-#### Daily sweep (automatic)
-
-Runs daily at 09:00 UTC via cron. The preflight job reads `repos.yml` and fans out one job per `{repo, branch}`. Each produces one PR with up to five successfully applied backports for that branch; skipped or unresolved candidates do not count against that cap.
-
-#### Manual backport (on-demand)
-
-```bash
-gh workflow run manual-backport.yml \
-  --repo valkey-io/valkey-ci-agent \
-  --field pr_url=https://github.com/valkey-io/valkey/pull/3601 \
-  --field target_branch=9.0
-```
-
-Creates one PR named `[Backport 9.0] <original title>`.
-
-#### Mark merged backports done
-
-A scheduled poller reconciles each project board against branch reality and
-flips items from `To be backported` to `Done` once the backport actually lands.
-It runs hourly via `backport-mark-done-poll.yml` and reconciles every repo and
-branch in `repos.yml`. Because it reconciles the whole board on every run, it is
-self-healing: it picks up backports applied by the sweep, by an earlier run, or
-by a manual cherry-pick, without depending on a merge event.
-
-An item is marked `Done` only when the source PR's commit is genuinely on the
-target branch - verified by the cherry-pick's trailing `(#N)` subject, or by the
-PR appearing in a sweep commit's `## Applied` table. A backport PR body that
-merely claims a PR was applied can never mark it `Done` on its own.
-
-Run it manually for a single repo (omit `--target-branch` to reconcile every
-configured branch), and add `--dry-run` to report what would change without
-mutating the board:
-
-```bash
-python -m scripts.backport.mark_done \
-  --repo valkey-io/valkey \
-  --target-branch 9.1 \
-  --target-token "$TOKEN" \
-  --dry-run
-```
-
-#### Filtering the sweep
-
-To run only for a specific repo or branch:
-
-```bash
-gh workflow run backport-sweep.yml \
-  --repo valkey-io/valkey-ci-agent \
-  --field repo=valkey-io/valkey \
-  --field project_number=14
-```
+See [DEVELOPMENT.md](DEVELOPMENT.md) for local setup, local validation commands,
+required GitHub Actions secrets, and manual workflow dispatch examples.
 
 ## Fuzzer Monitor Workflow
 
@@ -365,27 +283,27 @@ Dispatch it from this agent repository (rc1 of a new minor line):
 ```bash
 gh workflow run release-notes-cut.yml \
   --repo valkey-io/valkey-ci-agent \
-  --field source_ref=unstable \
   --field version=9.1.0 \
   --field stage=rc1 \
   --field urgency=LOW
 ```
 
-The other stages differ only in `stage` (and, for a patch GA, `source_ref`); see
-[Common recipes](#common-recipes) for how each baseline resolves:
+The target branch (`9.1`) is derived automatically from the version. The other
+stages differ only in `stage`; see [Common recipes](#common-recipes) for how each
+baseline resolves:
 
 ```bash
-# Next RC on the same line (continues pre-release-9.1.0)
+# Next RC (the 9.1.0-rc1 tag must exist on the 9.1 branch)
 gh workflow run release-notes-cut.yml --repo valkey-io/valkey-ci-agent \
-  --field source_ref=unstable --field version=9.1.0 --field stage=rc2 --field urgency=LOW
+  --field version=9.1.0 --field stage=rc2 --field urgency=LOW
 
-# GA after the final RC (renames pre-release-9.1.0 to the 9.1 line)
+# GA after the final RC (the last rc tag must exist on the 9.1 branch)
 gh workflow run release-notes-cut.yml --repo valkey-io/valkey-ci-agent \
-  --field source_ref=unstable --field version=9.1.0 --field stage=ga --field urgency=LOW
+  --field version=9.1.0 --field stage=ga --field urgency=LOW
 
-# Patch GA from an existing release branch (cut from 9.1, not unstable)
+# Patch GA (the 9.1.0 tag must exist on the 9.1 branch)
 gh workflow run release-notes-cut.yml --repo valkey-io/valkey-ci-agent \
-  --field source_ref=9.1 --field version=9.1.1 --field stage=ga --field urgency=LOW
+  --field version=9.1.1 --field stage=ga --field urgency=LOW
 ```
 
 Optional inputs: `date` (defaults to today), `base_ref` (explicit baseline ref
@@ -397,43 +315,44 @@ when the cut flags issues, instead of holding it as a draft; see [Edge-case
 handling](#edge-case-handling)), and `dry_run` (compute and log the cut without
 pushing or opening a PR). Stage is `rc1..rcN` or `ga`, case-insensitive.
 
-**Branch model** (one long-running branch per minor line):
+**Branch model** (tag-driven, one M.m branch per minor):
 
-| Dispatch | Target branch | Behavior |
-|----------|---------------|----------|
-| rc1 of M.m.p | `pre-release-M.m.p` | Create from the source branch |
-| rcN (N>1) | `pre-release-M.m.p` | Continue (keeps prior RCs' dated notes) |
-| ga of M.m.p | `M.m` | Create carrying the rc history, delete `pre-release-M.m.p` (a rename) |
-| later patches | `M.m` | Continue the existing minor line |
+| Dispatch | Target branch | Range baseline |
+|----------|---------------|----------------|
+| rc1 of M.m.p | `M.m` | Previous release tag (auto-resolved) |
+| rcN (N>1) | `M.m` | The `M.m.p-rc(N-1)` tag on M.m |
+| ga of M.m.p | `M.m` | The last rc tag on M.m |
+| later patches | `M.m` | The previous patch tag (e.g. `M.m.(p-1)`) |
+
+Maintainers create the M.m branch and push tags before dispatching. The agent
+never creates or deletes branches.
 
 ### Common recipes
 
-Only `source_ref`, `version`, `stage`, and `urgency` are ever required. The
-baseline resolves itself for every case except rc1 of an `M.0.0` (first release of
-a new major), so leave `base_ref` empty unless a recipe below sets it. 
+Only `version`, `stage`, and `urgency` are required. The target branch (`M.m`) is
+derived from the version. The baseline resolves itself for every case except rc1 of
+an `M.0.0` (first release of a new major), so leave `base_ref` empty unless a recipe
+below sets it.
 
-| Cutting | `source_ref` | `version` | `stage` | `base_ref` | Baseline the notes span |
-|---------|-------------|-----------|---------|-----------|--------------------------|
-| First RC of a new minor | `unstable` | `9.2.0` | `rc1` | *(empty)* | Auto: previous minor's GA (`9.1.0`) |
-| Next RC on the same line | `unstable` | `9.2.0` | `rc2` | *(empty)* | Auto: walks the `pre-release-9.2.0` line itself, from its fork point off `unstable` up to its tip (no RC tags are pushed) |
-| GA after the final RC | `unstable` | `9.2.0` | `ga` | *(empty)* | Auto: walks the `pre-release-9.2.0` line itself, fork point to tip (same as rc2+) |
-| Patch GA from a release branch | `9.1` | `9.1.9` | `ga` | *(empty)* | Auto: the previous patch tag (`9.1.8`) |
-| First RC of a new **major** | `unstable` | `9.0.0` | `rc1` | *(set it)* | You must pass the prior major's final release |
+| Cutting | `version` | `stage` | `base_ref` | Baseline the notes span |
+|---------|-----------|---------|-----------|--------------------------|
+| First RC of a new minor | `9.2.0` | `rc1` | *(empty)* | Auto: previous release tag (e.g. `9.1.0`) |
+| Next RC on the same line | `9.2.0` | `rc2` | *(empty)* | Auto: the `9.2.0-rc1` tag on the `9.2` branch |
+| GA after the final RC | `9.2.0` | `ga` | *(empty)* | Auto: the last rc tag (e.g. `9.2.0-rc2`) on `9.2` |
+| Patch GA | `9.1.9` | `ga` | *(empty)* | Auto: the previous patch tag (`9.1.8`) |
+| First RC of a new **major** | `9.0.0` | `rc1` | *(set it)* | You must pass the prior major's final release |
 
 Distinctions that are easy to get wrong:
 
-- **`source_ref` is `unstable` for a new minor line (rc/GA), but the release**
-  **branch itself for a patch GA.** A patch (`9.1.9`) is cut from `9.1` because the
-  fixes were backported onto that branch; a new minor is cut from `unstable` where
-  its work landed.
-- **`version` is the target you are cutting, always `M.m.p`** - use `9.2.0` for
+- **`version` is the target you are cutting, always `M.m.p`**: use `9.2.0` for
   every RC of that release (`rc1`, `rc2`, ...) and its GA, not `9.2.0-rc2`. The
-  `-rcN` suffix comes from `stage`, not `version`.
+  `-rcN` suffix comes from `stage`, not `version`. The M.m branch is derived from
+  the version automatically; maintainers must create it and push tags before dispatch.
 - **`base_ref` stays empty except for rc1 of `M.0.0`.** For every other case, the
-  tool derives or resolves the baseline (and shows the resolved range in the PR
-  body, so you can confirm it). Setting `base_ref` by hand on those cases is how a
-  wrong range gets cut; only use it when a cut's PR body flags an unanchored
-  or over-broad baseline.
+  tool resolves the baseline from tags on the target branch (and shows the resolved
+  range in the PR body, so you can confirm it). Setting `base_ref` by hand on those
+  cases is how a wrong range gets cut; only use it when a cut's PR body flags an
+  unanchored or over-broad baseline.
 
 When unsure, dispatch with `dry_run` first: it logs the resolved plan and the exact
 `base..head` range (both refs and their SHAs) without pushing or opening a PR.
@@ -449,21 +368,12 @@ human merges.
    whitespace) so `version.h`, the dated heading, the commit title, and the branch
    names all agree.
 2. **Discover the range** (code) - resolve `base..head` and walk it by graph
-   reachability, deduplicating to one entry per originating PR number. For a first
-   cut the head is the dispatched `source_ref`; the base is an explicit
-   `--base-ref`, else the previous release (rc1, a first GA of a new minor, or a
-   mis-dispatched rc2+ all anchor here, since no same-version RC tag is reachable
-   on `source_ref` under fork-at-freeze), else a patch GA's previous patch tag. A
-   continuing rc2+/GA cut instead walks the release line: the head is
-   the `pre-release-M.m.p` line tip and the base is the fork point where the line
-   left `source_ref`. This matters under valkey's fork-at-freeze model, where
-   `source_ref` (`unstable`) advances into the next minor after the freeze while
-   the RC fixes land only on the line; walking to `source_ref` would note the next
-   minor's PRs and miss the RC fixes. No RC tag is reachable to anchor on (this
-   workflow pushes none; the fork carries none), so the base is the `merge-base`
-   fork point, guarded to be an ancestor of the line tip. A mis-dispatch (rc2+ or a
-   GA with no line yet) still cuts a (draft) PR carrying the warning, rather than
-   aborting on an unreachable tag before a human sees it.
+   reachability, deduplicating to one entry per originating PR number. The head is
+   always the M.m branch tip (derived from the version). The base is an explicit
+   `--base-ref`, else tag resolution on the M.m branch: for rc1 it is the previous
+   release tag (resolved from all tags in the repo), for rc2+ it is the prior RC
+   tag (e.g. `9.2.0-rc1`), and for a patch GA it is the previous patch tag (e.g.
+   `9.1.8`). Tags are created by maintainers before dispatch.
 3. **Classify** (code) - partition PRs by their `release-notes` / `no-release-notes`
    labels into include / exclude / triage, mirroring valkey's `check_release_notes`.
 4. **Generate** (AI) - Claude writes one categorized, user-facing bullet per
@@ -471,13 +381,14 @@ human merges.
    appends those in `scripts/release_notes/render.py` (`format_bullet`), so the
    bullet format stays fixed in one place.
 5. **Render + bump** (code) - render the categorized bullets into a new dated
-   section on the release line via `render_release_notes` (`release_format.py`) /
-   `set_version` (`version_bump.py`), prepend prior RCs' sections, append the
-   contributor list (`contributors.py`), and bump `src/version.h`. These format
-   primitives live in-repo rather than being imported from valkey, because upstream
-   `valkey-io/valkey` ships no such tooling - so a cut runs against unmodified
-   upstream `unstable` (a plaintext `00-RELEASENOTES` placeholder and a
-   `src/version.h` with the `VALKEY_VERSION*` macros).
+   section prepended before any existing sections on the release line via
+   `render_release_notes` (`release_format.py`) / `set_version`
+   (`version_bump.py`), append the cumulative contributor list
+   (`contributors.py`), and bump `src/version.h`. These format primitives live
+   in-repo rather than being imported from valkey, because upstream
+   `valkey-io/valkey` ships no such tooling, so a cut runs against unmodified
+   upstream (a plaintext `00-RELEASENOTES` placeholder and a `src/version.h`
+   with the `VALKEY_VERSION*` macros).
 6. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
    and open/update a PR into the release line with a body that explains the cut and
    surfaces any advisories (below). When the cut flags anything a maintainer should
@@ -489,9 +400,8 @@ human merges.
 Malformed dispatch inputs fail fast at argparse (exit 2), before the clone + AI
 run: a non-`M.m.p` or out-of-range version, a bad stage, an urgency outside
 `LOW/MODERATE/HIGH/CRITICAL/SECURITY`, or a non-ISO date. An explicit `--base-ref`
-that resolves to nothing aborts right after the clone with a clear error. GA
-dispatched when both `pre-release-M.m.p` and `M.m` exist is refused as an
-inconsistent state rather than silently orphaning the pre-release line.
+that resolves to nothing aborts right after the clone with a clear error. A cut
+dispatched against a non-existent M.m branch is refused immediately.
 
 When the cut raises anything a maintainer should address before merging, the
 release PR opens as a draft (GitHub refuses to merge a draft) so a shipped
@@ -502,10 +412,7 @@ with no flags flips the draft ready on its own), or dispatch `force_ready` to op
 ready anyway (the banner then records that N items were overridden). `--dry-run`
 prints the same hold decision without opening a PR. The signals that hold:
 
-- **RC out of sequence** - a re-cut rc, a skipped rc, or rc2+ before rc1 exists.
-- **Release line state looks off** - an rc targeting a line that already went GA
-  (recreating a renamed-away pre-release branch), a repeat GA that would duplicate
-  a dated heading, or a GA continuation leaving a lingering `pre-release-M.m.p`.
+- **RC out of sequence** - a re-cut rc or a skipped rc number.
 - **Unanchored baseline** - rc1 of `M.0.0` with no `--base-ref` fell back to the
   nearest tag, which may over-broaden the range.
 - **Empty release notes** - no PRs in range, or every PR needs triage; the body
@@ -523,17 +430,17 @@ prints the same hold decision without opening a PR. The signals that hold:
 - **Triage** - PRs in range that are untagged or double-labelled.
 
 The body always shows the resolved notes range so an over-broad baseline is
-visible: the resolved mode (e.g. `rc2 continuation`), the source and target
-branches, and both ends as `ref @ <sha>`, so a reviewer can audit the exact
-commits the notes were computed over, not just the branch-model names.
-`--dry-run` prints the same range and advisories to the log.
+visible: the resolved mode (e.g. `rc2`), the source and target branches, and both
+ends as `ref @ <sha>`, so a reviewer can audit the exact commits the notes were
+computed over, not just the branch-model names. `--dry-run` prints the same range
+and advisories to the log.
 
 ### Configuration
 
 Reuses the same secrets and OIDC role as the other workflows (see
-[Step 1](#step-1-configure-secrets-and-variables)). The workflow mints one
+[DEVELOPMENT.md](DEVELOPMENT.md)). The workflow mints one
 short-lived App token on `valkey-io/valkey` with `contents:write` (push the prep
-branch, create/delete release lines), `pull-requests:write` (open the release PR),
+branch), `pull-requests:write` (open the release PR),
 and `metadata:read`. When `security_from_advisories` is set, it mints a token
 that additionally holds `repository-advisories:read`; that permission is
 requested only for an advisory cut, so an ordinary cut is never blocked when the

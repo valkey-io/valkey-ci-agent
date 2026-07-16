@@ -308,45 +308,34 @@ main.py (daily cron or manual dispatch)
 ## Release Notes Flow
 
 ```text
-main.py (manual dispatch: source_ref, version, stage, urgency)
+main.py (manual dispatch: version, stage, urgency)
   -> validate + canonicalize inputs (fail fast, exit 2 on malformed)
   -> clone valkey (full depth + tags), validate --base-ref
   -> release_cut.cut()
-       -> resolve_branch_plan()      maps (version, stage) onto the branch model
+       -> collect_advisory_fixes()   (if --security-from-advisories)
+       -> resolve_branch_plan()      verify M.m branch exists, derive target
        -> pipeline.regenerate_unreleased()
-            -> discover()  labelled PRs over base..HEAD, deduped by PR number
+            -> discover()  PRs over base..HEAD, deduped by PR number
             -> classify()  include / exclude / triage from labels
             -> generate()  AI: one categorized bullet per included PR
-            -> dedup bullets by PR number (pipeline; surfaces duplicate_prs)
+            -> dedup bullets by PR number (surfaces duplicate_prs)
             -> group_bullets()  {category: [canonical bullet line, ...]}
-       -> promote_and_bump()  render_release_notes(): dated section + version.h bump
+       -> _drop_already_credited()   dedup against PRs the line already ships
+       -> promote_and_bump()         dated section + version.h bump + contributors
        -> _commit_push_release_pr()  prep branch (force-with-lease) + PR into the line
-       -> GA rename: delete the old pre-release branch
 ```
 
-The branch model is one long-running branch per minor line: rc1 creates
-`pre-release-M.m.p`, rcN continues it, ga creates/renames to `M.m`. The cut lands
-on an agent-namespaced `agent/release-cut/...` prep branch and opens a PR into the
-release line, so the line only advances when a human merges. The notes/version
-format is fixed in one place - `render_release_notes` (`release_format.py`),
-`set_version` (`version_bump.py`), and `list_contributors` (`contributors.py`).
-They live in-repo because `valkey-io/valkey` ships no release tooling of its own,
-so a cut runs against unmodified upstream `unstable` (a plaintext `00-RELEASENOTES`
-placeholder and a `src/version.h` with the `VALKEY_VERSION*` macros).
+The branch model is tag-driven: all stages (rc1, rc2, ..., ga) target the existing
+M.m branch (e.g. `9.1`). Maintainers create the branch and push tags before
+dispatching. Tags determine the discovery range (rc1 uses the previous release tag,
+rc2+ finds the prior rc tag, ga finds the last rc/patch tag). The cut lands on an
+`agent/release-cut/...` prep branch and opens a PR into M.m, so the line only
+advances when a human merges.
 
-A cut's signals fall into three tiers. Malformed inputs and inconsistent branch
-state (ie GA with both `pre-release-M.m.p` and `M.m`) are hard errors that
-abort before any PR. Anything a maintainer should address first (out-of-sequence
-rc, GA duplicate/orphan, rc-after-GA, unanchored baseline, empty/duplicate notes,
-declined/low-confidence notes, security mismatches, triage PRs, and the three
-unresolved kinds: a commit with no resolvable PR, an unfetchable PR ref, or a note
-credited to a backport whose original PR could not be recovered) holds the
-merge: `_hold_reasons` collects them, the PR opens as a draft, and the PR body gives
-a banner naming them. Draft state reconciles on re-dispatch (`_reconcile_draft`
-via GitHub's `convert_to_draft` / `mark_ready_for_review`), so a re-cut with the
-flags cleared flips the PR ready and one that introduces flags re-holds it;
-`force_ready` opens ready despite the flags. A clean advisory match is purely
-informational and does not hold.
+Signals fall into two tiers. Malformed inputs or a missing target branch are hard
+errors that abort before any PR. Warnings (out-of-sequence stages, unresolved PRs,
+empty notes, security mismatches) hold the PR as a draft with a banner naming them;
+re-dispatch reconciles draft state automatically. `force_ready` bypasses holds.
 
 ### Entry Points
 
@@ -354,8 +343,10 @@ informational and does not hold.
 - `scripts/release_notes/release_cut.py` - branch-plan resolution, notes rendering, PR body + `_hold_reasons` (draft-hold decision)
 - `scripts/release_notes/pipeline.py` - discover -> classify -> generate -> render orchestration
 - `scripts/release_notes/discover.py` - range resolution and PR discovery by graph reachability
+- `scripts/release_notes/backport_refs.py` - recover the original PR of a backported commit (Applied table, -x trailer, branch name)
 - `scripts/release_notes/classify.py` - label-based include / exclude / triage partition
-- `scripts/release_notes/generate.py` - Claude bullet generation (read-only tools)
+- `scripts/release_notes/generate.py` - Claude bullet generation (no tools; PR data inlined in prompt)
+- `scripts/release_notes/models.py` - typed dataclasses for the pipeline
 - `scripts/release_notes/security.py` - Security Fixes from published GitHub advisories (never AI-authored)
 - `scripts/release_notes/render.py` - canonical `00-RELEASENOTES` rendering
 - `scripts/release_notes/publish.py` - find/open/update the release PR; `_reconcile_draft` flips draft state on re-dispatch

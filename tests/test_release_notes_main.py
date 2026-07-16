@@ -75,19 +75,13 @@ def test_missing_token_is_usage_error(monkeypatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("TARGET_TOKEN", raising=False)
     with pytest.raises(SystemExit) as exc:
-        main(["--head-ref", "unstable", "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
-    assert exc.value.code == 2
-
-
-def test_missing_head_ref_is_usage_error():
-    with pytest.raises(SystemExit) as exc:
-        main(["--token", "t", "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
+        main(["--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
     assert exc.value.code == 2
 
 
 def test_missing_version_stage_urgency_is_usage_error():
     with pytest.raises(SystemExit) as exc:
-        main(["--token", "t", "--head-ref", "unstable"])
+        main(["--token", "t", ])
     assert exc.value.code == 2
 
 
@@ -95,8 +89,7 @@ def test_missing_version_stage_urgency_is_usage_error():
 def test_malformed_version_is_usage_error(bad_version):
     # Fail fast (exit 2) at argparse, before any clone, rather than deep in promote().
     with pytest.raises(SystemExit) as exc:
-        main(["--token", "t", "--head-ref", "unstable",
-              "--version", bad_version, "--stage", "rc1", "--urgency", "LOW"])
+        main(["--token", "t", "--version", bad_version, "--stage", "rc1", "--urgency", "LOW"])
     assert exc.value.code == 2
 
 
@@ -104,7 +97,7 @@ def test_version_canonicalized_before_cut(patched):
     # Leading zeros / trailing space must not leak past the boundary: the cut sees
     # the canonical M.m.p so version.h, headings, and branch names all agree.
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable",
+    main(["--token", "t",
           "--version", "09.1.0 ", "--stage", "rc2", "--urgency", "LOW"])
     assert captured["version"] == "9.1.0"
 
@@ -112,14 +105,13 @@ def test_version_canonicalized_before_cut(patched):
 @pytest.mark.parametrize("bad_stage", ["beta", "rc0", "rc01", "ga1", ""])
 def test_malformed_stage_is_usage_error(bad_stage):
     with pytest.raises(SystemExit) as exc:
-        main(["--token", "t", "--head-ref", "unstable",
-              "--version", "9.1.0", "--stage", bad_stage, "--urgency", "LOW"])
+        main(["--token", "t", "--version", "9.1.0", "--stage", bad_stage, "--urgency", "LOW"])
     assert exc.value.code == 2
 
 
 def test_stage_normalized_before_cut(patched):
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable",
+    main(["--token", "t",
           "--version", "9.1.0", "--stage", "RC2", "--urgency", "LOW"])
     assert captured["stage"] == "rc2"
 
@@ -127,14 +119,13 @@ def test_stage_normalized_before_cut(patched):
 @pytest.mark.parametrize("bad_urgency", ["URGENT", "medium-ish", "none"])
 def test_bogus_urgency_is_usage_error(bad_urgency):
     with pytest.raises(SystemExit) as exc:
-        main(["--token", "t", "--head-ref", "unstable",
-              "--version", "9.1.0", "--stage", "rc1", "--urgency", bad_urgency])
+        main(["--token", "t", "--version", "9.1.0", "--stage", "rc1", "--urgency", bad_urgency])
     assert exc.value.code == 2
 
 
 def test_urgency_uppercased_before_cut(patched):
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable",
+    main(["--token", "t",
           "--version", "9.1.0", "--stage", "rc2", "--urgency", "high"])
     assert captured["urgency"] == "HIGH"
 
@@ -148,14 +139,14 @@ def test_urgency_uppercased_before_cut(patched):
 ])
 def test_malformed_date_is_usage_error(bad_date):
     with pytest.raises(SystemExit) as exc:
-        main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+        main(["--token", "t", "--version", "9.1.0",
               "--stage", "rc2", "--urgency", "LOW", "--date", bad_date])
     assert exc.value.code == 2
 
 
 def test_valid_iso_date_accepted(patched):
     captured = _capture_cut(patched)
-    rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    rc = main(["--token", "t", "--version", "9.1.0",
                "--stage", "rc2", "--urgency", "LOW", "--date", "2026-06-30"])
     assert rc == 0
 
@@ -170,8 +161,7 @@ def test_rc1_no_prior_release_marks_baseline_unanchored(patched, caplog):
                     lambda clone_dir, version: None)
     import logging
     with caplog.at_level(logging.WARNING):
-        main(["--token", "t", "--head-ref", "unstable",
-              "--version", "9.0.0", "--stage", "rc1", "--urgency", "LOW"])
+        main(["--token", "t", "--version", "9.0.0", "--stage", "rc1", "--urgency", "LOW"])
     assert captured["baseline_unanchored"] is True
     assert captured["base_ref"] is None
 
@@ -184,7 +174,7 @@ def test_rc1_anchors_to_resolved_previous_release(patched):
     captured = _capture_cut(patched)
     patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
                     lambda clone_dir, version: ("8.2.0", "a" * 40))
-    main(["--token", "t", "--head-ref", "unstable",
+    main(["--token", "t",
           "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
     assert captured["base_ref"] == "8.2.0"
     assert captured["baseline_unanchored"] is False
@@ -205,7 +195,7 @@ def test_rc1_explicit_base_ref_not_overridden_by_resolver(patched):
     # neutralize it so this test stays about "explicit base wins", not git behavior.
     patched.setattr(main_mod, "_recredited_commit_count",
                     lambda *a, **k: None)
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc1", "--urgency", "LOW", "--base-ref", "my-baseline"])
     assert captured["base_ref"] == "my-baseline"  # explicit value wins, not the sentinel
     assert captured["baseline_unanchored"] is False
@@ -220,7 +210,7 @@ def test_rc1_explicit_tag_glob_skips_resolver(patched):
         raise AssertionError("resolver must not run when --tag-glob is explicit")
 
     patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag", _boom)
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc1", "--urgency", "LOW", "--tag-glob", "9.0.*"])
     assert captured["base_ref"] is None
     assert captured["tag_glob"] == "9.0.*"
@@ -239,7 +229,7 @@ def test_missing_base_ref_aborts_before_cut(patched):
         return MagicMock()
 
     patched.setattr(main_mod, "run_git", _run_git)
-    rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    rc = main(["--token", "t", "--version", "9.1.0",
                "--stage", "rc2", "--urgency", "LOW", "--base-ref", "no-such-ref"])
     assert rc == 1
     assert captured == {}  # cut() never reached
@@ -249,32 +239,30 @@ def test_missing_base_ref_aborts_before_cut(patched):
 
 def test_dispatches_to_cut_with_parsed_args(patched):
     captured = _capture_cut(patched)
-    rc = main(["--token", "t", "--head-ref", "unstable",
-               "--version", "9.1.0", "--stage", "rc2", "--urgency", "HIGH"])
+    rc = main(["--token", "t",  "--version", "9.1.0", "--stage", "rc2", "--urgency", "HIGH"])
     assert rc == 0
     assert captured["version"] == "9.1.0"
     assert captured["stage"] == "rc2"
     assert captured["urgency"] == "HIGH"
-    assert captured["source_ref"] == "unstable"
 
 
 def test_dry_run_threads_through(patched):
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc1", "--urgency", "LOW", "--dry-run"])
     assert captured["dry_run"] is True
 
 
 def test_force_ready_defaults_false(patched):
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc2", "--urgency", "LOW"])
     assert captured["force_ready"] is False
 
 
 def test_force_ready_flag_threads_through(patched):
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc2", "--urgency", "LOW", "--force-ready"])
     assert captured["force_ready"] is True
 
@@ -284,7 +272,7 @@ def test_force_ready_env_default_reaches_cut(patched, monkeypatch):
     # ('true'/'false'), never as a CLI flag, so the env default must reach cut().
     captured = _capture_cut(patched)
     monkeypatch.setenv("RELEASE_NOTES_FORCE_READY", "true")
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc2", "--urgency", "LOW"])
     assert captured["force_ready"] is True
 
@@ -292,7 +280,7 @@ def test_force_ready_env_default_reaches_cut(patched, monkeypatch):
 def test_force_ready_env_false_is_false(patched, monkeypatch):
     captured = _capture_cut(patched)
     monkeypatch.setenv("RELEASE_NOTES_FORCE_READY", "false")
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc2", "--urgency", "LOW"])
     assert captured["force_ready"] is False
 
@@ -300,14 +288,14 @@ def test_force_ready_env_false_is_false(patched, monkeypatch):
 def test_security_from_advisories_defaults_false(patched):
     # Absent the flag/env, the cut must not attempt the advisory fetch.
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc2", "--urgency", "LOW"])
     assert captured["security_from_advisories"] is False
 
 
 def test_security_from_advisories_flag_threads_through(patched):
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc2", "--urgency", "LOW", "--security-from-advisories"])
     assert captured["security_from_advisories"] is True
 
@@ -317,7 +305,7 @@ def test_security_from_advisories_env_default_reaches_cut(patched, monkeypatch):
     # ('true'/'false'), never as a CLI flag, so the env default must reach cut().
     captured = _capture_cut(patched)
     monkeypatch.setenv("RELEASE_NOTES_SECURITY_FROM_ADVISORIES", "true")
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc2", "--urgency", "LOW"])
     assert captured["security_from_advisories"] is True
 
@@ -327,7 +315,7 @@ def test_security_from_advisories_env_false_is_false(patched, monkeypatch):
     # a bare bool(os.environ.get(...)) would misread it as truthy.
     captured = _capture_cut(patched)
     monkeypatch.setenv("RELEASE_NOTES_SECURITY_FROM_ADVISORIES", "false")
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc2", "--urgency", "LOW"])
     assert captured["security_from_advisories"] is False
 
@@ -337,7 +325,7 @@ def test_cut_failure_returns_one(patched):
         raise RuntimeError("boom")
 
     patched.setattr(main_mod.cut_mod, "cut", _cut)
-    rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    rc = main(["--token", "t", "--version", "9.1.0",
                "--stage", "rc1", "--urgency", "LOW"])
     assert rc == 1
 
@@ -350,7 +338,7 @@ def test_valueerror_logged_without_traceback(patched, caplog):
 
     patched.setattr(main_mod.cut_mod, "cut", _cut)
     with caplog.at_level("ERROR"):
-        rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+        rc = main(["--token", "t", "--version", "9.1.0",
                    "--stage", "rc2", "--urgency", "LOW"])
     assert rc == 1
     msgs = [r.message for r in caplog.records]
@@ -368,7 +356,7 @@ def test_calledprocesserror_stderr_logged(patched, caplog):
 
     patched.setattr(main_mod.cut_mod, "cut", _cut)
     with caplog.at_level("ERROR"):
-        rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+        rc = main(["--token", "t", "--version", "9.1.0",
                    "--stage", "rc2", "--urgency", "LOW"])
     assert rc == 1
     assert any("protected ref" in r.message for r in caplog.records)
@@ -410,7 +398,7 @@ class TestDefaultTagGlob:
 
 def test_rc2_default_glob_passed_to_cut(patched):
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable",
+    main(["--token", "t",
           "--version", "9.1.0", "--stage", "rc2", "--urgency", "LOW"])
     assert captured["tag_glob"] == "9.1.0-rc*"
     assert captured["base_ref"] is None
@@ -424,7 +412,7 @@ def test_rc1_defers_baseline_to_post_clone_resolver(patched):
     captured = _capture_cut(patched)
     patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
                     lambda clone_dir, version: ("9.0.0", "a" * 40))
-    main(["--token", "t", "--head-ref", "unstable",
+    main(["--token", "t",
           "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
     assert captured["base_ref"] == "9.0.0"
     assert captured["tag_glob"] is None
@@ -436,7 +424,7 @@ def test_rc1_uppercase_stage_still_resolves_previous_release(patched):
     captured = _capture_cut(patched)
     patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
                     lambda clone_dir, version: ("9.0.0", "a" * 40))
-    main(["--token", "t", "--head-ref", "unstable",
+    main(["--token", "t",
           "--version", "9.1.0", "--stage", "RC1", "--urgency", "LOW"])
     assert captured["base_ref"] == "9.0.0"
     assert captured["tag_glob"] is None
@@ -444,8 +432,7 @@ def test_rc1_uppercase_stage_still_resolves_previous_release(patched):
 
 def test_explicit_base_ref_overrides_glob(patched):
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "feature/release-notes-automation",
-          "--version", "9.1.0", "--stage", "rc2", "--urgency", "LOW", "--base-ref", "unstable"])
+    main(["--token", "t", "--version", "9.1.0", "--stage", "rc2", "--urgency", "LOW", "--base-ref", "unstable"])
     assert captured["base_ref"] == "unstable"
     assert captured["tag_glob"] is None
 
@@ -455,7 +442,7 @@ def test_rc1_explicit_tag_glob_not_overridden_by_derived_base(patched):
     # derived base must not preempt it (which would set base_ref and discard the
     # glob). The glob reaches the cut and base_ref stays None.
     captured = _capture_cut(patched)
-    main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    main(["--token", "t", "--version", "9.1.0",
           "--stage", "rc1", "--urgency", "LOW", "--tag-glob", "9.1.*"])
     assert captured["base_ref"] is None
     assert captured["tag_glob"] == "9.1.*"
@@ -471,8 +458,7 @@ def test_rc1_no_previous_release_degrades_not_aborts(patched, caplog):
     patched.setattr(main_mod.discover_mod, "resolve_previous_release_tag",
                     lambda clone_dir, version: None)
     with caplog.at_level(logging.WARNING):
-        rc = main(["--token", "t", "--head-ref", "unstable",
-                   "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
+        rc = main(["--token", "t",      "--version", "9.1.0", "--stage", "rc1", "--urgency", "LOW"])
     assert rc == 0                              # cut ran; did not abort
     assert captured["base_ref"] is None         # no anchor; falls to tag resolution
     assert captured["baseline_unanchored"] is True
@@ -492,7 +478,7 @@ def test_rc2_explicit_missing_base_still_aborts(patched):
         return MagicMock()
 
     patched.setattr(main_mod, "run_git", _run_git)
-    rc = main(["--token", "t", "--head-ref", "unstable", "--version", "9.1.0",
+    rc = main(["--token", "t", "--version", "9.1.0",
                "--stage", "rc2", "--urgency", "LOW", "--base-ref", "no-such-ref"])
     assert rc == 1
     assert captured == {}  # cut() never reached

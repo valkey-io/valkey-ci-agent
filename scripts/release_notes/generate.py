@@ -1,30 +1,9 @@
 """Ask Claude (via Bedrock) to turn merged PRs into categorized note bullets.
 
-The model does exactly one judgment job: for each included PR, write a concise,
-user-facing description and assign it to one of the canonical categories. It
-never emits the final markdown, the ``(#N)`` reference, or the ``by @handle``
-attribution; :mod:`render` appends those in code, so the canonical bullet layout
-stays authoritative there, not in model output (valkey ships no release tooling;
-its CI gate is label-only and never parses this file).
-
-The call runs through the low-level :func:`run_claude_code` wrapper with **no
-tools at all** (Read/Grep/Glob and Bash/Write/Edit all denied): the model is a
-pure text-in/text-out summarizer here. We deliberately do not add a 5th entry to
-the frozen agent profile registry for this.
-
-Why no tools, not read-only tools. ``--tools Read,Grep,Glob`` would be a
-*tool-existence* gate, not a path boundary: it controls which tools exist, not
-where they may read, and because the wrapper passes
-``--dangerously-skip-permissions`` nothing in the tool list stops the model from
-reading a file outside the clone. That matters because the inputs are
-attacker-influenceable (PR title/body/author/url) and the output is committed
-into a public release PR, so a steered out-of-tree read would be an exfiltration.
-Rather than police model-driven reads with a sandbox, we remove the capability:
-the source context the model needed the tools for (the PR's own diff) is gathered
-*in code* here (:func:`_collect_pr_diff`, a bounded ``git show`` of the PR's range
-commit in the clone) and inlined into the prompt. The read is therefore
-code-chosen and bounded by construction, not a filesystem door the model could
-walk through. No read boundary is needed because no read tool exists.
+The model writes a concise user-facing description per PR and assigns it to a
+canonical category. It runs with no tools: PR diffs are gathered in code
+(_collect_pr_diff) and inlined into the prompt, so the model has no filesystem
+access to attacker-influenceable clone content.
 """
 
 from __future__ import annotations
@@ -41,14 +20,10 @@ from scripts.release_notes.models import CategorizedBullet, GenerationResult, Me
 
 logger = logging.getLogger(__name__)
 
-# Cap PRs per Claude call so the prompt stays well within a single stdin write
-# even for a large release; results from each batch are merged.
+# Max PRs per Claude call; results from each batch are merged.
 _BATCH_SIZE = 80
 
-# Per-PR diff budget (characters) inlined into the prompt. A diffstat plus a
-# clipped patch gives the model enough to see *what* a PR changed without letting
-# one huge refactor blow the batch prompt. Chosen well below a single stdin write
-# so _BATCH_SIZE PRs each carrying a diff still fit comfortably.
+# Per-PR diff budget (characters) inlined into the prompt.
 _MAX_DIFF_CHARS = 6000
 
 _PROMPT_TEMPLATE = """\
@@ -112,26 +87,10 @@ Every "pr" must be one of the input PR numbers. Emit at most one bullet per PR.
 
 
 def _collect_pr_diff(repo_dir: str, sha: str) -> str:
-    """Return a bounded diff (diffstat + clipped patch) for *sha*, or ``""``.
+    """Return a bounded diff (diffstat + clipped patch) for *sha*, or "".
 
-    Replaces the model's former ability to read the clone with a code-chosen,
-    bounded read: ``git show --format= --stat --patch --first-parent`` of the PR's
-    range commit, clipped to :data:`_MAX_DIFF_CHARS`. This is the source context
-    the generator used the Read/Grep/Glob tools for, gathered here so the model
-    needs no filesystem access at all.
-
-    ``--first-parent`` matters when *sha* is a merge commit (a PR landed with
-    the "create a merge commit" strategy, so ``pull.merge_commit_sha`` has two
-    parents). Without it, ``git show --patch`` on a merge emits only the diffstat
-    and suppresses the patch (git's default is a combined diff shown only under
-    ``-c``/``--cc``), so the model would get a filename list with no code.
-    ``--first-parent`` diffs the merge against its first parent, yielding the
-    change the PR introduced; on an ordinary single-parent commit it is a no-op.
-
-    Degrades to ``""`` (the model then works from title/body/labels alone, as it
-    did when a clone was unavailable) rather than raising: a missing SHA (a PR
-    whose merge commit is not in this clone), an unreadable object, or a timeout
-    should never abort a cut. An empty *sha* short-circuits without shelling out.
+    Uses --first-parent so merge commits diff against their first parent (showing
+    the PR's change). Degrades to "" on any error rather than aborting the cut.
     """
     if not sha:
         return ""
@@ -143,8 +102,7 @@ def _collect_pr_diff(repo_dir: str, sha: str) -> str:
     diff = diff.strip()
     if len(diff) <= _MAX_DIFF_CHARS:
         return diff
-    # Clip on a line boundary near the cap so the last hunk is not torn mid-line,
-    # and mark the truncation so the model knows the patch is partial.
+    # Clip on a line boundary so the last hunk is not torn mid-line.
     clipped = diff[:_MAX_DIFF_CHARS]
     nl = clipped.rfind("\n")
     if nl > 0:
@@ -157,12 +115,8 @@ def build_prompt(
 ) -> str:
     """Render the generation prompt for a batch of PRs.
 
-    ``categories`` is the canonical list loaded from the valkey format module,
-    so the exact category strings are never hardcoded here. ``diffs`` maps a PR
-    number to its inlined diff text (see :func:`_collect_pr_diff`); a PR missing
-    from the map, or mapped to ``""``, carries no ``diff`` field and the
-    model works from its title/body/labels. Defaults to no diffs so the prompt
-    can be rendered (e.g. in tests) without a clone.
+    ``diffs`` maps PR number to inlined diff text; absent or empty entries omit
+    the diff field. Defaults to no diffs so the prompt works without a clone.
     """
     diffs = diffs or {}
     payload = []
@@ -180,15 +134,9 @@ def build_prompt(
 
 
 def _as_pr_number(value: object) -> "int | None":
-    """Return *value* iff it is an exact ``int`` PR number, else ``None``.
+    """Return *value* iff it is an exact non-bool int, else None.
 
-    The prompt hands PR numbers to the model as JSON integers, so a compliant
-    response echoes an ``int``. Guard against ``int()`` coercion: ``int(40.9)``
-    -> ``40`` and ``int(True)`` -> ``1`` (``bool`` is an ``int`` subclass) would
-    silently produce a *different, valid-looking* number that then collides with
-    a real PR at the ``valid_numbers`` check and mis-attributes the bullet. Only
-    an exact non-bool ``int`` is accepted; a float, bool, or numeric string is
-    rejected rather than coerced.
+    Rejects float/bool/string to avoid silent coercion to a different PR number.
     """
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -198,24 +146,16 @@ def _as_pr_number(value: object) -> "int | None":
 def _parse_batch(
     stdout: str, valid_numbers: set[int], valid_categories: set[str]
 ) -> tuple[list[CategorizedBullet], list[int], bool]:
-    """Parse one Claude response into ``(bullets, skipped, parsed_ok)``.
+    """Parse one Claude response into (bullets, skipped, parsed_ok).
 
-    A bullet whose ``pr`` is not an exact ``int`` in *valid_numbers* is dropped
-    (the model must not invent PRs, and a coerced float/bool must not alias a
-    real one; see :func:`_as_pr_number`). A bullet whose ``category`` is unknown
-    is kept and logged; render then coerces it into the catch-all
-    (``CATCH_ALL_CATEGORY``, "Other Changes") rather than emitting an invented
-    header (see :func:`render.group_bullets`).
+    Drops bullets with unknown PR numbers. Keeps bullets with unknown categories
+    (render coerces them into the catch-all).
     """
     obj = extract_json_object(stdout, required_key="bullets")
     if obj is None:
         return [], [], False
 
-    # bullets/skipped must be lists. A malformed-but-parseable response can carry
-    # a scalar ("bullets": 5) or null, which would raise TypeError on iteration
-    # (crashing the whole cut), or a bare string ("skipped": "40") that would
-    # iterate per character and silently drop the value. Coerce a non-list to
-    # empty with a warning so one bad batch degrades to "nothing parsed" instead.
+    # Non-list values would crash iteration; coerce to empty.
     raw_bullets = obj.get("bullets", [])
     if not isinstance(raw_bullets, list):
         logger.warning("Expected a list for 'bullets', got %s; treating as empty", type(raw_bullets).__name__)
@@ -243,21 +183,14 @@ def _parse_batch(
                 "PR #%s suggested non-canonical category %r; it will land in the catch-all",
                 number, category,
             )
-        # A non-canonical category is itself a reason to flag the note: the model
-        # suggested a category outside the list, so surface it for review. The
-        # bullet still ships (render coerces it into the catch-all); this only
-        # records the suggestion for a human.
         uncertain = bool(raw.get("uncertain")) or off_list
         raw_reason = raw.get("uncertain_reason", "")
         reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
         if off_list and not reason:
-            # An empty category (model returned null/none) reads as a nonsensical
-            # "suggested new category ''"; name the real situation instead.
             reason = (
                 "model returned no category" if not category
                 else f"suggested new category {category!r}"
             )
-        # Author is filled by the caller (factual, not model-supplied).
         bullets.append(CategorizedBullet(
             pr_number=number, author="", category=category, text=text,
             uncertain=uncertain, uncertain_reason=reason,
@@ -274,9 +207,6 @@ def _parse_batch(
         if number is None:
             continue
         if number not in valid_numbers:
-            # Same guard as the bullets path: the model must not invent a PR here
-            # either. An out-of-range "skipped" would otherwise surface verbatim in
-            # the PR body's declined-PRs section as a phantom #N not in the range.
             logger.warning("Dropping skip for unknown PR #%s", number)
             continue
         skipped.append(number)
@@ -293,11 +223,8 @@ def generate(
 ) -> GenerationResult:
     """Generate categorized bullets for *prs*, batching large inputs.
 
-    ``run_fn`` is injectable for tests. A nonzero exit code from the wrapper is
-    not treated as failure on its own (turn-budget exhaustion can still yield a
-    valid object); a batch fails only when its output has no parseable object,
-    in which case every PR in that batch is reported as skipped so the caller
-    can see what was lost.
+    A batch fails only when its output has no parseable JSON object; all PRs in
+    that batch are reported as skipped.
     """
     if not prs:
         return GenerationResult()
@@ -310,9 +237,6 @@ def generate(
     for start in range(0, len(prs), _BATCH_SIZE):
         batch = prs[start:start + _BATCH_SIZE]
         batch_numbers = {pr.number for pr in batch}
-        # Gather each PR's diff in code (bounded git show of its range commit) and
-        # inline it, rather than letting the model read the clone. See the module
-        # docstring: this is what lets the call run with no filesystem tools.
         diffs = {pr.number: _collect_pr_diff(repo_dir, pr.merge_commit_sha) for pr in batch}
         prompt = build_prompt(batch, categories=categories, diffs=diffs)
         stdout, stderr, code = run_fn(
@@ -320,12 +244,6 @@ def generate(
             cwd=repo_dir,
             timeout=timeout,
             model=None,  # let CI_AGENT_CLAUDE_MODEL env override win
-            # No tools: the model is a pure summarizer here. The source context it
-            # would have needed Read/Grep/Glob for is inlined above (per-PR diff),
-            # so we deny every filesystem tool rather than police model-driven reads
-            # of a clone holding untrusted PR content. allowed_tools="" grants none;
-            # disallowed_tools hard-denies each by name as defense in depth (the
-            # wrapper forwards it to the CLI as --disallowedTools).
             allowed_tools="",
             disallowed_tools="Read,Grep,Glob,Bash,Write,Edit,MultiEdit",
         )
@@ -337,8 +255,7 @@ def generate(
             )
             all_skipped.extend(sorted(batch_numbers))
             continue
-        # Re-stamp each bullet with the factual author from the PR (never the model),
-        # preserving the model's category/text and its uncertainty flag.
+        # Re-stamp each bullet with the factual author from the PR.
         all_bullets.extend(
             CategorizedBullet(
                 pr_number=b.pr_number,
@@ -352,10 +269,7 @@ def generate(
         )
         all_skipped.extend(skipped)
 
-        # A partial response can omit an input PR from both bullets and skipped.
-        # Fold any such PR into skipped so the caller sees what was lost instead
-        # of it disappearing silently (valkey's check_release_notes is label-only
-        # and won't catch a missing notes entry, so this is for human review).
+        # PRs absent from both bullets and skipped are folded into skipped.
         unaccounted = batch_numbers - {b.pr_number for b in bullets} - set(skipped)
         if unaccounted:
             logger.warning(

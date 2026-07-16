@@ -1,38 +1,28 @@
 # Cut a Valkey release: generate notes all at once + bump version + carry prior RCs.
 #
-# A maintainer dispatches this with the source branch (e.g. unstable), the target
-# version, stage, and urgency. The agent generates the release notes in one shot
-# from the labelled PRs in range (Claude via Bedrock). Nothing accumulates notes
-# on a branch. It then renders them onto the long-running release branch as a dated
-# section, bumps src/version.h, and refreshes the running contributor list, using the
-# release-format primitives in scripts/release_notes (release_format.py,
-# version_bump.py, contributors.py). valkey-io/valkey ships no release tooling, so
-# these own the format here. It opens one PR for the release branch for review;
-# the source branch is never modified.
+# A maintainer dispatches this with the source branch (the M.m release branch,
+# e.g. 9.1), the target version, stage, and urgency. The agent generates the release
+# notes in one shot from the labelled PRs in range (Claude via Bedrock). It renders
+# them onto the release branch as a dated section, bumps src/version.h, and refreshes
+# the running contributor list. It opens one PR (from an agent/ prep branch) into the
+# M.m release branch for review; the source branch is never force-pushed.
 #
-# Branch model (one long-running branch per minor line):
-#   rc1 of M.m.p -> create  pre-release-M.m.p
-#   rcN (N>1)     -> continue pre-release-M.m.p (keeps prior RCs' dated notes;
-#                    walks the line from its fork point to its tip, and drops PRs
-#                    the line's changelog already credits so RCs don't double-note)
-#   ga of M.m.p   -> create  M.m carrying the rc history, delete pre-release-M.m.p
+# Branch model: all stages target the existing M.m branch (created by maintainers).
+# Tags determine the discovery range:
+#   rc1         -> previous release tag..M.m tip
+#   rcN (N>1)  -> M.m.p-rc(N-1) tag..M.m tip
+#   ga          -> last rc tag (or last patch tag)..M.m tip
 name: Cut Release Notes
 
 on:
   workflow_dispatch:
     inputs:
-      source_ref:
-        description: "Source branch whose merged PRs are cut into the release, e.g. unstable or 9.1"
-        required: true
-        type: string
       version:
         description: "Target version MAJOR.MINOR.PATCH, e.g. 9.1.0"
         required: true
         type: string
       stage:
-        description: "Release stage: rc1..rcN or ga (rc1 has no prior RC tag, so it
-          defaults base_ref to the previous release: prior patch M.m.(p-1), or previous
-          minor M.(m-1).0 for a .0; M.0.0 has none, so set base_ref yourself)"
+        description: "Release stage: rc1..rcN or ga (rc1 anchors to the previous release tag; rc2+ finds the prior rc tag on the target branch)"
         required: true
         type: string
       urgency:
@@ -55,12 +45,10 @@ on:
         type: string
       base_ref:
         description: "Explicit baseline ref overriding tag resolution (branch/tag/SHA).
-          Leave empty for rc2+/ga: a continuing cut walks the pre-release-M.m.p line
-          itself, from its fork point off the source branch up to its tip, not an RC tag
-          (this workflow pushes none). For rc1 it auto-defaults to the previous release
-          (prior patch, or previous minor for a .0). Set this only for rc1 of M.0.0 (no
-          derivable baseline), or to correct an over-broad range the PR body flags as
-          unanchored."
+          Leave empty for rc2+/ga: tag resolution finds the previous rc/patch tag on
+          the target branch. For rc1 it auto-defaults to the previous release tag. Set
+          this only for rc1 of M.0.0 (no derivable baseline), or to correct an
+          over-broad range."
         required: false
         type: string
       security_fixes:
@@ -187,7 +175,6 @@ jobs:
           # skipped one yields "", so this resolves to whichever produced a token.
           RELEASE_NOTES_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token || steps.generate-token-advisories.outputs.token }}
           RELEASE_NOTES_REPO: valkey-io/valkey
-          RELEASE_NOTES_HEAD_REF: ${{ inputs.source_ref }}
           RELEASE_NOTES_VERSION: ${{ inputs.version }}
           RELEASE_NOTES_STAGE: ${{ inputs.stage }}
           RELEASE_NOTES_URGENCY: ${{ inputs.urgency }}
@@ -221,7 +208,6 @@ jobs:
               exit 1
             fi
           }
-          reject_bad_ref "source_ref" "${RELEASE_NOTES_HEAD_REF}"
           # No leading zeros: "09.1.0" would otherwise pass the gate but canonicalize
           # to "9.1.0" in Python, and a raw value leaking past would desync version.h
           # from the branch name. Match single-zero or no-leading-zero components only.

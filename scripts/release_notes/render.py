@@ -1,17 +1,8 @@
-"""Turn generated bullets into the canonical release-notes lines and grouping.
+"""Turn generated bullets into canonical release-notes lines and grouping.
 
-The format lives in :mod:`scripts.release_notes.release_format` (valkey-io/valkey
-ships no release tooling of its own; see that module's docstring). This module
-reuses its ``CATEGORIES`` so the agent never re-encodes the category names.
-
-What this module owns is purely mechanical: turning each
-:class:`CategorizedBullet` into the canonical bullet line
-``* <text> by @<handle> (#<N>)`` (the ``(#N)`` trailing and the ``by @handle``
-following valkey's hand-written release-note convention) and grouping those
-lines by category into the ``{category: [line, ...]}`` map that
-:func:`release_format.render_release_notes` renders into a dated section.
-valkey's ``check_release_notes`` gate is label-only and does not parse this
-file, so the form here is a convention, not something CI validates.
+Formats each CategorizedBullet as ``* <text> by @<handle> (#<N>)`` and groups
+them by category into the ``{category: [line, ...]}`` map that
+release_format.render_release_notes renders into a dated section.
 """
 
 from __future__ import annotations
@@ -25,39 +16,20 @@ from scripts.release_notes.models import CategorizedBullet
 
 logger = logging.getLogger(__name__)
 
-# A GitHub login is [A-Za-z0-9-]; the attribution follows ``by @([\w-]+)``.
-# Anything outside that set (a space, '.', '@', or parens from a malformed
-# author) would truncate or break the captured handle.
+# GitHub login charset: [A-Za-z0-9-].
 _HANDLE_SAFE_RE = re.compile(r"[^\w-]")
 
 
 def _one_line(text: str) -> str:
-    """Collapse *text* to a single physical line.
-
-    A bullet and a category header are line-oriented, so an embedded line break
-    would split the bullet or inject a spurious ``"### ..."``/``"## ..."`` line
-    into the rendered section. We split on exactly the boundaries
-    ``str.splitlines()`` recognizes, then join with single spaces.
-    """
+    """Collapse *text* to a single physical line."""
     return " ".join(text.splitlines()).strip()
 
 
 def format_bullet(bullet: CategorizedBullet) -> str:
     """Render one canonical bullet line: ``* <text> by @<handle> (#<N>)``.
 
-    The trailing ``(#N)`` and the ``by @handle`` are appended in this fixed
-    order to match valkey's hand-written release-note convention (trailing PR
-    ref, then attribution). When the author is unknown (a ghost account), the
-    ``by @`` segment is omitted. This is a formatting convention only: valkey's
-    ``check_release_notes`` gate is label-only and validates neither the PR ref
-    nor the attribution.
-
-    Both the text and the handle are sanitized: the text is collapsed to a
-    single line (a newline would split the bullet or inject a ``##``/``###``
-    line that terminates the block), a trailing ``(#...)`` the model left inside
-    the text is removed so the appended reference is the only trailing one, and
-    the handle is reduced to the ``[\\w-]`` login charset so a stray space or
-    punctuation can't break the attribution.
+    Strips any trailing ``(#...)`` the model left in the text, collapses to one
+    line, and omits the ``by @`` segment when the author is unknown.
     """
     text = _one_line(bullet.text)
     text = re.sub(r"\s*\(#[^)]*\)\s*$", "", text).strip()
@@ -70,23 +42,12 @@ def format_bullet(bullet: CategorizedBullet) -> str:
 
 
 def _reserved_sections() -> set[str]:
-    """Case-folded reserved section names ``group_bullets`` refuses to render.
-
-    ``Security Fixes`` / ``Contributors`` are populated at release-cut time from a
-    factual source, so a model-assigned bullet under either is dropped. Folded to
-    a case-insensitive set so a lowercase ``security fixes`` is refused too.
-    """
+    """Case-folded reserved section names that group_bullets refuses to render."""
     return {r.casefold() for r in _release_format.RESERVED_SECTIONS}
 
 
 def is_reserved_category(category: str) -> bool:
-    """Whether *category* names a reserved section ``group_bullets`` will drop.
-
-    Mirrors the refusal test in :func:`group_bullets` (single-lined, case-folded)
-    so a caller that must know *before* grouping whether a bullet will render
-    (the pipeline's per-PR dedup, which must not let a to-be-dropped reserved
-    bullet shadow a renderable one) shares one definition with the grouping.
-    """
+    """Whether *category* names a reserved section that group_bullets will drop."""
     return _one_line(category).casefold() in _reserved_sections()
 
 
@@ -95,28 +56,13 @@ def group_bullets(
 ) -> dict[str, list[str]]:
     """Group bullets into ``{category: [rendered line, ...]}``.
 
-    Only canonical categories (``release_format.CATEGORIES``) are ever emitted as
-    headers, in their canonical order. The model never creates a new ``### <name>``
-    header: a category it returns that is not canonical is a *suggestion*, so the
-    bullet is coerced into the catch-all (``CATCH_ALL_CATEGORY``, "Other Changes")
-    rather than rendered under an invented header. The suggestion is surfaced
-    separately for review (:mod:`generate` flags the bullet uncertain with the
-    suggested name; the cut lists it in the PR body). This also closes an injection
-    vector: an attacker-controlled category string can no longer emit a raw
-    ``### ``/``## `` header line into the changelog.
-
-    Bullets the model placed under the reserved ``Security Fixes`` /
-    ``Contributors`` sections are refused and logged; those are generated at
-    release-cut time from a factual source.
+    Non-canonical categories are coerced into the catch-all. Bullets under
+    reserved sections (Security Fixes, Contributors) are refused and logged.
+    Output keys are in CATEGORIES order.
     """
-    # Case-folded so a lowercase "security fixes" is refused too, not coerced into
-    # the catch-all and shipped alongside the real auto-generated section.
     reserved = _reserved_sections()
     canonical = set(_release_format.CATEGORIES)
-    # The catch-all must be a canonical category; keep a cheap consistency guard so
-    # that if release_format's CATCH_ALL_CATEGORY were ever edited off-list, an
-    # off-list bullet still lands under a valid canonical header (the last one)
-    # rather than resurrecting an invented one.
+    # Fallback if CATCH_ALL_CATEGORY were edited off-list.
     catch_all = _release_format.CATCH_ALL_CATEGORY
     if catch_all not in canonical:
         catch_all = _release_format.CATEGORIES[-1]
@@ -130,8 +76,6 @@ def group_bullets(
             )
             continue
         if category not in canonical:
-            # Off-list category: the model's choice is only a suggestion, never a
-            # new header. Land the note in the catch-all so it still ships.
             logger.warning(
                 "PR #%s assigned non-canonical category %r; placing under %r",
                 bullet.pr_number, category, catch_all,
@@ -139,7 +83,7 @@ def group_bullets(
             category = catch_all
         grouped.setdefault(category, []).append(format_bullet(bullet))
 
-    # Emit in canonical order; every key is canonical by construction.
+    # Emit in canonical order.
     ordered: dict[str, list[str]] = {}
     for name in _release_format.CATEGORIES:
         if grouped.get(name):
