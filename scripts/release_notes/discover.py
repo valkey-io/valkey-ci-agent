@@ -1,7 +1,7 @@
 """Discover PRs accrued on a release line since its last tag.
 
 Walks the graph (tag..head, first-parent) to enumerate merge/squash commits,
-then resolves each to the *original* PR that introduced the change via a tiered
+then resolves each to the original PR that introduced the change via a tiered
 strategy (## Applied table, -x trailer, subject (#N), commit->PR API). Results
 are deduplicated by PR number so each change appears once. Backport sweep merges
 are expanded to their per-source cherry-picks. Commits that resolve to no PR are

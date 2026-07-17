@@ -1,13 +1,15 @@
 """Typed data model for the release-notes generation pipeline.
 
     discover -> DiscoveryResult     (git/GitHub: which PRs merged since the last tag)
-    classify -> MergedPR.disposition (code: include / exclude / triage, from labels)
+    classify -> MergedPR.disposition (code: include / candidate, from the label)
+    triage   -> TriageResult        (AI: include/exclude each label-less candidate)
     generate -> GenerationResult    (AI: one categorized bullet per included PR)
     render   -> updated 00-RELEASENOTES text (code: canonical format, authoritative)
     publish  -> PR url              (code: branch + PR on valkey)
 
-AI populates judgment fields (category, text); code populates factual fields
-(PR number, author, labels, the trailing ``(#N)``, the ``by @handle`` attribution).
+AI populates judgment fields (triage include/exclude, category, text); code
+populates factual fields (PR number, author, labels, the trailing ``(#N)``, the
+``by @handle`` attribution).
 """
 
 from __future__ import annotations
@@ -17,11 +19,15 @@ from enum import Enum
 
 
 class PRDisposition(str, Enum):
-    """Label-derived disposition for a discovered PR."""
+    """Label-derived disposition for a discovered PR.
 
-    INCLUDE = "include"   # has 'release-notes', not 'no-release-notes' (other labels ignored)
-    EXCLUDE = "exclude"   # has 'no-release-notes', not 'release-notes' (other labels ignored)
-    TRIAGE = "triage"     # neither gate label, or both -> a human must decide
+    Only ``release-notes`` hard-includes. Everything else is a CANDIDATE that AI
+    triage judges (see :mod:`scripts.release_notes.triage`), so a change whose
+    author forgot the label is caught rather than silently dropped.
+    """
+
+    INCLUDE = "include"      # has 'release-notes' (other labels ignored)
+    CANDIDATE = "candidate"  # no 'release-notes' label -> AI triage decides
 
 
 @dataclass(frozen=True)
@@ -39,7 +45,7 @@ class MergedPR:
     body: str = ""
     labels: tuple[str, ...] = ()
     merge_commit_sha: str = ""
-    disposition: PRDisposition = PRDisposition.TRIAGE
+    disposition: PRDisposition = PRDisposition.CANDIDATE
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,56 @@ class GenerationResult:
 
     bullets: tuple[CategorizedBullet, ...] = ()
     skipped: tuple[int, ...] = ()   # PR numbers the model declined to summarize
+
+
+@dataclass(frozen=True)
+class TriageDecision:
+    """AI verdict on one label-less candidate PR: keep it in the notes or drop it.
+
+    ``included`` True means the change is user-facing and should be noted despite
+    the missing ``release-notes`` label; False means it is internal-only. ``reason``
+    is a short human-readable justification surfaced in the release PR body so a
+    maintainer can audit and override either call. ``uncertain`` flags a
+    low-confidence verdict (either direction) for closer review.
+    """
+
+    pr_number: int
+    included: bool
+    reason: str = ""
+    uncertain: bool = False
+
+
+@dataclass(frozen=True)
+class TriageResult:
+    """AI triage output for the label-less candidates in a range.
+
+    ``included`` and ``excluded`` partition every candidate the model returned a
+    verdict for; ``undecided`` holds candidates the model gave no verdict for (a
+    parse failure or a dropped entry), which are surfaced for human triage rather
+    than silently included or dropped.
+    """
+
+    included: tuple[TriageDecision, ...] = ()
+    excluded: tuple[TriageDecision, ...] = ()
+    undecided: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class TriagedPR:
+    """A label-less PR paired with its AI triage verdict, for the release PR body.
+
+    Joins the factual fields the body table needs (number/title/author/url) with
+    the model's ``included`` call, ``reason``, and ``uncertain`` flag, so a
+    maintainer can audit (and override) each AI include/exclude decision.
+    """
+
+    number: int
+    title: str
+    author: str
+    url: str
+    included: bool
+    reason: str = ""
+    uncertain: bool = False
 
 
 @dataclass(frozen=True)

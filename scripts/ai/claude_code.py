@@ -92,10 +92,11 @@ def run_claude_code(
         # is already hardened (GitHub tokens stripped, AWS-only) and runs in
         # throwaway checkouts.
         "--dangerously-skip-permissions",
-        # cwd is an untrusted checkout, so ignore any .mcp.json it carries:
-        # --tools gates the model's tools but not an MCP server the project
-        # config could otherwise auto-register into this AWS-credentialed
-        # subprocess.
+        # cwd is an untrusted checkout. --safe-mode disables all project
+        # customizations (CLAUDE.md, hooks, plugins, skills) so a malicious
+        # repo cannot execute code in our credentialed subprocess.
+        # --strict-mcp-config additionally blocks project-defined MCP servers.
+        "--safe-mode",
         "--strict-mcp-config",
         "--output-format", "stream-json",
         "--verbose",

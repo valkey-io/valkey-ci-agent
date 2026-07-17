@@ -49,13 +49,13 @@ def set_version(version_h_text: str, version: str, stage: str) -> str:
     text, n3 = _STAGE_DEFINE_RE.subn(
         lambda m: '{}"{}"'.format(m.group(1), stage), text
     )
-    # Each macro must appear exactly once.
+    # VERSION and VERSION_NUM are required.
+    # RELEASE_STAGE is optional: older branches (up to 8.0 inclusive) predate the macro.
     missing = [
         name
         for name, count in (
             ("VALKEY_VERSION", n1),
             ("VALKEY_VERSION_NUM", n2),
-            ("VALKEY_RELEASE_STAGE", n3),
         )
         if count != 1
     ]

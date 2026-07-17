@@ -1,4 +1,8 @@
-"""Tests for release-notes label disposition (pure)."""
+"""Tests for release-notes label disposition (pure).
+
+The gate is single-label: only ``release-notes`` hard-includes. Everything else
+(no label, or any other label) is a CANDIDATE that AI triage judges.
+"""
 
 from __future__ import annotations
 
@@ -14,18 +18,11 @@ class TestDispositionFor:
     def test_release_notes_only_includes(self) -> None:
         assert disposition_for(("release-notes",)) is PRDisposition.INCLUDE
 
-    def test_no_release_notes_only_excludes(self) -> None:
-        assert disposition_for(("no-release-notes",)) is PRDisposition.EXCLUDE
+    def test_arbitrary_labels_are_candidates(self) -> None:
+        assert disposition_for(("bug", "area/cluster")) is PRDisposition.CANDIDATE
 
-    def test_neither_label_triages(self) -> None:
-        assert disposition_for(("bug", "area/cluster")) is PRDisposition.TRIAGE
-
-    def test_empty_triages(self) -> None:
-        assert disposition_for(()) is PRDisposition.TRIAGE
-
-    def test_both_labels_triage_not_include(self) -> None:
-        # A contradiction the CI check rejects: must never silently include.
-        assert disposition_for(("release-notes", "no-release-notes")) is PRDisposition.TRIAGE
+    def test_empty_is_a_candidate(self) -> None:
+        assert disposition_for(()) is PRDisposition.CANDIDATE
 
     def test_release_notes_with_other_labels_includes(self) -> None:
         assert disposition_for(("release-notes", "bug")) is PRDisposition.INCLUDE
@@ -35,38 +32,36 @@ class TestClassify:
     def test_partitions_and_restamps(self) -> None:
         prs = [
             _pr(1, ("release-notes",)),
-            _pr(2, ("no-release-notes",)),
+            _pr(2, ("bug",)),
             _pr(3, ()),
-            _pr(4, ("release-notes", "no-release-notes")),
+            _pr(4, ("release-notes", "enhancement")),
         ]
-        include, exclude, triage = classify(prs)
-        assert [p.number for p in include] == [1]
-        assert [p.number for p in exclude] == [2]
-        assert sorted(p.number for p in triage) == [3, 4]
+        include, candidates = classify(prs)
+        assert [p.number for p in include] == [1, 4]
+        assert sorted(p.number for p in candidates) == [2, 3]
         # Disposition is stamped onto the returned objects.
-        assert include[0].disposition is PRDisposition.INCLUDE
-        assert exclude[0].disposition is PRDisposition.EXCLUDE
-        assert all(p.disposition is PRDisposition.TRIAGE for p in triage)
+        assert all(p.disposition is PRDisposition.INCLUDE for p in include)
+        assert all(p.disposition is PRDisposition.CANDIDATE for p in candidates)
 
     def test_preserves_pr_fields(self) -> None:
         pr = MergedPR(number=9, title="Title", author="bob", url="https://x/9",
                       labels=("release-notes",), merge_commit_sha="abc")
-        include, _, _ = classify([pr])
+        include, _ = classify([pr])
         out = include[0]
         assert (out.number, out.title, out.author, out.url, out.merge_commit_sha) == (
             9, "Title", "bob", "https://x/9", "abc",
         )
 
     def test_empty_input(self) -> None:
-        assert classify([]) == ([], [], [])
+        assert classify([]) == ([], [])
 
     def test_backport_remapped_pr_classified_by_source_labels(self) -> None:
         # After discovery remaps a backport to its original PR, the MergedPR carries
         # the *source* PR's labels. A source labelled release-notes must INCLUDE,
         # even though the backport PR itself would have carried only "backport"
-        # (which triages). This pins that identity, not the on-line PR, gates the note.
+        # (which is a candidate). This pins that identity, not the on-line PR, gates.
         remapped = MergedPR(number=7, title="Fix a leak", author="alice",
                             url="https://x/7", labels=("release-notes",))
-        include, _, triage = classify([remapped])
+        include, candidates = classify([remapped])
         assert [p.number for p in include] == [7]
-        assert triage == []
+        assert candidates == []

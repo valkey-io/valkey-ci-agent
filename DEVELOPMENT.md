@@ -5,8 +5,8 @@ used to test and run `valkey-ci-agent`. The workflow examples focus on the
 backport subsystem; the ci-fix, fuzzer-monitor, and test-failure-detector
 subsystems follow the same local setup and validation steps.
 
-For how the system is designed — the layers, per-workflow flows, and shared
-infrastructure — see [docs/architecture.md](docs/architecture.md).
+For how the system is designed (the layers, per-workflow flows, and shared
+infrastructure), see [docs/architecture.md](docs/architecture.md).
 
 ## Prerequisites
 

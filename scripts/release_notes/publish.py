@@ -50,7 +50,7 @@ def open_or_update_pr(
             lambda: existing.edit(title=title, body=body),
             retries=3, description=f"update PR #{existing.number}",
         )
-        _reconcile_draft(existing, draft)
+        reconcile_draft(existing, draft)
         logger.info("Updated release PR #%s (draft=%s)", existing.number, draft)
         return existing.html_url
     head_ref = build_pull_create_head_ref(base_repo, push_repo, branch)
@@ -62,7 +62,7 @@ def open_or_update_pr(
     return pr.html_url
 
 
-def _reconcile_draft(existing: Any, draft: bool) -> None:
+def reconcile_draft(existing: Any, draft: bool) -> None:
     """Flip *existing*'s draft state to *draft* if it differs."""
     if bool(existing.draft) == draft:
         return

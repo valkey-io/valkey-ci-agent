@@ -110,13 +110,14 @@ def _collect_pr_diff(repo_dir: str, sha: str) -> str:
     return clipped.rstrip() + "\n… (diff truncated)"
 
 
-def build_prompt(
-    prs: Sequence[MergedPR], *, categories: Sequence[str], diffs: dict[int, str] | None = None
+def build_prompt_payload(
+    prs: Sequence[MergedPR], *, diffs: dict[int, str] | None = None
 ) -> str:
-    """Render the generation prompt for a batch of PRs.
+    """Render the per-PR JSON array (number/title/author/url/body + optional diff).
 
-    ``diffs`` maps PR number to inlined diff text; absent or empty entries omit
-    the diff field. Defaults to no diffs so the prompt works without a clone.
+    ``diffs`` maps PR number to inlined diff text; absent or empty entries omit the
+    diff field. Shared by the generation and triage prompts so the model sees an
+    identically shaped PR record in both passes.
     """
     diffs = diffs or {}
     payload = []
@@ -127,9 +128,20 @@ def build_prompt(
         if diff:
             entry["diff"] = diff
         payload.append(entry)
+    return json.dumps(payload, indent=2)
+
+
+def build_prompt(
+    prs: Sequence[MergedPR], *, categories: Sequence[str], diffs: dict[int, str] | None = None
+) -> str:
+    """Render the generation prompt for a batch of PRs.
+
+    ``diffs`` maps PR number to inlined diff text; absent or empty entries omit
+    the diff field. Defaults to no diffs so the prompt works without a clone.
+    """
     return _PROMPT_TEMPLATE.format(
         categories="\n".join(f"- {name}" for name in categories),
-        prs_json=json.dumps(payload, indent=2),
+        prs_json=build_prompt_payload(prs, diffs=diffs),
     )
 
 

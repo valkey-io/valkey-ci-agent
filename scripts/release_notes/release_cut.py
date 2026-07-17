@@ -15,6 +15,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
+from scripts.common.git_auth import github_https_url
 from scripts.common.proc import BOT_EMAIL, BOT_NAME, git_output, run_git
 from scripts.release_notes import contributors as gc
 from scripts.release_notes import pipeline as pipeline_mod
@@ -133,6 +134,27 @@ def _remote_branch_exists(repo_dir: str, branch: str) -> bool:
     """True if ``refs/heads/<branch>`` exists on ``origin``."""
     out = git_output(repo_dir, "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
     return bool(out.strip())
+
+
+def _assert_origin_url(repo_dir: str, repo_full_name: str) -> None:
+    """Verify the clone's origin URL matches the expected repository.
+
+    Defense-in-depth against a tampered remote (the primary defense is --safe-mode
+    on Claude subprocess invocations, which prevents hooks from modifying the clone).
+    Skips the check for non-GitHub URLs (local test fixtures).
+    """
+    try:
+        actual = git_output(repo_dir, "remote", "get-url", "origin").strip()
+    except subprocess.CalledProcessError:
+        return  # no origin remote (local test fixture)
+    if not actual.startswith("https://github.com/"):
+        return  # local path or non-GitHub remote (test fixture)
+    expected = github_https_url(repo_full_name)
+    if actual != expected:
+        raise RuntimeError(
+            f"Clone origin URL was modified (expected {expected!r}, got {actual!r}). "
+            "Aborting to prevent credential disclosure to a tampered remote."
+        )
 
 
 def resolve_branch_plan(repo_dir: str, *, version: str, stage: str) -> BranchPlan:
@@ -550,7 +572,13 @@ def cut(
     )
 
     # Discovery range: head is always the M.m branch tip, base from tags.
-    notes_base_ref, notes_tag_glob, notes_head_ref = base_ref, tag_glob, source_ref
+    # Pin the head SHA so discovery, contributors, and worktree all refer to the
+    # same commit. Without pinning, a PR merged during AI generation would enter
+    # the worktree base but be absent from the notes and contributor list.
+    notes_base_ref, notes_tag_glob = base_ref, tag_glob
+    pinned_head_sha = git_output(source_clone_dir, "rev-parse", source_ref).strip()
+    notes_head_ref = pinned_head_sha
+    logger.info("Pinned head for discovery: %s -> %s", source_ref, pinned_head_sha[:12])
 
     if baseline_unanchored and notes_base_ref is None:
         root = _root_commit(source_clone_dir, notes_head_ref)
@@ -558,7 +586,8 @@ def cut(
             notes_base_ref = root
             logger.warning("No tagged baseline for %s; root..%s range may be over-broad.", version, notes_head_ref)
 
-    # 1. Generate the categorized bullets for the range from labelled PRs.
+    # 1. Generate the categorized bullets: labelled PRs plus the label-less ones
+    #    AI triage judged user-facing (see pipeline.regenerate_unreleased).
     regen = pipeline_mod.regenerate_unreleased(
         repo, source_clone_dir, head_ref=notes_head_ref,
         tag_glob=notes_tag_glob, base_ref=notes_base_ref,
@@ -576,6 +605,10 @@ def cut(
     #    promoted commit on an agent-namespaced prep branch and PR it into the
     #    release line, so the line only advances when a human merges. The prep
     #    branch starts from origin/<base_ref> so the PR diff is exactly the cut.
+    #    Defense-in-depth: verify origin URL hasn't been tampered with before any
+    #    authenticated fetch/push (the primary defense is --safe-mode on Claude,
+    #    which prevents hooks from modifying the clone).
+    _assert_origin_url(source_clone_dir, repo_full_name)
     run_git(source_clone_dir, "fetch", "origin", plan.base_ref, env=git_env)
     prep_branch = f"{PREP_BRANCH_PREFIX}/{version}-{plan.stage}"
     dest_dir = os.path.join(source_clone_dir, ".release-dest")
@@ -671,6 +704,19 @@ def cut(
 
         _write(dest_notes_path, new_dest_notes)
         _write(os.path.join(dest_dir, VERSION_FILE), new_version)
+
+        # Freshness check: verify the target branch hasn't advanced since we
+        # pinned it for discovery. A new merge during AI generation would be in
+        # the worktree base but absent from the notes and contributor list.
+        run_git(source_clone_dir, "fetch", "--quiet", "origin", plan.target, env=git_env)
+        current_head = git_output(source_clone_dir, "rev-parse", f"origin/{plan.target}").strip()
+        if current_head != pinned_head_sha:
+            raise RuntimeError(
+                f"Target branch {plan.target!r} advanced during generation "
+                f"(pinned {pinned_head_sha[:12]}, now {current_head[:12]}). "
+                "Re-run the cut to include the new commits."
+            )
+
         release_url = _commit_push_release_pr(
             repo, dest_dir, repo_full_name=repo_full_name, plan=plan,
             version=version, prep_branch=prep_branch, notes_meta=notes_meta,
@@ -739,8 +785,14 @@ def _print_dry_run(
               f"(kept only under Security Fixes): {list(notes_meta.security_noted_prs)}")
     if notes_meta.urgency.strip().upper() == _SECURITY_URGENCY and not notes_meta.security_fixes:
         print("⚠️  urgency SECURITY but no security-fix entries")
+    if regen.ai_included:
+        print("AI-triaged into notes (unlabelled but judged user-facing): "
+              f"{[p.number for p in regen.ai_included]}")
+    if regen.ai_excluded:
+        print("AI-triaged out (unlabelled, judged internal-only): "
+              f"{[p.number for p in regen.ai_excluded]}")
     if regen.triage:
-        print(f"triage PRs (untagged): {[p.number for p in regen.triage]}")
+        print(f"triage PRs (AI undecided): {[p.number for p in regen.triage]}")
     if regen.unresolved:
         print(f"⚠️  commits with no resolvable PR: {[c.sha[:12] for c in regen.unresolved]}")
     if regen.unresolved_prs:
@@ -772,7 +824,7 @@ def _commit_push_release_pr(
     The prep branch is agent-namespaced, so force-with-lease on it is safe.
     *notes_meta* carries the advisories surfaced in the body (out-of-sequence rc,
     branch-model anomalies, unanchored baseline, empty/duplicate notes, security
-    correlations, triage PRs).
+    correlations, AI-triage include/exclude decisions, undecided PRs).
 
     When those signals name anything a maintainer should address first (see
     :func:`_hold_reasons`), the PR is opened as a draft to hold the merge,
@@ -786,6 +838,23 @@ def _commit_push_release_pr(
     run_git(dest_dir, "commit", "-s", "-m", commit_title(version, plan.stage))
     if not prep_branch.startswith(f"{PREP_BRANCH_PREFIX}/"):
         raise RuntimeError(f"Refusing to push to non-namespaced prep branch: {prep_branch!r}")
+
+    # If an existing PR is open for this prep branch, convert it to draft before
+    # force-pushing. This prevents a window where the PR has new content but
+    # retains its old body and ready-for-merge state (which could auto-merge if
+    # branch protection allows it). The PR is marked ready only after BOTH the
+    # branch push and the body update succeed.
+    hold = bool(_hold_reasons(plan, notes_meta)) and not force_ready
+    title = commit_title(version, plan.stage)
+    body = _build_pr_body(plan, version, notes_meta, force_ready=force_ready)
+    existing = publish_mod.find_existing_pr(
+        repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
+        base_branch=plan.target,
+    )
+    if existing is not None and not existing.draft:
+        publish_mod.reconcile_draft(existing, draft=True)
+        logger.info("Converted PR #%s to draft before branch update", existing.number)
+
     # Give --force-with-lease a valid basis. The fresh `git clone --branch <M.m>`
     # never fetched this agent-namespaced prep branch, so its remote-tracking ref is
     # absent and the implicit lease expects "branch absent". A prep branch left by an
@@ -798,16 +867,9 @@ def _commit_push_release_pr(
                 f"+refs/heads/{prep_branch}:refs/remotes/origin/{prep_branch}", env=git_env)
     run_git(dest_dir, "push", "--force-with-lease", "origin", f"HEAD:{prep_branch}", env=git_env)
 
-    # Hold the merge as a draft when the cut raised anything a maintainer should
-    # look at first, unless force_ready overrides. The body leads with a banner
-    # naming the same reasons, so the draft state and the body never disagree.
-    hold = bool(_hold_reasons(plan, notes_meta)) and not force_ready
-    title = commit_title(version, plan.stage)
-    body = _build_pr_body(plan, version, notes_meta, force_ready=force_ready)
-    existing = publish_mod.find_existing_pr(
-        repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
-        base_branch=plan.target,
-    )
+    # Now update body and reconcile draft state. If this is a re-cut of an
+    # existing PR, both the content and the metadata are consistent only after
+    # this point.
     return publish_mod.open_or_update_pr(
         repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
         base_branch=plan.target, title=title, body=body, existing=existing,
@@ -840,11 +902,12 @@ def _hold_reasons(plan: BranchPlan, notes_meta: "_NotesMeta") -> list[str]:
     if notes_meta.baseline_unanchored:
         reasons.append("release-notes baseline is unanchored")
     # Empty dated section, and not the dedup cause (which has its own reason next).
-    # Mirrors _empty_notes_section's two sub-causes: no PRs, or all-triage.
-    # A non-empty security_fixes list counts as content (a security-only cut is
-    # legitimate, not a generation miss).
+    # Mirrors _empty_notes_section's two sub-causes: no PRs, or PRs existed but none
+    # were included (every candidate AI-excluded or left undecided). A non-empty
+    # security_fixes list counts as content (a security-only cut is legitimate, not
+    # a generation miss).
     if not (regen.bullet_count or notes_meta.already_credited or notes_meta.security_fixes) and (
-        not regen.had_prs or regen.triage
+        not regen.had_prs or not regen.included
     ):
         reasons.append("empty release notes")
     if notes_meta.already_credited and not (notes_meta.noted_bullet_count or notes_meta.security_fixes):
@@ -855,6 +918,10 @@ def _hold_reasons(plan: BranchPlan, notes_meta: "_NotesMeta") -> list[str]:
         reasons.append("model declined to note some labelled PRs")
     if regen.uncertain:
         reasons.append("notes flagged low-confidence")
+    # AI decided inclusion for label-less PRs (a call that used to require a human
+    # label), so a maintainer confirms the include/exclude table before shipping.
+    if regen.ai_included or regen.ai_excluded:
+        reasons.append("AI triaged unlabelled PRs (confirm include/exclude)")
     sel = notes_meta.advisories
     if sel is not None and sel.fetch_failed:
         reasons.append("security advisories could not be read")
@@ -866,7 +933,7 @@ def _hold_reasons(plan: BranchPlan, notes_meta: "_NotesMeta") -> list[str]:
     if notes_meta.urgency.strip().upper() == _SECURITY_URGENCY and not notes_meta.security_fixes:
         reasons.append("SECURITY urgency with no security-fix entries")
     if regen.triage:
-        reasons.append("PRs need triage")
+        reasons.append("AI triage could not decide some PRs")
     if regen.unresolved:
         reasons.append("commits with no resolvable PR")
     if regen.unresolved_prs:
@@ -917,8 +984,9 @@ def _build_pr_body(
     Sections are appended in a fixed, reviewer-friendly order: the most actionable
     "is this the right cut?" warnings (sequence, branch model, baseline) first,
     then the "why do the notes look like this?" explanations (empty, duplicate,
-    security), then the triage table. Each section helper returns "" when it does
-    not apply, so the body stays quiet on a clean cut. When the cut raised any hold
+    security), then the AI-triage tables (included / excluded / undecided). Each
+    section helper returns "" when it does not apply, so the body stays quiet on a
+    clean cut. When the cut raised any hold
     reason (see :func:`_hold_reasons`), a banner leads the body reflecting whether
     the PR was held as a draft or opened ready via *force_ready*. A purely
     informational section (a clean advisory match) renders without a banner.
@@ -941,6 +1009,8 @@ def _build_pr_body(
         + _advisory_section(notes_meta)
         + _security_dedup_section(notes_meta)
         + _security_warning_section(notes_meta)
+        + _ai_included_section(regen.ai_included)
+        + _ai_excluded_section(regen.ai_excluded)
         + _triage_section(regen.triage)
         + _unresolved_section(regen.unresolved)
         + _unresolved_prs_section(regen.unresolved_prs)
@@ -1040,9 +1110,11 @@ def _empty_notes_section(notes_meta: "_NotesMeta", plan: BranchPlan) -> str:
 
     The cut renders only the dated heading + version bump when no bullet survives.
     The already-credited cause has its own section (:func:`_no_new_prs_section`);
-    this covers the other two silent causes: an empty range (no PRs), and
-    a range whose every PR needs triage (so none were included). Skipped when the
-    section actually carries bullets, or when the already-credited drop explains it.
+    this covers the other two silent causes: an empty range (no PRs), and a range
+    whose PRs were all excluded (none labelled ``release-notes`` and AI triage
+    judged every label-less one internal-only or could not decide, so none were
+    included). Skipped when the section actually carries bullets, or when the
+    already-credited drop explains it.
     """
     regen = notes_meta.regen
     if regen.bullet_count or notes_meta.already_credited or notes_meta.security_fixes:
@@ -1055,13 +1127,14 @@ def _empty_notes_section(notes_meta: "_NotesMeta", plan: BranchPlan) -> str:
             "confirm the range above and that the target branch has the intended "
             "commits.\n"
         )
-    if regen.triage:
+    if not regen.included:
         return (
             "\n### Empty release notes\n\n"
-            f"All {len(regen.triage)} PR(s) in range are unlabelled or "
-            "double-labelled (see **Needs triage** below), so none were included "
-            "and the dated section has no bullets. Label them and re-cut if they "
-            "should appear.\n"
+            "No PR in range was labelled `release-notes`, and AI triage judged the "
+            f"{len(regen.ai_excluded)} unlabelled PR(s) internal-only or could not "
+            "decide (see the **AI-triaged** / **Needs triage** tables below), so "
+            "none were included and the dated section has no bullets. Add the "
+            "`release-notes` label to any that should appear and re-cut.\n"
         )
     return ""
 
@@ -1139,7 +1212,7 @@ def _advisory_section(notes_meta: "_NotesMeta") -> str:
     """Explain the auto-generated Security Fixes and disclaim what could be missed.
 
     Only rendered when ``--security-from-advisories`` ran (``advisories`` is set).
-    Because only *published* advisories are visible to the token and the version
+    Because only published advisories are visible to the token and the version
     match is against author-typed metadata, this always tells a maintainer to
     confirm and to add any embargoed/draft CVEs by hand. When the fetch failed
     (most often a missing advisory-read permission), it says so explicitly rather
@@ -1255,17 +1328,87 @@ def _no_new_prs_section(notes_meta: "_NotesMeta", plan: BranchPlan) -> str:
     )
 
 
+def _ai_triage_reason_cell(pr: Any) -> str:
+    """Render the reason cell for an AI-triaged PR, flagging low-confidence calls."""
+    reason = publish_mod.escape_cell(pr.reason) if pr.reason else "(no reason given)"
+    return f"⚠️ {reason}" if pr.uncertain else reason
+
+
+def _ai_included_section(ai_included: Sequence[Any]) -> str:
+    """Table of label-less PRs AI triage added to the notes, for maintainer review.
+
+    These PRs did not carry the ``release-notes`` label, so valkey's label-only
+    gate would have dropped them, but AI triage judged them user-facing and they
+    were noted in the dated section above. A maintainer confirms each belongs (or
+    removes the note); a ``⚠️`` marks a call the model flagged low-confidence.
+    """
+    if not ai_included:
+        return ""
+    lines = [
+        "",
+        "### AI-triaged into the notes",
+        "",
+        "These merged PRs were **not** labelled `release-notes`, but AI triage "
+        "judged them user-facing and noted them in the dated section above. Confirm "
+        "each belongs; if one does not, remove its note before merging:",
+        "",
+        "| PR | Title | Author | Why included |",
+        "|----|-------|--------|--------------|",
+    ]
+    for pr in ai_included:
+        author = f"@{pr.author}" if pr.author else "(unknown)"
+        lines.append(
+            f"| [#{pr.number}]({pr.url}) | {publish_mod.escape_cell(pr.title)} | "
+            f"{author} | {_ai_triage_reason_cell(pr)} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _ai_excluded_section(ai_excluded: Sequence[Any]) -> str:
+    """Table of label-less PRs AI triage dropped as internal-only, for a sanity check.
+
+    Surfaced so a maintainer can catch a user-facing change the model wrongly
+    dropped: these PRs are **absent** from the notes. A ``⚠️`` marks a call the
+    model flagged low-confidence. Add the ``release-notes`` label and re-cut to
+    pull one back in.
+    """
+    if not ai_excluded:
+        return ""
+    lines = [
+        "",
+        "### AI-triaged out of the notes",
+        "",
+        "These merged PRs were not labelled `release-notes`, and AI triage judged "
+        "them internal-only, so they are **absent** from the notes. Scan for any "
+        "user-facing change the model wrongly dropped; label it `release-notes` and "
+        "re-cut to include it:",
+        "",
+        "| PR | Title | Author | Why excluded |",
+        "|----|-------|--------|--------------|",
+    ]
+    for pr in ai_excluded:
+        author = f"@{pr.author}" if pr.author else "(unknown)"
+        lines.append(
+            f"| [#{pr.number}]({pr.url}) | {publish_mod.escape_cell(pr.title)} | "
+            f"{author} | {_ai_triage_reason_cell(pr)} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _triage_section(triage: Sequence[Any]) -> str:
-    """Render a Markdown table of untagged/double-labelled PRs for the PR body."""
+    """Render a Markdown table of PRs AI triage could not decide, for the PR body."""
     if not triage:
         return ""
     lines = [
         "",
         "### Needs triage",
         "",
-        "These merged PRs in range carry neither `release-notes` nor "
-        "`no-release-notes` (or carry both) and were not included. A maintainer "
-        "should label them:",
+        "These merged PRs were not labelled `release-notes`, and AI triage returned "
+        "no verdict for them (a parse failure or a dropped entry), so they were "
+        "**not** included. A maintainer should decide each: label it `release-notes` "
+        "and re-cut to include it, or leave it out.",
         "",
         "| PR | Title | Author |",
         "|----|-------|--------|",
@@ -1351,7 +1494,7 @@ def _unresolved_backports_section(unresolved_backports: Sequence[Any]) -> str:
     range commit resolved to a PR that is itself a backport, and discovery could
     not walk it back to the original (no ``## Applied`` table, ``-x`` trailer,
     ``## Backport Summary`` row, recoverable PR-commit ``(#N)``, or
-    ``backport/<n>-to-<branch>`` head). The change *is* noted, but credited to the
+    ``backport/<n>-to-<branch>`` head). The change is noted, but credited to the
     backport PR, not the change's author, and the note reads normally, so nothing
     else in the PR would tip off a reviewer. List it here so a maintainer can find
     the original PR and correct the credit (author and ``(#N)``) before merging.
@@ -1386,7 +1529,7 @@ def _unresolved_cherry_picks_section(unresolved_cherry_picks: Sequence[Any]) -> 
     SHAs resolved through the API (the source commit is not in this repo, a
     hand-applied pick from a fork or history predating PR association), so the note
     was credited from the commit's subject ``(#N)`` or the commit->PR API instead.
-    For a *rewritten* pick that names the PR that landed the change on this line,
+    For a rewritten pick that names the PR that landed the change on this line,
     not the change's author; for a preserved-message pick it is correct. The source
     is unreachable, so the two cannot be told apart, and the credited PR carries no
     backport markers, so nothing else in the PR flags it. List it here with the
@@ -1422,7 +1565,7 @@ def _collided_section(collided: Sequence[Any]) -> str:
     """Flag distinct commits dropped because another commit reused their ``(#N)``.
 
     Each entry is a :class:`~scripts.release_notes.models.CollidedCommit`: two
-    *different* changes resolved to one PR number via the ambiguous subject
+    different changes resolved to one PR number via the ambiguous subject
     ``(#N)`` tier (a backport reused a source PR's ``(#N)`` on an unrelated
     follow-up commit), so discovery kept the first and dropped this one. The
     dropped commit resolved to a number, so it is absent from the notes and from

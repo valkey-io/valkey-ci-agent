@@ -1,8 +1,10 @@
-"""Shared AI-notes pipeline: discover -> classify -> generate -> render.
+"""Shared AI-notes pipeline: discover -> classify -> triage -> generate -> render.
 
-Takes a release line's clone, finds labelled PRs merged since its last tag, and
-produces categorized bullets as a {category: [line, ...]} map. The release_format
-module renders that map into a dated section at cut time.
+Takes a release line's clone, finds PRs merged since its last tag, and produces
+categorized bullets as a {category: [line, ...]} map. PRs labelled ``release-notes``
+are included directly; the rest go through an AI triage pass that decides which are
+user-facing enough to note. The release_format module renders the resulting map
+into a dated section at cut time.
 """
 
 from __future__ import annotations
@@ -16,10 +18,12 @@ from scripts.release_notes import discover as discover_mod
 from scripts.release_notes import generate as generate_mod
 from scripts.release_notes import release_format as release_format_mod
 from scripts.release_notes import render as render_mod
+from scripts.release_notes import triage as triage_mod
 from scripts.release_notes.classify import classify
 from scripts.release_notes.models import (
     CollidedCommit,
     MergedPR,
+    TriagedPR,
     UncertainNote,
     UnresolvedBackport,
     UnresolvedCherryPick,
@@ -39,11 +43,13 @@ class RegenResult:
 
     base_tag: str
     grouped: dict[str, list[str]]  # {category: [rendered bullet line, ...]} for this cut
-    included: int               # PRs included (labelled release-notes)
+    included: int               # PRs fed to generate (labelled release-notes + AI-triaged in)
     bullet_count: int           # bullets actually rendered (post group_bullets: after dup-PR dedup and reserved-category drops)
     skipped: tuple[int, ...]    # PR numbers with no rendered note: model-declined, parse-failure batches, or reserved-category drops (see regenerate_unreleased)
-    triage: tuple[MergedPR, ...]  # untagged / double-labelled PRs
+    triage: tuple[MergedPR, ...]  # label-less PRs AI triage could not decide -> human triage
     had_prs: bool               # whether the range contained any PR at all
+    ai_included: tuple[TriagedPR, ...] = ()  # label-less PRs AI triage judged user-facing and added to the notes
+    ai_excluded: tuple[TriagedPR, ...] = ()  # label-less PRs AI triage judged internal-only and dropped
     duplicate_prs: tuple[int, ...] = ()  # PR numbers the model emitted more than once (extra bullets dropped)
     uncertain: tuple[UncertainNote, ...] = ()  # low-confidence notes the model flagged, for the PR body
     unresolved: tuple[UnresolvedCommit, ...] = ()  # range commits that resolved to no PR (shipped un-noted)
@@ -57,10 +63,13 @@ def regenerate_unreleased(
     repo: Any, clone_dir: str, *, head_ref: str, tag_glob: str | None,
     base_ref: str | None = None,
 ) -> RegenResult:
-    """Discover the range and generate categorized bullets for it.
+    """Discover the range, triage label-less PRs, and generate categorized bullets.
 
-    ``base_ref`` overrides tag-based baseline resolution. Returns a RegenResult
-    whose ``grouped`` map the cut caller renders into a dated section.
+    PRs labelled ``release-notes`` are included directly; the rest are run through
+    AI triage (see :mod:`scripts.release_notes.triage`) and the ones judged
+    user-facing join generation. ``base_ref`` overrides tag-based baseline
+    resolution. Returns a RegenResult whose ``grouped`` map the cut caller renders
+    into a dated section, plus the AI include/exclude decisions for the PR body.
     """
     discovery = discover_mod.discover(
         repo, clone_dir, head_ref, tag_glob=tag_glob, base_ref=base_ref
@@ -76,10 +85,30 @@ def regenerate_unreleased(
             collided=discovery.collided,
         )
 
-    include, _exclude, triage = classify(discovery.prs)
+    # Labelled PRs are included directly; the rest are candidates AI triage judges.
+    labelled, candidates = classify(discovery.prs)
+    triage_result = triage_mod.triage(
+        candidates, repo_dir=clone_dir, base_ref=discovery.base_tag
+    )
+
+    # Join each verdict back to its PR facts for the body, and collect the PRs the
+    # model judged user-facing so they flow into generation with the labelled ones.
+    by_number = {pr.number: pr for pr in candidates}
+    ai_included = _triaged_prs(triage_result.included, by_number)
+    ai_excluded = _triaged_prs(triage_result.excluded, by_number)
+    triaged_in = [
+        by_number[d.pr_number] for d in triage_result.included if d.pr_number in by_number
+    ]
+    # Candidates AI triage could not decide fall back to human triage.
+    human_triage = tuple(
+        by_number[n] for n in triage_result.undecided if n in by_number
+    )
+
+    include = labelled + triaged_in
     logger.info(
-        "%d included, %d excluded, %d triage", len(include),
-        len(discovery.prs) - len(include) - len(triage), len(triage),
+        "%d labelled, %d candidates -> %d AI-included, %d AI-excluded, %d undecided",
+        len(labelled), len(candidates), len(ai_included), len(ai_excluded),
+        len(human_triage),
     )
 
     gen = generate_mod.generate(
@@ -115,7 +144,8 @@ def regenerate_unreleased(
     return RegenResult(
         base_tag=discovery.base_tag, grouped=grouped,
         included=len(include), bullet_count=promoted_count, skipped=skipped,
-        triage=tuple(triage), had_prs=True,
+        triage=human_triage, had_prs=True,
+        ai_included=ai_included, ai_excluded=ai_excluded,
         duplicate_prs=duplicate_prs, uncertain=uncertain,
         unresolved=discovery.unresolved,
         unresolved_backports=discovery.unresolved_backports,
@@ -123,6 +153,24 @@ def regenerate_unreleased(
         unresolved_cherry_picks=discovery.unresolved_cherry_picks,
         collided=discovery.collided,
     )
+
+
+def _triaged_prs(decisions, by_number):
+    """Join AI triage decisions back to their PR facts, dropping unknown numbers.
+
+    Preserves decision order and skips any verdict whose PR is not in *by_number*
+    (an unknown number the triage parser should already have filtered out).
+    """
+    out = []
+    for d in decisions:
+        pr = by_number.get(d.pr_number)
+        if pr is None:
+            continue
+        out.append(TriagedPR(
+            number=pr.number, title=pr.title, author=pr.author, url=pr.url,
+            included=d.included, reason=d.reason, uncertain=d.uncertain,
+        ))
+    return tuple(out)
 
 
 def _dedup_bullets_by_pr(bullets):

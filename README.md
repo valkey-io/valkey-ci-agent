@@ -29,7 +29,7 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
 | CI Fix | Active | On-demand `@valkeyrie-bot fix <ci-link>` - diagnoses and fixes a failing test on a backport PR |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
-| Release Notes | Active | Cuts a release: AI-generates notes from labelled PRs, promotes them onto a release line branch, bumps `src/version.h`, opens a PR (held as a draft when the cut flags issues) |
+| Release Notes | Active | Cuts a release: AI-generates notes from labelled PRs plus AI-triaged label-less ones, promotes them onto a release line branch, bumps `src/version.h`, opens a PR (held as a draft when the cut flags issues) |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Additional Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
 
@@ -271,7 +271,8 @@ verify step. macOS verification runs once on its dedicated runner.
 
 Cuts a Valkey release in one shot. A maintainer dispatches the source branch, the
 target version, stage, and urgency; the agent generates the release notes from the
-labelled PRs in range (Claude via Bedrock), renders them onto the long-running
+labelled PRs plus the label-less ones AI triage judges user-facing (Claude via
+Bedrock), renders them onto the long-running
 release line as a dated section, bumps `src/version.h`, refreshes the running
 contributor list, and opens one PR for review (as a draft, holding the merge, when
 the cut flags anything a maintainer should address first; see [Edge-case
@@ -374,13 +375,18 @@ human merges.
    release tag (resolved from all tags in the repo), for rc2+ it is the prior RC
    tag (e.g. `9.2.0-rc1`), and for a patch GA it is the previous patch tag (e.g.
    `9.1.8`). Tags are created by maintainers before dispatch.
-3. **Classify** (code) - partition PRs by their `release-notes` / `no-release-notes`
-   labels into include / exclude / triage, mirroring valkey's `check_release_notes`.
-4. **Generate** (AI) - Claude writes one categorized, user-facing bullet per
-   included PR. The model never emits the `(#N)` reference or `by @handle` - code
-   appends those in `scripts/release_notes/render.py` (`format_bullet`), so the
-   bullet format stays fixed in one place.
-5. **Render + bump** (code) - render the categorized bullets into a new dated
+3. **Classify** (code) - split PRs by the `release-notes` label: labelled PRs are
+   included directly, everything else is a triage candidate.
+4. **Triage** (AI) - Claude decides, per label-less candidate, whether the change
+   is user-facing enough to note (include) or purely internal (exclude), with a
+   short reason for each. Included candidates join the labelled PRs; the model's
+   include/exclude table is surfaced in the PR body for a maintainer to confirm.
+   A candidate the model returns no verdict for falls back to human triage.
+5. **Generate** (AI) - Claude writes one categorized, user-facing bullet per
+   included PR (labelled + triaged-in). The model never emits the `(#N)` reference
+   or `by @handle` - code appends those in `scripts/release_notes/render.py`
+   (`format_bullet`), so the bullet format stays fixed in one place.
+6. **Render + bump** (code) - render the categorized bullets into a new dated
    section prepended before any existing sections on the release line via
    `render_release_notes` (`release_format.py`) / `set_version`
    (`version_bump.py`), append the cumulative contributor list
@@ -389,7 +395,7 @@ human merges.
    `valkey-io/valkey` ships no such tooling, so a cut runs against unmodified
    upstream (a plaintext `00-RELEASENOTES` placeholder and a `src/version.h`
    with the `VALKEY_VERSION*` macros).
-6. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
+7. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
    and open/update a PR into the release line with a body that explains the cut and
    surfaces any advisories (below). When the cut flags anything a maintainer should
    address first, the PR opens as a draft to hold the merge (see [Edge-case
@@ -415,11 +421,15 @@ prints the same hold decision without opening a PR. The signals that hold:
 - **RC out of sequence** - a re-cut rc or a skipped rc number.
 - **Unanchored baseline** - rc1 of `M.0.0` with no `--base-ref` fell back to the
   nearest tag, which may over-broaden the range.
-- **Empty release notes** - no PRs in range, or every PR needs triage; the body
-  says which, so an empty dated section is not mistaken for a generation miss.
+- **Empty release notes** - no PRs in range, or no PR was labelled and AI triage
+  included none of the label-less ones; the body says which, so an empty dated
+  section is not mistaken for a generation miss.
 - **Duplicate / declined / low-confidence** - a PR credited in more than one
   bullet, a labelled PR the model declined to note, or a note the model flagged
   as low-confidence.
+- **AI triage** - the model decided inclusion for label-less PRs (a call that used
+  to require a human label), so the PR holds until a maintainer confirms the
+  include/exclude table; a low-confidence triage call also holds.
 - **Security** - a `--security-fix` also noted as a normal bullet, `SECURITY`
   urgency with no security fixes, or advisories that could not be read (a clean
   advisory match is informational and does not hold).
@@ -427,7 +437,8 @@ prints the same hold decision without opening a PR. The signals that hold:
   valkey's label-only gate: a range commit with no resolvable PR (absent from the
   notes entirely), a commit whose resolved PR could not be fetched, or a note
   credited to a backport PR because the original author's PR could not be recovered.
-- **Triage** - PRs in range that are untagged or double-labelled.
+- **Triage** - label-less PRs AI triage could not decide (no verdict returned), so
+  a maintainer must decide whether to include them.
 
 The body always shows the resolved notes range so an over-broad baseline is
 visible: the resolved mode (e.g. `rc2`), the source and target branches, and both
@@ -459,5 +470,5 @@ App installation lacks it. The App installation must hold
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) — full system design including planned workflows
-- [DEVELOPMENT.md](DEVELOPMENT.md) — local setup, testing, and GitHub Actions usage
+- [docs/architecture.md](docs/architecture.md) - full system design including planned workflows
+- [DEVELOPMENT.md](DEVELOPMENT.md) - local setup, testing, and GitHub Actions usage

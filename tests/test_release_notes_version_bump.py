@@ -73,22 +73,33 @@ class TestSetVersion:
         for stage in ("dev", "ga", "rc1", "rc12"):
             set_version(_SAMPLE, "9.1.0", stage)  # must not raise
 
-    def test_missing_macro_raises(self) -> None:
-        # A version.h lacking one of the three macros is a hard error, not a
-        # silent partial rewrite.
+    def test_missing_required_macro_raises(self) -> None:
+        # VERSION and VERSION_NUM are required; a version.h lacking either is a
+        # hard error.
         without_num = '#define VALKEY_VERSION "1.0.0"\n#define VALKEY_RELEASE_STAGE "dev"\n'
         with pytest.raises(ValueError, match="VALKEY_VERSION_NUM"):
             set_version(without_num, "9.1.0", "rc1")
 
-    def test_duplicated_macro_raises(self) -> None:
-        # Two definitions of the same macro (count > 1) is as much a problem as a
-        # missing one: an ambiguous version.h must be rejected, not have both
-        # copies rewritten. The error names the duplicated macro.
+    def test_missing_stage_macro_is_tolerated(self) -> None:
+        # Older branches (7.2) predate VALKEY_RELEASE_STAGE. The version bump
+        # must succeed without it, updating only VERSION and VERSION_NUM.
+        legacy = (
+            '#define SERVER_NAME "valkey"\n'
+            '#define VALKEY_VERSION "7.2.13"\n'
+            "#define VALKEY_VERSION_NUM 0x0007020d\n"
+        )
+        out = set_version(legacy, "7.2.14", "rc1")
+        assert _macro(out, "VALKEY_VERSION") == '"7.2.14"'
+        assert _macro(out, "VALKEY_VERSION_NUM") == "0x0007020e"
+        assert "VALKEY_RELEASE_STAGE" not in out
+
+    def test_duplicated_required_macro_raises(self) -> None:
+        # Two definitions of a required macro (count > 1) is a hard error.
         doubled = (
             '#define VALKEY_VERSION "1.0.0"\n'
+            '#define VALKEY_VERSION "2.0.0"\n'
             "#define VALKEY_VERSION_NUM 0x00010000\n"
             '#define VALKEY_RELEASE_STAGE "dev"\n'
-            '#define VALKEY_RELEASE_STAGE "ga"\n'  # stray second definition
         )
-        with pytest.raises(ValueError, match="VALKEY_RELEASE_STAGE"):
+        with pytest.raises(ValueError, match="VALKEY_VERSION"):
             set_version(doubled, "9.1.0", "rc1")

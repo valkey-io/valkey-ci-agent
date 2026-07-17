@@ -440,8 +440,8 @@ class TestCutOrchestration:
 
     def _setup(self, monkeypatch, clone, *, line_exists, bullets=True, triage=(),
                had_prs=True, duplicate_prs=(), uncertain=(), unresolved=(),
-               unresolved_backports=(), unresolved_prs=(), stub_contrib_base=True,
-               writes=None):
+               unresolved_backports=(), unresolved_prs=(), ai_included=(),
+               ai_excluded=(), stub_contrib_base=True, writes=None):
         from scripts.release_notes import pipeline as pipeline_mod
         from scripts.release_notes import render as render_mod
         from scripts.release_notes.models import CategorizedBullet
@@ -450,13 +450,16 @@ class TestCutOrchestration:
         bl = ([CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix")]
               if bullets else [])
         grouped = render_mod.group_bullets(bl)
+        # included counts labelled bullets plus AI-triaged-in PRs, mirroring pipeline.
+        included = (1 if bullets else 0) + len(ai_included)
         monkeypatch.setattr(
             pipeline_mod, "regenerate_unreleased",
             lambda *a, **k: RegenResult(
                 base_tag="9.0.0", grouped=grouped,
-                included=1 if bullets else 0,
+                included=included,
                 bullet_count=sum(len(v) for v in grouped.values()), skipped=(),
                 triage=tuple(triage), had_prs=had_prs,
+                ai_included=tuple(ai_included), ai_excluded=tuple(ai_excluded),
                 duplicate_prs=tuple(duplicate_prs), uncertain=tuple(uncertain),
                 unresolved=tuple(unresolved),
                 unresolved_backports=tuple(unresolved_backports),
@@ -811,12 +814,13 @@ class TestCutOrchestration:
         assert "out of sequence" not in created[0]["body"]
 
     def _cut_body(self, monkeypatch, clone, *, line_exists, cut_kwargs,
-                  bullets=True, triage=(), had_prs=True, duplicate_prs=(), uncertain=()):
+                  bullets=True, triage=(), had_prs=True, duplicate_prs=(), uncertain=(),
+                  ai_included=(), ai_excluded=()):
         """Run cut() with GitHub mocked and return the created PR's body."""
         from unittest.mock import MagicMock
         self._setup(monkeypatch, clone, line_exists=line_exists, bullets=bullets,
                     triage=triage, had_prs=had_prs, duplicate_prs=duplicate_prs,
-                    uncertain=uncertain)
+                    uncertain=uncertain, ai_included=ai_included, ai_excluded=ai_excluded)
         repo = MagicMock()
         repo.get_pulls.return_value = []
         created = []
@@ -857,13 +861,16 @@ class TestCutOrchestration:
         assert "Empty release notes" in body
         assert "No merged PRs were found" in body
 
-    def test_all_triage_empty_notes_explained_in_body(self, monkeypatch, clone):
+    def test_all_undecided_empty_notes_explained_in_body(self, monkeypatch, clone):
+        # No PR labelled release-notes and AI triage decided nothing (all undecided):
+        # nothing was included, so the empty-notes section explains why and the
+        # Needs-triage table still lists the undecided PRs.
         from scripts.release_notes.models import MergedPR
         triage = (MergedPR(number=7, title="thing", author="bob", url="https://x/7"),)
         body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
                               bullets=False, had_prs=True, triage=triage)
         assert "Empty release notes" in body
-        assert "unlabelled or double-labelled" in body
+        assert "No PR in range was labelled" in body
         assert "Needs triage" in body  # the table is still rendered
 
     def test_duplicate_pr_warned_in_body(self, monkeypatch, clone):
@@ -871,6 +878,40 @@ class TestCutOrchestration:
                               duplicate_prs=(40,))
         assert "noted more than once" in body
         assert "#40" in body
+
+    def test_ai_included_listed_in_body(self, monkeypatch, clone):
+        # A label-less PR AI triage added to the notes is listed with its reason so
+        # a maintainer can confirm the include.
+        from scripts.release_notes.models import TriagedPR
+        ai_included = (TriagedPR(number=8, title="adds a config", author="dev",
+                                 url="https://x/8", included=True, reason="adds CONFIG foo"),)
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
+                              ai_included=ai_included)
+        assert "AI-triaged into the notes" in body
+        assert "[#8](https://x/8)" in body
+        assert "adds CONFIG foo" in body
+
+    def test_ai_excluded_listed_in_body(self, monkeypatch, clone):
+        # A label-less PR AI triage dropped is listed so a maintainer can catch a
+        # wrongly-dropped user-facing change; an uncertain call is marked.
+        from scripts.release_notes.models import TriagedPR
+        ai_excluded = (TriagedPR(number=9, title="refactor", author="dev",
+                                 url="https://x/9", included=False,
+                                 reason="internal refactor", uncertain=True),)
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
+                              ai_excluded=ai_excluded)
+        assert "AI-triaged out of the notes" in body
+        assert "[#9](https://x/9)" in body
+        assert "⚠️ internal refactor" in body  # uncertain calls are flagged
+
+    def test_ai_triage_holds_pr_as_draft(self, monkeypatch, clone):
+        # Any AI include/exclude decision holds the PR as a draft for confirmation.
+        from scripts.release_notes.models import TriagedPR
+        ai_included = (TriagedPR(number=8, title="t", author="d", url="https://x/8",
+                                 included=True, reason="user-facing"),)
+        body = self._cut_body(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
+                              ai_included=ai_included)
+        assert "AI triaged unlabelled PRs (confirm include/exclude)" in body
 
     def test_uncertain_notes_flagged_in_body(self, monkeypatch, clone):
         from scripts.release_notes.models import UncertainNote
@@ -1123,14 +1164,14 @@ class TestCutOrchestration:
         assert "baseline is unanchored" in kw["body"]
 
     def test_triage_only_cut_is_held(self, monkeypatch, clone):
-        # An advisory-tier signal (PRs needing triage, notes still non-empty) also
+        # An advisory-tier signal (AI-undecided PRs, notes still non-empty) also
         # holds: any reviewer-facing signal opens the PR as a draft.
         from scripts.release_notes.models import MergedPR
         triage = (MergedPR(number=7, title="thing", author="bob", url="https://x/7"),)
         kw = self._cut_created(monkeypatch, clone, line_exists={"9.1": True}, cut_kwargs={},
                                triage=triage)
         assert kw["draft"] is True
-        assert "PRs need triage" in kw["body"]
+        assert "AI triage could not decide some PRs" in kw["body"]
 
     def test_dry_run_previews_hold(self, monkeypatch, clone, capsys):
         # --dry-run shows the hold decision the real cut would make.
@@ -1534,6 +1575,7 @@ class TestSecurityOnlyCutNotEmpty:
         return SimpleNamespace(
             bullet_count=bullet_count, had_prs=had_prs, triage=triage,
             included=0, skipped=(), duplicate_prs=(), uncertain=(),
+            ai_included=(), ai_excluded=(),
             unresolved=(), unresolved_backports=(), unresolved_prs=(),
             unresolved_cherry_picks=(), collided=(), base_tag="9.0.0",
         )

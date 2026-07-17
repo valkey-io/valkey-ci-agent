@@ -13,6 +13,8 @@ from scripts.release_notes.models import (
     DiscoveryResult,
     GenerationResult,
     MergedPR,
+    TriageDecision,
+    TriageResult,
 )
 
 _FIXTURE_CLONE = os.path.join(os.path.dirname(__file__), "fixtures", "valkey_clone")
@@ -25,11 +27,21 @@ def clone(tmp_path):
     return str(dest)
 
 
-def _patch(monkeypatch, *, prs, bullets=(), skipped=()):
+def _patch(monkeypatch, *, prs, bullets=(), skipped=(), triage_result=None):
     monkeypatch.setattr(pipeline_mod.discover_mod, "discover",
                         lambda *a, **k: DiscoveryResult(base_tag="9.1.0-rc1", head_ref="9.1", prs=prs))
     monkeypatch.setattr(pipeline_mod.generate_mod, "generate",
                         lambda *a, **k: GenerationResult(bullets=bullets, skipped=skipped))
+
+    # Stub AI triage. By default every label-less candidate is left undecided, so a
+    # test that doesn't opt in behaves like the old "unlabelled -> triage" partition.
+    # Tests exercising AI include/exclude pass an explicit triage_result.
+    def _fake_triage(candidates, **k):
+        if triage_result is not None:
+            return triage_result
+        return TriageResult(undecided=tuple(c.number for c in candidates))
+
+    monkeypatch.setattr(pipeline_mod.triage_mod, "triage", _fake_triage)
 
 
 def _all_lines(grouped):
@@ -52,12 +64,53 @@ def test_generates_and_renders(monkeypatch, clone):
     assert r.grouped["Bug Fixes"] == ["* fix by @a (#40)"]
 
 
-def test_triage_surfaced(monkeypatch, clone):
+def test_undecided_candidate_surfaced_as_triage(monkeypatch, clone):
+    # A label-less PR AI triage returns no verdict for falls back to human triage.
     prs = (MergedPR(number=50, title="untagged", author="z", url="u", labels=()),)
-    _patch(monkeypatch, prs=prs)
+    _patch(monkeypatch, prs=prs)  # default stub leaves all candidates undecided
     r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
     assert [p.number for p in r.triage] == [50]
+    assert r.ai_included == () and r.ai_excluded == ()
     assert r.included == 0
+
+
+def test_ai_included_candidate_generates_a_bullet(monkeypatch, clone):
+    # A label-less PR AI triage judges user-facing joins generation and is credited,
+    # and it is surfaced in ai_included for the PR body (with the model's reason).
+    prs = (MergedPR(number=50, title="adds a config", author="z", url="u", labels=()),)
+    _patch(monkeypatch, prs=prs,
+           bullets=(CategorizedBullet(pr_number=50, author="z", category="Bug Fixes", text="fix"),),
+           triage_result=TriageResult(included=(
+               TriageDecision(pr_number=50, included=True, reason="adds CONFIG x"),)))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.included == 1 and r.bullet_count == 1
+    assert r.grouped["Bug Fixes"] == ["* fix by @z (#50)"]
+    assert [(p.number, p.reason, p.included) for p in r.ai_included] == [(50, "adds CONFIG x", True)]
+    assert r.triage == ()
+
+
+def test_ai_excluded_candidate_dropped_and_surfaced(monkeypatch, clone):
+    # A label-less PR AI triage judges internal-only is not generated and is
+    # surfaced in ai_excluded so a maintainer can sanity-check the drop.
+    prs = (MergedPR(number=51, title="refactor", author="z", url="u", labels=()),)
+    _patch(monkeypatch, prs=prs,
+           triage_result=TriageResult(excluded=(
+               TriageDecision(pr_number=51, included=False, reason="internal refactor"),)))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.included == 0 and r.bullet_count == 0
+    assert [(p.number, p.reason) for p in r.ai_excluded] == [(51, "internal refactor")]
+    assert r.ai_included == () and r.triage == ()
+
+
+def test_labelled_pr_bypasses_triage(monkeypatch, clone):
+    # A release-notes-labelled PR is included directly and never appears in any
+    # AI-triage bucket, even though the stub would leave a candidate undecided.
+    prs = (MergedPR(number=40, title="t", author="a", url="u", labels=("release-notes",)),)
+    _patch(monkeypatch, prs=prs,
+           bullets=(CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix"),))
+    r = pipeline_mod.regenerate_unreleased(object(), clone, head_ref="9.1", tag_glob=None)
+    assert r.included == 1 and r.bullet_count == 1
+    assert r.ai_included == () and r.ai_excluded == () and r.triage == ()
 
 
 def test_unresolved_backports_passthrough(monkeypatch, clone):
