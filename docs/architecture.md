@@ -326,6 +326,7 @@ main.py (manual dispatch: version, optional stage, urgency, dry_run)
             -> dedup bullets by PR number (surfaces duplicate_prs)
             -> group_bullets()  {category: [canonical bullet line, ...]}
        -> _drop_already_credited()   dedup against PRs the line already ships
+       -> feedback.revise_bullets()  replay authorized open-PR commands (reruns)
        -> promote_and_bump()         dated section + version.h bump + contributors
        -> _commit_push_release_pr()  prep branch (force-with-lease) + PR into the line
 ```
@@ -346,6 +347,15 @@ tip, rebuilds the prep commit on that tip, pushes it with force-with-lease, and
 updates the existing PR. Full regeneration is intentional: it includes new
 merges and also re-evaluates changed labels and PR metadata without treating a
 previous AI-generated branch as durable input.
+
+On a rerun with an open release PR, `feedback.py` reads only top-level comments
+whose body starts with `@valkeyrie-ops revise-release-notes`. The existing
+contributors-team authorization gate filters authors. All eligible comments are
+replayed oldest-first because the release cut regenerates from scratch; a
+processed marker alone would allow an earlier requested edit to disappear. The
+AI has no tools and emits only validated replace/drop operations over generated
+PR bullets. A collection, authorization-read, parse, or validation failure
+aborts before the existing prep branch or PR is mutated.
 
 Signals fall into two tiers. Malformed inputs, a missing target branch, an
 already-released/backward target, or a target branch that advances during
@@ -372,6 +382,7 @@ calendar date.
 - `scripts/release_notes/ai_inputs.py` - shared, bounded PR prompt payloads and SHA-cached diffs; combined sweep diffs are omitted when they cannot be attributed to one source PR
 - `scripts/release_notes/triage.py` - completeness-first Claude include/exclude plus deterministic release-impact guardrail for PRs without `release-notes` (no tools; PR data inlined in prompt)
 - `scripts/release_notes/generate.py` - Claude bullet generation (no tools; PR data inlined in prompt)
+- `scripts/release_notes/feedback.py` - authorized top-level PR feedback collection and constrained no-tools bullet revision
 - `scripts/release_notes/models.py` - typed dataclasses for the pipeline
 - `scripts/release_notes/security.py` - Security Fixes from published GitHub advisories (never AI-authored)
 - `scripts/release_notes/render.py` - canonical `00-RELEASENOTES` rendering

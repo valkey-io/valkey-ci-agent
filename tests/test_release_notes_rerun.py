@@ -8,8 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from scripts.common.proc import git_output, run_git
+from scripts.release_notes import feedback as feedback_mod
 from scripts.release_notes import pipeline as pipeline_mod
 from scripts.release_notes import release_cut as cut_mod
+from scripts.release_notes.feedback import FeedbackDecision, FeedbackResult
 from scripts.release_notes.models import CategorizedBullet, GenerationResult
 
 _FIXTURE_CLONE = Path(__file__).parent / "fixtures" / "valkey_clone"
@@ -33,7 +35,7 @@ def _clone(remote: Path, destination: Path) -> str:
     return str(destination)
 
 
-def _cut(repo: MagicMock, clone_dir: str) -> int:
+def _cut(repo: MagicMock, clone_dir: str, *, github: MagicMock) -> int:
     return cut_mod.cut(
         repo,
         repo_full_name="valkey-io/valkey",
@@ -50,6 +52,7 @@ def _cut(repo: MagicMock, clone_dir: str) -> int:
         token="token",
         git_env={},
         dry_run=False,
+        github=github,
     )
 
 
@@ -88,8 +91,24 @@ def test_rerun_regenerates_latest_tip_and_updates_same_open_pr(
 
     existing.convert_to_draft.side_effect = _convert_to_draft
     existing.mark_ready_for_review.side_effect = _mark_ready
-    repo.get_pulls.side_effect = [[], [existing]]
+    existing.get_issue_comments.return_value = [
+        SimpleNamespace(
+            id=9001,
+            body=(
+                "@valkeyrie-ops revise-release-notes\n"
+                "Make #40 explicit about compatibility."
+            ),
+            html_url="https://example.test/pull/77#issuecomment-9001",
+            user=SimpleNamespace(login="maintainer", type="User"),
+        )
+    ]
+    # First cut: publish lookup. Rerun: early feedback lookup, then publish lookup.
+    repo.get_pulls.side_effect = [[], [existing], [existing]]
     repo.create_pull.return_value = existing
+    github = MagicMock()
+    membership = SimpleNamespace(state="active")
+    team = github.get_organization.return_value.get_team_by_slug.return_value
+    team.get_team_membership.return_value = membership
 
     def _generate(prs, **_kwargs):
         return GenerationResult(
@@ -107,10 +126,43 @@ def test_rerun_regenerates_latest_tip_and_updates_same_open_pr(
     monkeypatch.setattr(pipeline_mod.generate_mod, "generate", _generate)
     monkeypatch.setattr(cut_mod, "_assert_origin_url", lambda *_args: None)
     monkeypatch.setattr(cut_mod, "_contrib_base", lambda *_args, **_kwargs: None)
+    feedback_calls = []
+
+    def _revise(items, bullets, **_kwargs):
+        feedback_calls.append((items, bullets))
+        revised = tuple(
+            CategorizedBullet(
+                pr_number=bullet.pr_number,
+                author=bullet.author,
+                category=bullet.category,
+                text=(
+                    "Clarify compatibility for release entry 40"
+                    if bullet.pr_number == 40
+                    else bullet.text
+                ),
+                uncertain=bullet.uncertain,
+                uncertain_reason=bullet.uncertain_reason,
+            )
+            for bullet in bullets
+        )
+        return FeedbackResult(
+            bullets=revised,
+            decisions=(
+                FeedbackDecision(
+                    comment_id=9001,
+                    author="maintainer",
+                    url="https://example.test/pull/77#issuecomment-9001",
+                    applied=True,
+                    summary="Reworded #40 to emphasize compatibility",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(feedback_mod, "revise_bullets", _revise)
 
     prep_branch = "agent/release-cut/9.1.0-rc1"
     first_clone = _clone(remote, tmp_path / "first-clone")
-    assert _cut(repo, first_clone) == 0
+    assert _cut(repo, first_clone, github=github) == 0
     first_prep_sha = git_output(str(remote), "rev-parse", prep_branch).strip()
     first_notes = git_output(str(remote), "show", f"{prep_branch}:00-RELEASENOTES")
     assert "(#40)" in first_notes
@@ -122,7 +174,7 @@ def test_rerun_regenerates_latest_tip_and_updates_same_open_pr(
     run_git(str(work), "push", "-q", "origin", "9.1")
 
     second_clone = _clone(remote, tmp_path / "second-clone")
-    assert _cut(repo, second_clone) == 0
+    assert _cut(repo, second_clone, github=github) == 0
 
     second_prep_sha = git_output(str(remote), "rev-parse", prep_branch).strip()
     second_prep_parent = git_output(str(remote), "rev-parse", f"{prep_branch}^").strip()
@@ -132,6 +184,10 @@ def test_rerun_regenerates_latest_tip_and_updates_same_open_pr(
     assert second_prep_parent == second_change_sha
     assert second_notes.count("(#40)") == 1
     assert second_notes.count("(#41)") == 1
+    assert "Clarify compatibility for release entry 40" in second_notes
+    assert "Process release entry 40" not in second_notes
+    assert len(feedback_calls) == 1
+    assert [item.comment_id for item in feedback_calls[0][0]] == [9001]
 
     repo.create_pull.assert_called_once()
     assert repo.create_pull.call_args.kwargs["head"] == prep_branch
@@ -139,3 +195,6 @@ def test_rerun_regenerates_latest_tip_and_updates_same_open_pr(
     existing.convert_to_draft.assert_called_once()
     existing.mark_ready_for_review.assert_called_once()
     assert existing.draft is False
+    updated_body = existing.edit.call_args.kwargs["body"]
+    assert "AI-handled release-note feedback" in updated_body
+    assert "issuecomment-9001" in updated_body

@@ -337,6 +337,7 @@ def _run_cut(
                 token=token, git_env=git_env, dry_run=dry_run,
                 force_ready=force_ready,
                 baseline_unanchored=baseline_unanchored,
+                github=gh,
             )
         finally:
             shutil.rmtree(clone_dir, ignore_errors=True)

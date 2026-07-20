@@ -325,6 +325,23 @@ well as processing new ones, so changed labels or PR metadata are picked up.
 Because the prep branch is replaced with `--force-with-lease`, manual edits made
 directly on that generated branch are not retained.
 
+Before that rerun, an active `valkey-io/contributors` member can request a
+revision in a top-level comment on the open release PR:
+
+```text
+@valkeyrie-ops revise-release-notes
+Rewrite #4123 to emphasize replication compatibility.
+Move #4150 to Configuration.
+```
+
+The rerun replays every authorized command against the fully regenerated
+bullets, so an earlier requested edit is not lost when newer changes arrive.
+The feedback AI may rewrite, recategorize, or drop an already-generated bullet;
+it cannot add a missing PR or change version, urgency, contributor, advisory, or
+Security Fixes data. Add or correct the PR labels to include a missing entry,
+then rerun. Unsupported feedback is listed in the PR body and holds the PR as a
+draft. A comment/API/AI failure aborts before the prep branch is changed.
+
 Use `release-notes-cut-advanced.yml` only for an explicit date/baseline,
 contributor override, security entries/advisory lookup, or `force_ready`. It
 delegates to the same release workflow as the normal dispatch, so the release
@@ -422,7 +439,11 @@ human merges.
    review. The model never emits the `(#N)` reference or `by @handle`; code
    removes accidental duplicate markers and terminal punctuation, then appends
    the canonical attribution in `scripts/release_notes/render.py`.
-6. **Render + bump** (code) - render the categorized bullets into a new dated
+6. **Apply PR feedback** (AI + code, reruns only) - collect top-level
+   `@valkeyrie-ops revise-release-notes` commands from active contributors,
+   replay them through a no-tools structured revision pass, and validate that
+   every operation targets an existing generated bullet and canonical category.
+7. **Render + bump** (code) - render the categorized bullets into a new dated
    section prepended before any existing sections on the release line via
    `render_release_notes` (`release_format.py`) / `set_version`
    (`version_bump.py`), append the cumulative contributor list
@@ -432,7 +453,7 @@ human merges.
    `valkey-io/valkey` ships no such tooling, so a cut runs against unmodified
    upstream (a plaintext `00-RELEASENOTES` placeholder and a `src/version.h`
    with the `VALKEY_VERSION*` macros).
-7. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
+8. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
    and open/update a PR into the release line with a body that explains the cut and
    surfaces any advisories (below). When the cut flags anything a maintainer should
    address first, the PR opens as a draft to hold the merge (see [Edge-case

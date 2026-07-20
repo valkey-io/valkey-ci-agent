@@ -555,7 +555,7 @@ class TestCutOrchestration:
                 included=included,
                 bullet_count=sum(len(v) for v in grouped.values()),
                 skipped=tuple(skipped),
-                triage=tuple(triage), had_prs=had_prs,
+                triage=tuple(triage), had_prs=had_prs, bullets=tuple(bl),
                 ai_included=tuple(ai_included),
                 guardrail_included=tuple(guardrail_included),
                 ai_excluded=tuple(ai_excluded),
@@ -1477,6 +1477,186 @@ class TestCutOrchestration:
         )
         # The fetch must precede the lease push so the tracking ref is current.
         assert fetch_idx < lease_idx, (fetch_idx, lease_idx)
+
+    def test_feedback_failure_leaves_existing_branch_and_pr_unchanged(
+        self, monkeypatch, clone
+    ):
+        from unittest.mock import MagicMock
+
+        from scripts.release_notes.feedback import FeedbackError, ReleaseFeedback
+
+        prep = "agent/release-cut/9.1.0-rc1"
+        calls = self._setup(
+            monkeypatch,
+            clone,
+            line_exists={"9.1": True, prep: True},
+        )
+        existing = MagicMock(number=77, draft=False)
+        repo = MagicMock()
+        repo.get_pulls.return_value = [existing]
+        monkeypatch.setattr(
+            rc.feedback_mod,
+            "collect_feedback",
+            lambda *_a, **_k: (
+                ReleaseFeedback(
+                    comment_id=9001,
+                    author="maintainer",
+                    body="Rewrite #40",
+                    url="https://x/comment/9001",
+                ),
+            ),
+        )
+
+        def _raise_feedback_error(*_args, **_kwargs):
+            raise FeedbackError("feedback parse failed")
+
+        monkeypatch.setattr(
+            rc.feedback_mod,
+            "revise_bullets",
+            _raise_feedback_error,
+        )
+
+        with pytest.raises(FeedbackError, match="feedback parse failed"):
+            rc.cut(
+                repo,
+                repo_full_name="valkey-io/valkey",
+                source_clone_dir=clone,
+                valkey_clone_dir=clone,
+                version="9.1.0",
+                stage="rc1",
+                urgency="LOW",
+                date="2026-06-25",
+                tag_glob=None,
+                base_ref=None,
+                contrib_base_ref=None,
+                security_fixes=None,
+                token="t",
+                git_env={},
+                dry_run=False,
+                github=MagicMock(),
+            )
+
+        assert not [call for call in calls if call[:1] == ("push",)]
+        existing.edit.assert_not_called()
+        existing.convert_to_draft.assert_not_called()
+
+    def test_ignored_feedback_is_audited_and_holds_existing_pr(
+        self, monkeypatch, clone
+    ):
+        from unittest.mock import MagicMock
+
+        from scripts.release_notes.feedback import (
+            FeedbackDecision,
+            FeedbackResult,
+            ReleaseFeedback,
+        )
+
+        prep = "agent/release-cut/9.1.0-rc1"
+        self._setup(
+            monkeypatch,
+            clone,
+            line_exists={"9.1": True, prep: True},
+        )
+        existing = MagicMock(number=77, draft=False, html_url="https://x/77")
+        existing.convert_to_draft.side_effect = lambda: setattr(
+            existing, "draft", True
+        )
+        repo = MagicMock()
+        repo.get_pulls.return_value = [existing]
+        monkeypatch.setattr(
+            rc.feedback_mod,
+            "collect_feedback",
+            lambda *_a, **_k: (
+                ReleaseFeedback(
+                    comment_id=9001,
+                    author="maintainer",
+                    body="Change version.h",
+                    url="https://x/comment/9001",
+                ),
+            ),
+        )
+
+        def _ignore_feedback(_items, bullets, **_kwargs):
+            return FeedbackResult(
+                bullets=tuple(bullets),
+                decisions=(
+                    FeedbackDecision(
+                        comment_id=9001,
+                        author="maintainer",
+                        url="https://x/comment/9001",
+                        applied=False,
+                        summary="Version metadata is outside feedback scope",
+                    ),
+                ),
+            )
+
+        monkeypatch.setattr(rc.feedback_mod, "revise_bullets", _ignore_feedback)
+
+        assert (
+            rc.cut(
+                repo,
+                repo_full_name="valkey-io/valkey",
+                source_clone_dir=clone,
+                valkey_clone_dir=clone,
+                version="9.1.0",
+                stage="rc1",
+                urgency="LOW",
+                date="2026-06-25",
+                tag_glob=None,
+                base_ref=None,
+                contrib_base_ref=None,
+                security_fixes=None,
+                token="t",
+                git_env={},
+                dry_run=False,
+                github=MagicMock(),
+            )
+            == 0
+        )
+
+        body = existing.edit.call_args.kwargs["body"]
+        assert "AI-handled release-note feedback" in body
+        assert "Not applied" in body
+        assert "Version metadata is outside feedback scope" in body
+        assert "release-note feedback was not applied" in body
+        existing.convert_to_draft.assert_called_once()
+
+    def test_existing_release_pr_requires_github_client(self, monkeypatch, clone):
+        from unittest.mock import MagicMock
+
+        from scripts.release_notes.feedback import FeedbackError
+
+        prep = "agent/release-cut/9.1.0-rc1"
+        calls = self._setup(
+            monkeypatch,
+            clone,
+            line_exists={"9.1": True, prep: True},
+        )
+        existing = MagicMock(number=77)
+        repo = MagicMock()
+        repo.get_pulls.return_value = [existing]
+
+        with pytest.raises(FeedbackError, match="feedback cannot be checked safely"):
+            rc.cut(
+                repo,
+                repo_full_name="valkey-io/valkey",
+                source_clone_dir=clone,
+                valkey_clone_dir=clone,
+                version="9.1.0",
+                stage="rc1",
+                urgency="LOW",
+                date="2026-06-25",
+                tag_glob=None,
+                base_ref=None,
+                contrib_base_ref=None,
+                security_fixes=None,
+                token="t",
+                git_env={},
+                dry_run=False,
+            )
+
+        assert not [call for call in calls if call[:1] == ("push",)]
+        existing.edit.assert_not_called()
 
     def test_first_cut_skips_prep_fetch(self, monkeypatch, clone):
         # On a first cut the prep branch is absent, so there is no tracking ref to

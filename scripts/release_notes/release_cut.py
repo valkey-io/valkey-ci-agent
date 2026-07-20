@@ -15,17 +15,20 @@ import logging
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Sequence
 
 from scripts.common.git_auth import github_https_url
 from scripts.common.proc import BOT_EMAIL, BOT_NAME, git_output, run_git
 from scripts.release_notes import contributors as gc
+from scripts.release_notes import feedback as feedback_mod
 from scripts.release_notes import pipeline as pipeline_mod
 from scripts.release_notes import publish as publish_mod
 from scripts.release_notes import release_format as rn
+from scripts.release_notes import render as render_mod
 from scripts.release_notes import security as security_mod
 from scripts.release_notes import version_bump as bv
+from scripts.release_notes.models import UncertainNote
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +103,7 @@ class _NotesMeta:
     baseline_unanchored: bool           # rc1 of M.0.0 with no --base-ref (over-broad range risk)
     advisories: Optional[Any] = None    # security.AdvisorySelection when --security-from-advisories ran, else None
     notes_range: Optional["_NotesRange"] = None  # resolved base/head refs + SHAs for the range display
+    feedback_decisions: Sequence[feedback_mod.FeedbackDecision] = ()
 
 
 def _split_version(version: str) -> tuple[int, int, int]:
@@ -605,6 +609,7 @@ def cut(
     baseline_unanchored: bool = False,
     security_from_advisories: bool = False,
     force_ready: bool = False,
+    github: Any | None = None,
 ) -> int:
     """Cut a release: generate notes with AI, render onto the release line, open PRs.
 
@@ -650,6 +655,35 @@ def cut(
     logger.info(
         "Plan: stage=%s target=%s base=%s", plan.stage, plan.target, plan.base_ref,
     )
+    prep_branch = f"{PREP_BRANCH_PREFIX}/{version}-{plan.stage}"
+
+    # An existing prep branch makes this a possible re-cut. Find its open PR
+    # before generation so authorized top-level feedback can influence the new
+    # notes. The push path performs a fresh lookup later; this early object is
+    # only a read snapshot and is never trusted for publication.
+    feedback_items: Sequence[feedback_mod.ReleaseFeedback] = ()
+    if _remote_branch_exists(source_clone_dir, prep_branch):
+        feedback_pr = publish_mod.find_existing_pr(
+            repo,
+            base_repo=repo_full_name,
+            push_repo=None,
+            branch=prep_branch,
+            base_branch=plan.target,
+        )
+        if feedback_pr is not None:
+            if github is None:
+                raise feedback_mod.FeedbackError(
+                    f"Existing release PR #{feedback_pr.number} found without a "
+                    "GitHub client; feedback cannot be checked safely."
+                )
+            feedback_items = feedback_mod.collect_feedback(github, feedback_pr)
+            if feedback_items:
+                logger.info(
+                    "Replaying %d authorized release-note feedback comment(s) "
+                    "from PR #%s",
+                    len(feedback_items),
+                    feedback_pr.number,
+                )
 
     # Discovery range: head is always the M.m branch tip, base from tags.
     # Pin the head SHA so discovery, contributors, and worktree all refer to the
@@ -681,6 +715,10 @@ def cut(
         )
         return 1
     grouped = dict(regen.grouped)  # {category: [bullet line, ...]} for this cut
+    rendered_prs = _grouped_pr_numbers(grouped)
+    structured_bullets = tuple(
+        bullet for bullet in regen.bullets if bullet.pr_number in rendered_prs
+    )
 
     # 2. Materialize a throwaway worktree at the release line's base. We never
     #    check out (or force-push) the real release branch; instead we build the
@@ -691,7 +729,6 @@ def cut(
     #    Defense-in-depth: verify origin URL hasn't been tampered with before any
     #    authenticated fetch/push (the primary defense is --safe-mode on Claude,
     #    which prevents hooks from modifying the clone).
-    prep_branch = f"{PREP_BRANCH_PREFIX}/{version}-{plan.stage}"
     dest_dir = os.path.join(source_clone_dir, ".release-dest")
     run_git(source_clone_dir, "worktree", "add", "--force", "-B", prep_branch, dest_dir,
             pinned_head_sha)
@@ -716,6 +753,11 @@ def cut(
         )
         if already_credited:
             grouped, _dropped = _drop_already_credited(grouped, set(already_credited))
+            structured_bullets = tuple(
+                bullet
+                for bullet in structured_bullets
+                if bullet.pr_number not in set(already_credited)
+            )
             logger.info(
                 "Dropped %d PR(s) already credited on %s: %s",
                 len(already_credited), plan.target, already_credited,
@@ -742,10 +784,48 @@ def cut(
         )
         if security_noted_prs:
             grouped, _dropped = _drop_already_credited(grouped, set(security_noted_prs))
+            structured_bullets = tuple(
+                bullet
+                for bullet in structured_bullets
+                if bullet.pr_number not in set(security_noted_prs)
+            )
             logger.info(
                 "Dropped %d generated bullet(s) also supplied as a --security-fix "
                 "(kept only under Security Fixes): %s",
                 len(security_noted_prs), security_noted_prs,
+            )
+
+        feedback_decisions: Sequence[feedback_mod.FeedbackDecision] = ()
+        if feedback_items:
+            grouped_count = sum(len(lines) for lines in grouped.values())
+            if len(structured_bullets) != grouped_count:
+                raise feedback_mod.FeedbackError(
+                    "Generated notes do not have a one-to-one structured bullet "
+                    "representation; leaving the existing release PR unchanged."
+                )
+            feedback_result = feedback_mod.revise_bullets(
+                feedback_items,
+                structured_bullets,
+                repo_dir=source_clone_dir,
+                categories=rn.CATEGORIES,
+            )
+            structured_bullets = feedback_result.bullets
+            feedback_decisions = feedback_result.decisions
+            grouped = render_mod.group_bullets(structured_bullets)
+            regen = replace(
+                regen,
+                grouped=grouped,
+                bullets=structured_bullets,
+                bullet_count=sum(len(lines) for lines in grouped.values()),
+                uncertain=tuple(
+                    UncertainNote(
+                        pr_number=bullet.pr_number,
+                        category=bullet.category,
+                        reason=bullet.uncertain_reason,
+                    )
+                    for bullet in structured_bullets
+                    if bullet.uncertain
+                ),
             )
 
         # 3. Render bullets -> dated section on dest; bump version.h.
@@ -778,7 +858,7 @@ def cut(
             noted_bullet_count=noted_bullet_count, urgency=urgency,
             security_fixes=security_fixes, security_noted_prs=security_noted_prs,
             baseline_unanchored=baseline_unanchored, advisories=advisories,
-            notes_range=notes_range,
+            notes_range=notes_range, feedback_decisions=feedback_decisions,
         )
 
         if dry_run:
@@ -837,6 +917,11 @@ def _print_dry_run(
         print(f"⚠️  rc out of sequence: {plan.rc_warning}")
     if notes_meta.already_credited:
         print(f"already credited on {plan.target} (dropped): {list(notes_meta.already_credited)}")
+    if notes_meta.feedback_decisions:
+        print(
+            "release-note feedback: "
+            f"{[(d.comment_id, 'applied' if d.applied else 'ignored') for d in notes_meta.feedback_decisions]}"
+        )
     if regen.duplicate_prs:
         print(f"⚠️  PR(s) noted more than once (extra bullets dropped): {list(regen.duplicate_prs)}")
     if regen.skipped:
@@ -1054,6 +1139,8 @@ def _hold_reasons(plan: BranchPlan, notes_meta: "_NotesMeta") -> list[str]:
         reasons.append("notes with an unconfirmed cherry-pick origin")
     if regen.collided:
         reasons.append("a distinct commit was dropped by a reused PR number")
+    if any(not decision.applied for decision in notes_meta.feedback_decisions):
+        reasons.append("release-note feedback was not applied")
     return reasons
 
 
@@ -1109,6 +1196,7 @@ def _build_pr_body(
         f"- Promotes the release notes into a dated section, bumps "
         f"`src/version.h`, and refreshes the running contributor list.\n"
         + _notes_range_body_section(notes_meta.notes_range, regen)
+        + _feedback_section(notes_meta.feedback_decisions)
         + _rc_warning_section(plan)
         + _baseline_warning_section(notes_meta, version)
         + _empty_notes_section(notes_meta, plan)
@@ -1132,6 +1220,38 @@ def _build_pr_body(
         + _collided_section(regen.collided)
         + "\n*Generated by valkey-ci-agent. Review before merging into the release line.*"
     )
+
+
+def _feedback_section(
+    decisions: Sequence[feedback_mod.FeedbackDecision],
+) -> str:
+    """Audit every authorized release-note feedback command replayed this run."""
+    if not decisions:
+        return ""
+    lines = [
+        "",
+        "### AI-handled release-note feedback",
+        "",
+        "The workflow replayed these authorized "
+        "`@valkeyrie-ops revise-release-notes` commands against the fully "
+        "regenerated bullets:",
+        "",
+        "| Comment | Author | Result | Summary |",
+        "|---------|--------|--------|---------|",
+    ]
+    for decision in decisions:
+        comment = (
+            f"[#{decision.comment_id}]({decision.url})"
+            if decision.url
+            else f"#{decision.comment_id}"
+        )
+        result = "Applied" if decision.applied else "Not applied"
+        lines.append(
+            f"| {comment} | @{publish_mod.escape_cell(decision.author)} | "
+            f"{result} | {publish_mod.escape_cell(decision.summary)} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _short_sha(sha: str) -> str:

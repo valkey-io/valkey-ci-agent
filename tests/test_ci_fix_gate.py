@@ -11,7 +11,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from scripts.ci_fix.gate import (
+    AuthorizationState,
     GateRejection,
+    authorization_state,
     build_fix_request,
     is_authorized,
     parse_command,
@@ -92,6 +94,33 @@ def test_membership_read_error_fails_closed():
     gh = MagicMock()
     gh.get_organization.side_effect = RuntimeError("403 no permission")
     assert is_authorized(gh, "valkey-io", "contributors", "carol") is False
+    assert (
+        authorization_state(gh, "valkey-io", "contributors", "carol")
+        is AuthorizationState.ERROR
+    )
+
+
+def test_pending_member_is_distinct_from_membership_error():
+    gh = _team_membership_gh("pending")
+    assert (
+        authorization_state(gh, "valkey-io", "contributors", "bob")
+        is AuthorizationState.UNAUTHORIZED
+    )
+
+
+def test_missing_member_is_distinct_from_membership_error():
+    from github.GithubException import UnknownObjectException
+
+    gh = _team_membership_gh("active")
+    team = gh.get_organization.return_value.get_team_by_slug.return_value
+    team.get_team_membership.side_effect = UnknownObjectException(
+        404, {"message": "Not Found"}, {}
+    )
+
+    assert (
+        authorization_state(gh, "valkey-io", "contributors", "outsider")
+        is AuthorizationState.UNAUTHORIZED
+    )
 
 
 def test_empty_username_not_authorized():

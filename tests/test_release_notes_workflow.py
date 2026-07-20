@@ -80,6 +80,18 @@ def test_release_concurrency_serializes_inferred_and_explicit_ga() -> None:
     assert concurrency["cancel-in-progress"] == "false"
 
 
+def test_release_tokens_can_authorize_feedback_commenters() -> None:
+    steps = _workflow(_SIMPLE)["jobs"]["cut"]["steps"]
+    token_steps = [
+        step for step in steps
+        if step.get("id") in {"generate-token", "generate-token-advisories"}
+    ]
+
+    assert len(token_steps) == 2
+    assert all(step["with"]["permission-members"] == "read" for step in token_steps)
+    assert all(step["with"]["permission-pull-requests"] == "write" for step in token_steps)
+
+
 def _run_cut_step(
     tmp_path: Path, *, version: str, stage: str
 ) -> tuple[subprocess.CompletedProcess[str], str]:

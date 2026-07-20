@@ -4,6 +4,7 @@
     classify -> MergedPR.disposition (code: include / candidate / exclude, from the label)
     triage   -> TriageResult        (AI: include/exclude each non-release-notes candidate)
     generate -> GenerationResult    (AI: one categorized bullet per included PR)
+    feedback -> revised bullets     (AI: constrained maintainer-requested edits)
     render   -> updated 00-RELEASENOTES text (code: canonical format, authoritative)
     publish  -> PR url              (code: branch + PR on valkey)
 

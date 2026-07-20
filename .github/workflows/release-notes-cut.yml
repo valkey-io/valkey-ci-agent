@@ -148,6 +148,9 @@ jobs:
           # pull-requests:write to open the release PR; metadata:read is always required.
           permission-contents: write
           permission-pull-requests: write
+          # Release-note feedback commands are accepted only from active members
+          # of valkey-io/contributors.
+          permission-members: read
           permission-metadata: read
 
       - name: Generate GitHub App token (with advisories)
@@ -167,6 +170,7 @@ jobs:
           # readable, but the explicit grant guarantees the token sees them.)
           permission-contents: write
           permission-pull-requests: write
+          permission-members: read
           permission-metadata: read
           permission-repository-advisories: read
 

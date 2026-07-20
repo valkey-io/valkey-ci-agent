@@ -22,6 +22,7 @@ from scripts.release_notes import triage as triage_mod
 from scripts.release_notes.ai_inputs import PRDiffCollector
 from scripts.release_notes.classify import classify
 from scripts.release_notes.models import (
+    CategorizedBullet,
     CollidedCommit,
     MergedPR,
     ReleaseImpact,
@@ -50,6 +51,7 @@ class RegenResult:
     skipped: tuple[int, ...]    # PR numbers with no rendered note: model-declined, parse-failure batches, or reserved-category drops (see regenerate_unreleased)
     triage: tuple[MergedPR, ...]  # non-release-notes PRs AI could not decide -> human triage
     had_prs: bool               # whether the range contained any PR at all
+    bullets: tuple[CategorizedBullet, ...] = ()  # retained for constrained feedback revision
     ai_included: tuple[TriagedPR, ...] = ()  # non-release-notes PRs AI judged user-facing
     guardrail_included: tuple[TriagedPR, ...] = ()  # AI-excluded/missing risky PRs code forced into notes
     ai_excluded: tuple[TriagedPR, ...] = ()  # non-release-notes PRs AI judged internal-only
@@ -185,7 +187,7 @@ def regenerate_unreleased(
     return RegenResult(
         base_tag=discovery.base_tag, grouped=grouped,
         included=len(include), bullet_count=promoted_count, skipped=skipped,
-        triage=human_triage, had_prs=True,
+        triage=human_triage, had_prs=True, bullets=tuple(bullets),
         ai_included=ai_included, guardrail_included=guardrail_included,
         ai_excluded=ai_excluded, label_excluded=label_excluded,
         impact_review=impact_review,

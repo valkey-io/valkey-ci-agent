@@ -22,7 +22,10 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
+
+from github.GithubException import UnknownObjectException
 
 from scripts.ci_fix.models import FixRequest
 from scripts.common.github_client import retry_github_call
@@ -45,6 +48,14 @@ _RUN_URL_RE = re.compile(
 )
 
 _DEFAULT_AUTH_TEAM = "contributors"
+
+
+class AuthorizationState(str, Enum):
+    """Result of a team-membership authorization check."""
+
+    AUTHORIZED = "authorized"
+    UNAUTHORIZED = "unauthorized"
+    ERROR = "error"
 
 
 @dataclass(frozen=True)
@@ -81,15 +92,15 @@ def parse_command(body: str) -> ParsedCommand | None:
     )
 
 
-def is_authorized(
+def authorization_state(
     gh: Any,
     org: str,
     team_slug: str,
     username: str,
     *,
     retries: int = 2,
-) -> bool:
-    """Return True only if ``username`` is allowed to drive the bot.
+) -> AuthorizationState:
+    """Return the result of checking whether ``username`` may drive the bot.
 
     ``username`` must be a GitHub-verified principal (``github.actor`` for the
     current dispatch). A future comment trigger must pass ``comment.user.login``
@@ -98,7 +109,8 @@ def is_authorized(
 
     The primary source is active membership of ``org/team_slug``. Fails closed:
     any error reading membership (permission, network, missing team) returns
-    False, and a ``pending`` invitation does not authorize.
+    ``ERROR``, while a missing member or ``pending`` invitation returns
+    ``UNAUTHORIZED``.
 
     An explicit allowlist may be supplied via ``CI_FIX_AUTH_ALLOWLIST`` (a
     comma-separated list of logins). It is empty by default - in production the
@@ -107,24 +119,52 @@ def is_authorized(
     readable, without weakening the default behavior.
     """
     if not username:
-        return False
+        return AuthorizationState.UNAUTHORIZED
     if username in _auth_allowlist():
         logger.info("Authorizing %s via CI_FIX_AUTH_ALLOWLIST", username)
-        return True
+        return AuthorizationState.AUTHORIZED
     try:
         team = retry_github_call(
             lambda: gh.get_organization(org).get_team_by_slug(team_slug),
             retries=retries, description=f"get team {org}/{team_slug}",
         )
+    except Exception as exc:  # noqa: BLE001 - fail closed on any read error
+        logger.warning("Authorization check failed closed for %s: %s", username, exc)
+        return AuthorizationState.ERROR
+    try:
         membership = retry_github_call(
             lambda: team.get_team_membership(username),
             retries=retries, description=f"team membership {username}",
         )
+    except UnknownObjectException as exc:
+        if exc.status == 404:
+            return AuthorizationState.UNAUTHORIZED
+        logger.warning("Authorization check failed closed for %s: %s", username, exc)
+        return AuthorizationState.ERROR
     except Exception as exc:  # noqa: BLE001 - fail closed on any read error
         logger.warning("Authorization check failed closed for %s: %s", username, exc)
-        return False
+        return AuthorizationState.ERROR
     state = getattr(membership, "state", None)
-    return state == "active"
+    if state == "active":
+        return AuthorizationState.AUTHORIZED
+    return AuthorizationState.UNAUTHORIZED
+
+
+def is_authorized(
+    gh: Any,
+    org: str,
+    team_slug: str,
+    username: str,
+    *,
+    retries: int = 2,
+) -> bool:
+    """Return True only if ``username`` is allowed to drive the bot."""
+    return (
+        authorization_state(
+            gh, org, team_slug, username, retries=retries
+        )
+        is AuthorizationState.AUTHORIZED
+    )
 
 
 def _auth_allowlist() -> frozenset[str]:
