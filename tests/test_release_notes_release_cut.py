@@ -2079,7 +2079,7 @@ class TestSecurityOnlyCutNotEmpty:
         )
 
     def _meta(self, *, security_fixes=None, already_credited=(), noted_bullet_count=0,
-              bullet_count=0, had_prs=False):
+              bullet_count=0, had_prs=False, feedback_decisions=()):
         return rc._NotesMeta(
             regen=self._regen(bullet_count=bullet_count, had_prs=had_prs),
             already_credited=already_credited,
@@ -2088,6 +2088,7 @@ class TestSecurityOnlyCutNotEmpty:
             security_fixes=security_fixes,
             security_noted_prs=(),
             baseline_unanchored=False,
+            feedback_decisions=feedback_decisions,
         )
 
     def test_hold_reasons_no_empty_when_security_fixes_present(self):
@@ -2099,6 +2100,33 @@ class TestSecurityOnlyCutNotEmpty:
         meta = self._meta(security_fixes=None)
         reasons = rc._hold_reasons(self._RC_PLAN, meta)
         assert "empty release notes" in reasons
+
+    def test_hold_reasons_feedback_dropping_every_bullet_holds(self):
+        from scripts.release_notes.feedback import FeedbackDecision
+
+        decision = FeedbackDecision(
+            comment_id=9001, author="maintainer", url="",
+            applied=True, summary="Dropped everything",
+        )
+        # had_prs/included would suppress the plain "empty release notes"
+        # reason; feedback emptying the section must hold on its own.
+        meta = self._meta(bullet_count=0, had_prs=True,
+                          feedback_decisions=(decision,))
+        meta.regen.included = 1
+        reasons = rc._hold_reasons(self._RC_PLAN, meta)
+        assert "release-note feedback removed every generated bullet" in reasons
+
+    def test_hold_reasons_feedback_with_surviving_bullets_does_not_hold(self):
+        from scripts.release_notes.feedback import FeedbackDecision
+
+        decision = FeedbackDecision(
+            comment_id=9001, author="maintainer", url="",
+            applied=True, summary="Reworded one bullet",
+        )
+        meta = self._meta(bullet_count=2, had_prs=True,
+                          feedback_decisions=(decision,))
+        reasons = rc._hold_reasons(self._RC_PLAN, meta)
+        assert "release-note feedback removed every generated bullet" not in reasons
 
     def test_empty_notes_section_suppressed_with_security_fixes(self):
         meta = self._meta(security_fixes=["Fix CVE-2025-1234 (CVSS 9.8)"])

@@ -31,6 +31,10 @@ _MAX_FEEDBACK_CHARS = 4000
 _MAX_FEEDBACK_ITEMS = 50
 _MAX_SUMMARY_CHARS = 500
 _MAX_NOTE_CHARS = 1000
+# ``(#N)`` anywhere in replacement text. render.format_bullet strips only a
+# trailing marker before appending the canonical attribution, so a mid-text
+# marker would ship and mis-credit a PR.
+_PR_MARKER_RE = re.compile(r"\(#\d+\)")
 
 
 class FeedbackError(RuntimeError):
@@ -76,8 +80,6 @@ def parse_feedback_command(body: str) -> str | None:
     instruction = body[match.end():].lstrip(" \t:").strip()
     if not instruction:
         return None
-    if len(instruction) > _MAX_FEEDBACK_CHARS:
-        instruction = instruction[:_MAX_FEEDBACK_CHARS].rstrip()
     return instruction
 
 
@@ -125,6 +127,16 @@ def collect_feedback(
                 author or "unknown",
             )
             continue
+        if len(instruction) > _MAX_FEEDBACK_CHARS:
+            # Truncating could invert the request (e.g. cut off a negation), so
+            # an over-limit command fails closed rather than applying partially.
+            # Checked only for authorized authors so an outsider comment cannot
+            # abort the refresh.
+            raise FeedbackError(
+                f"Release-note feedback comment {getattr(comment, 'id', '?')} is "
+                f"{len(instruction)} characters; the limit is "
+                f"{_MAX_FEEDBACK_CHARS}. Edit the comment to shorten it."
+            )
         comment_id = exact_pr_number(getattr(comment, "id", None))
         if comment_id is None:
             logger.warning("Ignoring release-note feedback with an invalid comment id")
@@ -375,6 +387,11 @@ def _parse_result(
                 raise FeedbackError(
                     f"Feedback comment {item.comment_id} returned invalid text "
                     f"for PR #{number}."
+                )
+            if _PR_MARKER_RE.search(text):
+                raise FeedbackError(
+                    f"Feedback comment {item.comment_id} returned text containing "
+                    f"a PR reference for PR #{number}; code adds the attribution."
                 )
             original = original_by_pr[number]
             current[number] = CategorizedBullet(

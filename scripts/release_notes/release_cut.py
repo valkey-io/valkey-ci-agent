@@ -1141,6 +1141,15 @@ def _hold_reasons(plan: BranchPlan, notes_meta: "_NotesMeta") -> list[str]:
         reasons.append("a distinct commit was dropped by a reused PR number")
     if any(not decision.applied for decision in notes_meta.feedback_decisions):
         reasons.append("release-note feedback was not applied")
+    # The refuse-empty-notes guard runs before feedback, and the "empty release
+    # notes" reason above requires an empty/undecided range, so feedback that
+    # drops every bullet would otherwise ship an empty dated section unheld.
+    if (
+        any(decision.applied for decision in notes_meta.feedback_decisions)
+        and not regen.bullet_count
+        and not notes_meta.security_fixes
+    ):
+        reasons.append("release-note feedback removed every generated bullet")
     return reasons
 
 

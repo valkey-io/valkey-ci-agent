@@ -138,6 +138,12 @@ def authorization_state(
         )
     except UnknownObjectException as exc:
         if exc.status == 404:
+            # GitHub answers 404 both for "not a member" and for a token that
+            # cannot see memberships at all. Distinguishing them relies on the
+            # team fetch above as a canary: a token without org/members read
+            # cannot resolve the team either, so it returns ERROR there and
+            # never reaches this branch. A 404 here therefore means the token
+            # can read the team but ``username`` has no membership.
             return AuthorizationState.UNAUTHORIZED
         logger.warning("Authorization check failed closed for %s: %s", username, exc)
         return AuthorizationState.ERROR

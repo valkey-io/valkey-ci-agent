@@ -152,6 +152,44 @@ class TestCollectFeedback:
         with pytest.raises(FeedbackError, match="Could not verify"):
             collect_feedback(MagicMock(), pr)
 
+    def test_oversized_authorized_feedback_aborts_instead_of_truncating(
+        self, monkeypatch
+    ) -> None:
+        pr = MagicMock(number=77)
+        oversized = "@valkeyrie-ops revise-release-notes " + "x" * 5000
+        pr.get_issue_comments.return_value = [_comment(12, oversized)]
+        monkeypatch.setattr(
+            feedback_mod,
+            "authorization_state",
+            lambda *_args: AuthorizationState.AUTHORIZED,
+        )
+
+        with pytest.raises(FeedbackError, match="limit is 4000"):
+            collect_feedback(MagicMock(), pr)
+
+    def test_oversized_unauthorized_feedback_cannot_abort_the_refresh(
+        self, monkeypatch
+    ) -> None:
+        pr = MagicMock(number=77)
+        oversized = "@valkeyrie-ops revise-release-notes " + "x" * 5000
+        pr.get_issue_comments.return_value = [
+            _comment(12, oversized, login="outsider"),
+            _comment(20, "@valkeyrie-ops revise-release-notes rewrite #40"),
+        ]
+        states = {
+            "outsider": AuthorizationState.UNAUTHORIZED,
+            "alice": AuthorizationState.AUTHORIZED,
+        }
+        monkeypatch.setattr(
+            feedback_mod,
+            "authorization_state",
+            lambda _gh, _org, _team, login: states[login],
+        )
+
+        result = collect_feedback(MagicMock(), pr)
+
+        assert [item.comment_id for item in result] == [20]
+
 
 class TestPrompt:
     def test_feedback_is_json_data_not_instruction_prose(self) -> None:
@@ -341,6 +379,26 @@ class TestReviseBullets:
                     ]
                 },
                 "invalid category",
+            ),
+            (
+                {
+                    "comments": [
+                        {
+                            "id": 10,
+                            "status": "applied",
+                            "summary": "smuggled attribution",
+                            "revisions": [
+                                {
+                                    "pr": 40,
+                                    "action": "replace",
+                                    "category": "Bug Fixes",
+                                    "text": "Fix crash (#41) during rehash",
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "PR reference",
             ),
         ],
     )

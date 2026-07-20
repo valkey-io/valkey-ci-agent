@@ -340,7 +340,10 @@ The feedback AI may rewrite, recategorize, or drop an already-generated bullet;
 it cannot add a missing PR or change version, urgency, contributor, advisory, or
 Security Fixes data. Add or correct the PR labels to include a missing entry,
 then rerun. Unsupported feedback is listed in the PR body and holds the PR as a
-draft. A comment/API/AI failure aborts before the prep branch is changed.
+draft; feedback that removes every generated bullet also holds the PR. A
+comment/API/AI failure aborts before the prep branch is changed, as does an
+authorized command over 4,000 characters (edit the comment to shorten it) or
+more than 50 authorized commands on one PR.
 
 Use `release-notes-cut-advanced.yml` only for an explicit date/baseline,
 contributor override, security entries/advisory lookup, or `force_ready`. It
