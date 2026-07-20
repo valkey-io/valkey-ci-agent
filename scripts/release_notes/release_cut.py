@@ -5,6 +5,8 @@ renders them in one shot. The release-line branch model is tag-driven (one M.m
 branch per minor): all stages target the existing M.m branch, and tags determine
 the discovery range. The agent never mutates the release line directly; it creates
 or updates only an agent-namespaced prep branch and opens a PR into that line.
+Re-running the same version and stage regenerates the complete range from the
+latest release-line tip, then replaces that prep branch and updates its open PR.
 """
 
 from __future__ import annotations
@@ -944,6 +946,14 @@ def _commit_push_release_pr(
         repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
         base_branch=plan.target,
     )
+    if existing is not None:
+        logger.info(
+            "Refreshing open release PR #%s on %s with the fully regenerated "
+            "range through %s",
+            existing.number,
+            prep_branch,
+            expected_base_sha[:12] if expected_base_sha else plan.target,
+        )
     if existing is not None and not existing.draft:
         publish_mod.reconcile_draft(existing, draft=True)
         logger.info("Converted PR #%s to draft before branch update", existing.number)

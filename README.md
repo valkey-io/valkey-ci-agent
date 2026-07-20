@@ -316,6 +316,15 @@ After reviewing the preview, repeat the same dispatch with
 exposes only `version`, `stage`, `urgency`, and `dry_run`; `stage` is
 case-insensitive and is required only when the patch component is zero.
 
+If more changes merge into `M.m` while that release PR is open, dispatch the
+same `version` and `stage` again with `dry_run=false`. A rerun regenerates the
+complete release range through the latest `M.m` tip, rebuilds the same
+`agent/release-cut/<version>-<stage>` branch from that tip, and updates the
+existing open PR in place. This deliberately re-evaluates earlier entries as
+well as processing new ones, so changed labels or PR metadata are picked up.
+Because the prep branch is replaced with `--force-with-lease`, manual edits made
+directly on that generated branch are not retained.
+
 Use `release-notes-cut-advanced.yml` only for an explicit date/baseline,
 contributor override, security entries/advisory lookup, or `force_ready`. It
 delegates to the same release workflow as the normal dispatch, so the release
@@ -429,6 +438,9 @@ human merges.
    address first, the PR opens as a draft to hold the merge (see [Edge-case
    handling](#edge-case-handling)). Immediately before changing the prep branch,
    the agent re-fetches M.m and aborts if its tip differs from the pinned SHA.
+   Re-dispatching the same version/stage fully regenerates against the latest
+   M.m tip, force-updates the deterministic prep branch, and edits the same open
+   PR rather than creating another one.
 
 ### Edge-case handling
 

@@ -340,6 +340,13 @@ a dry run; patch versions may omit stage and infer `ga`, while `M.m.0` always
 requires an explicit stage. The advanced dispatch is a thin wrapper around the
 same reusable workflow.
 
+The prep branch name is deterministic for a version and stage. Re-dispatching
+while its PR is open regenerates the full tagged range through the latest M.m
+tip, rebuilds the prep commit on that tip, pushes it with force-with-lease, and
+updates the existing PR. Full regeneration is intentional: it includes new
+merges and also re-evaluates changed labels and PR metadata without treating a
+previous AI-generated branch as durable input.
+
 Signals fall into two tiers. Malformed inputs, a missing target branch, an
 already-released/backward target, or a target branch that advances during
 generation are hard errors that abort before any PR. Warnings (out-of-sequence
