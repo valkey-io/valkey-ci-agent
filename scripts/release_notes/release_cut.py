@@ -28,7 +28,7 @@ from scripts.release_notes import release_format as rn
 from scripts.release_notes import render as render_mod
 from scripts.release_notes import security as security_mod
 from scripts.release_notes import version_bump as bv
-from scripts.release_notes.models import UncertainNote
+from scripts.release_notes.models import CategorizedBullet, UncertainNote
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +537,19 @@ def _drop_already_credited(
     return kept, dropped
 
 
+def _drop_bullets_by_pr(
+    bullets: Sequence["CategorizedBullet"], pr_numbers: Sequence[int]
+) -> tuple["CategorizedBullet", ...]:
+    """Drop structured bullets whose PR is in *pr_numbers*.
+
+    Structured-bullet counterpart of ``_drop_already_credited``: every grouped
+    drop must apply the same PR set here so the two representations cannot
+    diverge.
+    """
+    dropped = set(pr_numbers)
+    return tuple(bullet for bullet in bullets if bullet.pr_number not in dropped)
+
+
 def _sanitize_security_fixes(
     security_fixes: Optional[Sequence[str]],
 ) -> Optional[Sequence[str]]:
@@ -753,11 +766,7 @@ def cut(
         )
         if already_credited:
             grouped, _dropped = _drop_already_credited(grouped, set(already_credited))
-            structured_bullets = tuple(
-                bullet
-                for bullet in structured_bullets
-                if bullet.pr_number not in set(already_credited)
-            )
+            structured_bullets = _drop_bullets_by_pr(structured_bullets, already_credited)
             logger.info(
                 "Dropped %d PR(s) already credited on %s: %s",
                 len(already_credited), plan.target, already_credited,
@@ -784,11 +793,7 @@ def cut(
         )
         if security_noted_prs:
             grouped, _dropped = _drop_already_credited(grouped, set(security_noted_prs))
-            structured_bullets = tuple(
-                bullet
-                for bullet in structured_bullets
-                if bullet.pr_number not in set(security_noted_prs)
-            )
+            structured_bullets = _drop_bullets_by_pr(structured_bullets, security_noted_prs)
             logger.info(
                 "Dropped %d generated bullet(s) also supplied as a --security-fix "
                 "(kept only under Security Fixes): %s",
