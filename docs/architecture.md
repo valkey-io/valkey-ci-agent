@@ -267,7 +267,10 @@ Workflow-agnostic helpers in `scripts/common/`:
 - `issue_dedup.py` - `IssueDedupPublisher` creates or updates a GitHub
   issue keyed by a fingerprint marker. Workflows supply the rendered title,
   body, and comment via a small `render(marker, occurrences) -> IssueContent`
-  callback; the publisher owns the dedup machinery.
+  callback; the publisher owns the dedup machinery. Before creating a new
+  issue, it checks for a recently closed issue with the same marker (default
+  lookback: 1 day) to avoid duplicating issues for failures that were already
+  fixed.
 
 Workflow setup is centralized in `.github/actions/setup-agent`. Jobs still
 check out the agent repository explicitly, then use that local composite action

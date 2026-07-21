@@ -167,16 +167,20 @@ class TestProcessFailures:
             ("created", "https://x/issues/1"),
             ("updated", "https://x/issues/2"),
             ("skipped-duplicate", "https://x/issues/3"),
+            ("skipped-recently-closed", "https://x/issues/4"),
         ]
 
         failures = [
             _make_failure(test_name="a"),
             _make_failure(test_name="b"),
             _make_failure(test_name="c"),
+            _make_failure(test_name="d"),
         ]
         result = process_failures(MagicMock(), "valkey-io/valkey", failures)
 
-        assert result == {"created": 1, "updated": 1, "skipped": 1, "errors": 0}
+        assert result == {
+            "created": 1, "updated": 1, "skipped": 1, "skipped_closed": 1, "errors": 0,
+        }
 
     @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
     def test_one_failing_upsert_does_not_abort_the_batch(self, mock_publisher_cls) -> None:
@@ -196,7 +200,9 @@ class TestProcessFailures:
         ]
         result = process_failures(MagicMock(), "valkey-io/valkey", failures)
 
-        assert result == {"created": 1, "updated": 1, "skipped": 0, "errors": 1}
+        assert result == {
+            "created": 1, "updated": 1, "skipped": 0, "skipped_closed": 0, "errors": 1,
+        }
         # All three were attempted despite the middle one raising.
         assert publisher.upsert.call_count == 3
 
@@ -215,7 +221,9 @@ class TestProcessFailures:
             [_make_failure(test_name="a"), _make_failure(test_name="b")],
         )
 
-        assert result == {"created": 1, "updated": 0, "skipped": 0, "errors": 1}
+        assert result == {
+            "created": 1, "updated": 0, "skipped": 0, "skipped_closed": 0, "errors": 1,
+        }
 
     @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
     def test_passes_run_id_as_idempotency_key(self, mock_publisher_cls) -> None:

@@ -39,8 +39,9 @@ def _build_job_summary(
         f"| Unique failures detected | {num_failures} |",
         f"| Issues created | {result.get('created', 0)} |",
         f"| Issues skipped (duplicate run) | {result.get('skipped', 0)} |",
+        f"| Issues skipped (recently closed) | {result.get('skipped_closed', 0)} |",
         f"| Issues updated | {result.get('updated', 0)} |",
-        f"| MISC Errors | {result.get('errors', 0)} |",
+        f"| Errors | {result.get('errors', 0)} |",
         "",
     ]
     return "\n".join(lines)

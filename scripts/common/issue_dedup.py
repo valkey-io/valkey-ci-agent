@@ -9,6 +9,11 @@ Optional ``idempotency_key`` records the source event (e.g. a workflow run
 id) and skips the update if the same key has already been seen, so a
 re-triggered cron does not inflate the counter.
 
+When no open issue matches, the publisher checks for a recently closed issue
+with the same marker (default: 1 day). If one is found, creation
+is suppressed and ``"skipped-recently-closed"`` is returned, avoiding
+duplicates for failures that were fixed between the CI run and the detector.
+
 Callers supply rendered title, body, and comment via a render callback;
 this module owns only the dedup machinery. Search failures are propagated
 so a transient outage records as an error rather than silently creating a
@@ -20,6 +25,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from scripts.common.github_client import retry_github_call
@@ -40,13 +46,27 @@ class IssueContent:
 class IssueDedupPublisher:
     """Create or update an issue, deduplicating on a fingerprint marker."""
 
-    def __init__(self, github_client: Any, *, marker_namespace: str) -> None:
+    # Default window for skipping creation when a matching issue was recently
+    # closed. One day safely covers the gap between a Daily CI run and the detector.
+    DEFAULT_CLOSED_LOOKBACK = timedelta(days=1)
+
+    def __init__(
+        self,
+        github_client: Any,
+        *,
+        marker_namespace: str,
+        closed_lookback: timedelta | None = DEFAULT_CLOSED_LOOKBACK,
+    ) -> None:
         """`marker_namespace` should be a stable workflow-scoped string,
         e.g. ``"valkey-ci-agent:fuzzer-issue"``. It appears literally in
         issue bodies and in search queries.
+
+        `closed_lookback` controls how far back to search for recently closed
+        issues before creating a new one. Set to ``None`` to disable the check.
         """
         self._gh = github_client
         self._ns = marker_namespace
+        self._closed_lookback = closed_lookback
 
     def upsert(
         self,
@@ -64,8 +84,10 @@ class IssueDedupPublisher:
         the occurrence count (1 for new issues, >=2 for updates) and must
         return a fully rendered :class:`IssueContent`. Returns
         ``(action, html_url)`` where action is ``"created"``, ``"updated"``,
-        or ``"skipped-duplicate"`` (when ``idempotency_key`` matches the last
-        recorded key on an existing issue).
+        ``"skipped-duplicate"`` (when ``idempotency_key`` matches the last
+        recorded key on an existing issue), or ``"skipped-recently-closed"``
+        (when no open issue exists but a matching issue was closed within the
+        lookback window).
 
         If ``idempotency_key`` is set, the publisher records it in the issue
         body as ``<!-- <ns>:last-key:<value> -->`` and refuses to bump the
@@ -108,6 +130,14 @@ class IssueDedupPublisher:
                 )
 
         if existing is None:
+            recently_closed = self._find_recently_closed(repo_name, marker)
+            if recently_closed is not None:
+                logger.info(
+                    "Issue #%s for %s was closed recently; skipping creation",
+                    recently_closed.number, fingerprint,
+                )
+                return "skipped-recently-closed", recently_closed.html_url
+
             content = render(marker, 1)
             body = content.body
             if idempotency_key is not None:
@@ -199,6 +229,31 @@ class IssueDedupPublisher:
         for issue in results:
             if issue.title == title:
                 return self._reload(repo_name, issue.number)
+        return None
+
+    def _find_recently_closed(self, repo_name: str, marker: str) -> Any:
+        """Find a closed issue containing the marker that was closed within
+        the lookback window, or None.
+
+        Guards against re-filing an issue for a failure that was already fixed
+        and whose issue was closed between the CI run and the detector run.
+        """
+        if self._closed_lookback is None:
+            return None
+        cutoff = datetime.now(timezone.utc) - self._closed_lookback
+        # GitHub search's "closed:>DATE" qualifier filters on close time.
+        date_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+        query = (
+            f'"{marker}" in:body repo:{repo_name} is:issue is:closed '
+            f"closed:>{date_str}"
+        )
+        results = retry_github_call(
+            lambda: list(self._gh.search_issues(query)),
+            retries=2, description="search recently closed issues",
+        )
+        for issue in results:
+            if marker in (issue.body or ""):
+                return issue
         return None
 
     def _reload(self, repo_name: str, number: int) -> Any:

@@ -1,7 +1,8 @@
 """Tests for the generic marker-based issue dedup publisher."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -233,7 +234,9 @@ def test_title_fallback_requires_exact_title_match():
     mock_repo.create_issue.return_value = mock_issue
     mock_gh = MagicMock()
     mock_gh.get_repo.return_value = mock_repo
-    mock_gh.search_issues.side_effect = [iter([]), [candidate]]
+    # (1) marker search misses, (2) title fallback: near-miss candidate,
+    # (3) recently-closed search: nothing.
+    mock_gh.search_issues.side_effect = [iter([]), [candidate], iter([])]
 
     publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
     action, _ = publisher.upsert(
@@ -318,3 +321,93 @@ def test_idempotency_key_different_value_still_updates():
     assert f"<!-- {NAMESPACE}:occurrences:2 -->" in edited
     assert f"<!-- {NAMESPACE}:last-key:run-99 -->" in edited
     assert f"<!-- {NAMESPACE}:last-key:run-42 -->" not in edited
+
+
+# --- Recently-closed issue suppression ---
+
+
+def test_skips_creation_when_matching_issue_recently_closed():
+    """If no open issue matches but a closed issue with the same marker was
+    closed within the lookback window, creation is suppressed."""
+    marker = f"<!-- {NAMESPACE}:fp1 -->"
+    closed_issue = MagicMock(
+        number=10, html_url="https://x/issues/10", body=f"{marker}\nold body",
+    )
+    mock_repo = MagicMock()
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    # First search (open) returns nothing; second (recently closed) finds it.
+    mock_gh.search_issues.side_effect = [iter([]), [closed_issue]]
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, url = publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
+
+    assert action == "skipped-recently-closed"
+    assert url == "https://x/issues/10"
+    mock_repo.create_issue.assert_not_called()
+
+
+def test_creates_issue_when_closed_issue_not_within_lookback():
+    """A closed issue whose body does not actually contain the marker is
+    ignored, so creation proceeds."""
+    mock_repo = MagicMock()
+    mock_issue = MagicMock(number=1, html_url="https://x/issues/1")
+    mock_repo.create_issue.return_value = mock_issue
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    # Open search: nothing. Closed search: candidate whose body doesn't match.
+    no_match = MagicMock(number=99, body="unrelated body")
+    mock_gh.search_issues.side_effect = [iter([]), [no_match]]
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, _ = publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
+
+    assert action == "created"
+    mock_repo.create_issue.assert_called_once()
+
+
+def test_closed_lookback_disabled_skips_search():
+    """Setting closed_lookback=None disables the recently-closed check entirely,
+    so no second search is issued."""
+    mock_repo = MagicMock()
+    mock_issue = MagicMock(number=1, html_url="https://x/issues/1")
+    mock_repo.create_issue.return_value = mock_issue
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.return_value = iter([])
+
+    publisher = IssueDedupPublisher(
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=None,
+    )
+    action, _ = publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
+
+    assert action == "created"
+    # Only one search call (the open-issue check); no closed-issue search.
+    assert mock_gh.search_issues.call_count == 1
+
+
+def test_closed_lookback_custom_duration():
+    """A custom closed_lookback value produces the correct cutoff timestamp."""
+    marker = f"<!-- {NAMESPACE}:fp1 -->"
+    closed_issue = MagicMock(
+        number=10, html_url="https://x/issues/10", body=f"{marker}\nold body",
+    )
+    mock_repo = MagicMock()
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.side_effect = [iter([]), [closed_issue]]
+
+    frozen_now = datetime(2026, 7, 21, 12, 0, 0, tzinfo=timezone.utc)
+    with patch("scripts.common.issue_dedup.datetime") as mock_dt:
+        mock_dt.now.return_value = frozen_now
+        mock_dt.strftime = datetime.strftime
+        publisher = IssueDedupPublisher(
+            mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(hours=6),
+        )
+        action, _ = publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
+
+    assert action == "skipped-recently-closed"
+    closed_query = mock_gh.search_issues.call_args_list[1][0][0]
+    assert "is:closed" in closed_query
+    # 12:00 UTC minus 6 hours = 06:00 UTC
+    assert "closed:>2026-07-21T06:00:00" in closed_query
