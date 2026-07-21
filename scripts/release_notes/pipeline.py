@@ -64,6 +64,7 @@ class RegenResult:
     unresolved_cherry_picks: tuple[UnresolvedCherryPick, ...] = ()  # notes credited past an unresolvable -x trailer (origin unconfirmed)
     collided: tuple[CollidedCommit, ...] = ()  # distinct commits dropped by a reused subject (#N) (shipped un-noted)
     reverted: tuple[RevertedSourcePR, ...] = ()  # Revert-titled sweep manifest rows (the range ships the revert, not the change)
+    pr_authors: tuple[str, ...] = ()  # GitHub logins of all resolved PR authors in the range (for contributor list)
 
 
 def regenerate_unreleased(
@@ -94,6 +95,7 @@ def regenerate_unreleased(
             unresolved_cherry_picks=discovery.unresolved_cherry_picks,
             collided=discovery.collided,
             reverted=discovery.reverted,
+            pr_authors=(),
         )
 
     # Labelled PRs are included directly; no-release-notes PRs are hard-excluded
@@ -185,6 +187,11 @@ def regenerate_unreleased(
     # Only flag duplicates for PRs that actually rendered.
     duplicate_prs = tuple(pr for pr in duplicate_prs if pr in rendered_prs)
 
+    all_pr_authors = tuple(dict.fromkeys(
+        pr.author for pr in discovery.prs
+        if pr.author and not pr.author.endswith("[bot]")
+    ))
+
     return RegenResult(
         base_tag=discovery.base_tag, grouped=grouped,
         included=len(include), bullet_count=promoted_count, skipped=skipped,
@@ -199,6 +206,7 @@ def regenerate_unreleased(
         unresolved_cherry_picks=discovery.unresolved_cherry_picks,
         collided=discovery.collided,
         reverted=discovery.reverted,
+        pr_authors=all_pr_authors,
     )
 
 

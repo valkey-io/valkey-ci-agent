@@ -437,7 +437,7 @@ class TestPromoteAndBump:
         version_text = open(os.path.join(clone, "src", "version.h"), encoding="utf-8").read()
         captured: dict = {}
 
-        def _list(repo, base, head, token, *, repo_dir=None):
+        def _list(repo, base, head, token, *, repo_dir=None, pr_logins=None):
             captured["base"] = base
             captured["head"] = head
             return ["Jane Doe @jane"]

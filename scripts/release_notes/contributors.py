@@ -308,10 +308,13 @@ def list_contributors(
     token: Optional[str] = None,
     *,
     repo_dir: str = ".",
+    pr_logins: Optional[List[str]] = None,
 ) -> List[str]:
     """Return alpha-sorted ``"Full Name @handle"`` strings for the commit range.
 
     Falls back to name-only entries from git-shortlog when the API is unavailable.
+    *pr_logins* are GitHub logins resolved from PR metadata, giving contributors
+    inside squash-merged commits proper @handles instead of bare trailer names.
     """
     truncated = False
     git_names: List[str] = []
@@ -338,6 +341,28 @@ def list_contributors(
     # Seed git author names so shortlog dedup works when display name differs.
     for gn in git_names:
         have.update(_identity_aliases(gn))
+
+    # PR-resolved logins: resolve to Name @handle, upgrading any existing
+    # bare-name entry from shortlog that matches.
+    if pr_logins:
+        for login in pr_logins:
+            if _is_bot(login):
+                continue
+            login_aliases = _identity_aliases(login)
+            name = _display_name(login, token) or login
+            name_aliases = _identity_aliases(name)
+            combined = login_aliases | name_aliases
+            if combined.isdisjoint(have):
+                entries.append("{} @{}".format(name, login))
+            else:
+                for i, entry in enumerate(entries):
+                    if " @" in entry:
+                        continue
+                    entry_aliases = _identity_aliases(entry)
+                    if not entry_aliases.isdisjoint(combined):
+                        entries[i] = "{} @{}".format(name, login)
+                        break
+            have.update(combined)
 
     # Supplement from shortlog when the API's 250-commit cap was hit.
     if truncated:

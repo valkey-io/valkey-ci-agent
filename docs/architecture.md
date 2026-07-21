@@ -378,7 +378,7 @@ calendar date.
 - `scripts/release_notes/publish.py` - find/open/update the release PR; `_reconcile_draft` flips draft state on re-dispatch
 - `scripts/release_notes/release_format.py` - `00-RELEASENOTES` dated-section rendering
 - `scripts/release_notes/version_bump.py` - `src/version.h` macro rewriting
-- `scripts/release_notes/contributors.py` - contributor discovery; cumulative rendering reconciles display-name, login, and co-author email aliases
+- `scripts/release_notes/contributors.py` - contributor discovery; reconciles display-name, login, co-author trailers, and PR-resolved logins
 
 ## Planned Workflows
 

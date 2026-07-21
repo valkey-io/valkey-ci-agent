@@ -318,6 +318,7 @@ def promote_and_bump(
     contrib_head: str,
     token: Optional[str],
     security_fixes: Optional[Sequence[str]],
+    pr_authors: Optional[Sequence[str]] = None,
 ) -> tuple[str, str]:
     """Render *grouped* onto the destination changelog and bump the version.
 
@@ -337,7 +338,8 @@ def promote_and_bump(
         base_sha = _compare_ref(valkey_clone_dir, contrib_base)
         head_sha = _compare_ref(valkey_clone_dir, contrib_head)
         contributors = gc.list_contributors(
-            repo_full_name, base_sha, head_sha, token, repo_dir=valkey_clone_dir
+            repo_full_name, base_sha, head_sha, token, repo_dir=valkey_clone_dir,
+            pr_logins=list(pr_authors) if pr_authors else None,
         )
         logger.info(
             "Collected %d contributor(s) over %s..%s",
@@ -759,6 +761,7 @@ def cut(
             repo_full_name=repo_full_name, contrib_base=contrib_base,
             contrib_head=notes_head_ref, token=token,
             security_fixes=security_fixes,
+            pr_authors=regen.pr_authors,
         )
 
         # Count what survives into the dated section after the already-credited

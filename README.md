@@ -427,7 +427,8 @@ human merges.
    `render_release_notes` (`release_format.py`) / `set_version`
    (`version_bump.py`), append the cumulative contributor list
    (`contributors.py`) deduplicated by case-insensitive display-name/login
-   identity, and bump `src/version.h`. These format primitives live
+   identity (PR-resolved logins give squash-merged authors proper @handles),
+   and bump `src/version.h`. These format primitives live
    in-repo rather than being imported from valkey, because upstream
    `valkey-io/valkey` ships no such tooling, so a cut runs against unmodified
    upstream (a plaintext `00-RELEASENOTES` placeholder and a `src/version.h`

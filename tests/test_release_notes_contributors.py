@@ -512,3 +512,135 @@ class TestCoauthorUnion:
         assert contrib.list_contributors(
             "r", "base", "main", repo_dir=repo
         ) == ["Jules Lasarte"]
+
+
+class TestPRLogins:
+    """PR-resolved logins give squash-merged contributors proper @handles."""
+
+    def test_pr_logins_produce_handle_entries(self, monkeypatch, tmp_path) -> None:
+        repo = _init_repo(tmp_path)
+        _commit(repo, "base", name="Root", email="root@x")
+        run_git(repo, "tag", "base")
+        _commit(repo, "sweep", name="valkeyrie-ops[bot]", email="bot@x",
+                body="Co-authored-by: devnick <devnick@example.com>")
+
+        monkeypatch.setattr(contrib, "_compare_logins",
+                            lambda *a, **k: ([], False, []))
+        monkeypatch.setattr(contrib, "_display_name", lambda login, token: None)
+
+        result = contrib.list_contributors(
+            "r", "base", "main", token="t", repo_dir=repo,
+            pr_logins=["devnick"],
+        )
+        assert result == ["devnick @devnick"]
+
+    def test_pr_logins_with_display_name(self, monkeypatch, tmp_path) -> None:
+        repo = _init_repo(tmp_path)
+        _commit(repo, "base", name="Root", email="root@x")
+        run_git(repo, "tag", "base")
+        _commit(repo, "sweep", name="valkeyrie-ops[bot]", email="bot@x",
+                body="Co-authored-by: Pat Rivera <privera@example.com>")
+
+        monkeypatch.setattr(contrib, "_compare_logins",
+                            lambda *a, **k: ([], False, []))
+        monkeypatch.setattr(contrib, "_display_name",
+                            lambda login, token: "Pat Rivera" if login == "privera" else None)
+
+        result = contrib.list_contributors(
+            "r", "base", "main", token="t", repo_dir=repo,
+            pr_logins=["privera"],
+        )
+        assert result == ["Pat Rivera @privera"]
+
+    def test_pr_logins_dedup_against_compare_api(self, monkeypatch, tmp_path) -> None:
+        repo = _init_repo(tmp_path)
+        _commit(repo, "base", name="Root", email="root@x")
+        run_git(repo, "tag", "base")
+        _commit(repo, "feat", name="Amy", email="amy@x")
+
+        monkeypatch.setattr(contrib, "_compare_logins",
+                            lambda *a, **k: (["amy"], False, []))
+        monkeypatch.setattr(contrib, "_display_name", lambda login, token: "Amy P")
+
+        result = contrib.list_contributors(
+            "r", "base", "main", token="t", repo_dir=repo,
+            pr_logins=["amy"],
+        )
+        assert result == ["Amy P @amy"]
+
+    def test_pr_logins_suppress_bare_coauthor_name(self, monkeypatch, tmp_path) -> None:
+        repo = _init_repo(tmp_path)
+        _commit(repo, "base", name="Root", email="root@x")
+        run_git(repo, "tag", "base")
+        _commit(repo, "sweep", name="valkeyrie-ops[bot]", email="bot@x",
+                body="Co-authored-by: devnick <devnick@example.com>")
+
+        monkeypatch.setattr(contrib, "_compare_logins",
+                            lambda *a, **k: ([], False, []))
+        monkeypatch.setattr(contrib, "_display_name", lambda login, token: None)
+
+        result = contrib.list_contributors(
+            "r", "base", "main", token="t", repo_dir=repo,
+            pr_logins=["devnick"],
+        )
+        assert result == ["devnick @devnick"]
+
+    def test_pr_logins_bot_filtered(self, monkeypatch, tmp_path) -> None:
+        repo = _init_repo(tmp_path)
+        _commit(repo, "base", name="Root", email="root@x")
+        run_git(repo, "tag", "base")
+        _commit(repo, "feat", name="human", email="h@x")
+
+        monkeypatch.setattr(contrib, "_compare_logins",
+                            lambda *a, **k: ([], False, []))
+        monkeypatch.setattr(contrib, "_display_name", lambda login, token: None)
+
+        result = contrib.list_contributors(
+            "r", "base", "main", token="t", repo_dir=repo,
+            pr_logins=["valkeyrie-ops[bot]", "human"],
+        )
+        assert result == ["human @human"]
+
+    def test_pr_logins_mixed_with_compare_api(self, monkeypatch, tmp_path) -> None:
+        repo = _init_repo(tmp_path)
+        _commit(repo, "base", name="Root", email="root@x")
+        run_git(repo, "tag", "base")
+        _commit(repo, "direct", name="Alice", email="alice@x")
+        _commit(repo, "sweep", name="bot", email="bot@x",
+                body="Co-authored-by: devnick <devnick@example.com>\n"
+                     "Co-authored-by: Unknown Person <unknown@x>")
+
+        monkeypatch.setattr(contrib, "_compare_logins",
+                            lambda *a, **k: (["alice123"], False, ["Alice"]))
+
+        def _mock_display(login, token):
+            return {"alice123": "Alice", "devnick": None}.get(login)
+
+        monkeypatch.setattr(contrib, "_display_name", _mock_display)
+
+        result = contrib.list_contributors(
+            "r", "base", "main", token="t", repo_dir=repo,
+            pr_logins=["devnick"],
+        )
+        assert result == ["Alice @alice123", "devnick @devnick", "Unknown Person"]
+
+    def test_pr_logins_upgrade_shortlog_by_display_name(self, monkeypatch, tmp_path) -> None:
+        # Login aliases don't overlap with the shortlog entry, but the resolved
+        # display name does. The bare entry should be upgraded, not duplicated.
+        repo = _init_repo(tmp_path)
+        _commit(repo, "base", name="Root", email="root@x")
+        run_git(repo, "tag", "base")
+        _commit(repo, "feat", name="Alice", email="alice@x")
+
+        def _boom(*a, **k):
+            raise urllib.error.URLError("offline")
+
+        monkeypatch.setattr(contrib, "_compare_logins", _boom)
+        monkeypatch.setattr(contrib, "_display_name",
+                            lambda login, token: "Alice" if login == "alice123" else None)
+
+        result = contrib.list_contributors(
+            "r", "base", "main", token="t", repo_dir=repo,
+            pr_logins=["alice123"],
+        )
+        assert result == ["Alice @alice123"]
