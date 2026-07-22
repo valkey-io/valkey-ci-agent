@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,7 +22,10 @@ try:
         renderer_for,
         title_for,
     )
-    from scripts.test_failure_detector.manage_issues import process_failures
+    from scripts.test_failure_detector.manage_issues import (
+        CLOSED_ISSUE_LOOKBACK,
+        process_failures,
+    )
     from scripts.test_failure_detector.parse_failures import JobReference, UniqueFailure
 
     _SKIP_REASON = None
@@ -248,6 +252,19 @@ class TestProcessFailures:
         process_failures(MagicMock(), "valkey-io/valkey", [_make_failure()])
 
         assert publisher.upsert.call_args.kwargs["idempotency_key"] is None
+
+    @patch("scripts.test_failure_detector.manage_issues.IssueDedupPublisher")
+    def test_detector_opts_in_to_closed_lookback(self, mock_publisher_cls) -> None:
+        """The recently-closed check is off by default on the shared publisher;
+        the detector must enable it explicitly with its 1-day window."""
+        publisher = mock_publisher_cls.return_value
+        publisher.upsert.return_value = ("created", "https://x/issues/1")
+
+        process_failures(MagicMock(), "valkey-io/valkey", [_make_failure()])
+
+        kwargs = mock_publisher_cls.call_args.kwargs
+        assert kwargs["closed_lookback"] == CLOSED_ISSUE_LOOKBACK
+        assert CLOSED_ISSUE_LOOKBACK == timedelta(days=1)
 
     def test_render_callable_produces_labelled_content(self) -> None:
         content = renderer_for(_make_failure()).render("<!-- m -->", 1)

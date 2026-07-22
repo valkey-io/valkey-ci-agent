@@ -134,7 +134,7 @@ The detector is a thin pipeline (`scripts/test_failure_detector/`) layered on sh
    - **created** - no matching issue exists: opens one titled `[TEST-FAILURE] {test_name} in {test_file}` with the `test-failure` label, error trace, CI links, and environment list
    - **updated** - a matching issue exists: merges any new failing environments into the body and bumps the occurrence counter / adds a recurrence comment
    - **skipped** - the run ID matches the `last-key` marker already recorded on the issue, so a re-triggered sweep over the same CI run does not inflate the occurrence count or post a duplicate comment
-   - **skipped-recently-closed** - no open issue matches, but a matching issue was closed within the past day; creation is suppressed because the failure was likely already fixed
+   - **skipped-recently-closed** - no open issue matches, but a matching issue (by marker, or by exact title for issues from the older fingerprint scheme) was closed within the past day; creation is suppressed because the failure was likely already fixed. This check is opt-in on the shared publisher and enabled only by the detector, so the fuzzer monitor never suppresses a recurring incident
 
 A GitHub Actions job summary is emitted at every exit path with a table of metrics (failures detected, issues created/updated).
 

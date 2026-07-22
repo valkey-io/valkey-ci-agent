@@ -9,10 +9,13 @@ Optional ``idempotency_key`` records the source event (e.g. a workflow run
 id) and skips the update if the same key has already been seen, so a
 re-triggered cron does not inflate the counter.
 
-When no open issue matches, the publisher checks for a recently closed issue
-with the same marker (default: 1 day). If one is found, creation
-is suppressed and ``"skipped-recently-closed"`` is returned, avoiding
-duplicates for failures that were fixed between the CI run and the detector.
+When no open issue matches and ``closed_lookback`` is set, the publisher
+checks for a recently closed issue with the same marker (or, for legacy
+issues, the exact fallback title). If one is found, creation is suppressed
+and ``"skipped-recently-closed"`` is returned, avoiding duplicates for
+failures that were fixed between the CI run and the detector. The check is
+opt-in (disabled by default) so workflows that must never suppress a
+recurrence, such as the fuzzer monitor, are unaffected.
 
 Callers supply rendered title, body, and comment via a render callback;
 this module owns only the dedup machinery. Search failures are propagated
@@ -46,23 +49,20 @@ class IssueContent:
 class IssueDedupPublisher:
     """Create or update an issue, deduplicating on a fingerprint marker."""
 
-    # Default window for skipping creation when a matching issue was recently
-    # closed. One day safely covers the gap between a Daily CI run and the detector.
-    DEFAULT_CLOSED_LOOKBACK = timedelta(days=1)
-
     def __init__(
         self,
         github_client: Any,
         *,
         marker_namespace: str,
-        closed_lookback: timedelta | None = DEFAULT_CLOSED_LOOKBACK,
+        closed_lookback: timedelta | None = None,
     ) -> None:
         """`marker_namespace` should be a stable workflow-scoped string,
         e.g. ``"valkey-ci-agent:fuzzer-issue"``. It appears literally in
         issue bodies and in search queries.
 
         `closed_lookback` controls how far back to search for recently closed
-        issues before creating a new one. Set to ``None`` to disable the check.
+        issues before creating a new one. ``None`` (the default) disables the
+        check; pass a window such as ``timedelta(days=1)`` to opt in.
         """
         self._gh = github_client
         self._ns = marker_namespace
@@ -108,7 +108,9 @@ class IssueDedupPublisher:
         issue with this exact title; on a hit it adopts that issue and the
         update re-stamps it with the current marker, so a format change does
         not orphan it into a duplicate. The match must be exact and
-        case-sensitive. Pass the same title ``render`` produces.
+        case-sensitive. Pass the same title ``render`` produces. The same
+        fallback applies to the recently-closed check, so a legacy issue
+        closed within the lookback window also suppresses creation.
         """
         repo = retry_github_call(
             lambda: self._gh.get_repo(repo_name),
@@ -130,7 +132,7 @@ class IssueDedupPublisher:
                 )
 
         if existing is None:
-            recently_closed = self._find_recently_closed(repo_name, marker)
+            recently_closed = self._find_recently_closed(repo_name, marker, title_fallback)
             if recently_closed is not None:
                 logger.info(
                     "Issue #%s for %s was closed recently; skipping creation",
@@ -211,16 +213,11 @@ class IssueDedupPublisher:
     def _find_by_title(self, repo_name: str, title: str) -> Any:
         """Find an open issue whose title exactly equals ``title``, or None.
 
-        Migration fallback for when the marker search misses. A title can hold
-        characters that break search syntax (quotes, ``:``), so the query uses
-        word tokens only to narrow the candidates; the exact, case-sensitive
-        match is then verified in Python.
+        Migration fallback for when the marker search misses.
         """
-        tokens = re.findall(r"\w+", title)
-        if not tokens:
+        phrase = _title_search_phrase(title)
+        if phrase is None:
             return None
-        # Cap the tokens to keep the query short; the check below decides the match.
-        phrase = " ".join(tokens[:10])
         query = f'{phrase} in:title repo:{repo_name} is:issue is:open'
         results = retry_github_call(
             lambda: list(self._gh.search_issues(query)),
@@ -231,9 +228,12 @@ class IssueDedupPublisher:
                 return self._reload(repo_name, issue.number)
         return None
 
-    def _find_recently_closed(self, repo_name: str, marker: str) -> Any:
-        """Find a closed issue containing the marker that was closed within
-        the lookback window, or None.
+    def _find_recently_closed(
+        self, repo_name: str, marker: str, title_fallback: str | None,
+    ) -> Any:
+        """Find an issue that was closed within the lookback window and
+        matches the marker or, for legacy issues, ``title_fallback`` exactly.
+        Returns None when nothing matches or the check is disabled.
 
         Guards against re-filing an issue for a failure that was already fixed
         and whose issue was closed between the CI run and the detector run.
@@ -243,16 +243,35 @@ class IssueDedupPublisher:
         cutoff = datetime.now(timezone.utc) - self._closed_lookback
         # GitHub search's "closed:>DATE" qualifier filters on close time.
         date_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
-        query = (
-            f'"{marker}" in:body repo:{repo_name} is:issue is:closed '
-            f"closed:>{date_str}"
-        )
+        closed_filter = f"is:issue is:closed closed:>{date_str}"
+        query = f'"{marker}" in:body repo:{repo_name} {closed_filter}'
         results = retry_github_call(
             lambda: list(self._gh.search_issues(query)),
             retries=2, description="search recently closed issues",
         )
         for issue in results:
             if marker in (issue.body or ""):
+                return issue
+
+        # A legacy issue carries an older (or no) marker, so the marker search
+        # misses it. Fall back to an exact title match, mirroring the open-issue
+        # migration path, so a just-closed legacy issue is not duplicated.
+        if title_fallback is None:
+            return None
+        phrase = _title_search_phrase(title_fallback)
+        if phrase is None:
+            return None
+        title_query = f'{phrase} in:title repo:{repo_name} {closed_filter}'
+        results = retry_github_call(
+            lambda: list(self._gh.search_issues(title_query)),
+            retries=2, description="search recently closed issues by title",
+        )
+        for issue in results:
+            if issue.title == title_fallback:
+                logger.info(
+                    "Matched recently closed legacy issue #%s via title fallback",
+                    issue.number,
+                )
                 return issue
         return None
 
@@ -262,6 +281,20 @@ class IssueDedupPublisher:
             lambda: self._gh.get_repo(repo_name).get_issue(number),
             retries=2, description=f"get issue #{number}",
         )
+
+
+def _title_search_phrase(title: str) -> str | None:
+    """Build a search-safe phrase from a title, or None if it has no words.
+
+    A title can hold characters that break search syntax (quotes, ``:``), so
+    the query uses word tokens only to narrow the candidates; callers verify
+    the exact, case-sensitive match in Python.
+    """
+    tokens = re.findall(r"\w+", title)
+    if not tokens:
+        return None
+    # Cap the tokens to keep the query short; the caller's check decides the match.
+    return " ".join(tokens[:10])
 
 
 def _occurrence_re(namespace: str) -> re.Pattern[str]:

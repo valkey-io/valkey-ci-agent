@@ -234,9 +234,8 @@ def test_title_fallback_requires_exact_title_match():
     mock_repo.create_issue.return_value = mock_issue
     mock_gh = MagicMock()
     mock_gh.get_repo.return_value = mock_repo
-    # (1) marker search misses, (2) title fallback: near-miss candidate,
-    # (3) recently-closed search: nothing.
-    mock_gh.search_issues.side_effect = [iter([]), [candidate], iter([])]
+    # (1) marker search misses, (2) title fallback: near-miss candidate.
+    mock_gh.search_issues.side_effect = [iter([]), [candidate]]
 
     publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
     action, _ = publisher.upsert(
@@ -339,7 +338,9 @@ def test_skips_creation_when_matching_issue_recently_closed():
     # First search (open) returns nothing; second (recently closed) finds it.
     mock_gh.search_issues.side_effect = [iter([]), [closed_issue]]
 
-    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    publisher = IssueDedupPublisher(
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
+    )
     action, url = publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
 
     assert action == "skipped-recently-closed"
@@ -359,16 +360,94 @@ def test_creates_issue_when_closed_issue_not_within_lookback():
     no_match = MagicMock(number=99, body="unrelated body")
     mock_gh.search_issues.side_effect = [iter([]), [no_match]]
 
-    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    publisher = IssueDedupPublisher(
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
+    )
     action, _ = publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
 
     assert action == "created"
     mock_repo.create_issue.assert_called_once()
 
 
-def test_closed_lookback_disabled_skips_search():
-    """Setting closed_lookback=None disables the recently-closed check entirely,
-    so no second search is issued."""
+def test_closed_lookback_off_by_default():
+    """The recently-closed check is opt-in: a publisher constructed without
+    closed_lookback must not issue a closed-issue search. Guards workflows
+    like the fuzzer monitor, where a recurring incident must never be
+    silently suppressed."""
+    mock_repo = MagicMock()
+    mock_issue = MagicMock(number=1, html_url="https://x/issues/1")
+    mock_repo.create_issue.return_value = mock_issue
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.return_value = iter([])
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, _ = publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
+
+    assert action == "created"
+    # Only one search call (the open-issue check); no closed-issue search.
+    assert mock_gh.search_issues.call_count == 1
+
+
+def test_recently_closed_legacy_issue_matched_via_title_fallback():
+    """A legacy issue (old or missing marker) closed within the lookback
+    window is found via the exact-title fallback, so creation is suppressed
+    for migration cases too."""
+    legacy_closed = MagicMock(
+        number=11, html_url="https://x/issues/11",
+        body="no marker here", title="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    mock_repo = MagicMock()
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    # (1) open marker search misses, (2) open title fallback misses,
+    # (3) closed marker search misses, (4) closed title search finds it.
+    mock_gh.search_issues.side_effect = [iter([]), iter([]), iter([]), [legacy_closed]]
+
+    publisher = IssueDedupPublisher(
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
+    )
+    action, url = publisher.upsert(
+        "o/r", fingerprint="newfp", render=_render_static(),
+        title_fallback="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+
+    assert action == "skipped-recently-closed"
+    assert url == "https://x/issues/11"
+    mock_repo.create_issue.assert_not_called()
+    # The closed title search carries the closed filter, not in:body.
+    closed_title_query = mock_gh.search_issues.call_args_list[3][0][0]
+    assert "is:closed" in closed_title_query
+    assert "in:title" in closed_title_query
+
+
+def test_recently_closed_title_fallback_requires_exact_match():
+    """A near-miss title in the closed search must not suppress creation."""
+    near_miss = MagicMock(
+        number=12, body="no marker", title="[TEST-FAILURE] PSYNC2 in t.tcl EXTRA",
+    )
+    mock_repo = MagicMock()
+    mock_issue = MagicMock(number=1, html_url="https://x/issues/1")
+    mock_repo.create_issue.return_value = mock_issue
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_gh.search_issues.side_effect = [iter([]), iter([]), iter([]), [near_miss]]
+
+    publisher = IssueDedupPublisher(
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
+    )
+    action, _ = publisher.upsert(
+        "o/r", fingerprint="newfp", render=_render_static(),
+        title_fallback="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+
+    assert action == "created"
+    mock_repo.create_issue.assert_called_once()
+
+
+def test_recently_closed_skips_title_search_without_fallback():
+    """Without a title_fallback there is no legacy scheme to migrate from, so
+    the closed check stops after the marker search."""
     mock_repo = MagicMock()
     mock_issue = MagicMock(number=1, html_url="https://x/issues/1")
     mock_repo.create_issue.return_value = mock_issue
@@ -377,13 +456,13 @@ def test_closed_lookback_disabled_skips_search():
     mock_gh.search_issues.return_value = iter([])
 
     publisher = IssueDedupPublisher(
-        mock_gh, marker_namespace=NAMESPACE, closed_lookback=None,
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
     )
     action, _ = publisher.upsert("o/r", fingerprint="fp1", render=_render_static())
 
     assert action == "created"
-    # Only one search call (the open-issue check); no closed-issue search.
-    assert mock_gh.search_issues.call_count == 1
+    # Open marker search + closed marker search only; no closed title search.
+    assert mock_gh.search_issues.call_count == 2
 
 
 def test_closed_lookback_custom_duration():
