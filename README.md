@@ -13,6 +13,7 @@ scripts/
   fuzzer/      Fuzzer run monitoring (active)
   ci_fix/      On-demand CI test-fix bot (active)
   release_notes/  Release cutter: AI notes + version bump (active)
+  cve_scan/    CVE scanning + automatic base-verified rebuild dispatch (active)
   common/      Shared infrastructure (git auth, GitHub client, safety guards)
 .github/actions/setup-agent
               Shared workflow setup for Python deps and optional Claude Code
@@ -30,6 +31,7 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | CI Fix | Active | On-demand `@valkeyrie-bot fix <ci-link>` - diagnoses and fixes a failing test on a backport PR |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
 | Release Notes | Active | Cuts a release for valkey core or a module repo (search/json/bloom): AI-generates notes from `release-notes` PRs plus AI-triaged candidates without that label, promotes them onto a release line branch, bumps the repo's version file, opens a PR (held as a draft when the cut flags issues) |
+| CVE Scan | Active | Scans container images for vulnerabilities, dispatches rebuilds automatically when fixes are verified present in the base image |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Additional Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
 
@@ -558,12 +560,102 @@ cut, so an ordinary cut is never blocked when the App installation lacks it.
 The App installation must hold `repository-advisories:read` for an advisory cut
 to read the advisories.
 
+## CVE Scan Workflow
+
+Scans published container images for vulnerabilities across all published platforms, classifies which CVEs are fixable by a plain rebuild, verifies fixes are actually present in the upstream base image using native dpkg/apk comparison semantics, and dispatches targeted rebuilds automatically when confirmed. The trigger condition is verified evidence, consistent with valkey-container's publishing model (daily unstable cron, versions.json merges). All findings (confirmed-fixable and not-fixable) are reported in the GitHub Actions job summary. No GitHub issues are created.
+
+This is Phase 1: a concrete implementation targeting `valkey-io/valkey-container`. Phase 2 (reusable `workflow_call` extraction for other repos) is planned.
+
+### How it works
+
+A single workflow (`.github/workflows/cve-scan.yml`) with two jobs:
+
+**Job 1: `scan`** (weekly cron + manual `workflow_dispatch`)
+
+1. **Install scanner**: sets up Trivy on the runner.
+2. **Resolve image matrix**: in dynamic mode, `image_matrix.py` fetches the upstream `versions.json` manifest and derives the full set of image tags to scan. It also builds an image-to-base mapping (e.g. `valkey/valkey:9.1-alpine` to `alpine:3.23`, `valkey/valkey:9.1` to `debian:trixie-slim`) used by the base pre-check.
+3. **Scan (multi-arch)**: `sweep.py` runs Trivy per image per platform via `scanner.py`. Each image is scanned on all 4 published platforms (linux/amd64, linux/arm64, linux/arm/v7, linux/ppc64le). Findings are deduplicated by (image, package, cve_id, installed_version) so a CVE identical across all architectures is counted once.
+4. **Classify**: `rebuild_decider.py` determines whether each finding is fixable by rebuilding (a patched package version exists) or requires upstream fixes. Uses a pure-Python comparator with correct Debian semantics (epoch, tilde ordering, `+` suffix ordering, revision splitting).
+5. **Base pre-check** (dynamic mode only): `base_precheck.py` reads the base image package database (apk for Alpine, dpkg for Debian) and compares installed package versions against the fix. The comparison uses native dpkg/apk tools via docker for correct Debian/Alpine ordering. Any comparison error is fail-closed (downgraded). Findings where the base image has not yet been republished with the fix are downgraded to not-fixable, avoiding no-op rebuilds.
+6. **Report findings**: all findings (confirmed-fixable and not-fixable) are rendered in the GitHub Actions job summary as grouped markdown tables. No GitHub issues are created.
+7. **Emit outputs**: writes `fixable` (true/false) and `versions` (space-separated version lines, e.g. `8.0 9.1`) to `GITHUB_OUTPUT` for the downstream job. The `versions` output is derived from confirmed-fixable image tags (e.g. `valkey/valkey:8.0-alpine` and `valkey/valkey:8.0` both contribute `8.0`). It is empty when no fixable findings exist.
+
+**Job 2: `rebuild`** (conditional, automatic)
+
+1. **Condition**: runs only when the scan job emits `fixable == 'true'` AND `versions != ''` and the run is not a dry run.
+2. **Dispatch**: the job mints a scoped Valkeyrie Bot App token (`actions:write` on valkey-container) and dispatches the rebuild workflow (`gh workflow run ci.yml --repo valkey-io/valkey-container --field version="<versions>"`), where `<versions>` is the space-separated list of version lines from the `versions` output (e.g. `8.0 9.1`). This targets only the affected versions rather than rebuilding everything.
+
+The trigger condition is verified evidence: the distro published a fix, the base pre-check confirmed the fix is present in the current base image tag using native package-manager comparison, and the published container image still lacks it. This is consistent with valkey-container's publishing model, which builds and publishes on cron and on versions.json merges.
+
+A concurrency group (`cve-scan-${{ github.ref }}`, cancel-in-progress) ensures stale in-flight runs are superseded by newer scans.
+
+### Installation
+
+#### Prerequisites
+
+- The **Valkeyrie Bot GitHub App** installed on the target repository with:
+  - `actions: write` (dispatch the rebuild workflow)
+  - `contents: read`, `metadata: read`
+- Org-level secrets: `VALKEYRIE_BOT_APP_ID` and `VALKEYRIE_BOT_PRIVATE_KEY`
+
+#### Step 1: Configure secrets
+
+On the repo hosting the agent workflows:
+
+| Type | Name | Value |
+|------|------|-------|
+| Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie Bot GitHub App ID |
+| Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | App private key |
+
+For forks without org secrets, the workflow falls back to `AUTOMATION_PAT`.
+
+### Configuration
+
+Settings are loaded from `CVE_SCAN_*` environment variables with sensible defaults
+targeting `valkey-io/valkey-container`. The workflow pins all values explicitly in
+its `env:` block (house style: visible-in-workflow configuration). Override any
+variable to change behavior for forks or testing.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CVE_SCAN_VERSIONS_URL` | `https://raw.githubusercontent.com/valkey-io/valkey-container/mainline/versions.json` | URL to the versions.json manifest for dynamic image resolution |
+| `CVE_SCAN_REPOSITORY` | `valkey/valkey` | Docker Hub repository prefix for derived image tags |
+| `CVE_SCAN_INCLUDE_UNSTABLE` | `false` | Include the `unstable` version line (truthy: `1`, `true`, `yes`, `on`; falsy: `0`, `false`, `no`, `off`, empty) |
+| `CVE_SCAN_SCANNER` | `trivy` | Vulnerability scanner (trivy only; env var kept for forward compatibility) |
+| `CVE_SCAN_SEVERITY_THRESHOLD` | `HIGH` | Ignore findings below this severity (`UNKNOWN`, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`). |
+| `CVE_SCAN_IMAGES` | *(empty)* | Optional static image list (comma-separated). When set, overrides dynamic resolution from versions.json. Testing/escape hatch. |
+| `CVE_SCAN_PLATFORMS` | `linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le` | Comma-separated platforms to scan per image. Defaults to the verified published set for valkey images. |
+
+Invalid values (unknown scanner, bad severity, empty labels) raise immediately:
+a typo must not silently scan nothing.
+
+### Usage
+
+#### Weekly scan (automatic)
+
+Runs weekly on the configured schedule (default: Monday 06:00 UTC). Scans all images in the matrix on all configured platforms, reports findings in the job summary, and dispatches a targeted rebuild automatically if confirmed-fixable CVEs are found.
+
+#### Manual scan
+
+```bash
+gh workflow run cve-scan.yml --repo <agent-repo>
+```
+
+Supports a `dry_run` input that prints findings without dispatching a rebuild. Supports a `severity_threshold` input for ad-hoc investigation.
+
+#### Reviewing results
+
+After each scan, check the workflow run's job summary in GitHub Actions. The summary lists all findings (confirmed-fixable and not-fixable) as grouped markdown tables. Confirmed-fixable findings trigger a targeted rebuild automatically.
+
 ## Safety
 
 - **Branch namespace** - the agent writes only `agent/backport/...` (backports) and `agent/release-cut/...` (release cuts) branches and opens PRs for maintainer review. It never force-pushes a release line directly.
 - **Credential isolation** - all GitHub auth uses `GIT_ASKPASS`; tokens never appear in `.git/config` or URLs
 - **Claude Code env isolation** - `GITHUB_TOKEN`, `GH_TOKEN`, and `*_SECRET` are stripped from the subprocess environment. Claude cannot see credentials.
 - **Deterministic validation** - registry-configured build commands run before push. A validation failure blocks the push.
+- **CVE scan: verified-evidence trigger** - rebuild dispatch requires three conditions to be true simultaneously: (1) the distro published a fix for the CVE, (2) the base-image pre-check confirms the patched package is present in the current base tag using native dpkg/apk comparison tools, and (3) the published container image still carries the vulnerable version. If any condition is ambiguous or unverifiable, the finding is downgraded (fail-closed). The workflow run log is the audit record for every automatic dispatch.
+- **CVE scan: targeted dispatch** - rebuilds are dispatched with `--field version="<versions>"` for only the affected version lines (e.g. `8.0 9.1`), not a rebuild-all. This minimizes the blast radius of automatic rebuilds.
+- **CVE scan: no AI in the pipeline** - the entire scan-classify-precheck-dispatch path is deterministic code (scanner, classifier, base pre-check, `gh workflow run`). No AI layer participates in any decision or dispatch step.
 - **Fork sync** - when a different-owner `push_repo` is configured, the agent fast-forwards that fork's release branch to match upstream before cherry-picking
 - **Stale branch pruning** - if a previous backport PR was closed without merging, the agent deletes the orphaned branch before starting fresh
 - **DCO** - backport commits are signed off. ci_fix commits are authored by the bot without a sign-off, so a human certifies the change before merge.

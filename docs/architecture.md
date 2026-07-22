@@ -14,6 +14,7 @@ scripts/
   test_failure_detector/ Test Failure Detector workflow
   ci_fix/      CI test-fix bot
   release_notes/ Release-notes cutter: AI notes + version bump
+  cve_scan/    CVE scan + automatic base-verified rebuild workflow
   ai/          Claude Code subprocess orchestration
   common/      Shared infrastructure
 repos.yml      Registry of repos, release branches, and project boards
@@ -390,6 +391,83 @@ calendar date.
 - `scripts/release_notes/release_format.py` - `00-RELEASENOTES` dated-section rendering
 - `scripts/release_notes/version_bump.py` - `src/version.h` macro rewriting
 - `scripts/release_notes/contributors.py` - contributor discovery; reconciles display-name, login, co-author trailers, and PR-resolved logins
+
+## CVE Scan Flow
+
+A single workflow (`.github/workflows/cve-scan.yml`) with two jobs: a deterministic scan
+that classifies findings, verifies fixes in the base image across all published platforms,
+and reports all findings in the job summary, followed by an automatic rebuild
+dispatch targeting only the affected version lines when confirmed-fixable findings exist.
+
+```text
+Job 1 - scan (scheduled / workflow_dispatch)
+sweep.py
+  → image_matrix.py
+      resolve_matrix() fetches versions.json once
+      derives image tags + image-to-base mapping
+      (e.g. valkey/valkey:9.1-alpine → alpine:3.23)
+  → scanner.py (Trivy subprocess per image per platform)
+      scans each image on each published platform (amd64, arm64, arm/v7, ppc64le)
+      deduplicates findings by (image, package, cve_id, installed_version)
+  → rebuild_decider.py (pure-Python classify: rebuild-fixable vs not)
+  → base_precheck.py (dynamic mode only)
+      reads each distinct base image's package database (apk/dpkg)
+      compares versions using native dpkg/apk tools via docker (correct Debian semantics)
+      downgrades findings where base is still vulnerable (fail-closed)
+  → summary.py (render grouped findings tables for job summary)
+  → emit GITHUB_OUTPUT: fixable=true/false, versions=<space-separated lines>
+
+Job 2 - rebuild (runs only if fixable == 'true' AND versions != '' AND not dry_run)
+  → mint Valkeyrie Bot App token (actions:write, scoped to valkey-container)
+  → gh workflow run ci.yml --repo valkey-io/valkey-container
+         --field "version=<versions from scan output>"
+```
+
+The rebuild dispatches automatically because the trigger condition is verified
+evidence: the distro published a fix, the base-image pre-check confirmed the fix is
+present in the current base tag using native dpkg/apk comparison semantics, and the
+published image still lacks it. This is consistent with the publishing model of
+valkey-container, which builds and publishes on cron (daily unstable builds) and on
+versions.json merges.
+
+### Entry Points
+
+- `scripts/cve_scan/sweep.py`: orchestrates the full pipeline (scan, classify, base pre-check, job summary, output emission)
+- `scripts/cve_scan/summary.py`: renders grouped findings tables for the job summary
+- `scripts/cve_scan/base_precheck.py`: verifies fixable findings against the actual upstream base image using native package-manager version comparison
+- `scripts/cve_scan/version_compare.py`: native dpkg/apk version comparison via docker (used by base_precheck as the safety gate)
+- `scripts/cve_scan/image_matrix.py`: resolves image tags and image-to-base mappings from versions.json
+- `scripts/cve_scan/scanner.py`: per-image per-platform Trivy invocation with finding deduplication
+
+### Security Model
+
+The design relies on verified evidence and deterministic code:
+
+- **Verified-evidence trigger (fail-closed)**: rebuild dispatch requires three conditions simultaneously: (1) the distro published a fix (fixed_version exists), (2) the base-image pre-check confirms the patched package is present in the current base tag by reading the base image package database and comparing versions using the native dpkg/apk tools (correct Debian/Alpine semantics, fail-closed on any comparison error), and (3) the published container image still carries the vulnerable version. If any condition is ambiguous or unverifiable, the finding is downgraded rather than triggering a rebuild.
+- **Targeted version dispatch**: the rebuild job passes `--field version="<versions>"` with only the affected version lines (e.g. `8.0 9.1`) rather than rebuilding all images, minimizing blast radius.
+- **Multi-arch coverage**: each image is scanned on all 4 published platforms (amd64, arm64, arm/v7, ppc64le). Findings are deduplicated across platforms so a CVE present on all architectures is reported once. Base package versions are assumed arch-uniform per tag (validated indirectly by the multi-arch scan).
+- **Deterministic code path**: scanning, classification, base pre-check, and dispatch are all deterministic code with no AI in the loop. The pipeline is stdlib Python plus a scanner subprocess.
+- **Least-privilege tokens**: the scan job needs only `contents:read`. The rebuild job mints a separate token scoped to `actions:write` + `metadata:read`. Neither token is broader than required.
+- **Audit trail**: every automatic dispatch is recorded in the workflow run log and the job summary. All findings are visible in the run summary as grouped markdown tables.
+
+This matches valkey-container's existing posture: the same `ci.yml` workflow already runs automatically on cron and on push. The CVE scanner dispatches it through the same path with the same effect, triggered by verified vulnerability evidence rather than a timer.
+
+### Authentication
+
+The rebuild job authenticates as the **Valkeyrie Bot GitHub App** by minting a short-lived, repo-scoped installation token (via `actions/create-github-app-token`) with `actions:write` scope. The scan job requires only `contents:read`. A fork-safe fallback uses `AUTOMATION_PAT` when org secrets are unavailable.
+
+### Idempotency
+
+The concurrency group (`cancel-in-progress: true`) supersedes stale workflow runs
+so only the latest scan result drives the dispatch decision.
+
+### Configuration
+
+Settings are loaded from `CVE_SCAN_*` environment variables with sensible defaults
+targeting `valkey-io/valkey-container`. The workflow pins all values explicitly in
+its `env:` block (house style: visible-in-workflow configuration, matching the
+`CI_FIX_*` and `RELEASE_NOTES_*` patterns used by other workflows). Invalid values
+raise immediately rather than acting on defaults.
 
 ## Planned Workflows
 
