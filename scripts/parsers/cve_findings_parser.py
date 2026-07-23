@@ -11,7 +11,7 @@ from typing import Any
 from scripts.cve_scan.models import Finding, Severity
 
 
-def parse_trivy(json_obj: dict[str, Any], image: str) -> list[Finding]:
+def parse_trivy(json_obj: dict[str, Any], image: str, platform: str = "") -> list[Finding]:
     """Parse Trivy JSON output into a list of Finding objects.
 
     Expected structure::
@@ -51,18 +51,20 @@ def parse_trivy(json_obj: dict[str, Any], image: str) -> list[Finding]:
                     cve_id=vuln["VulnerabilityID"],
                     severity=Severity.from_str(vuln["Severity"]),
                     fixed_version=fixed if fixed else None,
+                    platform=platform,
                 )
             )
     return findings
 
 
-def parse_findings(scanner: str, json_obj: dict[str, Any], image: str) -> list[Finding]:
+def parse_findings(scanner: str, json_obj: dict[str, Any], image: str, platform: str = "") -> list[Finding]:
     """Dispatch to the correct parser based on scanner name.
 
     Args:
         scanner: Must be "trivy".
         json_obj: Parsed JSON output from the scanner.
         image: Image reference that was scanned.
+        platform: Platform string to stamp on each finding (e.g. "linux/amd64").
 
     Returns:
         List of Finding objects.
@@ -71,7 +73,7 @@ def parse_findings(scanner: str, json_obj: dict[str, Any], image: str) -> list[F
         ValueError: If scanner is not recognized.
     """
     if scanner == "trivy":
-        return parse_trivy(json_obj, image)
+        return parse_trivy(json_obj, image, platform=platform)
     raise ValueError(f"Unsupported scanner: {scanner!r}. Must be 'trivy'.")
 
 

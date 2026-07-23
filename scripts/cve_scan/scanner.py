@@ -6,8 +6,9 @@ via the findings parser.
 
 Multi-arch scanning: each image is scanned per platform by passing
 ``--platform <p>`` to trivy. Findings from all platforms are merged and
-deduplicated by (image, package, cve_id, installed_version) so a CVE that
-appears identically across all architectures is reported once.
+deduplicated by (image, package, cve_id, installed_version, platform) so
+exact duplicates on the same platform are collapsed, but cross-platform
+findings remain distinct for per-platform base verification.
 
 Expected scan count: len(images) * len(platforms). For the default 4-platform
 configuration (amd64, arm64, arm/v7, ppc64le) and a typical 10-image matrix
@@ -22,6 +23,7 @@ import logging
 import subprocess
 from typing import Any
 
+from scripts.cve_scan.config import DEFAULT_PLATFORMS
 from scripts.cve_scan.models import Finding, Severity
 from scripts.parsers.cve_findings_parser import filter_by_threshold, parse_findings
 
@@ -31,17 +33,6 @@ logger = logging.getLogger(__name__)
 #: Cached-DB scans complete in tens of seconds; the job-level timeout is 30 min.
 _SCAN_TIMEOUT_SECONDS = 180
 
-# Verified published platforms for valkey images.
-# Verified via: docker buildx imagetools inspect public.ecr.aws/valkey/valkey:8.0
-# (and :8.0-alpine). Both images publish the same 4-platform set.
-# Note: linux/386 is NOT published; linux/ppc64le IS.
-DEFAULT_PLATFORMS: list[str] = [
-    "linux/amd64",
-    "linux/arm64",
-    "linux/arm/v7",
-    "linux/ppc64le",
-]
-
 
 class ScanError(Exception):
     """Raised when a scanner subprocess fails or produces unparseable output."""
@@ -50,7 +41,10 @@ class ScanError(Exception):
 def _build_command(scanner: str, image: str, platform: str | None = None) -> list[str]:
     """Build the scanner command as an argument list (no shell interpolation)."""
     if scanner == "trivy":
-        cmd = ["trivy", "image", "--format", "json", "--quiet", "--scanners", "vuln"]
+        cmd = [
+            "trivy", "image", "--format", "json", "--quiet",
+            "--scanners", "vuln", "--pkg-types", "os",
+        ]
         if platform:
             cmd.extend(["--platform", platform])
         cmd.append(image)
@@ -117,20 +111,21 @@ def scan_image(image: str, scanner: str, platform: str | None = None) -> list[Fi
     """
     command = _build_command(scanner, image, platform=platform)
     json_obj = _run_scanner(command)
-    return parse_findings(scanner, json_obj, image)
+    return parse_findings(scanner, json_obj, image, platform=platform or "")
 
 
 def _dedup_findings(findings: list[Finding]) -> list[Finding]:
-    """Deduplicate findings by (image, package, cve_id, installed_version).
+    """Deduplicate findings by (image, package, cve_id, installed_version, platform).
 
-    When scanning multiple platforms, identical CVEs appear once per platform
-    (same vulnerability, same installed version). This collapses them to one
-    representative finding. The first occurrence is kept.
+    When scanning multiple platforms, identical CVEs on the SAME platform can
+    appear if trivy reports duplicates. This collapses them to one per platform.
+    Findings on DIFFERENT platforms are kept distinct so base verification can
+    check each platform's base image independently. The first occurrence is kept.
     """
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, str, str, str, str]] = set()
     deduped: list[Finding] = []
     for f in findings:
-        key = (f.image, f.package, f.cve_id, f.installed_version)
+        key = (f.image, f.package, f.cve_id, f.installed_version, f.platform)
         if key not in seen:
             seen.add(key)
             deduped.append(f)
@@ -147,11 +142,9 @@ def scan_images(
 
     Each image is scanned once per platform in ``platforms``. Findings are
     merged across platforms and deduplicated by (image, package, cve_id,
-    installed_version) so a CVE identical on all architectures is counted once.
-
-    Base pre-check remains native-arch: base package versions are assumed
-    arch-uniform per tag, which the multi-arch scan validates indirectly (if
-    a package version differs per arch, dedup would keep both findings).
+    installed_version, platform) so exact duplicates on the same platform are
+    collapsed but cross-platform findings remain distinct for per-platform
+    base verification.
 
     Args:
         images: List of container image references to scan.

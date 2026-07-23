@@ -37,6 +37,7 @@ class Finding:
     cve_id: str
     severity: Severity
     fixed_version: str | None
+    platform: str = ""
 
 
 @dataclass

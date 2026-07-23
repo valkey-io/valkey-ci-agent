@@ -352,10 +352,65 @@ class TestBaseCaching:
                 classifications, base_map
             )
 
+        # Both findings have platform="" so cache key is ("alpine:3.23", "")
         assert mock_get.call_count == 1
-        mock_get.assert_called_once_with("alpine:3.23")
+        mock_get.assert_called_once_with("alpine:3.23", platform="")
         assert len(confirmed) == 2
         assert len(downgraded) == 0
+
+    def test_same_base_different_platforms_queried_separately(self) -> None:
+        """Same base ref on different platforms -> separate get_base_packages calls."""
+        finding_amd64 = Finding(
+            image="valkey/valkey:9.1-alpine",
+            package="openssl",
+            installed_version="3.0.12-r0",
+            cve_id="CVE-2024-1111",
+            severity=Severity.HIGH,
+            fixed_version="3.0.13-r0",
+            platform="linux/amd64",
+        )
+        finding_arm64 = Finding(
+            image="valkey/valkey:9.1-alpine",
+            package="openssl",
+            installed_version="3.0.12-r0",
+            cve_id="CVE-2024-1111",
+            severity=Severity.HIGH,
+            fixed_version="3.0.13-r0",
+            platform="linux/arm64",
+        )
+        classifications = [
+            _make_classification(finding_amd64),
+            _make_classification(finding_arm64),
+        ]
+        base_map = {"valkey/valkey:9.1-alpine": "alpine:3.23"}
+
+        call_args: list[tuple[str, str]] = []
+
+        def mock_get(base_ref, platform=""):
+            call_args.append((base_ref, platform))
+            if platform == "linux/amd64":
+                return {"openssl": "3.0.13-r0"}  # amd64 has the fix
+            else:
+                return {"openssl": "3.0.12-r0"}  # arm64 base is stale
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            side_effect=mock_get,
+        ):
+            confirmed, downgraded = verify_fixable_in_base(
+                classifications, base_map
+            )
+
+        # Two calls: one per (base_ref, platform) pair
+        assert len(call_args) == 2
+        assert ("alpine:3.23", "linux/amd64") in call_args
+        assert ("alpine:3.23", "linux/arm64") in call_args
+        # amd64 confirmed, arm64 downgraded
+        assert len(confirmed) == 1
+        assert confirmed[0].finding.platform == "linux/amd64"
+        assert len(downgraded) == 1
+        assert downgraded[0].finding.platform == "linux/arm64"
+        assert "still ships" in downgraded[0].rationale
 
 
 # ---------------------------------------------------------------------------

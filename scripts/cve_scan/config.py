@@ -41,7 +41,14 @@ _DEFAULT_SEVERITY_THRESHOLD = "HIGH"
 # `docker buildx imagetools inspect public.ecr.aws/valkey/valkey:8.0`
 # and `public.ecr.aws/valkey/valkey:8.0-alpine`; both publish the same set).
 # Note: linux/386 is NOT published; linux/ppc64le IS.
-_DEFAULT_PLATFORMS = "linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le"
+DEFAULT_PLATFORMS: list[str] = [
+    "linux/amd64",
+    "linux/arm64",
+    "linux/arm/v7",
+    "linux/ppc64le",
+]
+
+_DEFAULT_PLATFORMS_STR = ",".join(DEFAULT_PLATFORMS)
 
 
 class CveScanConfigError(Exception):
@@ -100,7 +107,7 @@ def load_settings() -> CveScanSettings:
     images_raw = os.environ.get("CVE_SCAN_IMAGES", "")
     images = [img.strip() for img in images_raw.split(",") if img.strip()]
 
-    platforms_raw = os.environ.get("CVE_SCAN_PLATFORMS", _DEFAULT_PLATFORMS)
+    platforms_raw = os.environ.get("CVE_SCAN_PLATFORMS", _DEFAULT_PLATFORMS_STR)
     platforms = [p.strip() for p in platforms_raw.split(",") if p.strip()]
     if not platforms:
         raise CveScanConfigError(

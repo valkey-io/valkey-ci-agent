@@ -91,7 +91,7 @@ def _parse_dpkg_query(raw: str) -> dict[str, str]:
     return packages
 
 
-def get_base_packages(base_ref: str) -> dict[str, str]:
+def get_base_packages(base_ref: str, platform: str = "") -> dict[str, str]:
     """Read the base image's package database.
 
     Runs the base image once via docker to extract the installed package list.
@@ -99,6 +99,9 @@ def get_base_packages(base_ref: str) -> dict[str, str]:
 
     Args:
         base_ref: Base image reference (e.g. "alpine:3.23", "debian:trixie-slim").
+        platform: Optional platform string (e.g. "linux/arm64"). When provided,
+            passed as ``--platform`` to ``docker run`` so the correct arch
+            manifest is pulled and inspected.
 
     Returns:
         Mapping of package name to installed version string.
@@ -107,13 +110,19 @@ def get_base_packages(base_ref: str) -> dict[str, str]:
         BasePrecheckError: On unknown base flavor, docker failure, or empty output.
     """
     if base_ref.startswith("alpine:"):
-        cmd = ["docker", "run", "--rm", base_ref, "cat", "/lib/apk/db/installed"]
+        cmd = ["docker", "run"]
+        if platform:
+            cmd.extend(["--platform", platform])
+        cmd.extend(["--rm", base_ref, "cat", "/lib/apk/db/installed"])
         parser = _parse_apk_installed
     elif base_ref.startswith("debian:"):
-        cmd = [
-            "docker", "run", "--rm", base_ref,
+        cmd = ["docker", "run"]
+        if platform:
+            cmd.extend(["--platform", platform])
+        cmd.extend([
+            "--rm", base_ref,
             "dpkg-query", "-W", "-f", "${Package} ${Version}\n",
-        ]
+        ])
         parser = _parse_dpkg_query
     else:
         raise BasePrecheckError(
@@ -160,10 +169,11 @@ def verify_fixable_in_base(
 ) -> tuple[list[Classification], list[Classification]]:
     """Verify fixable findings against their base images' package databases.
 
-    Reads each distinct base image's package list once (cached per invocation)
-    and compares installed versions against the finding's fixed_version.
-    Findings confirmed fixable stay in the confirmed list; findings where the
-    base is still vulnerable (or comparison is ambiguous) are downgraded.
+    Reads each distinct (base image, platform) pair's package list once (cached
+    per invocation) and compares installed versions against the finding's
+    fixed_version. Findings confirmed fixable stay in the confirmed list;
+    findings where the base is still vulnerable (or comparison is ambiguous)
+    are downgraded.
 
     Args:
         fixable: Classifications previously marked as rebuild-fixable.
@@ -178,8 +188,8 @@ def verify_fixable_in_base(
     if not fixable:
         return [], []
 
-    # Cache: base_ref -> {package: version}
-    base_pkg_cache: dict[str, dict[str, str]] = {}
+    # Cache: (base_ref, platform) -> {package: version}
+    base_pkg_cache: dict[tuple[str, str], dict[str, str]] = {}
 
     confirmed: list[Classification] = []
     downgraded: list[Classification] = []
@@ -189,10 +199,6 @@ def verify_fixable_in_base(
         base_ref = base_map.get(finding.image)
 
         if base_ref is None:
-            # No base mapping available: fail-closed (conservative).
-            # Unreachable in dynamic mode after the resolve_matrix merge
-            # (base_map keys == images). Reachable only in static mode
-            # where base_map is empty and pre-check should not be called.
             logger.warning(
                 "No base image mapping for %s; downgrading %s/%s conservatively.",
                 finding.image,
@@ -209,14 +215,16 @@ def verify_fixable_in_base(
             ))
             continue
 
-        # Read base package database (cached)
-        if base_ref not in base_pkg_cache:
+        # Read base package database (cached per base_ref + platform)
+        cache_key = (base_ref, finding.platform)
+        if cache_key not in base_pkg_cache:
             logger.info(
-                "Reading base image package database: %s ...", base_ref
+                "Reading base image package database: %s (platform=%s) ...",
+                base_ref, finding.platform or "native",
             )
-            base_pkg_cache[base_ref] = get_base_packages(base_ref)
+            base_pkg_cache[cache_key] = get_base_packages(base_ref, platform=finding.platform)
 
-        base_packages = base_pkg_cache[base_ref]
+        base_packages = base_pkg_cache[cache_key]
 
         # Look up the finding's package in the base
         base_version = base_packages.get(finding.package)

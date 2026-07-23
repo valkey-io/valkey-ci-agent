@@ -121,7 +121,7 @@ class TestIntegrationFixable:
         # Base pre-check: base has the fix (package at fixed version)
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref: {"openssl": "3.0.13-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.13-r0"},
         )
 
         settings = load_settings()
@@ -171,7 +171,7 @@ class TestIntegrationFixable:
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref: {"openssl": "3.0.11-r0", "zlib": "1.2.14-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.11-r0", "zlib": "1.2.14-r0"},
         )
 
         settings = load_settings()
@@ -325,7 +325,7 @@ class TestIntegrationDynamic:
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref: {"openssl": "3.0.13-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.13-r0"},
         )
 
         settings = load_settings()
@@ -384,7 +384,7 @@ class TestIntegrationBasePrecheck:
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref: {"openssl": "3.0.12-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.12-r0"},
         )
 
         settings = load_settings()
@@ -426,7 +426,7 @@ class TestIntegrationBasePrecheck:
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref: {"openssl": "3.0.12-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.12-r0"},
         )
 
         settings = load_settings()
@@ -469,7 +469,7 @@ class TestIntegrationBasePrecheck:
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref: {"openssl": "3.0.13-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.13-r0"},
         )
 
         settings = load_settings()
@@ -562,7 +562,7 @@ class TestSweepOutputNoEnvVar:
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref: {"openssl": "3.0.13-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.13-r0"},
         )
 
         settings = load_settings()
@@ -643,7 +643,7 @@ class TestJobSummaryContent:
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref: {"openssl": "3.0.13-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.13-r0"},
         )
 
         settings = load_settings()

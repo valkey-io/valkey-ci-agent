@@ -193,6 +193,47 @@ class TestParseFindings:
         with pytest.raises(ValueError, match="Unsupported scanner"):
             parse_findings("grype", {}, IMAGE)
 
+    def test_platform_stamped_on_findings(self) -> None:
+        """Platform argument is stamped on each Finding."""
+        trivy_json = {
+            "Results": [
+                {
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2024-0001",
+                            "PkgName": "pkg",
+                            "InstalledVersion": "1.0",
+                            "FixedVersion": "1.1",
+                            "Severity": "HIGH",
+                        }
+                    ]
+                }
+            ]
+        }
+        findings = parse_findings("trivy", trivy_json, IMAGE, platform="linux/arm64")
+        assert len(findings) == 1
+        assert findings[0].platform == "linux/arm64"
+
+    def test_platform_defaults_to_empty(self) -> None:
+        """Platform defaults to empty string when not provided."""
+        trivy_json = {
+            "Results": [
+                {
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2024-0001",
+                            "PkgName": "pkg",
+                            "InstalledVersion": "1.0",
+                            "FixedVersion": "1.1",
+                            "Severity": "HIGH",
+                        }
+                    ]
+                }
+            ]
+        }
+        findings = parse_findings("trivy", trivy_json, IMAGE)
+        assert findings[0].platform == ""
+
 
 # ---------------------------------------------------------------------------
 # filter_by_threshold

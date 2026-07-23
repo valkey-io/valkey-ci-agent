@@ -7,6 +7,7 @@ B1 (sweep.py): versions output derivation
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -69,6 +70,7 @@ class TestMultiArchScanAndDedup:
             cve_id="CVE-2024-1234",
             severity=Severity.HIGH,
             fixed_version="3.0.13",
+            platform="linux/amd64",
         )
         with patch("scripts.cve_scan.scanner.scan_image", return_value=[finding]):
             results = scan_images(
@@ -79,29 +81,52 @@ class TestMultiArchScanAndDedup:
             )
         assert len(results) == 1
         assert results[0].cve_id == "CVE-2024-1234"
+        assert results[0].platform == "linux/amd64"
 
     def test_two_platforms_same_findings_deduped_to_one(self) -> None:
-        """Same finding on two platforms -> deduplicated to one."""
+        """Same finding on two platforms -> kept distinct (per-platform verification)."""
         from scripts.cve_scan.scanner import scan_images
 
-        finding = Finding(
+        finding_amd64 = Finding(
             image="valkey/valkey:8.0",
             package="openssl",
             installed_version="3.0.12",
             cve_id="CVE-2024-1234",
             severity=Severity.HIGH,
             fixed_version="3.0.13",
+            platform="linux/amd64",
         )
-        # Both platforms return the same finding
-        with patch("scripts.cve_scan.scanner.scan_image", return_value=[finding]):
+        finding_arm64 = Finding(
+            image="valkey/valkey:8.0",
+            package="openssl",
+            installed_version="3.0.12",
+            cve_id="CVE-2024-1234",
+            severity=Severity.HIGH,
+            fixed_version="3.0.13",
+            platform="linux/arm64",
+        )
+
+        call_count = [0]
+
+        def mock_scan_image(image, scanner, platform=None):
+            call_count[0] += 1
+            if platform == "linux/amd64":
+                return [finding_amd64]
+            elif platform == "linux/arm64":
+                return [finding_arm64]
+            return []
+
+        with patch("scripts.cve_scan.scanner.scan_image", side_effect=mock_scan_image):
             results = scan_images(
                 ["valkey/valkey:8.0"],
                 "trivy",
                 Severity.HIGH,
                 platforms=["linux/amd64", "linux/arm64"],
             )
-        # Deduped to one finding
-        assert len(results) == 1
+        # Per-platform findings kept distinct for base verification
+        assert len(results) == 2
+        platforms_found = {r.platform for r in results}
+        assert platforms_found == {"linux/amd64", "linux/arm64"}
 
     def test_two_platforms_unique_findings_both_kept(self) -> None:
         """Different CVEs on different platforms -> both kept."""
@@ -114,6 +139,7 @@ class TestMultiArchScanAndDedup:
             cve_id="CVE-2024-1111",
             severity=Severity.HIGH,
             fixed_version="3.0.13",
+            platform="linux/amd64",
         )
         finding_cve2 = Finding(
             image="valkey/valkey:8.0",
@@ -122,6 +148,7 @@ class TestMultiArchScanAndDedup:
             cve_id="CVE-2024-2222",
             severity=Severity.HIGH,
             fixed_version="1.2.14",
+            platform="linux/arm64",
         )
         call_count = [0]
 
@@ -146,25 +173,31 @@ class TestMultiArchScanAndDedup:
         assert call_count[0] == 2  # one call per platform
 
     def test_four_platforms_same_finding_deduped(self) -> None:
-        """Same finding across 4 platforms -> one result."""
+        """Same finding across 4 platforms -> four results (per-platform)."""
         from scripts.cve_scan.scanner import scan_images
 
-        finding = Finding(
-            image="valkey/valkey:8.0",
-            package="openssl",
-            installed_version="3.0.12",
-            cve_id="CVE-2024-9999",
-            severity=Severity.HIGH,
-            fixed_version="3.0.13",
-        )
-        with patch("scripts.cve_scan.scanner.scan_image", return_value=[finding]):
+        def mock_scan_image(image, scanner, platform=None):
+            return [Finding(
+                image="valkey/valkey:8.0",
+                package="openssl",
+                installed_version="3.0.12",
+                cve_id="CVE-2024-9999",
+                severity=Severity.HIGH,
+                fixed_version="3.0.13",
+                platform=platform or "",
+            )]
+
+        with patch("scripts.cve_scan.scanner.scan_image", side_effect=mock_scan_image):
             results = scan_images(
                 ["valkey/valkey:8.0"],
                 "trivy",
                 Severity.HIGH,
                 platforms=["linux/amd64", "linux/arm64", "linux/arm/v7", "linux/ppc64le"],
             )
-        assert len(results) == 1
+        # Per-platform findings kept distinct
+        assert len(results) == 4
+        platforms_found = {r.platform for r in results}
+        assert platforms_found == {"linux/amd64", "linux/arm64", "linux/arm/v7", "linux/ppc64le"}
 
     def test_platform_passed_to_trivy_command(self) -> None:
         """Trivy --platform flag is passed for each platform."""
@@ -187,7 +220,7 @@ class TestMultiArchScanAndDedup:
 
     def test_default_platforms_are_four(self) -> None:
         """Default platform list has exactly 4 entries (verified published set)."""
-        from scripts.cve_scan.scanner import DEFAULT_PLATFORMS
+        from scripts.cve_scan.config import DEFAULT_PLATFORMS
 
         assert len(DEFAULT_PLATFORMS) == 4
         assert "linux/amd64" in DEFAULT_PLATFORMS
@@ -213,19 +246,21 @@ class TestMultiArchScanAndDedup:
         """2 images x 2 platforms = 4 scanner invocations."""
         from scripts.cve_scan.scanner import scan_images
 
-        finding = Finding(
-            image="valkey/valkey:8.0",
-            package="openssl",
-            installed_version="3.0.12",
-            cve_id="CVE-2024-1234",
-            severity=Severity.HIGH,
-            fixed_version="3.0.13",
-        )
         call_args = []
 
         def mock_scan_image(image, scanner, platform=None):
             call_args.append((image, platform))
-            return [finding] if image == "valkey/valkey:8.0" else []
+            if image == "valkey/valkey:8.0":
+                return [Finding(
+                    image="valkey/valkey:8.0",
+                    package="openssl",
+                    installed_version="3.0.12",
+                    cve_id="CVE-2024-1234",
+                    severity=Severity.HIGH,
+                    fixed_version="3.0.13",
+                    platform=platform or "",
+                )]
+            return []
 
         with patch("scripts.cve_scan.scanner.scan_image", side_effect=mock_scan_image):
             results = scan_images(
@@ -241,6 +276,8 @@ class TestMultiArchScanAndDedup:
         assert ("valkey/valkey:8.0", "linux/arm64") in call_args
         assert ("valkey/valkey:9.1", "linux/amd64") in call_args
         assert ("valkey/valkey:9.1", "linux/arm64") in call_args
+        # 8.0 has findings on 2 platforms (kept distinct), 9.1 has none
+        assert len(results) == 2
 
     def test_below_threshold_finding_excluded(self) -> None:
         """Findings below threshold are excluded even in multi-arch mode."""
@@ -253,6 +290,7 @@ class TestMultiArchScanAndDedup:
             cve_id="CVE-2024-LOW",
             severity=Severity.LOW,
             fixed_version="7.89.0",
+            platform="linux/amd64",
         )
         with patch("scripts.cve_scan.scanner.scan_image", return_value=[low_finding]):
             results = scan_images(
@@ -262,6 +300,31 @@ class TestMultiArchScanAndDedup:
                 platforms=["linux/amd64"],
             )
         assert len(results) == 0
+
+    def test_same_platform_duplicates_collapsed(self) -> None:
+        """Exact duplicate findings on same platform are still collapsed."""
+        from scripts.cve_scan.scanner import _dedup_findings
+
+        f1 = Finding(
+            image="valkey/valkey:8.0",
+            package="openssl",
+            installed_version="3.0.12",
+            cve_id="CVE-2024-1234",
+            severity=Severity.HIGH,
+            fixed_version="3.0.13",
+            platform="linux/amd64",
+        )
+        f2 = Finding(
+            image="valkey/valkey:8.0",
+            package="openssl",
+            installed_version="3.0.12",
+            cve_id="CVE-2024-1234",
+            severity=Severity.HIGH,
+            fixed_version="3.0.13",
+            platform="linux/amd64",
+        )
+        results = _dedup_findings([f1, f2])
+        assert len(results) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +366,7 @@ class TestVersionsOutput:
         assert _fixable_versions([]) == []
 
     def test_versions_output_written_to_github_output(
-        self, tmp_path: pytest.TempdirFactory, monkeypatch
+        self, tmp_path: Path, monkeypatch
     ) -> None:
         """versions= is written alongside fixable= to GITHUB_OUTPUT."""
         from scripts.cve_scan.sweep import _emit_outputs
