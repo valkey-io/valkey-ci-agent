@@ -17,8 +17,16 @@ failures that were fixed between the CI run and the detector. The check is
 opt-in (disabled by default) so workflows that must never suppress a
 recurrence, such as the fuzzer monitor, are unaffected.
 
+Existing issues are discovered by listing the repository's issues via the
+REST list endpoint and matching markers and titles locally, not via the
+Search API. The list endpoint draws on the core rate limit (thousands of
+requests per hour) instead of the Search API's 30-per-minute budget, which
+a batch of failures could exhaust, and it is strongly consistent where
+search results can lag the index or silently omit matches. Listings are
+fetched once per publisher and reused across upserts in the same batch.
+
 Callers supply rendered title, body, and comment via a render callback;
-this module owns only the dedup machinery. Search failures are propagated
+this module owns only the dedup machinery. Listing failures are propagated
 so a transient outage records as an error rather than silently creating a
 duplicate issue on the next cron tick.
 """
@@ -55,18 +63,27 @@ class IssueDedupPublisher:
         *,
         marker_namespace: str,
         closed_lookback: timedelta | None = None,
+        filter_label: str | None = None,
     ) -> None:
         """`marker_namespace` should be a stable workflow-scoped string,
         e.g. ``"valkey-ci-agent:fuzzer-issue"``. It appears literally in
-        issue bodies and in search queries.
+        issue bodies and drives the local marker matching.
 
-        `closed_lookback` controls how far back to search for recently closed
+        `closed_lookback` controls how far back to look for recently closed
         issues before creating a new one. ``None`` (the default) disables the
         check; pass a window such as ``timedelta(days=1)`` to opt in.
+
+        `filter_label`, when set, scopes the issue listing server-side to
+        only issues carrying that label, reducing data volume on repos with
+        many open issues. Pass the same label that `render()` attaches to
+        new issues.
         """
         self._gh = github_client
         self._ns = marker_namespace
         self._closed_lookback = closed_lookback
+        self._filter_label = filter_label
+        self._open_issues: dict[str, list[Any]] = {}
+        self._recently_closed: dict[str, list[Any]] = {}
 
     def upsert(
         self,
@@ -104,7 +121,7 @@ class IssueDedupPublisher:
         of what the transform returns. Ignored when creating a new issue.
 
         ``title_fallback`` migrates issues created under an older fingerprint
-        scheme. When the marker search misses, the publisher looks for an open
+        scheme. When the marker match misses, the publisher looks for an open
         issue with this exact title; on a hit it adopts that issue and the
         update re-stamps it with the current marker, so a format change does
         not orphan it into a duplicate. The match must be exact and
@@ -117,14 +134,14 @@ class IssueDedupPublisher:
             retries=2, description=f"get repo {repo_name}",
         )
         marker = f"<!-- {self._ns}:{fingerprint} -->"
-        existing = self._find_existing(repo_name, marker)
+        existing = self._find_existing(repo, repo_name, marker)
 
         # An issue from an older fingerprint scheme carries a different (or no)
-        # marker, so the marker search misses it. Fall back to an exact title
+        # marker, so the marker match misses it. Fall back to an exact title
         # match. The update path below re-stamps the current marker, so this
         # only fires once per issue; later runs match on the marker.
         if existing is None and title_fallback is not None:
-            existing = self._find_by_title(repo_name, title_fallback)
+            existing = self._find_by_title(repo, repo_name, title_fallback)
             if existing is not None:
                 logger.info(
                     "Adopting legacy issue #%s for %s via title fallback",
@@ -132,7 +149,9 @@ class IssueDedupPublisher:
                 )
 
         if existing is None:
-            recently_closed = self._find_recently_closed(repo_name, marker, title_fallback)
+            recently_closed = self._find_recently_closed(
+                repo, repo_name, marker, title_fallback,
+            )
             if recently_closed is not None:
                 logger.info(
                     "Issue #%s for %s was closed recently; skipping creation",
@@ -144,15 +163,18 @@ class IssueDedupPublisher:
             body = content.body
             if idempotency_key is not None:
                 body = f"{body}\n{_last_key_marker(self._ns, idempotency_key)}"
+            # Labels ride along on the create call so they are atomic with creation
+            create_kwargs: dict[str, Any] = {"title": content.title, "body": body}
+            if content.labels:
+                create_kwargs["labels"] = list(content.labels)
             issue = retry_github_call(
-                lambda: repo.create_issue(title=content.title, body=body),
+                lambda: repo.create_issue(**create_kwargs),
                 retries=2, description="create issue",
             )
-            if content.labels:
-                try:
-                    issue.add_to_labels(*content.labels)
-                except Exception as exc:
-                    logger.info("Could not add labels to issue #%s: %s", issue.number, exc)
+            # Make the new issue visible to later upserts in this batch, so a
+            # repeated fingerprint or title updates it instead of filing a
+            # duplicate. _find_existing above guarantees the cache entry exists.
+            self._open_issues[repo_name].append(issue)
             logger.info("Created issue #%s for %s", issue.number, fingerprint)
             return "created", issue.html_url
 
@@ -198,38 +220,78 @@ class IssueDedupPublisher:
         logger.info("Updated issue #%s (occurrence %d)", existing.number, count)
         return "updated", existing.html_url
 
-    def _find_existing(self, repo_name: str, marker: str) -> Any:
+    def _open_issues_for(self, repo: Any, repo_name: str) -> list[Any]:
+        """Open issues of the repo, fetched once and cached.
+
+        When ``filter_label`` is set, the listing is scoped server-side to
+        that label. Issues this publisher creates always carry their labels
+        (applied atomically on the create call), so they are never missed.
+        Marker-bearing issues filed outside the publisher without the label
+        (e.g. a human reusing the issue template) are invisible to the
+        filtered listing and may be duplicated; that is inherent to label
+        filtering.
+        """
+        if repo_name not in self._open_issues:
+            kwargs: dict[str, Any] = {"state": "open"}
+            if self._filter_label is not None:
+                kwargs["labels"] = [self._filter_label]
+            issues = retry_github_call(
+                lambda: list(repo.get_issues(**kwargs)),
+                retries=2, description="list open issues",
+            )
+            self._open_issues[repo_name] = _drop_pull_requests(issues)
+            logger.info(
+                "Cached %d open issue(s) from %s for dedup matching",
+                len(self._open_issues[repo_name]), repo_name,
+            )
+        return self._open_issues[repo_name]
+
+    def _recently_closed_for(self, repo: Any, repo_name: str) -> list[Any]:
+        """Issues closed within the lookback window, fetched once and cached."""
+        if repo_name not in self._recently_closed:
+            assert self._closed_lookback is not None  # guarded by _find_recently_closed
+            cutoff = datetime.now(timezone.utc) - self._closed_lookback
+            # The list endpoint can't filter on close time; ``since`` filters
+            # on update time server-side, which is a safe over-approximation
+            # (closing an issue updates it), and the exact close-time check
+            # happens locally on ``closed_at``.
+            kwargs: dict[str, Any] = {"state": "closed", "since": cutoff}
+            if self._filter_label is not None:
+                kwargs["labels"] = [self._filter_label]
+            issues = retry_github_call(
+                lambda: list(repo.get_issues(**kwargs)),
+                retries=2, description="list recently closed issues",
+            )
+            self._recently_closed[repo_name] = [
+                issue for issue in _drop_pull_requests(issues)
+                if issue.closed_at is not None and issue.closed_at >= cutoff
+            ]
+            logger.info(
+                "Cached %d recently closed issue(s) from %s for dedup matching",
+                len(self._recently_closed[repo_name]), repo_name,
+            )
+        return self._recently_closed[repo_name]
+
+    def _find_existing(self, repo: Any, repo_name: str, marker: str) -> Any:
         """Find an open issue containing the marker, or None."""
-        query = f'"{marker}" in:body repo:{repo_name} is:issue is:open'
-        results = retry_github_call(
-            lambda: list(self._gh.search_issues(query)),
-            retries=2, description="search issues",
-        )
-        for issue in results:
+        for issue in self._open_issues_for(repo, repo_name):
             if marker in (issue.body or ""):
-                return self._reload(repo_name, issue.number)
+                return self._reload(repo, issue.number)
         return None
 
-    def _find_by_title(self, repo_name: str, title: str) -> Any:
+    def _find_by_title(self, repo: Any, repo_name: str, title: str) -> Any:
         """Find an open issue whose title exactly equals ``title``, or None.
 
-        Migration fallback for when the marker search misses.
+        Migration fallback for when the marker match misses. The comparison
+        is exact and case-sensitive.
         """
-        phrase = _title_search_phrase(title)
-        if phrase is None:
-            return None
-        query = f'{phrase} in:title repo:{repo_name} is:issue is:open'
-        results = retry_github_call(
-            lambda: list(self._gh.search_issues(query)),
-            retries=2, description="search issues by title",
-        )
-        for issue in results:
+        for issue in self._open_issues_for(repo, repo_name):
             if issue.title == title:
-                return self._reload(repo_name, issue.number)
+                return self._reload(repo, issue.number)
         return None
 
     def _find_recently_closed(
-        self, repo_name: str, marker: str, title_fallback: str | None,
+        self, repo: Any, repo_name: str, marker: str, title_fallback: str | None,
     ) -> Any:
         """Find an issue that was closed within the lookback window and
         matches the marker or, for legacy issues, ``title_fallback`` exactly.
@@ -240,33 +302,17 @@ class IssueDedupPublisher:
         """
         if self._closed_lookback is None:
             return None
-        cutoff = datetime.now(timezone.utc) - self._closed_lookback
-        # GitHub search's "closed:>DATE" qualifier filters on close time.
-        date_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
-        closed_filter = f"is:issue is:closed closed:>{date_str}"
-        query = f'"{marker}" in:body repo:{repo_name} {closed_filter}'
-        results = retry_github_call(
-            lambda: list(self._gh.search_issues(query)),
-            retries=2, description="search recently closed issues",
-        )
-        for issue in results:
+        closed_issues = self._recently_closed_for(repo, repo_name)
+        for issue in closed_issues:
             if marker in (issue.body or ""):
                 return issue
 
-        # A legacy issue carries an older (or no) marker, so the marker search
+        # A legacy issue carries an older (or no) marker, so the marker match
         # misses it. Fall back to an exact title match, mirroring the open-issue
         # migration path, so a just-closed legacy issue is not duplicated.
         if title_fallback is None:
             return None
-        phrase = _title_search_phrase(title_fallback)
-        if phrase is None:
-            return None
-        title_query = f'{phrase} in:title repo:{repo_name} {closed_filter}'
-        results = retry_github_call(
-            lambda: list(self._gh.search_issues(title_query)),
-            retries=2, description="search recently closed issues by title",
-        )
-        for issue in results:
+        for issue in closed_issues:
             if issue.title == title_fallback:
                 logger.info(
                     "Matched recently closed legacy issue #%s via title fallback",
@@ -275,26 +321,24 @@ class IssueDedupPublisher:
                 return issue
         return None
 
-    def _reload(self, repo_name: str, number: int) -> Any:
-        """Reload an issue via its repo so we get a mutable issue handle."""
+    def _reload(self, repo: Any, number: int) -> Any:
+        """Reload an issue so the update path edits a fresh, mutable handle."""
         return retry_github_call(
-            lambda: self._gh.get_repo(repo_name).get_issue(number),
+            lambda: repo.get_issue(number),
             retries=2, description=f"get issue #{number}",
         )
 
 
-def _title_search_phrase(title: str) -> str | None:
-    """Build a search-safe phrase from a title, or None if it has no words.
+def _drop_pull_requests(issues: list[Any]) -> list[Any]:
+    """Filter pull requests out of an issue listing.
 
-    A title can hold characters that break search syntax (quotes, ``:``), so
-    the query uses word tokens only to narrow the candidates; callers verify
-    the exact, case-sensitive match in Python.
+    The REST issues list endpoint returns pull requests alongside issues.
+    We read the internal ``_rawData`` dict (the already-stored payload)
+    rather than the public ``raw_data`` property or ``pull_request``
+    attribute, both of which trigger ``_completeIfNeeded()`` and fire a
+    per-issue GET that would defeat the single-listing rate-limit goal.
     """
-    tokens = re.findall(r"\w+", title)
-    if not tokens:
-        return None
-    # Cap the tokens to keep the query short; the caller's check decides the match.
-    return " ".join(tokens[:10])
+    return [issue for issue in issues if "pull_request" not in issue._rawData]
 
 
 def _occurrence_re(namespace: str) -> re.Pattern[str]:

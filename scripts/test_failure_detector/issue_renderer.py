@@ -23,7 +23,7 @@ from scripts.test_failure_detector.parse_failures import UniqueFailure
 
 MARKER_NAMESPACE = "valkey-ci-agent:test-failure"
 
-_LABEL_NAME = "test-failure"
+LABEL_NAME = "test-failure"
 
 
 def fingerprint_for(failure: UniqueFailure) -> str:
@@ -31,8 +31,7 @@ def fingerprint_for(failure: UniqueFailure) -> str:
 
     The identity is ``test_name`` + ``test_file``, hashed via
     :func:`scripts.common.incidents.compute_fingerprint` like the fuzzer
-    pipeline, into a fixed-shape hex token that is safe to embed in the marker
-    and the search query.
+    pipeline, into a fixed-shape hex token safe for the HTML-comment marker.
 
     The pair is the identity, so it goes in ``namespace`` (joined in order,
     never normalized) rather than ``shapes``. That keeps digits significant so
@@ -95,7 +94,7 @@ class _FailureRenderer:
                 newly_failing=self._newly_failing,
                 new_error=self._new_error,
             ),
-            labels=(_LABEL_NAME,),
+            labels=(LABEL_NAME,),
         )
 
     def merge_environments(self, existing_body: str) -> str:

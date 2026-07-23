@@ -53,6 +53,7 @@ def process_failures(
         # Opt in to recently-closed suppression: the detector lags the Daily CI,
         # so an already-fixed failure must not be re-filed.
         closed_lookback=CLOSED_ISSUE_LOOKBACK,
+        filter_label=issue_renderer.LABEL_NAME,
     )
     idempotency_key = str(run_id) if run_id is not None else None
 
