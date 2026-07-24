@@ -1,13 +1,7 @@
 """Findings table renderer for CVE scan job summaries.
 
-Produces a grouped one-row-per-CVE markdown table suitable for GitHub Actions
-job summaries. Rows are grouped by (cve_id, severity, rationale); packages,
-installed versions, fixed versions, and images are aggregated per group.
-
-Columns: | CVE | Severity | Packages | Installed | Fixed | Images | Rationale |
-Sorted: severity descending, then CVE ID ascending.
-
-This module is deterministic: no AI, no network, no subprocess.
+Renders a grouped one-row-per-CVE markdown table for GitHub Actions job
+summaries. Deterministic: no AI, no network, no subprocess.
 """
 
 from __future__ import annotations
@@ -16,21 +10,17 @@ from scripts.cve_scan.models import Classification
 
 
 def _strip_repo_prefix(image: str) -> str:
-    """Strip the repository prefix from an image reference, returning the tag.
-
-    Example: 'valkey/valkey:8.0-alpine' -> '8.0-alpine'
-    """
+    """Return the tag part of an image reference ('valkey/valkey:8.0-alpine' -> '8.0-alpine')."""
     return image.rsplit(":", 1)[-1] if ":" in image else image
 
 
 def render_findings_table(
     classifications: list[Classification],
 ) -> str:
-    """Render a grouped findings table for job summaries.
+    """Render a grouped findings table (markdown) for job summaries.
 
-    Rows are grouped by (cve_id, severity value, rationale). For each group,
-    packages, installed versions, fixed versions, and images are aggregated.
-    Columns: | CVE | Severity | Packages | Installed | Fixed | Images | Rationale |
+    Rows grouped by (cve_id, severity, rationale); packages, versions, and
+    images aggregated per group. Sorted severity desc, then CVE ID asc.
 
     Args:
         classifications: List of classifications to render.
@@ -38,7 +28,6 @@ def render_findings_table(
     Returns:
         Markdown table string.
     """
-    # Group by (cve_id, severity value, rationale)
     groups: dict[tuple[str, int, str], list[Classification]] = {}
     for c in classifications:
         key = (c.finding.cve_id, c.finding.severity.value, c.rationale)
@@ -51,7 +40,7 @@ def render_findings_table(
         "|-----|----------|----------|-----------|-------|--------|-----------|",
     ]
 
-    # Sort rows by severity descending then cve_id ascending
+    # Severity descending, then cve_id ascending
     for key in sorted(groups, key=lambda k: (-k[1], k[0])):
         cve_id, _sev_val, rationale = key
         items = groups[key]

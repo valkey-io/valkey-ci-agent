@@ -1,24 +1,11 @@
 """Base-image pre-check for CVE rebuild decisions.
 
-Verifies that a rebuild-fixable CVE has actually been patched in the upstream
-base image (alpine:X.Y / debian:Z-slim) before requesting a container rebuild.
-This closes the gap where a distro advisory publishes a FixedVersion but the
-base image tag has not yet been republished with the patched package.
-
-Algorithm:
-    For each fixable Classification, read the corresponding base image's
-    package database (apk for Alpine, dpkg for Debian) via a one-shot
-    ``docker run`` and compare installed package versions against the
-    finding's fixed_version. If the base ships an older version than the
-    fix, the base is stale and a rebuild would not help: downgrade the
-    classification. Otherwise the fix is confirmed present in the base.
-
-Version comparison at the safety gate uses native dpkg/apk semantics via
-version_compare.compare_versions(), not the pure-Python approximation in
-rebuild_decider. Any comparison error or None result downgrades conservatively
-(fail-closed).
-
-Security model: deterministic, no AI, stdlib only.
+Verifies a rebuild-fixable CVE is actually patched in the upstream base image
+(advisory FixedVersion may precede a republished base tag). Reads each base's
+package database via one-shot ``docker run`` and compares with native dpkg/apk
+semantics (version_compare), not the pure-Python approximation. Any comparison
+error or ambiguity downgrades conservatively (fail-closed). Deterministic, no
+AI, stdlib only.
 """
 
 from __future__ import annotations
@@ -44,14 +31,7 @@ _DOCKER_TIMEOUT = 300  # seconds
 
 
 def _parse_apk_installed(raw: str) -> dict[str, str]:
-    """Parse Alpine's /lib/apk/db/installed format.
-
-    The file contains blank-line-separated stanzas. Within each stanza:
-      P:<package_name>
-      V:<version>
-
-    Returns a dict mapping package name to version string.
-    """
+    """Parse Alpine's /lib/apk/db/installed (blank-line-separated P:/V: stanzas) into {name: version}."""
     packages: dict[str, str] = {}
     name: str | None = None
     version: str | None = None
@@ -76,10 +56,7 @@ def _parse_apk_installed(raw: str) -> dict[str, str]:
 
 
 def _parse_dpkg_query(raw: str) -> dict[str, str]:
-    """Parse dpkg-query -W -f '${Package} ${Version}\\n' output.
-
-    Each line is: <package_name> <version>
-    """
+    """Parse '<package> <version>' lines from dpkg-query -W output."""
     packages: dict[str, str] = {}
     for line in raw.splitlines():
         line = line.strip()
@@ -92,16 +69,11 @@ def _parse_dpkg_query(raw: str) -> dict[str, str]:
 
 
 def get_base_packages(base_ref: str, platform: str = "") -> dict[str, str]:
-    """Read the base image's package database.
-
-    Runs the base image once via docker to extract the installed package list.
-    Alpine uses /lib/apk/db/installed; Debian uses dpkg-query.
+    """Read the base image's package database via one-shot docker run.
 
     Args:
         base_ref: Base image reference (e.g. "alpine:3.23", "debian:trixie-slim").
-        platform: Optional platform string (e.g. "linux/arm64"). When provided,
-            passed as ``--platform`` to ``docker run`` so the correct arch
-            manifest is pulled and inspected.
+        platform: Optional platform passed as ``--platform`` to docker run.
 
     Returns:
         Mapping of package name to installed version string.
@@ -169,11 +141,9 @@ def verify_fixable_in_base(
 ) -> tuple[list[Classification], list[Classification]]:
     """Verify fixable findings against their base images' package databases.
 
-    Reads each distinct (base image, platform) pair's package list once (cached
-    per invocation) and compares installed versions against the finding's
-    fixed_version. Findings confirmed fixable stay in the confirmed list;
-    findings where the base is still vulnerable (or comparison is ambiguous)
-    are downgraded.
+    Reads each distinct (base image, platform) package list once (cached per
+    invocation). Findings where the base is still vulnerable or comparison is
+    ambiguous are downgraded (fail-closed).
 
     Args:
         fixable: Classifications previously marked as rebuild-fixable.
@@ -226,7 +196,6 @@ def verify_fixable_in_base(
 
         base_packages = base_pkg_cache[cache_key]
 
-        # Look up the finding's package in the base
         base_version = base_packages.get(finding.package)
 
         if base_version is None:
@@ -244,15 +213,12 @@ def verify_fixable_in_base(
             ))
             continue
 
-        # Compare base version against the fix version using native semantics.
-        # _native_compare uses dpkg/apk inside docker for correct ordering.
-        # Any error returns None -> fail-closed (downgrade).
+        # Native dpkg/apk comparison; None -> fail-closed (downgrade)
         if finding.fixed_version is None:
             # Should not happen for fixable findings, but be safe
             confirmed.append(classification)
             continue
 
-        # Determine flavor from base_ref prefix
         if base_ref.startswith("alpine:"):
             flavor = "alpine"
         elif base_ref.startswith("debian:"):
@@ -263,7 +229,7 @@ def verify_fixable_in_base(
         cmp = _native_compare(base_version, finding.fixed_version, flavor, base_ref)
 
         if cmp is None:
-            # Ambiguous version comparison: downgrade conservatively
+            # Ambiguous comparison: fail closed
             rationale = (
                 f"Fix for {finding.cve_id} in {finding.package}: version "
                 f"comparison between base version {base_version} and fix "
@@ -276,7 +242,7 @@ def verify_fixable_in_base(
                 rationale=rationale,
             ))
         elif cmp < 0:
-            # Base version older than fix: base is stale
+            # Base still ships an older version: stale base
             rationale = (
                 f"Fix for {finding.cve_id} in {finding.package} is published "
                 f"upstream but base image {base_ref} still ships "
@@ -289,7 +255,7 @@ def verify_fixable_in_base(
                 rationale=rationale,
             ))
         else:
-            # Base version >= fix: fix is present in base
+            # Base ships the fix
             rationale = (
                 f"{classification.rationale} "
                 f"Verified: base {base_ref} ships {base_version}."

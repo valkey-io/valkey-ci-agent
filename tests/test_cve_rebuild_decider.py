@@ -31,11 +31,6 @@ def _make_finding(
     )
 
 
-# ---------------------------------------------------------------------------
-# Fixable: installed < fixed
-# ---------------------------------------------------------------------------
-
-
 class TestFixable:
     def test_simple_version_bump(self) -> None:
         result = classify(_make_finding(installed="1.0.0", fixed="1.0.1"))
@@ -69,11 +64,6 @@ class TestFixable:
         assert result.finding is finding
 
 
-# ---------------------------------------------------------------------------
-# Not fixable: no fixed_version
-# ---------------------------------------------------------------------------
-
-
 class TestNoFixAvailable:
     def test_none_fixed_version(self) -> None:
         result = classify(_make_finding(fixed=None))
@@ -82,11 +72,6 @@ class TestNoFixAvailable:
     def test_rationale_mentions_no_upstream_fix(self) -> None:
         result = classify(_make_finding(fixed=None, cve_id="CVE-2024-7777"))
         assert "no upstream fix" in result.rationale.lower() or "not" in result.rationale.lower()
-
-
-# ---------------------------------------------------------------------------
-# Already fixed: installed >= fixed
-# ---------------------------------------------------------------------------
 
 
 class TestAlreadyFixed:
@@ -105,11 +90,6 @@ class TestAlreadyFixed:
     def test_rationale_mentions_already_at_or_above(self) -> None:
         result = classify(_make_finding(installed="2.0.0", fixed="1.0.0"))
         assert "already" in result.rationale.lower() or "stale" in result.rationale.lower()
-
-
-# ---------------------------------------------------------------------------
-# classify_all batch
-# ---------------------------------------------------------------------------
 
 
 class TestClassifyAll:
@@ -136,11 +116,6 @@ class TestClassifyAll:
         assert classify_all([]) == []
 
 
-# ---------------------------------------------------------------------------
-# Edge cases in version comparison
-# ---------------------------------------------------------------------------
-
-
 class TestVersionComparison:
     @pytest.mark.parametrize(
         "installed,fixed,expected_fixable",
@@ -158,11 +133,6 @@ class TestVersionComparison:
     ) -> None:
         result = classify(_make_finding(installed=installed, fixed=fixed))
         assert result.fixable is expected_fixable
-
-
-# ---------------------------------------------------------------------------
-# Tilde ordering (Debian policy: ~ sorts before everything)
-# ---------------------------------------------------------------------------
 
 
 class TestTildeOrdering:
@@ -189,11 +159,6 @@ class TestTildeOrdering:
         assert result.fixable is False
 
 
-# ---------------------------------------------------------------------------
-# Epoch handling (Debian N:version)
-# ---------------------------------------------------------------------------
-
-
 class TestEpochHandling:
     """Epoch prefix is compared numerically before the version body."""
 
@@ -216,11 +181,6 @@ class TestEpochHandling:
         """installed=2:3.0.0 vs fixed=2:2.0.0: same epoch, installed newer -> not fixable."""
         result = classify(_make_finding(installed="2:3.0.0", fixed="2:2.0.0"))
         assert result.fixable is False
-
-
-# ---------------------------------------------------------------------------
-# Ambiguous comparison -> fail closed (fixable=False)
-# ---------------------------------------------------------------------------
 
 
 class TestAmbiguousFailClosed:

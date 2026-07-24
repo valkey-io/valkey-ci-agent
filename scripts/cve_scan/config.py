@@ -1,21 +1,8 @@
-"""Settings loader for the CVE scan workflow (env-var house style).
+"""Settings loader for the CVE scan workflow.
 
-Configuration is driven by prefixed environment variables with sensible
-defaults, consistent with the ci_fix and release_notes workflows in this
-repo. A dedicated config file is unnecessary: only one container repo
-(valkey-container) exists.
-
-Env vars:
-    CVE_SCAN_VERSIONS_URL     - versions.json manifest URL for dynamic resolution
-    CVE_SCAN_REPOSITORY       - Docker Hub repository prefix for derived tags
-    CVE_SCAN_INCLUDE_UNSTABLE - include the unstable version line (default false)
-    CVE_SCAN_SCANNER          - vulnerability scanner (trivy only)
-    CVE_SCAN_SEVERITY_THRESHOLD - ignore findings below this severity
-    CVE_SCAN_IMAGES           - optional static image list (overrides dynamic)
-    CVE_SCAN_PLATFORMS        - comma-separated platforms to scan per image
-                                (default: verified published platforms for valkey)
-
-Invalid values raise immediately: an env typo must not silently scan nothing.
+Driven by CVE_SCAN_* env vars with defaults (repo house style; no config
+file since valkey-container is the only target). Invalid values raise
+immediately: an env typo must not silently scan nothing.
 """
 
 from __future__ import annotations
@@ -37,10 +24,8 @@ _DEFAULT_REPOSITORY = "valkey/valkey"
 _DEFAULT_SCANNER = "trivy"
 _DEFAULT_SEVERITY_THRESHOLD = "HIGH"
 
-# Verified published platforms for valkey images (inspected via
-# `docker buildx imagetools inspect public.ecr.aws/valkey/valkey:8.0`
-# and `public.ecr.aws/valkey/valkey:8.0-alpine`; both publish the same set).
-# Note: linux/386 is NOT published; linux/ppc64le IS.
+# Verified published platforms for valkey images (via buildx imagetools inspect).
+# linux/386 is NOT published; linux/ppc64le IS.
 DEFAULT_PLATFORMS: list[str] = [
     "linux/amd64",
     "linux/arm64",
@@ -71,7 +56,7 @@ class CveScanSettings:
 def load_settings() -> CveScanSettings:
     """Build CveScanSettings from CVE_SCAN_* env vars with defaults.
 
-    Raises :class:`CveScanConfigError` on invalid values.
+    Raises CveScanConfigError on invalid values.
     """
     versions_url = os.environ.get("CVE_SCAN_VERSIONS_URL", _DEFAULT_VERSIONS_URL)
     repository = os.environ.get("CVE_SCAN_REPOSITORY", _DEFAULT_REPOSITORY)

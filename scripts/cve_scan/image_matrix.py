@@ -1,13 +1,8 @@
 """Dynamic image matrix resolver for the CVE scan workflow.
 
-Resolves the list of container images to scan, supporting two modes:
-
-1. Static override: settings.images is non-empty (returned as-is).
-2. Dynamic (default): fetches the versions-json manifest from settings.versions_url
-   and derives image tags from its structure.
-
-The resolver is fail-closed: any network, parsing, or derivation failure raises
-an exception rather than silently falling back to a stale or incomplete list.
+Static override (settings.images) or dynamic derivation from versions.json.
+Fail-closed: any fetch, parse, or derivation failure raises rather than
+silently falling back to a stale or incomplete list.
 """
 
 from __future__ import annotations
@@ -34,8 +29,7 @@ class MatrixResolutionError(Exception):
 def _fetch_versions_json(url: str) -> dict:
     """Fetch and parse versions.json from the given URL.
 
-    Raises:
-        MatrixResolutionError: On network failure, non-200 status, or invalid JSON.
+    Raises MatrixResolutionError on network failure, non-200 status, or invalid JSON.
     """
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "valkey-ci-agent/cve-scan"})
@@ -69,14 +63,9 @@ def _derive_images(
     repository: str,
     include_unstable: bool,
 ) -> list[str]:
-    """Derive the sorted image tag list from a versions.json structure.
+    """Derive the sorted image tag list (keys of _derive_base_map, single source of truth).
 
-    Single source of truth: delegates to :func:`_derive_base_map` (which
-    applies the version-iteration, include_unstable, and variant rules) and
-    returns its keys, so the derivation logic is not duplicated.
-
-    Raises:
-        MatrixResolutionError: If derivation produces an empty list.
+    Raises MatrixResolutionError if derivation produces an empty list.
     """
     images = sorted(_derive_base_map(versions, repository, include_unstable))
     if not images:
@@ -91,16 +80,10 @@ def _derive_base_map(
     repository: str,
     include_unstable: bool,
 ) -> dict[str, str]:
-    """Derive a mapping from each derived image tag to its base image reference.
+    """Map each derived image tag to its base image reference.
 
-    Base image conventions (from valkey-container Dockerfiles):
-    - Alpine variant: FROM alpine:<alpine.version>
-    - Debian variant: FROM debian:<debian.version>-slim
-
-    Returns:
-        dict mapping image_ref -> base_ref (e.g.
-        'valkey/valkey:9.1-alpine' -> 'alpine:3.23',
-        'valkey/valkey:9.1' -> 'debian:trixie-slim').
+    Base conventions (valkey-container Dockerfiles): alpine:<version> for
+    -alpine tags, debian:<version>-slim otherwise.
     """
     base_map: dict[str, str] = {}
     for version_key, value in versions.items():
@@ -122,23 +105,17 @@ def _derive_base_map(
 def resolve_matrix(settings: CveScanSettings) -> tuple[list[str], dict[str, str]]:
     """Resolve the image list and base-image mapping from a single fetch.
 
-    Static override: settings.images is non-empty, returned with an empty base_map.
-    Dynamic (default): fetches the manifest from settings.versions_url once and
-    derives both the image list and the image-to-base mapping.
-
     Args:
         settings: Loaded CveScanSettings instance.
 
     Returns:
-        Tuple of (images, base_map):
-        - images: sorted list of image references to scan.
-        - base_map: mapping of image_ref -> base_ref (empty in static mode).
+        (images, base_map): sorted image refs and image_ref -> base_ref
+        mapping (base_map is empty in static override mode).
 
     Raises:
         MatrixResolutionError: On any dynamic resolution failure.
     """
     if settings.images:
-        # Static override mode: no base image info available
         logger.info(
             "Using static image override (%d image(s)): %s",
             len(settings.images),
@@ -146,7 +123,6 @@ def resolve_matrix(settings: CveScanSettings) -> tuple[list[str], dict[str, str]
         )
         return settings.images, {}
 
-    # Dynamic mode: single fetch, derive both images and base_map
     logger.info(
         "Resolving dynamic image matrix from %s (repository=%s, include_unstable=%s)",
         settings.versions_url,

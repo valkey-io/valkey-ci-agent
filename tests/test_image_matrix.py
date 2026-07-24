@@ -1,14 +1,7 @@
-"""Tests for scripts/cve_scan/image_matrix.py -- dynamic image matrix resolution.
+"""Tests for scripts/cve_scan/image_matrix.py.
 
-Covers:
-  - Static passthrough: settings.images is non-empty, returned as-is with empty base_map.
-  - Dynamic derivation: mocked versions.json -> correct sorted tags + base_map.
-  - Unstable skipped by default, included when include_unstable=True.
-  - Single-variant versions (only alpine or only debian) handled correctly.
-  - Fetch failure (network error) raises MatrixResolutionError.
-  - Invalid JSON raises MatrixResolutionError.
-  - Empty derivation (no valid versions) raises MatrixResolutionError.
-  - Single fetch (no double fetch).
+Covers static passthrough, dynamic derivation (mocked fetch), unstable
+handling, single-variant versions, error cases, and single-fetch behavior.
 """
 
 from __future__ import annotations
@@ -28,10 +21,6 @@ from scripts.cve_scan.image_matrix import (
     resolve_matrix,
 )
 from scripts.cve_scan.models import Severity
-
-# ---------------------------------------------------------------------------
-# Sample versions.json payloads
-# ---------------------------------------------------------------------------
 
 SAMPLE_VERSIONS: dict[str, Any] = {
     "7.2": {
@@ -111,11 +100,6 @@ def _mock_urlopen(data: Any, status: int = 200):
     return resp
 
 
-# ---------------------------------------------------------------------------
-# Static passthrough
-# ---------------------------------------------------------------------------
-
-
 class TestStaticPassthrough:
     """Static override mode: settings.images is non-empty, return as-is."""
 
@@ -130,11 +114,6 @@ class TestStaticPassthrough:
         images, base_map = resolve_matrix(settings)
         assert images == ["valkey/valkey:8.0-alpine"]
         assert base_map == {}
-
-
-# ---------------------------------------------------------------------------
-# Dynamic derivation (mocked fetch)
-# ---------------------------------------------------------------------------
 
 
 class TestDynamicDerivation:
@@ -250,11 +229,6 @@ class TestDynamicDerivation:
         assert mock_open.call_count == 1
 
 
-# ---------------------------------------------------------------------------
-# Error cases
-# ---------------------------------------------------------------------------
-
-
 class TestDynamicErrors:
     """Dynamic mode failure cases raise MatrixResolutionError."""
 
@@ -299,11 +273,6 @@ class TestDynamicErrors:
                 resolve_matrix(settings)
 
 
-# ---------------------------------------------------------------------------
-# _derive_images unit tests
-# ---------------------------------------------------------------------------
-
-
 class TestDeriveImages:
     """Direct tests for the _derive_images helper."""
 
@@ -323,10 +292,7 @@ class TestDeriveImages:
         assert result == ["r:7.2"]
 
 
-# ---------------------------------------------------------------------------
-# RC-era regression: derivation must key off version-line keys, not versions
-# ---------------------------------------------------------------------------
-
+# RC-era snapshot: derivation must key off version-line keys, not full versions.
 RC_ERA_VERSIONS: dict[str, Any] = {
     "7.2": {"version": "7.2.12", "debian": {"version": "trixie"}, "alpine": {"version": "3.23"}},
     "8.0": {"version": "8.0.7", "debian": {"version": "trixie"}, "alpine": {"version": "3.23"}},

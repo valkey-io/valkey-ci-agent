@@ -1,19 +1,8 @@
-"""Invoke a CVE scanner subprocess and parse findings.
+"""Invoke Trivy as a subprocess and parse findings.
 
-Runs Trivy against container images (optionally per platform for multi-arch
-images), captures JSON output, and converts it into structured Finding objects
-via the findings parser.
-
-Multi-arch scanning: each image is scanned per platform by passing
-``--platform <p>`` to trivy. Findings from all platforms are merged and
+Each image is scanned per platform (``--platform``); findings are merged and
 deduplicated by (image, package, cve_id, installed_version, platform) so
-exact duplicates on the same platform are collapsed, but cross-platform
-findings remain distinct for per-platform base verification.
-
-Expected scan count: len(images) * len(platforms). For the default 4-platform
-configuration (amd64, arm64, arm/v7, ppc64le) and a typical 10-image matrix
-this is ~40 trivy invocations. At ~30 seconds each the job-level 30 min
-timeout is sufficient.
+cross-platform findings stay distinct for per-platform base verification.
 """
 
 from __future__ import annotations
@@ -29,8 +18,7 @@ from scripts.parsers.cve_findings_parser import filter_by_threshold, parse_findi
 
 logger = logging.getLogger(__name__)
 
-#: Per-scan subprocess timeout in seconds.
-#: Cached-DB scans complete in tens of seconds; the job-level timeout is 30 min.
+#: Per-scan subprocess timeout in seconds (cached-DB scans take tens of seconds).
 _SCAN_TIMEOUT_SECONDS = 180
 
 
@@ -53,10 +41,9 @@ def _build_command(scanner: str, image: str, platform: str | None = None) -> lis
 
 
 def _run_scanner(command: list[str], timeout: int = _SCAN_TIMEOUT_SECONDS) -> dict[str, Any]:
-    """Run the scanner subprocess and return parsed JSON output.
+    """Run the scanner subprocess and return parsed JSON.
 
-    Raises:
-        ScanError: On non-zero exit, timeout, or invalid JSON output.
+    Raises ScanError on non-zero exit, timeout, or invalid JSON.
     """
     try:
         result = subprocess.run(
@@ -94,13 +81,12 @@ def _run_scanner(command: list[str], timeout: int = _SCAN_TIMEOUT_SECONDS) -> di
 
 
 def scan_image(image: str, scanner: str, platform: str | None = None) -> list[Finding]:
-    """Scan a single image (optionally for a specific platform) and return all findings.
+    """Scan a single image (optionally per platform) and return all findings.
 
     Args:
         image: Container image reference (e.g. "valkey/valkey:8.0-alpine").
         scanner: Scanner to use ("trivy").
-        platform: Optional platform string (e.g. "linux/amd64"). When provided,
-            passed as ``--platform`` to trivy to scan the specific arch manifest.
+        platform: Optional platform (e.g. "linux/amd64") passed as ``--platform``.
 
     Returns:
         List of Finding objects from the scan.
@@ -115,12 +101,10 @@ def scan_image(image: str, scanner: str, platform: str | None = None) -> list[Fi
 
 
 def _dedup_findings(findings: list[Finding]) -> list[Finding]:
-    """Deduplicate findings by (image, package, cve_id, installed_version, platform).
+    """Collapse same-platform duplicates; keep cross-platform findings distinct.
 
-    When scanning multiple platforms, identical CVEs on the SAME platform can
-    appear if trivy reports duplicates. This collapses them to one per platform.
-    Findings on DIFFERENT platforms are kept distinct so base verification can
-    check each platform's base image independently. The first occurrence is kept.
+    First occurrence wins. Cross-platform findings stay separate so base
+    verification can check each platform's base image independently.
     """
     seen: set[tuple[str, str, str, str, str]] = set()
     deduped: list[Finding] = []
@@ -138,13 +122,7 @@ def scan_images(
     threshold: Severity,
     platforms: list[str] | None = None,
 ) -> list[Finding]:
-    """Scan multiple images (per platform) and return findings at or above the severity threshold.
-
-    Each image is scanned once per platform in ``platforms``. Findings are
-    merged across platforms and deduplicated by (image, package, cve_id,
-    installed_version, platform) so exact duplicates on the same platform are
-    collapsed but cross-platform findings remain distinct for per-platform
-    base verification.
+    """Scan multiple images per platform; return deduplicated findings at or above threshold.
 
     Args:
         images: List of container image references to scan.
@@ -153,8 +131,7 @@ def scan_images(
         platforms: Platforms to scan per image. Defaults to DEFAULT_PLATFORMS.
 
     Returns:
-        Combined deduplicated list of findings from all images and platforms,
-        filtered by threshold.
+        Combined deduplicated findings from all images and platforms.
 
     Raises:
         ScanError: If any scanner invocation fails.

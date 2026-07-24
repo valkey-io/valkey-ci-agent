@@ -1,16 +1,9 @@
 """Native package-manager version comparison for the CVE safety gate.
 
-Provides compare_versions(), which delegates to the native comparison tool
-of the relevant package manager (dpkg for Debian, apk for Alpine). This is
-used in base_precheck.py as the actual gate before dispatch: it has correct
-Debian/Alpine semantics by design, rather than a hand-rolled approximation.
-
-Both tools are invoked via ``docker run --rm <image> <cmd>`` so the runner
-needs Docker available. Any subprocess failure or unparseable output
-returns None (fail-closed: caller must treat as "not fixable").
-
-Security model: deterministic, no AI, no network beyond the docker pull
-that already happened for the trivy scan.
+Delegates to dpkg (Debian) or apk (Alpine) via ``docker run --rm`` for
+semantically correct ordering. Any subprocess failure or unparseable output
+returns None (fail-closed: caller must treat as not fixable). Deterministic,
+no AI, no shell interpolation.
 """
 
 from __future__ import annotations
@@ -24,9 +17,8 @@ logger = logging.getLogger(__name__)
 #: Docker run timeout in seconds for a single comparison command.
 _COMPARE_TIMEOUT = 60
 
-# Canonical public images used when comparing versions independent of a
-# specific base image. Kept small: these are just used to host the comparison
-# tool (dpkg / apk), not to read installed package databases.
+# Canonical public images hosting the comparison tool (dpkg / apk) when no
+# specific base image is given.
 _DEBIAN_COMPARATOR_IMAGE = "public.ecr.aws/docker/library/debian:stable-slim"
 _ALPINE_COMPARATOR_IMAGE = "public.ecr.aws/docker/library/alpine:latest"
 
@@ -39,23 +31,15 @@ def compare_versions(
 ) -> Optional[int]:
     """Compare two package version strings using the native package manager.
 
-    Runs ``dpkg --compare-versions a lt b`` (Debian) or
-    ``apk version -t a b`` (Alpine) inside a minimal container to obtain
-    semantically correct ordering.
-
     Args:
         a: First version string (e.g. installed version).
         b: Second version string (e.g. fixed version).
         flavor: Package manager flavor: ``'debian'`` or ``'alpine'``.
-        base_image: Override the container image used to host the comparison
-            tool. Defaults to a canonical public image for the flavor.
+        base_image: Optional override for the container hosting the comparison tool.
 
     Returns:
-        -1 if a < b
-         0 if a == b
-         1 if a > b
-        None on any error (subprocess failure, timeout, unparseable output).
-        None is the fail-closed sentinel: callers must treat it as not-fixable.
+        -1/0/1 ordering of a vs b, or None on any error (fail-closed
+        sentinel: callers must treat it as not-fixable).
     """
     if flavor == "debian":
         return _compare_debian(a, b, base_image or _DEBIAN_COMPARATOR_IMAGE)
@@ -86,14 +70,11 @@ def _run_docker(cmd: list[str]) -> "tuple[int, str, str]":
 
 
 def _compare_debian(a: str, b: str, image: str) -> Optional[int]:
-    """Compare versions using dpkg --compare-versions.
+    """Compare via dpkg --compare-versions (lt then eq).
 
-    Runs two comparisons (lt and eq) to determine the full ordering.
-    ``dpkg --compare-versions`` legitimately exits 0 (true) or 1 (false).
-    Any other exit code indicates an unexpected failure (e.g. docker error
-    125/126/127) and we return None (fail-closed).
+    dpkg legitimately exits 0 (true) or 1 (false); any other exit code is a
+    docker-level failure and returns None (fail-closed).
     """
-    # Check a < b
     rc_lt, _, stderr_lt = _run_docker([
         "docker", "run", "--rm", image,
         "dpkg", "--compare-versions", a, "lt", b,
@@ -108,7 +89,6 @@ def _compare_debian(a: str, b: str, image: str) -> Optional[int]:
     if rc_lt == 0:
         return -1  # a < b
 
-    # Check a == b
     rc_eq, _, stderr_eq = _run_docker([
         "docker", "run", "--rm", image,
         "dpkg", "--compare-versions", a, "eq", b,
@@ -123,22 +103,17 @@ def _compare_debian(a: str, b: str, image: str) -> Optional[int]:
     if rc_eq == 0:
         return 0  # a == b
 
-    # Neither lt nor eq -> a > b
-    return 1
+    return 1  # neither lt nor eq -> a > b
 
 
 def _compare_alpine(a: str, b: str, image: str) -> Optional[int]:
-    """Compare versions using ``apk version -t``.
-
-    ``apk version -t a b`` prints one of '<', '=', '>'.
-    Invoked as an argv list (no shell) to avoid quoting hazards.
-    """
+    """Compare via ``apk version -t`` (prints '<', '=', or '>'). Argv list, no shell."""
     rc, stdout, stderr = _run_docker([
         "docker", "run", "--rm", image,
         "apk", "version", "-t", a, b,
     ])
     if rc == -1:
-        # _run_docker signals timeout/OSError with rc == -1
+        # rc == -1 signals timeout/OSError from _run_docker
         return None
     if rc != 0:
         logger.warning(

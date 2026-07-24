@@ -12,25 +12,11 @@ from scripts.cve_scan.models import Finding, Severity
 
 
 def parse_trivy(json_obj: dict[str, Any], image: str, platform: str = "") -> list[Finding]:
-    """Parse Trivy JSON output into a list of Finding objects.
+    """Parse Trivy JSON output into Finding objects.
 
-    Expected structure::
-
-        {
-          "Results": [
-            {
-              "Vulnerabilities": [
-                {
-                  "VulnerabilityID": "CVE-...",
-                  "PkgName": "...",
-                  "InstalledVersion": "...",
-                  "FixedVersion": "...",   # may be absent or empty
-                  "Severity": "HIGH"
-                }
-              ]
-            }
-          ]
-        }
+    Reads Results[].Vulnerabilities[] (VulnerabilityID, PkgName,
+    InstalledVersion, FixedVersion, Severity); FixedVersion may be
+    absent or empty (mapped to None).
     """
     findings: list[Finding] = []
     results = json_obj.get("Results")
@@ -58,33 +44,12 @@ def parse_trivy(json_obj: dict[str, Any], image: str, platform: str = "") -> lis
 
 
 def parse_findings(scanner: str, json_obj: dict[str, Any], image: str, platform: str = "") -> list[Finding]:
-    """Dispatch to the correct parser based on scanner name.
-
-    Args:
-        scanner: Must be "trivy".
-        json_obj: Parsed JSON output from the scanner.
-        image: Image reference that was scanned.
-        platform: Platform string to stamp on each finding (e.g. "linux/amd64").
-
-    Returns:
-        List of Finding objects.
-
-    Raises:
-        ValueError: If scanner is not recognized.
-    """
+    """Dispatch to the correct parser based on scanner name; raises ValueError if unrecognized."""
     if scanner == "trivy":
         return parse_trivy(json_obj, image, platform=platform)
     raise ValueError(f"Unsupported scanner: {scanner!r}. Must be 'trivy'.")
 
 
 def filter_by_threshold(findings: list[Finding], threshold: Severity) -> list[Finding]:
-    """Return findings at or above the given severity threshold.
-
-    Args:
-        findings: List of findings to filter.
-        threshold: Minimum severity level (inclusive).
-
-    Returns:
-        Filtered list containing only findings with severity >= threshold.
-    """
+    """Return findings at or above the given severity threshold (inclusive)."""
     return [f for f in findings if f.severity >= threshold]

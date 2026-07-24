@@ -1,13 +1,7 @@
-"""Tests for scripts/cve_scan/version_compare.py -- native version comparison.
+"""Tests for scripts/cve_scan/version_compare.py.
 
-Covers:
-  - Debian comparison via mocked docker output (dpkg --compare-versions).
-  - Alpine comparison via mocked docker output (apk version -t).
-  - Error handling: docker failure -> None (fail-closed).
-  - Error handling: timeout -> None (fail-closed).
-  - Error handling: unexpected apk output -> None (fail-closed).
-  - Unknown flavor -> None (fail-closed).
-  - B3 regression: python comparator on 1.0-1 vs 1.0+deb12u1 -> -1.
+Covers mocked dpkg/apk comparisons, fail-closed error handling, and the B3
+regression (pure-Python comparator: 1.0-1 < 1.0+deb12u1).
 """
 
 from __future__ import annotations
@@ -18,10 +12,6 @@ import pytest
 
 from scripts.cve_scan.version_compare import compare_versions
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _docker_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
     """Build a mock subprocess.CompletedProcess."""
@@ -30,11 +20,6 @@ def _docker_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
     result.stdout = stdout
     result.stderr = stderr
     return result
-
-
-# ---------------------------------------------------------------------------
-# Debian: mocked dpkg --compare-versions
-# ---------------------------------------------------------------------------
 
 
 class TestCompareVersionsDebian:
@@ -132,11 +117,6 @@ class TestCompareVersionsDebian:
         assert any("debian:bookworm-slim" in " ".join(c) for c in calls)
 
 
-# ---------------------------------------------------------------------------
-# Alpine: mocked apk version -t
-# ---------------------------------------------------------------------------
-
-
 class TestCompareVersionsAlpine:
     """compare_versions with flavor='alpine' uses apk semantics."""
 
@@ -219,11 +199,6 @@ class TestCompareVersionsAlpine:
         assert result is None
 
 
-# ---------------------------------------------------------------------------
-# Unknown flavor
-# ---------------------------------------------------------------------------
-
-
 class TestCompareVersionsUnknownFlavor:
     """Unknown flavor returns None (fail-closed)."""
 
@@ -232,18 +207,8 @@ class TestCompareVersionsUnknownFlavor:
         assert result is None
 
 
-# ---------------------------------------------------------------------------
-# B3 regression: Python comparator + suffix ordering
-# ---------------------------------------------------------------------------
-
-
 class TestPythonComparatorPlusSuffix:
-    """Regression tests for the fixed pure-Python comparator.
-
-    These tests verify that the comparator now correctly handles the Debian
-    case where a + suffix indicates a later version (debian patch on top of
-    the upstream release): 1.0 < 1.0+deb12u1.
-    """
+    """B3 regression: the pure-Python comparator must honor Debian '+' ordering (1.0 < 1.0+deb12u1)."""
 
     def test_bare_less_than_plus_suffix(self) -> None:
         """1.0-1 < 1.0+deb12u1: Debian patch is newer than upstream."""

@@ -15,10 +15,6 @@ from scripts.cve_scan.config import (
 )
 from scripts.cve_scan.models import Severity
 
-# ---------------------------------------------------------------------------
-# Helper to clear all CVE_SCAN_* env vars for a clean slate
-# ---------------------------------------------------------------------------
-
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -28,11 +24,6 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in list(os.environ):
         if key.startswith("CVE_SCAN_"):
             monkeypatch.delenv(key, raising=False)
-
-
-# ---------------------------------------------------------------------------
-# Happy-path: all defaults when env unset
-# ---------------------------------------------------------------------------
 
 
 class TestDefaults:
@@ -53,11 +44,6 @@ class TestDefaults:
         settings = load_settings()
         with pytest.raises(Exception):  # noqa: B017 - FrozenInstanceError
             settings.scanner = "invalid"  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# Happy-path: each env override works correctly
-# ---------------------------------------------------------------------------
 
 
 class TestEnvOverrides:
@@ -118,11 +104,6 @@ class TestEnvOverrides:
         monkeypatch.setenv("CVE_SCAN_IMAGES", "  ,  , ")
         settings = load_settings()
         assert settings.images == []
-
-
-# ---------------------------------------------------------------------------
-# Strict rejection: invalid values raise CveScanConfigError
-# ---------------------------------------------------------------------------
 
 
 class TestStrictRejection:

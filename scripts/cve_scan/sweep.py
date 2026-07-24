@@ -1,27 +1,12 @@
 """CVE scan sweep: scheduled scan + decision + job summary reporting.
 
-Entry point for the CVE scan workflow. Runs on a cron schedule or
-workflow_dispatch. Loads settings from CVE_SCAN_* env vars, scans images
-across all configured platforms, classifies findings, and reports results
-in the GitHub Actions job summary.
+Entry point for the CVE scan workflow. Scans images across configured
+platforms, classifies findings, verifies fixes against base images
+(dynamic mode), and reports everything in the job summary. Emits job
+outputs ``fixable`` and ``versions`` for the rebuild job. Static override
+mode always emits fixable=false to prevent unverified rebuilds.
 
-Emits GitHub Actions job outputs:
-  fixable  - 'true' when confirmed-fixable findings exist (for job 2 condition)
-  versions - space-separated version lines derived from fixable images
-             (e.g. '8.0 9.1'), passed as --field version= to the rebuild workflow
-
-All findings (confirmed-fixable being rebuilt AND not-fixable) are reported in
-the job summary. No GitHub issues are created.
-
-In dynamic mode (default), a base-image pre-check verifies that the upstream
-base image already carries the patched package before requesting a rebuild.
-Findings where the base has not been updated are downgraded to not-fixable.
-The pre-check is skipped in static override mode, and static mode always emits
-fixable=false to prevent unverified rebuilds.
-
-Usage:
-    python -m scripts.cve_scan.sweep --repo valkey-io/valkey-container
-    python -m scripts.cve_scan.sweep --repo valkey-io/valkey-container --dry-run
+Usage: python -m scripts.cve_scan.sweep --repo valkey-io/valkey-container [--dry-run]
 """
 
 from __future__ import annotations
@@ -56,19 +41,13 @@ def _split_classifications(
 
 
 def _fixable_versions(fixable: list[Classification]) -> list[str]:
-    """Derive space-separated version line names from confirmed-fixable images.
+    """Derive sorted deduplicated version lines from confirmed-fixable images.
 
-    Converts image tags to line-prefix version strings suitable for passing
-    as ``--field version=`` to valkey-container ci.yml. For example:
-      'valkey/valkey:8.0-alpine' -> '8.0'
-      'valkey/valkey:9.1'        -> '9.1'
-
-    Returns a sorted, deduplicated list of version lines.
+    'valkey/valkey:8.0-alpine' -> '8.0' (for --field version= to ci.yml).
     """
     versions: set[str] = set()
     for c in fixable:
         tag = c.finding.image.rsplit(":", 1)[-1] if ":" in c.finding.image else c.finding.image
-        # Strip the '-alpine' suffix to get the line prefix
         line = tag.replace("-alpine", "")
         if line:
             versions.add(line)
@@ -76,14 +55,9 @@ def _fixable_versions(fixable: list[Classification]) -> list[str]:
 
 
 def _emit_outputs(fixable: bool, versions: list[str] | None = None) -> None:
-    """Emit GitHub Actions job outputs (fixable and versions).
+    """Emit GitHub Actions job outputs (fixable, versions) to $GITHUB_OUTPUT.
 
-    Writes to $GITHUB_OUTPUT when running in Actions. When unset (local/dry-run),
-    logs the values instead.
-
-    Args:
-        fixable: Whether confirmed-fixable findings exist.
-        versions: Sorted version lines for the rebuild dispatch (e.g. ['8.0', '9.1']).
+    When GITHUB_OUTPUT is unset (local/dry-run), prints the values instead.
     """
     versions_str = " ".join(versions or [])
     fixable_str = "true" if fixable else "false"
@@ -209,7 +183,6 @@ def run_sweep(
     static_mode = bool(settings.images)
     logger.info("Resolved %d image(s) to scan: %s", len(images), ", ".join(images))
 
-    # Scan across all configured platforms
     logger.info(
         "Scanning %d image(s) x %d platform(s) with %s...",
         len(images), len(settings.platforms), settings.scanner,
@@ -232,7 +205,6 @@ def run_sweep(
         )
         return
 
-    # Classify
     classifications = classify_all(findings)
     fixable, not_fixable = _split_classifications(classifications)
     logger.info(
@@ -241,7 +213,7 @@ def run_sweep(
         len(not_fixable),
     )
 
-    # Base-image pre-check (dynamic mode only): verify fixes are present in base
+    # Base pre-check (dynamic mode only): verify fixes are present in base
     if fixable and not static_mode:
         logger.info("Running base package check for %d fixable finding(s)...", len(fixable))
         confirmed, downgraded = verify_fixable_in_base(fixable, base_map)
@@ -259,16 +231,14 @@ def run_sweep(
     else:
         logger.info("Skipping base pre-check (no fixable findings).")
 
-    # Derive versions string for the rebuild dispatch
     versions = _fixable_versions(fixable) if fixable and not static_mode else []
 
-    # Emit outputs: static mode always emits fixable=false (no verified rebuild)
+    # Static mode always emits fixable=false (no unverified rebuild)
     if static_mode:
         _emit_outputs(False)
     else:
         _emit_outputs(len(fixable) > 0, versions)
 
-    # Dry run: print and exit
     if dry_run:
         _print_dry_run(fixable, not_fixable)
         _emit_run_summary(
@@ -278,7 +248,7 @@ def run_sweep(
         )
         return
 
-    # Live mode: emit run summary (rebuild dispatch happens in the workflow YAML)
+    # Live mode: rebuild dispatch happens in the workflow YAML
     _emit_run_summary(
         images=images, findings_count=len(findings), fixable=fixable,
         not_fixable=not_fixable, threshold_name=settings.severity_threshold.name,

@@ -7,10 +7,7 @@ from enum import IntEnum
 
 
 class Severity(IntEnum):
-    """CVE severity levels, ordered low to high for threshold comparison.
-
-    Usage: ``finding_severity >= Severity[config.severity_threshold]``
-    """
+    """CVE severity levels, ordered low to high for threshold comparison."""
 
     UNKNOWN = 0
     LOW = 1
@@ -20,7 +17,7 @@ class Severity(IntEnum):
 
     @classmethod
     def from_str(cls, value: str) -> Severity:
-        """Parse a case-insensitive severity string, raising ValueError on unknown input."""
+        """Parse a case-insensitive severity string; raises ValueError on unknown input."""
         try:
             return cls[value.upper()]
         except KeyError:

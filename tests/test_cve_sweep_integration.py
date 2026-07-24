@@ -1,18 +1,9 @@
 """Integration tests for the CVE scan sweep: real settings loading + real output emission.
 
-These tests do NOT mock load_settings or _emit_outputs. Only scan_images and
-(for dynamic settings) the HTTP fetch are monkeypatched to avoid
-network/docker dependencies. This exercises the real config-to-output path.
-
-Verifies:
-  - Case A: fixable finding (dynamic) -> GITHUB_OUTPUT contains fixable=true.
-  - Case B: no fix available -> GITHUB_OUTPUT contains fixable=false.
-  - Case C: invalid env var -> raises CveScanConfigError (regression guard).
-  - Case D: dynamic settings + mocked fetch -> sweep resolves + emits correctly.
-  - Case E: base pre-check integration (stale base -> downgraded).
-  - Case F: static mode + fixable finding -> fixable=false (dispatch disabled).
-  - Case G: no GITHUB_OUTPUT env -> prints fixable= without error.
-  - Case H: zero findings -> fixable=false.
+load_settings and _emit_outputs are NOT mocked; only scan_images, the HTTP
+fetch, and base package reads are patched. Covers fixable/not-fixable output
+emission, config-error regression, dynamic resolution, base pre-check
+downgrades, static-mode dispatch disable, and job summary content.
 """
 
 from __future__ import annotations
@@ -28,10 +19,6 @@ from scripts.cve_scan.config import CveScanConfigError, load_settings
 from scripts.cve_scan.models import Finding, Severity
 from scripts.cve_scan.sweep import run_sweep
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 
 @pytest.fixture(autouse=True)
 def _clean_cve_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -43,11 +30,7 @@ def _clean_cve_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _mock_native_compare(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch _native_compare to avoid real Docker calls in integration tests.
-
-    Uses the pure-Python comparator from rebuild_decider, which is correct for
-    all version strings exercised in these tests.
-    """
+    """Patch _native_compare with the pure-Python comparator (no real Docker)."""
     from scripts.cve_scan.rebuild_decider import _compare_versions as _py_compare
 
     monkeypatch.setattr(
@@ -82,11 +65,6 @@ SAMPLE_VERSIONS = {
     "9.1": {"version": "9.1.0", "debian": {"version": "trixie"}, "alpine": {"version": "3.23"}},
     "unstable": {"version": "unstable", "debian": {"version": "trixie"}, "alpine": {"version": "3.23"}},
 }
-
-
-# ---------------------------------------------------------------------------
-# Case A: fixable finding (dynamic) -> fixable=true
-# ---------------------------------------------------------------------------
 
 
 class TestIntegrationFixable:
@@ -185,11 +163,6 @@ class TestIntegrationFixable:
         assert "fixable=true" in output.strip().splitlines()
 
 
-# ---------------------------------------------------------------------------
-# Case B: no fix available -> fixable=false
-# ---------------------------------------------------------------------------
-
-
 class TestIntegrationNotFixable:
     """Real load_settings + real _emit_outputs with only non-fixable findings."""
 
@@ -259,11 +232,6 @@ class TestIntegrationNotFixable:
         assert "fixable=false" in lines
 
 
-# ---------------------------------------------------------------------------
-# Case C: invalid env -> CveScanConfigError (regression guard)
-# ---------------------------------------------------------------------------
-
-
 class TestIntegrationConfigError:
     """Proves the REAL load path is exercised (not mocked away)."""
 
@@ -282,11 +250,6 @@ class TestIntegrationConfigError:
         monkeypatch.setenv("CVE_SCAN_SEVERITY_THRESHOLD", "INVALID")
         with pytest.raises(CveScanConfigError, match="Invalid CVE_SCAN_SEVERITY_THRESHOLD"):
             load_settings()
-
-
-# ---------------------------------------------------------------------------
-# Case D: dynamic settings + mocked fetch -> sweep resolves correctly
-# ---------------------------------------------------------------------------
 
 
 class TestIntegrationDynamic:
@@ -346,11 +309,6 @@ class TestIntegrationDynamic:
         # Verify outputs emitted
         output = github_output.read_text()
         assert "fixable=true" in output
-
-
-# ---------------------------------------------------------------------------
-# Case E: dynamic mode + base pre-check (stale base -> downgraded to triage)
-# ---------------------------------------------------------------------------
 
 
 class TestIntegrationBasePrecheck:
@@ -483,11 +441,6 @@ class TestIntegrationBasePrecheck:
         assert "fixable=true" in output
 
 
-# ---------------------------------------------------------------------------
-# Case F: static mode + fixable finding -> fixable=false (dispatch disabled)
-# ---------------------------------------------------------------------------
-
-
 class TestStaticModeDispatchDisabled:
     """Static mode always emits fixable=false regardless of findings."""
 
@@ -525,11 +478,6 @@ class TestStaticModeDispatchDisabled:
         output = github_output_file.read_text()
         lines = output.strip().splitlines()
         assert "fixable=false" in lines
-
-
-# ---------------------------------------------------------------------------
-# Case G: GITHUB_OUTPUT unset - prints without error
-# ---------------------------------------------------------------------------
 
 
 class TestSweepOutputNoEnvVar:
@@ -600,11 +548,6 @@ class TestSweepOutputNoEnvVar:
 
         captured = capsys.readouterr()
         assert "fixable=false" in captured.out
-
-
-# ---------------------------------------------------------------------------
-# Job summary content assertions
-# ---------------------------------------------------------------------------
 
 
 class TestJobSummaryContent:

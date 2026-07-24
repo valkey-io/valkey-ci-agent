@@ -18,11 +18,6 @@ from scripts.parsers.cve_findings_parser import (
 IMAGE = "valkey/valkey:7.2"
 
 
-# ---------------------------------------------------------------------------
-# Trivy parser
-# ---------------------------------------------------------------------------
-
-
 class TestParseTrivy:
     def test_basic_finding(self) -> None:
         trivy_json = {
@@ -159,11 +154,6 @@ class TestParseTrivy:
         assert findings[0].severity == Severity[sev]
 
 
-# ---------------------------------------------------------------------------
-# Grype parser
-# ---------------------------------------------------------------------------
-
-
 class TestParseFindings:
     def test_dispatches_trivy(self) -> None:
         trivy_json = {
@@ -233,11 +223,6 @@ class TestParseFindings:
         }
         findings = parse_findings("trivy", trivy_json, IMAGE)
         assert findings[0].platform == ""
-
-
-# ---------------------------------------------------------------------------
-# filter_by_threshold
-# ---------------------------------------------------------------------------
 
 
 class TestFilterByThreshold:

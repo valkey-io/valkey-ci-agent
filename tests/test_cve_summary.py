@@ -1,24 +1,9 @@
-"""Tests for scripts/cve_scan/summary.py -- findings table renderer.
-
-Verifies:
-  - Basic table structure (header, columns, CVE in output).
-  - Multiple images grouped into a single row.
-  - Multiple packages same CVE grouped into one row.
-  - Mixed rationale produces separate rows.
-  - Repository prefix stripped from image tags.
-  - No "Affected Images" section (old format removed).
-  - Severity sorted descending, then CVE ascending.
-  - No urgency column when map is None.
-"""
+"""Tests for scripts/cve_scan/summary.py -- grouped findings table renderer."""
 
 from __future__ import annotations
 
 from scripts.cve_scan.models import Classification, Finding, Severity
 from scripts.cve_scan.summary import _strip_repo_prefix, render_findings_table
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_classification(
@@ -44,11 +29,6 @@ def _make_classification(
     )
 
 
-# ---------------------------------------------------------------------------
-# _strip_repo_prefix
-# ---------------------------------------------------------------------------
-
-
 class TestStripRepoPrefix:
     """Unit tests for _strip_repo_prefix."""
 
@@ -60,11 +40,6 @@ class TestStripRepoPrefix:
 
     def test_multiple_colons_strips_after_last(self) -> None:
         assert _strip_repo_prefix("registry.io:5000/repo:tag") == "tag"
-
-
-# ---------------------------------------------------------------------------
-# render_findings_table
-# ---------------------------------------------------------------------------
 
 
 class TestRenderFindingsTable:

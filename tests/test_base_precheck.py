@@ -1,21 +1,9 @@
-"""Tests for scripts/cve_scan/base_precheck.py -- base-image pre-check.
+"""Tests for scripts/cve_scan/base_precheck.py.
 
-Covers:
-  - (a) Base version older than fix -> downgraded.
-  - (b) Base version >= fix -> confirmed.
-  - (c) Package absent from base db -> confirmed with note.
-  - (d) Ambiguous version comparison -> downgraded conservatively.
-  - (e) Two images sharing one base -> get_base_packages called once.
-  - (f) Image missing from base_map -> downgraded conservatively (fail-closed).
-  - (g) Unknown base flavor -> raises BasePrecheckError.
-  - (h) Subprocess failure -> raises BasePrecheckError.
-  - (i) Real-format Alpine apk db parsing.
-  - (j) Real-format Debian dpkg-query parsing.
-
-Note: _native_compare (the docker-based comparator) is patched with the pure-Python
-_compare_versions from rebuild_decider throughout this test module (autouse fixture)
-to avoid real Docker calls. Tests for _native_compare itself are in
-test_version_compare.py.
+Covers confirm/downgrade paths, fail-closed behavior, per-(base, platform)
+caching, docker failure handling, and real-format apk/dpkg parsing. The
+docker-based native comparator is patched with the pure-Python one (autouse
+fixture) to avoid real Docker calls; it is tested in test_version_compare.py.
 """
 
 from __future__ import annotations
@@ -38,19 +26,11 @@ from scripts.cve_scan.rebuild_decider import _compare_versions as _py_compare
 
 @pytest.fixture(autouse=True)
 def _mock_native_compare(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace the docker-based native comparator with the pure-Python one.
-
-    This prevents real Docker calls in unit tests. The pure-Python comparator
-    has been fixed to match Debian semantics for all cases exercised here.
-    """
+    """Patch the docker-based native comparator with the pure-Python one (no real Docker)."""
     monkeypatch.setattr(
         "scripts.cve_scan.base_precheck._native_compare",
         lambda a, b, flavor, base_image=None: _py_compare(a, b),
     )
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_finding(
@@ -145,11 +125,6 @@ zlib1g 1:1.2.13.dfsg-1
 """
 
 
-# ---------------------------------------------------------------------------
-# (a) Base version older than fix -> downgraded
-# ---------------------------------------------------------------------------
-
-
 class TestBaseOlderThanFix:
     """Base has an older version than the fix -> downgrade."""
 
@@ -191,11 +166,6 @@ class TestBaseOlderThanFix:
         assert "zlib" in downgraded[0].rationale
 
 
-# ---------------------------------------------------------------------------
-# (b) Base version >= fix -> confirmed
-# ---------------------------------------------------------------------------
-
-
 class TestBaseHasFix:
     """Base has the fix (installed >= fixed) -> confirmed."""
 
@@ -234,11 +204,6 @@ class TestBaseHasFix:
         assert "Verified: base alpine:3.23 ships 3.0.13-r0" in confirmed[0].rationale
 
 
-# ---------------------------------------------------------------------------
-# (c) Package absent from base db -> confirmed with note
-# ---------------------------------------------------------------------------
-
-
 class TestPackageAbsentFromBase:
     """Package not in base image db -> confirmed (installed at build time)."""
 
@@ -260,11 +225,6 @@ class TestPackageAbsentFromBase:
         assert confirmed[0].fixable is True
         assert "not in base image" in confirmed[0].rationale
         assert "installed at build time" in confirmed[0].rationale
-
-
-# ---------------------------------------------------------------------------
-# (d) Ambiguous version comparison -> downgraded conservatively
-# ---------------------------------------------------------------------------
 
 
 class TestAmbiguousComparison:
@@ -316,11 +276,6 @@ class TestAmbiguousComparison:
         assert len(downgraded) == 1
         assert downgraded[0].fixable is False
         assert "ambiguous" in downgraded[0].rationale
-
-
-# ---------------------------------------------------------------------------
-# (e) Two images sharing one base -> get_base_packages called once
-# ---------------------------------------------------------------------------
 
 
 class TestBaseCaching:
@@ -413,11 +368,6 @@ class TestBaseCaching:
         assert "still ships" in downgraded[0].rationale
 
 
-# ---------------------------------------------------------------------------
-# (f) Image missing from base_map -> left as-is (confirmed)
-# ---------------------------------------------------------------------------
-
-
 class TestMissingBaseMap:
     """Image not in base_map -> downgraded conservatively (fail-closed)."""
 
@@ -441,11 +391,6 @@ class TestMissingBaseMap:
         assert "fail-closed" in downgraded[0].rationale
 
 
-# ---------------------------------------------------------------------------
-# (g) Unknown base flavor -> raises BasePrecheckError
-# ---------------------------------------------------------------------------
-
-
 class TestUnknownBaseFlavor:
     """Unknown base image prefix -> raises BasePrecheckError."""
 
@@ -460,11 +405,6 @@ class TestUnknownBaseFlavor:
 
         with pytest.raises(BasePrecheckError, match="Unknown base image flavor"):
             verify_fixable_in_base([classification], base_map)
-
-
-# ---------------------------------------------------------------------------
-# (h) Subprocess failure -> raises BasePrecheckError
-# ---------------------------------------------------------------------------
 
 
 class TestSubprocessFailure:
@@ -499,11 +439,6 @@ class TestSubprocessFailure:
             )
             with pytest.raises(BasePrecheckError, match="Empty package database"):
                 get_base_packages("alpine:3.23")
-
-
-# ---------------------------------------------------------------------------
-# (i) Real-format Alpine apk db parsing
-# ---------------------------------------------------------------------------
 
 
 class TestApkDbParsing:
@@ -543,11 +478,6 @@ class TestApkDbParsing:
 
     def test_parse_apk_db_only_blanks(self) -> None:
         assert _parse_apk_installed("\n\n\n") == {}
-
-
-# ---------------------------------------------------------------------------
-# (j) Real-format Debian dpkg-query parsing
-# ---------------------------------------------------------------------------
 
 
 class TestDpkgQueryParsing:

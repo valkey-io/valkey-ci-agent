@@ -15,10 +15,6 @@ import pytest
 from scripts.cve_scan.config import CveScanSettings
 from scripts.cve_scan.models import Classification, Finding, Severity
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 def _make_settings(severity: Severity = Severity.HIGH) -> CveScanSettings:
     return CveScanSettings(
@@ -49,11 +45,6 @@ def _make_classification(
         fixable=fixable,
         rationale="Test rationale",
     )
-
-
-# ---------------------------------------------------------------------------
-# B6: Multi-arch scan + dedup
-# ---------------------------------------------------------------------------
 
 
 class TestMultiArchScanAndDedup:
@@ -325,11 +316,6 @@ class TestMultiArchScanAndDedup:
         )
         results = _dedup_findings([f1, f2])
         assert len(results) == 1
-
-
-# ---------------------------------------------------------------------------
-# B1: versions output
-# ---------------------------------------------------------------------------
 
 
 class TestVersionsOutput:
