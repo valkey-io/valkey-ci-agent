@@ -30,12 +30,27 @@ def _clean_cve_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _mock_native_compare(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch _native_compare with the pure-Python comparator (no real Docker)."""
-    from scripts.cve_scan.rebuild_decider import _compare_versions as _py_compare
+    """Patch _native_compare with a deterministic stub (no real Docker).
+
+    Parses the 'X.Y.Z[-rN]' shapes used in these tests as tuples of ints;
+    anything else returns None (fail-closed, like the native comparator).
+    """
+    def parse(version: str) -> "tuple[int, ...] | None":
+        nums, _, rev = version.partition("-r")
+        try:
+            return tuple(int(p) for p in nums.split(".")) + (int(rev) if rev else 0,)
+        except ValueError:
+            return None
+
+    def stub_compare(a: str, b: str, flavor: str, base_image: str | None = None) -> int | None:
+        pa, pb = parse(a), parse(b)
+        if pa is None or pb is None:
+            return None
+        return (pa > pb) - (pa < pb)
 
     monkeypatch.setattr(
         "scripts.cve_scan.base_precheck._native_compare",
-        lambda a, b, flavor, base_image=None: _py_compare(a, b),
+        stub_compare,
     )
 
 

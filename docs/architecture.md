@@ -409,10 +409,10 @@ sweep.py
   → scanner.py (Trivy subprocess per image per platform)
       scans each image on each published platform (amd64, arm64, arm/v7, ppc64le)
       deduplicates findings by (image, package, cve_id, installed_version)
-  → rebuild_decider.py (pure-Python classify: rebuild-fixable vs not)
+  → rebuild_decider.py (classify: fix published → rebuild candidate; no fix → not fixable)
   → base_precheck.py (dynamic mode only)
       reads each distinct base image's package database (apk/dpkg)
-      compares versions using native dpkg/apk tools via docker (correct Debian semantics)
+      compares versions using native dpkg/apk tools via docker (authoritative, correct Debian semantics)
       downgrades findings where base is still vulnerable (fail-closed)
   → summary.py (render grouped findings tables for job summary)
   → emit GITHUB_OUTPUT: fixable=true/false, versions=<space-separated lines>

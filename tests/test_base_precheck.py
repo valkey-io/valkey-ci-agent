@@ -2,8 +2,9 @@
 
 Covers confirm/downgrade paths, fail-closed behavior, per-(base, platform)
 caching, docker failure handling, and real-format apk/dpkg parsing. The
-docker-based native comparator is patched with the pure-Python one (autouse
-fixture) to avoid real Docker calls; it is tested in test_version_compare.py.
+docker-based native comparator is patched with a deterministic local stub
+(autouse fixture) to avoid real Docker calls; the real comparator is tested
+in test_version_compare.py.
 """
 
 from __future__ import annotations
@@ -21,15 +22,34 @@ from scripts.cve_scan.base_precheck import (
     verify_fixable_in_base,
 )
 from scripts.cve_scan.models import Classification, Finding, Severity
-from scripts.cve_scan.rebuild_decider import _compare_versions as _py_compare
+
+
+def _stub_compare(a: str, b: str, flavor: str, base_image: str | None = None) -> int | None:
+    """Deterministic test stand-in for the native comparator.
+
+    Parses only the 'X.Y.Z[-rN]' shapes used in these tests as tuples of
+    ints; anything else returns None (ambiguous), mirroring the native
+    comparator's fail-closed contract.
+    """
+    def parse(version: str) -> "tuple[int, ...] | None":
+        nums, _, rev = version.partition("-r")
+        try:
+            return tuple(int(p) for p in nums.split(".")) + (int(rev) if rev else 0,)
+        except ValueError:
+            return None
+
+    pa, pb = parse(a), parse(b)
+    if pa is None or pb is None:
+        return None
+    return (pa > pb) - (pa < pb)
 
 
 @pytest.fixture(autouse=True)
 def _mock_native_compare(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch the docker-based native comparator with the pure-Python one (no real Docker)."""
+    """Patch the docker-based native comparator with a deterministic stub (no real Docker)."""
     monkeypatch.setattr(
         "scripts.cve_scan.base_precheck._native_compare",
-        lambda a, b, flavor, base_image=None: _py_compare(a, b),
+        _stub_compare,
     )
 
 
@@ -243,17 +263,16 @@ class TestAmbiguousComparison:
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages"
         ) as mock_get:
-            # Use a version that will produce ambiguous comparison
-            # _compare_versions returns None for genuinely ambiguous comparisons
+            # Non-numeric version: the stub comparator returns None (ambiguous)
             mock_get.return_value = {"weird-pkg": "1.0.0alpha2"}
             confirmed, downgraded = verify_fixable_in_base(
                 [classification], base_map
             )
 
-        # When comparison is ambiguous, should downgrade
-        # Note: whether this particular pair is actually ambiguous depends on
-        # _compare_versions internals. We'll verify via a mock if needed.
-        assert len(confirmed) + len(downgraded) == 1
+        # Ambiguous comparison downgrades (fail-closed)
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert downgraded[0].fixable is False
 
     def test_downgraded_with_mocked_ambiguous_comparison(self) -> None:
         """Direct test with mocked compare_versions returning None (native comparator)."""

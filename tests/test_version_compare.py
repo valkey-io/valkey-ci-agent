@@ -1,7 +1,8 @@
 """Tests for scripts/cve_scan/version_compare.py.
 
 Covers mocked dpkg/apk comparisons, fail-closed error handling, and the B3
-regression (pure-Python comparator: 1.0-1 < 1.0+deb12u1).
+regression (Debian '+' suffix ordering: 1.0-1 < 1.0+deb12u1, via the native
+dpkg path with mocked docker).
 """
 
 from __future__ import annotations
@@ -205,66 +206,3 @@ class TestCompareVersionsUnknownFlavor:
     def test_unknown_flavor_returns_none(self) -> None:
         result = compare_versions("1.0", "1.1", "rpm")
         assert result is None
-
-
-class TestPythonComparatorPlusSuffix:
-    """B3 regression: the pure-Python comparator must honor Debian '+' ordering (1.0 < 1.0+deb12u1)."""
-
-    def test_bare_less_than_plus_suffix(self) -> None:
-        """1.0-1 < 1.0+deb12u1: Debian patch is newer than upstream."""
-        from scripts.cve_scan.rebuild_decider import _compare_versions
-
-        result = _compare_versions("1.0-1", "1.0+deb12u1")
-        assert result == -1, (
-            f"Expected 1.0-1 < 1.0+deb12u1 (Debian rules: + suffix is newer), got {result}"
-        )
-
-    def test_plus_suffix_greater_than_bare(self) -> None:
-        """1.0+deb12u1 > 1.0: confirmed reverse direction."""
-        from scripts.cve_scan.rebuild_decider import _compare_versions
-
-        result = _compare_versions("1.0+deb12u1", "1.0")
-        assert result == 1
-
-    def test_bare_less_than_bare_plus(self) -> None:
-        """3.0.13 < 3.0.13+deb12u1."""
-        from scripts.cve_scan.rebuild_decider import _compare_versions
-
-        result = _compare_versions("3.0.13", "3.0.13+deb12u1")
-        assert result == -1
-
-    def test_tilde_still_less_than_bare(self) -> None:
-        """1.0~rc1 < 1.0 (tilde ordering unchanged)."""
-        from scripts.cve_scan.rebuild_decider import _compare_versions
-
-        result = _compare_versions("1.0~rc1", "1.0")
-        assert result == -1
-
-    def test_tilde_less_than_plus(self) -> None:
-        """1.0~beta < 1.0+patch (tilde < anything including plus)."""
-        from scripts.cve_scan.rebuild_decider import _compare_versions
-
-        result = _compare_versions("1.0~beta", "1.0+patch")
-        assert result == -1
-
-    def test_alpine_revision_ordering(self) -> None:
-        """3.0.12-r0 < 3.0.12-r1 (Alpine revision unchanged)."""
-        from scripts.cve_scan.rebuild_decider import _compare_versions
-
-        result = _compare_versions("3.0.12-r0", "3.0.12-r1")
-        assert result == -1
-
-    def test_epoch_comparison(self) -> None:
-        """1:1.0 > 0:2.0 (epoch takes precedence)."""
-        from scripts.cve_scan.rebuild_decider import _compare_versions
-
-        result = _compare_versions("1:1.0", "0:2.0")
-        assert result == 1
-
-    def test_debian_real_case_libssl(self) -> None:
-        """3.0.13-1~deb12u1 is a valid Debian version: installed == fixed -> not fixable."""
-        from scripts.cve_scan.rebuild_decider import _compare_versions
-
-        # installed and fixed are the same Debian version
-        result = _compare_versions("3.0.13-1~deb12u1", "3.0.13-1~deb12u1")
-        assert result == 0
