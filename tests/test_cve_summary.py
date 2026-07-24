@@ -13,6 +13,7 @@ def _make_classification(
     fixed_version: str | None = None,
     fixable: bool = False,
     rationale: str = "Test rationale",
+    platform: str = "",
 ) -> Classification:
     """Build a Classification with sensible defaults."""
     return Classification(
@@ -23,6 +24,7 @@ def _make_classification(
             cve_id=cve_id,
             severity=Severity.HIGH,
             fixed_version=fixed_version,
+            platform=platform,
         ),
         fixable=fixable,
         rationale=rationale,
@@ -53,7 +55,7 @@ class TestRenderFindingsTable:
         assert "### Findings" in table
         assert "CVE-2024-9999" in table
         assert "busybox" in table
-        assert "| CVE | Severity | Packages |" in table
+        assert "| CVE | Severity | Packages | Installed | Fixed | Images | Platforms | Rationale |" in table
 
     def test_multiple_images_grouped_into_single_row(self) -> None:
         """2 images sharing 1 CVE+severity+rationale -> 1 row with both tags."""
@@ -183,6 +185,29 @@ class TestRenderFindingsTable:
         ]
         table = render_findings_table(classifications)
         assert "Distro severity" not in table
+
+    def test_platforms_column_aggregates_sorted_short_names(self) -> None:
+        """Per-platform findings for one CVE -> one row with sorted short platform names."""
+        classifications = [
+            _make_classification(cve_id="CVE-2024-3000", platform="linux/arm64"),
+            _make_classification(cve_id="CVE-2024-3000", platform="linux/amd64"),
+            _make_classification(cve_id="CVE-2024-3000", platform="linux/arm64"),
+        ]
+        table = render_findings_table(classifications)
+        data_rows = [line for line in table.splitlines() if line.startswith("| CVE-")]
+        assert len(data_rows) == 1
+        assert "| amd64, arm64 |" in data_rows[0]
+        assert "linux/" not in data_rows[0]
+
+    def test_platforms_column_dash_when_platform_empty(self) -> None:
+        """Static-mode findings (empty platform) render '-' in the Platforms column."""
+        classifications = [
+            _make_classification(cve_id="CVE-2024-4000"),
+        ]
+        table = render_findings_table(classifications)
+        data_rows = [line for line in table.splitlines() if line.startswith("| CVE-")]
+        assert len(data_rows) == 1
+        assert "| - |" in data_rows[0]
 
     def test_inline_render_2_cves_5_images_produces_2_rows(self) -> None:
         """Verify: 10 classifications (2 CVEs x 5 images) -> exactly 2 data rows."""

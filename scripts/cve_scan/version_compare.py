@@ -19,8 +19,16 @@ _COMPARE_TIMEOUT = 60
 
 # Canonical public images hosting the comparison tool (dpkg / apk) when no
 # specific base image is given.
-_DEBIAN_COMPARATOR_IMAGE = "public.ecr.aws/docker/library/debian:stable-slim"
-_ALPINE_COMPARATOR_IMAGE = "public.ecr.aws/docker/library/alpine:latest"
+# Pinned by digest for the deterministic safety gate; refresh via
+# `docker buildx imagetools inspect <image:tag>`.
+_DEBIAN_COMPARATOR_IMAGE = (
+    "public.ecr.aws/docker/library/debian:stable-slim"
+    "@sha256:328d16499860ae6cb9b345e2e4cebca08c2a36e4f7278482c7bd1f39d71e5bfd"
+)
+_ALPINE_COMPARATOR_IMAGE = (
+    "public.ecr.aws/docker/library/alpine:3.21"
+    "@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d"
+)
 
 
 def compare_versions(

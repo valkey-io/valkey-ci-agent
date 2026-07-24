@@ -14,13 +14,19 @@ def _strip_repo_prefix(image: str) -> str:
     return image.rsplit(":", 1)[-1] if ":" in image else image
 
 
+def _short_platform(platform: str) -> str:
+    """Return the short platform name ('linux/arm64' -> 'arm64')."""
+    return platform.removeprefix("linux/")
+
+
 def render_findings_table(
     classifications: list[Classification],
 ) -> str:
     """Render a grouped findings table (markdown) for job summaries.
 
-    Rows grouped by (cve_id, severity, rationale); packages, versions, and
-    images aggregated per group. Sorted severity desc, then CVE ID asc.
+    Rows grouped by (cve_id, severity, rationale); packages, versions,
+    images, and platforms aggregated per group. Sorted severity desc, then
+    CVE ID asc.
 
     Args:
         classifications: List of classifications to render.
@@ -36,8 +42,8 @@ def render_findings_table(
     lines: list[str] = [
         "### Findings",
         "",
-        "| CVE | Severity | Packages | Installed | Fixed | Images | Rationale |",
-        "|-----|----------|----------|-----------|-------|--------|-----------|",
+        "| CVE | Severity | Packages | Installed | Fixed | Images | Platforms | Rationale |",
+        "|-----|----------|----------|-----------|-------|--------|-----------|-----------|",
     ]
 
     # Severity descending, then cve_id ascending
@@ -50,9 +56,12 @@ def render_findings_table(
         fixed_versions = sorted({c.finding.fixed_version or "N/A" for c in items})
         fixed = ", ".join(fixed_versions)
         images = ", ".join(sorted({_strip_repo_prefix(c.finding.image) for c in items}))
+        platforms = ", ".join(
+            sorted({_short_platform(c.finding.platform) for c in items if c.finding.platform})
+        ) or "-"
         lines.append(
             f"| {cve_id} | {severity_name} | {packages} | {installed} "
-            f"| {fixed} | {images} | {rationale} |"
+            f"| {fixed} | {images} | {platforms} | {rationale} |"
         )
 
     lines.append("")

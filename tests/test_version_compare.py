@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scripts.cve_scan.version_compare import compare_versions
+from scripts.cve_scan.version_compare import _ALPINE_COMPARATOR_IMAGE, compare_versions
 
 
 def _docker_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -180,7 +180,7 @@ class TestCompareVersionsAlpine:
         # Verify argv structure
         assert cmd == [
             "docker", "run", "--rm",
-            "public.ecr.aws/docker/library/alpine:latest",
+            _ALPINE_COMPARATOR_IMAGE,
             "apk", "version", "-t", "3.0.12-r0", "3.0.13-r0",
         ]
 
