@@ -236,15 +236,17 @@ def test_poll_all_repos_isolates_single_repo_failure(monkeypatch):
         return 1
 
     monkeypatch.setattr(comment_poll, "poll_once", fake_poll_once)
+    # Failing repo first: proves polling CONTINUES to the good repo after the
+    # exception rather than aborting the whole tick.
     dispatched = comment_poll._poll_all_repos(
         MagicMock(),
-        target_repos=("owner/good", "owner/bad"),
+        target_repos=("owner/bad", "owner/good"),
         org="valkey-io", team_slug="contributors",
         bot_login="valkeyrie-ops[bot]", lookback_minutes=30,
         dispatch=MagicMock(),
     )
     assert dispatched == 1
-    assert calls == ["owner/good", "owner/bad"]
+    assert calls == ["owner/bad", "owner/good"]
 
 
 def test_poll_all_repos_raises_when_all_fail(monkeypatch):

@@ -252,9 +252,11 @@ Reuses the same secrets and OIDC role as the other workflows (see
 [Step 1](#step-1-configure-secrets-and-variables)). The workflow mints two
 short-lived App tokens:
 
-- On `valkey-io/valkey`: `members:read` (team authorization), `actions:read`
-  (run logs and failed-job listing), `contents:write` (push the fix),
-  `issues:write` (PR comments), `pull-requests:write` (PR metadata).
+- On `valkey-io/valkey` and `valkey-io/valkey-search`: `members:read` (team
+  authorization), `actions:read` (run logs and failed-job listing),
+  `contents:write` (push the fix), `issues:write` (PR comments),
+  `pull-requests:write` (PR metadata). The comment poller mints the same
+  scopes on both repos so a fix can be driven from either.
 - On `valkey-io/valkey-ci-agent`: `actions:write` (dispatch and read the
   macOS verification workflow). Used only for the macOS backend.
 
