@@ -83,6 +83,7 @@ def download_all_test_failures(
     github_token: str,
     *,
     artifact_client: ArtifactClient | None = None,
+    damaged: list[str] | None = None,
 ) -> bytes | None:
     """Download the 'all-test-failures' artifact from a workflow run.
 
@@ -91,6 +92,10 @@ def download_all_test_failures(
     zip extraction to the shared :class:`ArtifactClient`, which handles the
     auth-stripping redirect, transient-failure retries, expired (404)
     artifacts, and a runaway-extraction cap.
+
+    Pass ``damaged`` to collect the zip members that could not be read. The
+    failures JSON can survive alongside them, so the caller needs this to know
+    the run was only partly analyzed.
     """
     client = artifact_client or ArtifactClient(gh, token=github_token)
 
@@ -111,7 +116,9 @@ def download_all_test_failures(
         return None
 
     logger.info("Downloading artifact: %s (id=%d)", target.name, target.artifact_id)
-    files = client.download_artifact(repo_full_name, target.artifact_id)
+    files = client.download_artifact(
+        repo_full_name, target.artifact_id, damaged=damaged,
+    )
 
     content = files.get(_FAILURES_JSON_NAME)
     if content is None:

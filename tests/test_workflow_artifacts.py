@@ -132,3 +132,73 @@ def test_list_run_artifacts_skips_malformed_entries():
     client = ArtifactClient(mock_gh, token="t")
     arts = client.list_run_artifacts("r", 99)
     assert [a.name for a in arts] == ["good"]
+
+
+def _zip_with_unsupported_member(*, include_good: bool):
+    """A zip whose first member declares compression method 99."""
+    import struct
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("bad.bin", b'{"x":1}' * 100)
+        if include_good:
+            zf.writestr("all-test-failures.json", b'{"real":"data"}')
+    raw = bytearray(buf.getvalue())
+    struct.pack_into("<H", raw, raw.find(b"PK\x03\x04") + 8, 99)
+    struct.pack_into("<H", raw, raw.find(b"PK\x01\x02") + 10, 99)
+    return bytes(raw)
+
+
+def test_extract_zip_survives_unsupported_compression():
+    """zipfile raises NotImplementedError for an unknown method. Left uncaught
+    it aborts the sweep before any issue is filed."""
+    assert _extract_zip(_zip_with_unsupported_member(include_good=False)) == {}
+
+
+def test_extract_zip_keeps_readable_members_alongside_a_bad_one():
+    """One unreadable member must not discard the rest of the bundle."""
+    files = _extract_zip(_zip_with_unsupported_member(include_good=True))
+    assert files == {"all-test-failures.json": b'{"real":"data"}'}
+
+
+def test_extract_zip_survives_corrupt_deflate_stream():
+    """A bit-flip inside the compressed payload raises zlib.error on read."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("corrupt.bin", bytes(range(256)) * 40)
+        zf.writestr("all-test-failures.json", b'{"real":"data"}')
+    raw = bytearray(buf.getvalue())
+    start = raw.find(b"PK\x03\x04")
+    for off in range(start + 60, start + 120):
+        raw[off] ^= 0xA5
+
+    files = _extract_zip(bytes(raw))
+    assert files == {"all-test-failures.json": b'{"real":"data"}'}
+
+
+def test_extract_zip_reports_damaged_members():
+    """Callers that pass a damaged list learn which members were skipped, so
+    they can report that the extraction was incomplete."""
+    damaged: list[str] = []
+    files = _extract_zip(_zip_with_unsupported_member(include_good=True), damaged)
+
+    assert files == {"all-test-failures.json": b'{"real":"data"}'}
+    assert len(damaged) == 1
+    assert damaged[0].startswith("bad.bin: NotImplementedError")
+
+
+def test_extract_zip_reports_unopenable_archive():
+    """A zip that cannot be opened at all is reported as whole-archive damage."""
+    damaged: list[str] = []
+    assert _extract_zip(b"not a zip", damaged) == {}
+    assert len(damaged) == 1
+    assert damaged[0].startswith("whole archive:")
+
+
+def test_extract_zip_leaves_damaged_empty_when_intact():
+    """An intact archive records no damage."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("all-test-failures.json", b"[]")
+    damaged: list[str] = []
+    assert _extract_zip(buf.getvalue(), damaged) == {"all-test-failures.json": b"[]"}
+    assert damaged == []

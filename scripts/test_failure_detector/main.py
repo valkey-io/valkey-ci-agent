@@ -27,6 +27,7 @@ def _build_job_summary(
     repo_full_name: str,
     num_failures: int,
     result: dict[str, int],
+    damaged: list[str] | None = None,
 ) -> str:
     lines = [
         "## Test Failure Detector",
@@ -44,7 +45,29 @@ def _build_job_summary(
         f"| Errors | {result.get('errors', 0)} |",
         "",
     ]
+    if damaged:
+        # The counts above cover only what could be read. Whatever the entries
+        # below describe was never analyzed, so no issue exists for it.
+        lines.extend([
+            "### Incomplete artifact",
+            "",
+            f"{len(damaged)} part(s) of the `all-test-failures` artifact could "
+            "not be read. Any failure recorded in them was not analyzed and is "
+            "missing from the counts above:",
+            "",
+        ])
+        lines.extend(f"- `{_one_line(entry)}`" for entry in damaged)
+        lines.append("")
     return "\n".join(lines)
+
+
+def _one_line(text: str) -> str:
+    """Collapse text to a single line safe inside a markdown code span.
+
+    A damage entry carries a zip member name and an exception message, either of
+    which can hold a newline or a backtick that would break the list item.
+    """
+    return " ".join(text.split()).replace("`", "'")
 
 def run(
     *,
@@ -91,13 +114,23 @@ def run(
 
     # Step 2: Download the all-test-failures artifact
     logger.info("Downloading all-test-failures artifact from run %d...", run_id)
+    # Unreadable members of the artifact zip. The failures JSON can survive
+    # alongside them, in which case the run is analyzed from an artifact known
+    # to be incomplete: every report below has to say so.
+    damaged: list[str] = []
     artifact_content = download_all_test_failures(
-        gh, repo_full_name, run_id, github_token, artifact_client=artifact_client,
+        gh, repo_full_name, run_id, github_token,
+        artifact_client=artifact_client, damaged=damaged,
     )
+    if damaged:
+        logger.error(
+            "%d part(s) of the artifact from run %d could not be read: %s",
+            len(damaged), run_id, "; ".join(damaged),
+        )
     if artifact_content is None:
         logger.info("No test failures artifact found — CI run likely passed cleanly.")
-        emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}))
-        return 0
+        emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}, damaged))
+        return 1 if damaged else 0
 
     try:
         all_failures = json.loads(artifact_content)
@@ -143,8 +176,8 @@ def run(
 
     if not unique_failures:
         logger.info("No test failures to report.")
-        emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}))
-        return 0
+        emit_job_summary(_build_job_summary(run_id, repo_full_name, 0, {}, damaged))
+        return 1 if damaged else 0
 
     logger.info("Found %d unique failure(s)", len(unique_failures))
 
@@ -153,14 +186,18 @@ def run(
         for f in unique_failures:
             envs = ", ".join(j.job for j in f.jobs)
             logger.info("  %s [%s]", f.display_name, envs)
-        emit_job_summary(_build_job_summary(run_id, repo_full_name, len(unique_failures), {}))
-        return 0
+        emit_job_summary(
+            _build_job_summary(run_id, repo_full_name, len(unique_failures), {}, damaged)
+        )
+        return 1 if damaged else 0
 
     # Step 5: Create or update issues
     logger.info("Processing issues on %s...", repo_full_name)
     result = process_failures(gh, repo_full_name, unique_failures, run_id=run_id)
 
-    emit_job_summary(_build_job_summary(run_id, repo_full_name, len(unique_failures), result))
+    emit_job_summary(
+        _build_job_summary(run_id, repo_full_name, len(unique_failures), result, damaged)
+    )
 
     # process_failures isolates per-failure errors so one bad failure can't
     # abort the batch, but those failures got no issue created or updated. Exit
@@ -169,6 +206,14 @@ def run(
         logger.error(
             "%d failure(s) could not be processed; exiting non-zero.",
             result["errors"],
+        )
+        return 1
+    # Issues were filed for everything readable, but the unreadable part of the
+    # artifact was never analyzed, so the run cannot be reported as a full pass.
+    if damaged:
+        logger.error(
+            "Artifact from run %d was incomplete; %d part(s) unreadable.",
+            run_id, len(damaged),
         )
         return 1
     return 0

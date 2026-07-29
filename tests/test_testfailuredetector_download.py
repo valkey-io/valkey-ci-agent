@@ -214,7 +214,9 @@ class TestDownloadAllTestFailures:
         )
         assert result is not None
         assert json.loads(result) == failures_data
-        client.download_artifact.assert_called_once_with("owner/repo", 555)
+        client.download_artifact.assert_called_once_with(
+            "owner/repo", 555, damaged=None,
+        )
 
     def test_returns_none_when_no_artifact(self) -> None:
         """Should return None if no all-test-failures artifact exists."""

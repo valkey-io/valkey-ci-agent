@@ -10,6 +10,7 @@ import io
 import logging
 import time
 import zipfile
+import zlib
 from dataclasses import dataclass
 from itertools import islice
 from typing import TYPE_CHECKING, Any
@@ -84,10 +85,23 @@ class ArtifactClient:
             and isinstance(a.get("name"), str)
         ]
 
-    def download_artifact(self, repo_full_name: str, artifact_id: int) -> dict[str, bytes]:
-        return _extract_zip(self._download(
-            f"/repos/{repo_full_name}/actions/artifacts/{artifact_id}/zip"
-        ))
+    def download_artifact(
+        self,
+        repo_full_name: str,
+        artifact_id: int,
+        damaged: list[str] | None = None,
+    ) -> dict[str, bytes]:
+        """Download and extract an artifact zip to ``{name: bytes}``.
+
+        Pass ``damaged`` to learn which members were unreadable, so a caller
+        that reports on the artifact can say the extraction was incomplete.
+        """
+        return _extract_zip(
+            self._download(
+                f"/repos/{repo_full_name}/actions/artifacts/{artifact_id}/zip"
+            ),
+            damaged,
+        )
 
     def download_run_logs(self, repo_full_name: str, run_id: int) -> dict[str, bytes]:
         """Download a workflow run's console logs as a ``{path: bytes}`` map.
@@ -143,20 +157,68 @@ class ArtifactClient:
 _MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024
 
 
-def _extract_zip(blob: bytes) -> dict[str, bytes]:
+def _extract_zip(blob: bytes, damaged: list[str] | None = None) -> dict[str, bytes]:
+    """Extract a zip to ``{name: bytes}``, skipping unreadable members.
+
+    Pass ``damaged`` to collect a description of every member that could not be
+    read, plus one entry for a zip that could not be opened at all. Callers use
+    it to report that the extraction was incomplete; without it the loss is only
+    logged.
+    """
     if not blob:
         return {}
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as zf:
             members = [m for m in zf.infolist() if not m.is_dir()]
-            total = sum(m.file_size for m in members)
-            if total > _MAX_UNCOMPRESSED_BYTES:
+            # zipfile bounds each read to the member's declared file_size, so
+            # capping the declared total also caps what can be decompressed.
+            declared = sum(m.file_size for m in members)
+            if declared > _MAX_UNCOMPRESSED_BYTES:
                 logger.warning(
-                    "Artifact uncompressed size %d exceeds cap %d; refusing to extract",
-                    total, _MAX_UNCOMPRESSED_BYTES,
+                    "Artifact declares uncompressed size %d over cap %d; "
+                    "refusing to extract", declared, _MAX_UNCOMPRESSED_BYTES,
                 )
+                if damaged is not None:
+                    damaged.append(
+                        f"whole archive: declared uncompressed size {declared} "
+                        f"exceeds the {_MAX_UNCOMPRESSED_BYTES} byte cap"
+                    )
                 return {}
-            return {m.filename: zf.read(m) for m in members}
-    except zipfile.BadZipFile:
+            return _read_members(zf, members, damaged)
+    except (zipfile.BadZipFile, EOFError) as exc:
         logger.warning("Artifact zip is corrupt; returning empty")
+        if damaged is not None:
+            damaged.append(f"whole archive: {type(exc).__name__}: {exc}")
         return {}
+
+
+def _read_members(
+    zf: zipfile.ZipFile,
+    members: list[zipfile.ZipInfo],
+    damaged: list[str] | None = None,
+) -> dict[str, bytes]:
+    """Decompress members, skipping any that are individually unreadable.
+
+    A corrupt or unsupported member raises from its own read, so each is
+    attempted independently: one bad file in an artifact bundle must not
+    discard the others (the failures JSON is usually the one that matters).
+    Skipped members are appended to ``damaged`` when it is supplied.
+    """
+    files: dict[str, bytes] = {}
+    for member in members:
+        try:
+            with zf.open(member) as fh:
+                data = fh.read()
+        except (zipfile.BadZipFile, NotImplementedError, RuntimeError,
+                EOFError, zlib.error, ValueError) as exc:
+            logger.warning(
+                "Skipping unreadable zip member %r: %s: %s",
+                member.filename, type(exc).__name__, exc,
+            )
+            if damaged is not None:
+                damaged.append(
+                    f"{member.filename}: {type(exc).__name__}: {exc}"
+                )
+            continue
+        files[member.filename] = data
+    return files
