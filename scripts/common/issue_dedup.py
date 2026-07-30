@@ -22,8 +22,7 @@ REST list endpoint and matching markers and titles locally, not via the
 Search API. The list endpoint draws on the core rate limit (thousands of
 requests per hour) instead of the Search API's 30-per-minute budget, which
 a batch of failures could exhaust, and it is strongly consistent where
-search results can lag the index or silently omit matches. Listings are
-fetched once per publisher and reused across upserts in the same batch.
+search results can lag the index or silently omit matches.
 
 Callers supply rendered title, body, and comment via a render callback;
 this module owns only the dedup machinery. Listing failures are propagated
@@ -52,6 +51,11 @@ class IssueContent:
     body: str
     comment: str
     labels: tuple[str, ...] = ()
+    # Posted as a comment right after the issue is created. The body holds one
+    # trace by design, so a caller with a second one (a valgrind and a sanitizer
+    # report of one bug) puts it here rather than losing it. Empty for the usual
+    # single-trace case, which posts no comment on creation.
+    creation_comment: str = ""
 
 
 class IssueDedupPublisher:
@@ -84,6 +88,13 @@ class IssueDedupPublisher:
         self._filter_label = filter_label
         self._open_issues: dict[str, list[Any]] = {}
         self._recently_closed: dict[str, list[Any]] = {}
+        # (repo, issue number) -> body as of this publisher's last update to it.
+        self._bodies: dict[tuple[str, int], str] = {}
+        # Closed issues already used to suppress a creation, by (repo, number).
+        # Keyed the same way as _bodies: upsert takes the repo per call, and
+        # issue numbers restart per repo, so a bare number would let one repo's
+        # suppression block the same number in another.
+        self._suppressed_by_title: set[tuple[str, int]] = set()
 
     def upsert(
         self,
@@ -175,6 +186,20 @@ class IssueDedupPublisher:
             # repeated fingerprint or title updates it instead of filing a
             # duplicate. _find_existing above guarantees the cache entry exists.
             self._open_issues[repo_name].append(issue)
+            if content.creation_comment:
+                # Best-effort: the issue exists and records the failure, so a
+                # comment that cannot be posted must not turn a successful
+                # creation into an error.
+                try:
+                    retry_github_call(
+                        lambda: issue.create_comment(body=content.creation_comment),
+                        retries=2, description=f"comment on new issue #{issue.number}",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not post the creation comment on issue #%s",
+                        issue.number, exc_info=True,
+                    )
             logger.info("Created issue #%s for %s", issue.number, fingerprint)
             return "created", issue.html_url
 
@@ -199,7 +224,9 @@ class IssueDedupPublisher:
         count = int(m.group(1)) + 1 if m else 2
         marker_occurrences = f"<!-- {self._ns}:occurrences:{count} -->"
         new_body = (
-            _occurrence_re(self._ns).sub(marker_occurrences, body)
+            # First occurrence only: the body embeds tool output, and a second
+            # marker pasted into it must not be rewritten as a counter.
+            _occurrence_re(self._ns).sub(marker_occurrences, body, count=1)
             if m else f"{body}\n{marker_occurrences}"
         )
         if idempotency_key is not None:
@@ -217,8 +244,28 @@ class IssueDedupPublisher:
             lambda: existing.create_comment(body=content.comment),
             retries=2, description=f"comment on issue #{existing.number}",
         )
+        self._record_body(repo_name, existing.number, new_body)
         logger.info("Updated issue #%s (occurrence %d)", existing.number, count)
         return "updated", existing.html_url
+
+    def _record_body(self, repo_name: str, number: int, body: str) -> None:
+        """Remember an issue's body as of the update this publisher just made.
+
+        ``edit`` updates only the handle it was called on, so the cached listing
+        entry keeps its pre-update body. A later fingerprint whose title matches
+        would then read the issue as unclaimed and adopt it, overwriting the
+        first failure's marker and filing no issue of its own. Kept beside the
+        listing rather than written onto it: ``Issue.body`` is a read-only
+        property.
+        """
+        self._bodies[(repo_name, number)] = body
+
+    def _body_of(self, repo_name: str, issue: Any) -> str:
+        """An issue's body, preferring one this publisher has since written."""
+        recorded = self._bodies.get((repo_name, issue.number))
+        if recorded is not None:
+            return recorded
+        return issue.body or ""
 
     def _open_issues_for(self, repo: Any, repo_name: str) -> list[Any]:
         """Open issues of the repo, fetched once and cached.
@@ -275,19 +322,34 @@ class IssueDedupPublisher:
     def _find_existing(self, repo: Any, repo_name: str, marker: str) -> Any:
         """Find an open issue containing the marker, or None."""
         for issue in self._open_issues_for(repo, repo_name):
-            if marker in (issue.body or ""):
+            if marker in self._body_of(repo_name, issue):
                 return self._reload(repo, issue.number)
         return None
 
     def _find_by_title(self, repo: Any, repo_name: str, title: str) -> Any:
-        """Find an open issue whose title exactly equals ``title``, or None.
+        """Find an open unclaimed issue whose title exactly equals ``title``, or None.
 
-        Migration fallback for when the marker match misses. The comparison
-        is exact and case-sensitive.
+        Migration fallback for when the marker match misses. The comparison is
+        exact and case-sensitive.
+
+        Titles are summarized and truncated, so two different bugs can share
+        one. An issue already stamped with a marker from this namespace belongs
+        to a different fingerprint and must not be adopted: doing so would
+        retarget this fingerprint onto that issue and leave the current failure
+        with no issue of its own.
         """
+        claimed = _fingerprint_marker_re(self._ns)
         for issue in self._open_issues_for(repo, repo_name):
-            if issue.title == title:
-                return self._reload(repo, issue.number)
+            if issue.title != title:
+                continue
+            already_claimed = claimed.search(self._body_of(repo_name, issue))
+            if already_claimed:
+                logger.info(
+                    "Not adopting issue #%s by title: already claimed by fingerprint %s",
+                    issue.number, already_claimed.group(1),
+                )
+                continue
+            return self._reload(repo, issue.number)
         return None
 
     def _find_recently_closed(
@@ -310,15 +372,42 @@ class IssueDedupPublisher:
         # A legacy issue carries an older (or no) marker, so the marker match
         # misses it. Fall back to an exact title match, mirroring the open-issue
         # migration path, so a just-closed legacy issue is not duplicated.
+        #
+        # The claimed check mirrors _find_by_title and matters more here: titles
+        # are summarized and truncated, so two different bugs can share one, and
+        # suppressing creation is silent. An issue already stamped with a marker
+        # from this namespace belongs to a different fingerprint, so matching it
+        # by title would discard this failure instead of filing it.
         if title_fallback is None:
             return None
+        claimed = _fingerprint_marker_re(self._ns)
         for issue in closed_issues:
-            if issue.title == title_fallback:
+            if issue.title != title_fallback:
+                continue
+            already_claimed = claimed.search(issue.body or "")
+            if already_claimed:
                 logger.info(
-                    "Matched recently closed legacy issue #%s via title fallback",
+                    "Not suppressing via closed issue #%s: its title matches but "
+                    "it is claimed by fingerprint %s",
+                    issue.number, already_claimed.group(1),
+                )
+                continue
+            # One closed issue stands in for one fingerprint. A title is shared
+            # by more than one bug, and suppression files nothing, so letting it
+            # match repeatedly would drop every fingerprint after the first.
+            if (repo_name, issue.number) in self._suppressed_by_title:
+                logger.info(
+                    "Not suppressing via closed issue #%s: already matched by "
+                    "another fingerprint in this run",
                     issue.number,
                 )
-                return issue
+                continue
+            self._suppressed_by_title.add((repo_name, issue.number))
+            logger.info(
+                "Matched recently closed legacy issue #%s via title fallback",
+                issue.number,
+            )
+            return issue
         return None
 
     def _reload(self, repo: Any, number: int) -> Any:
@@ -344,6 +433,29 @@ def _drop_pull_requests(issues: list[Any]) -> list[Any]:
 def _occurrence_re(namespace: str) -> re.Pattern[str]:
     """A namespaced occurrence-counter regex: ``<!-- <ns>:occurrences:<n> -->``."""
     return re.compile(rf"<!-- {re.escape(namespace)}:occurrences:(\d+) -->")
+
+
+def _fingerprint_marker_re(namespace: str) -> re.Pattern[str]:
+    """A fingerprint marker regex: ``<!-- <ns>:<hex> -->``.
+
+    Matches only the hex digest written by ``compute_fingerprint``, so it does
+    not collide with the namespace's other markers (``occurrences``,
+    ``last-key``) or with a legacy marker in some older, non-hex format;
+    those must stay adoptable by title.
+
+    The namespace's own prefix up to its last segment is matched rather than the
+    namespace itself, so an issue claimed under a sibling namespace still reads
+    as claimed. One publisher must not adopt another's issue by title: the
+    namespaces are per-failure-type and titles are summarized and shared across
+    types, so a title collision across two of them would retarget this
+    fingerprint onto an unrelated bug's issue and leave this failure unfiled.
+
+    The segment before the digest must not itself contain a colon, which is what
+    keeps ``last-key`` out: a workflow run id is all digits, so it satisfies the
+    digest pattern and would otherwise make every updated issue read as claimed.
+    """
+    prefix = namespace.rsplit(":", 1)[0] if ":" in namespace else namespace
+    return re.compile(rf"<!-- {re.escape(prefix)}:[^\s:>]*:?([0-9a-f]{{8,}}) -->")
 
 
 def _last_key_marker(namespace: str, key: str) -> str:

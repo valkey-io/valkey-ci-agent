@@ -134,6 +134,102 @@ def test_list_run_artifacts_skips_malformed_entries():
     assert [a.name for a in arts] == ["good"]
 
 
+def _artifact_pages(mock_repo):
+    """Record the URLs requested so pagination can be asserted on."""
+    urls = []
+
+    def _fetch(method, url):
+        urls.append(url)
+        return {}, mock_repo.pages.pop(0) if mock_repo.pages else {"artifacts": []}
+
+    mock_repo._requester.requestJsonAndCheck.side_effect = _fetch
+    return urls
+
+
+def test_list_run_artifacts_follows_pagination():
+    """A Daily run uploads one artifact per job, so the target can sit past the
+    first page. Reading only page 1 would report the run as artifact-free."""
+    mock_repo = MagicMock()
+    first = [{"id": i, "name": f"test-failures-job{i}"} for i in range(100)]
+    second = [{"id": 100, "name": "all-test-failures"}]
+    mock_repo.pages = [
+        {"total_count": 101, "artifacts": first},
+        {"total_count": 101, "artifacts": second},
+    ]
+    urls = _artifact_pages(mock_repo)
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    client = ArtifactClient(mock_gh, token="t")
+    arts = client.list_run_artifacts("r", 99)
+
+    assert len(arts) == 101
+    assert any(a.name == "all-test-failures" for a in arts)
+    assert "page=1" in urls[0] and "page=2" in urls[1]
+
+
+def test_list_run_artifacts_ignores_ids_repeated_across_pages():
+    """An upload landing mid-listing shifts later entries onto the next page, so
+    the same artifact can come back twice. Counting it twice would make a single
+    consolidated artifact look like several."""
+    mock_repo = MagicMock()
+    page = [{"id": i, "name": f"test-failures-job{i}"} for i in range(100)]
+    mock_repo.pages = [
+        {"total_count": 150, "artifacts": page},
+        # Page 2 repeats one entry from page 1 alongside a genuinely new one.
+        {"total_count": 150, "artifacts": [page[99], {"id": 100, "name": "all-test-failures"}]},
+    ]
+    _artifact_pages(mock_repo)
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    client = ArtifactClient(mock_gh, token="t")
+    arts = client.list_run_artifacts("r", 99)
+
+    assert len(arts) == 101
+    assert len({a.artifact_id for a in arts}) == 101
+
+
+def test_list_run_artifacts_filters_by_name_server_side():
+    """Passing name lets GitHub do the filtering, so the result can't be pushed
+    off page 1 by hundreds of sibling artifacts."""
+    mock_repo = MagicMock()
+    mock_repo.pages = [{"total_count": 1, "artifacts": [{"id": 5, "name": "all-test-failures"}]}]
+    urls = _artifact_pages(mock_repo)
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    client = ArtifactClient(mock_gh, token="t")
+    arts = client.list_run_artifacts("r", 99, name="all-test-failures")
+
+    assert [a.name for a in arts] == ["all-test-failures"]
+    assert "name=all-test-failures" in urls[0]
+    assert len(urls) == 1
+
+
+def test_list_run_artifacts_stops_at_page_cap(monkeypatch):
+    """A pathological run must not page forever."""
+    from scripts.common import workflow_artifacts as artifacts_mod
+    monkeypatch.setattr(artifacts_mod, "_MAX_ARTIFACT_PAGES", 3)
+    mock_repo = MagicMock()
+    # Always a full page and a total_count that is never reached.
+    full = [{"id": i, "name": f"a{i}"} for i in range(100)]
+
+    def _fetch(method, url):
+        page = int(url.rsplit("page=", 1)[1].split("&")[0])
+        return {}, {"total_count": 10_000, "artifacts": [
+            {"id": page * 1000 + a["id"], "name": a["name"]} for a in full
+        ]}
+
+    mock_repo._requester.requestJsonAndCheck.side_effect = _fetch
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    client = ArtifactClient(mock_gh, token="t")
+    arts = client.list_run_artifacts("r", 99)
+    assert len(arts) == 300
+
+
 def _zip_with_unsupported_member(*, include_good: bool):
     """A zip whose first member declares compression method 99."""
     import struct
@@ -175,6 +271,35 @@ def test_extract_zip_survives_corrupt_deflate_stream():
     assert files == {"all-test-failures.json": b'{"real":"data"}'}
 
 
+def test_extract_zip_skips_member_understating_its_size(monkeypatch):
+    """An archive that understates file_size slips past the declared-total cap.
+    zipfile bounds the read to that understated size, so the payload fails its
+    CRC and the member is skipped rather than extracted at its real size."""
+    from scripts.common import workflow_artifacts as artifacts_mod
+    monkeypatch.setattr(artifacts_mod, "_MAX_UNCOMPRESSED_BYTES", 64)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("big.bin", b"a" * 4096)
+    raw = bytearray(buf.getvalue())
+    # Understate the uncompressed size in both headers so the pre-check passes.
+    import struct
+    struct.pack_into("<I", raw, raw.find(b"PK\x03\x04") + 22, 1)
+    struct.pack_into("<I", raw, raw.find(b"PK\x01\x02") + 24, 1)
+
+    assert _extract_zip(bytes(raw)) == {}
+
+
+def test_extract_zip_refuses_archive_declaring_oversized_total(monkeypatch):
+    """The declared-total cap is what bounds decompression: members are each
+    read whole, so an honest archive over the cap must be refused up front."""
+    from scripts.common import workflow_artifacts as artifacts_mod
+    monkeypatch.setattr(artifacts_mod, "_MAX_UNCOMPRESSED_BYTES", 64)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("a.bin", b"a" * 40)
+        zf.writestr("b.bin", b"b" * 40)  # cumulative 80 > 64
+
+    assert _extract_zip(buf.getvalue()) == {}
 def test_extract_zip_reports_damaged_members():
     """Callers that pass a damaged list learn which members were skipped, so
     they can report that the extraction was incomplete."""
