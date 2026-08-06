@@ -304,6 +304,22 @@ class TestNormalizeErrorIdentity:
         without_summary = stack + "==1== \n==1== extra reachable-block line\n==1== another line"
         assert normalize_error_identity(with_summary) == normalize_error_identity(without_summary)
 
+    def test_startup_reason_line_distinguishes_failures(self) -> None:
+        """Startup blobs share the 'Can't start' header and a bare 'ERROR:'
+        separator; the fatal reason on the last line must split them."""
+        template = (
+            "Can't start src/valkey-server\n"
+            "CONFIGURATION:\n"
+            "dir ./tests/tmp/server.31337.5\n"
+            "port 21111\n"
+            "ERROR:\n"
+            "*** FATAL CONFIG FILE ERROR (Version 255.255.255) ***\n"
+            "{reason}"
+        )
+        e1 = template.format(reason="Unable to bind unix socket: Address already in use")
+        e2 = template.format(reason="argument couldn't be parsed into an integer")
+        assert normalize_error_identity(e1) != normalize_error_identity(e2)
+
     def test_startup_identity_stable_across_reruns(self) -> None:
         """Same startup failure with different temp dirs/ports deduplicates."""
         template = (
@@ -813,3 +829,65 @@ class TestParenthesizedCountScrubbing:
         first = report("41 byte(s)", "1 object(s)", "1 allocation(s)")
         second = report("52 byte(s)", "2 object(s)", "2 allocation(s)")
         assert normalize_error_identity(first) == normalize_error_identity(second)
+
+
+def _startup_blob(reason: str) -> str:
+    """A start_server_error blob: exe, full config dump, then the reason.
+
+    The config dump is long enough to push the ERROR: section past the
+    identity extraction's significant-line window if it were not elided.
+    """
+    config = "\n".join(f"config-directive-{i} value-{i}" for i in range(40))
+    return f"Can't start /path/to/valkey-server\nCONFIGURATION:\n{config}\nERROR:\n{reason}"
+
+
+class TestStartupFailureIdentity:
+    """Startup fingerprints must anchor on the failure reason after ERROR:,
+    not on the config dump shared by every startup blob."""
+
+    def test_different_reasons_different_identity(self) -> None:
+        bad_directive = _startup_blob(
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Bad directive or wrong number of arguments"
+        )
+        bind_failure = _startup_blob("Unable to bind unix socket: Permission denied")
+        assert normalize_error_identity(bad_directive) != normalize_error_identity(bind_failure)
+
+    def test_identity_names_the_reason(self) -> None:
+        blob = _startup_blob("Unable to bind unix socket: Permission denied")
+        assert "Unable to bind unix socket" in normalize_error_identity(blob)
+
+    def test_same_reason_across_runs_same_identity(self) -> None:
+        # Config contents (ports, dirs) drift between runs of the same cause.
+        blob = _startup_blob("Unable to bind unix socket: Permission denied")
+        rerun = blob.replace("value-3", "value-3-changed")
+        assert normalize_error_identity(blob) == normalize_error_identity(rerun)
+
+    def test_blob_without_error_section_falls_back_to_first_line(self) -> None:
+        identity = normalize_error_identity("Can't start /path/to/valkey-server")
+        assert identity == "Can't start valkey-server"
+
+    def test_identity_ignores_the_runners_workspace_layout(self) -> None:
+        """The exe path is the runner's layout, not the bug: the same failure is
+        under /home/runner on Linux, /Users/runner on macOS, and /__w in a
+        container job. Keeping it files one issue per platform."""
+        reason = (
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Bad directive or wrong number of arguments"
+        )
+        identities = {
+            normalize_error_identity(
+                _startup_blob(reason).replace("/path/to/valkey-server", exe)
+            )
+            for exe in (
+                "/home/runner/work/valkey/valkey/src/valkey-server",
+                "/Users/runner/work/valkey/valkey/src/valkey-server",
+                "/__w/valkey/valkey/src/valkey-server",
+            )
+        }
+        assert len(identities) == 1
+
+    def test_identity_still_separates_different_executables(self) -> None:
+        server = _startup_blob("Unable to bind unix socket: Permission denied")
+        sentinel = server.replace("valkey-server", "valkey-sentinel")
+        assert normalize_error_identity(server) != normalize_error_identity(sentinel)

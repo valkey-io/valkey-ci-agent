@@ -28,6 +28,7 @@ from scripts.test_failure_detector.parse_failures import (
     is_plumbing_frame,
     normalize_error_identity,
     scrub_volatile_tokens,
+    startup_reason_from_lines,
 )
 
 MARKER_NAMESPACE = "valkey-ci-agent:test-failure"
@@ -410,6 +411,23 @@ def _leak_site(error: str) -> str:
     return first_source_site
 
 
+# A startup blob: "Can't start <exe>\nCONFIGURATION:\n<config>\nERROR:\n
+# <reason>". The exe path is identical for every startup failure; the reason
+# is what tells two causes apart, so the title must carry it. Progress and
+# banner lines before the reason are skipped, mirroring the identity
+# extraction in normalize_error_identity.
+_STARTUP_REASON_RE = re.compile(r"\nERROR:\n(?P<tail>.+)", re.DOTALL)
+
+
+def _startup_reason(error: str) -> str:
+    """The fatal reason after the startup blob's ERROR: header, or ""."""
+    match = _STARTUP_REASON_RE.search(error)
+    if not match:
+        return ""
+    tail = _scrub_volatile_title_tokens(match.group("tail"))
+    return startup_reason_from_lines([line.strip() for line in tail.split("\n")])
+
+
 # Longest error summary a title carries. GitHub truncates a title past 256
 # characters, which would leave the stored title unequal to the rendered one and
 # break the publisher's exact-match title fallback for good. This leaves room for
@@ -456,6 +474,15 @@ def _error_summary_line(error: str) -> str:
     # field; otherwise a startup blob falls through to generic truncation and
     # the title becomes the runner's absolute exe path cut mid-word.
     error = error.strip()
+
+    if error.startswith("Can't start"):
+        # A reason is not always parseable: on the "server never came up" path
+        # the runner hands over the whole log instead of a fatal-error blob.
+        # Name the failure anyway rather than falling through to a title built
+        # from the log's first line.
+        reason = _startup_reason(error)
+        return _title_text(f"Can't start server: {reason}" if reason
+                           else "Can't start server")
 
     # A macOS leaks report's first line is the Tcl test name with a volatile
     # PID ("Check for memory leaks (pid 9443) in ..."); the totals line is the

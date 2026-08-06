@@ -134,6 +134,66 @@ _ROOT_LEAK_RE = re.compile(
     r"^\s*\d+\s+\([^)]*\)\s+ROOT LEAK:\s*(?P<site>[^\[]+)", re.MULTILINE
 )
 
+# The startup blob's config dump: "Can't start <exe>\nCONFIGURATION:\n<full
+# config file>\nERROR:\n<reason>". The config is dozens of lines shared by
+# every startup failure; left in place it fills the significant-line window
+# before the ERROR: reason is reached, collapsing all startup causes into one
+# identity. The reason after ERROR: is the identity; the dump is not.
+_STARTUP_CONFIG_SECTION_RE = re.compile(
+    r"\nCONFIGURATION:\n.*?\nERROR:\n", re.DOTALL
+)
+
+# The startup blob opens with the server executable's absolute path, which is
+# the runner's workspace layout rather than anything about the bug: the same
+# failure reads "/home/runner/work/..." on a Linux runner, "/Users/runner/..."
+# on macOS, and "/__w/..." in a container job. Left verbatim it splits one
+# startup bug into an issue per platform. Only the path is reduced; the
+# "Can't start" prefix stays, since it is what marks the blob as a startup
+# failure downstream.
+_STARTUP_EXE_PATH_RE = re.compile(r"(Can't start )\S*/([^/\s]+)")
+
+# The startup blob's captured stderr is prefixed with runner and server
+# progress lines that carry no cause: the harness's "### Starting server for
+# test" marker, the "*** FATAL CONFIG FILE ERROR ***" banner (identical for
+# every config error), and the ">>> '<directive>'" echo of the offending line.
+# Skipping these reaches the fatal reason itself ("Bad directive or wrong
+# number of arguments"), which is what tells two startup causes apart.
+_STARTUP_NOISE_PREFIXES = ("***", "###", ">>>")
+
+# The server's config loader prints the fatal reason last, behind a fixed
+# banner and, only when it knows the offending line, a position line and an
+# echo of that line. The banner is identical across causes and the position
+# moves whenever the config file changes, so neither can be the identity; the
+# reason after them is. Nothing before the banner qualifies either: under
+# valgrind the capture opens with the tool's own startup banner.
+_FATAL_CONFIG_BANNER_PREFIX = "*** FATAL CONFIG FILE ERROR"
+_CONFIG_POSITION_PREFIX = "Reading the configuration file, at line"
+
+
+def startup_reason_from_lines(lines: list[str]) -> str:
+    """The fatal reason from a startup blob's stderr lines, or "".
+
+    Expects lines already scrubbed of volatile tokens and stripped of
+    surrounding whitespace.
+    """
+    for index, line in enumerate(lines):
+        if not line.startswith(_FATAL_CONFIG_BANNER_PREFIX):
+            continue
+        for following in lines[index + 1 :]:
+            if not following or following.startswith(
+                (_CONFIG_POSITION_PREFIX, ">>>")
+            ):
+                continue
+            return following
+        return ""
+
+    # No config-file diagnostic: the reason is the first line that is neither
+    # blank nor progress/banner noise (e.g. the harness's own summary message).
+    for line in lines:
+        if line and not line.startswith(_STARTUP_NOISE_PREFIXES):
+            return line
+    return ""
+
 
 # A stack frame after volatile stripping. Valgrind: "at : malloc (...)" or
 # "by : sdsdup (sds.c:190)". Sanitizer: "#1  in ztrymalloc_usable_internal
@@ -334,7 +394,9 @@ def normalize_error_identity(error: str) -> str:
     Two runs that hit the same bug with different PIDs/addresses will produce
     the same normalized identity.
     """
-    text = scrub_volatile_tokens(error)
+    text = _STARTUP_CONFIG_SECTION_RE.sub("\nERROR:\n", error)
+    text = _STARTUP_EXE_PATH_RE.sub(r"\1\2", text)
+    text = scrub_volatile_tokens(text)
 
     lines = [line.strip() for line in text.split("\n") if line.strip()]
 
@@ -345,6 +407,16 @@ def normalize_error_identity(error: str) -> str:
         if any(bp in line for bp in _BOILERPLATE_SUBSTRINGS):
             continue
         if any(kw in line for kw in _SIGNIFICANT_KEYWORDS):
+            if line == "ERROR:" and index + 1 < len(lines):
+                # A bare "ERROR:" header (startup blob's stderr separator)
+                # matches the keyword but names no bug; the fatal reason
+                # follows it, behind progress and banner lines that are
+                # identical across causes. Take the reason, not the blob's
+                # last line: a trailing server-log tail would bind the
+                # identity to volatile text and mint a fresh issue per run.
+                reason = startup_reason_from_lines(lines[index + 1 :])
+                if reason:
+                    line = f"ERROR: {reason}"
             significant.append(line)
             if len(significant) >= 3:
                 break

@@ -787,6 +787,16 @@ class TestTitleFollowsFingerprint:
             "    #1 0x55bb11 in lookupKey /home/runner/src/db.c:412\n",
         ),
         (
+            "startup log reason carries a clock and a runner path",
+            FailureType.STARTUP,
+            "Can't start /home/runner/work/valkey/valkey/src/valkey-server\n"
+            "CONFIGURATION:\nport 21111\nERROR:\n"
+            "943:C 29 Jul 04:15:32.117 * Valkey is starting\n",
+            "Can't start /Users/runner/work/valkey/valkey/src/valkey-server\n"
+            "CONFIGURATION:\nport 22345\nERROR:\n"
+            "987:C 30 Jul 11:02:07.882 * Valkey is starting\n",
+        ),
+        (
             "macos leaks pid drift",
             FailureType.MEMORY_LEAK,
             "Check for memory leaks (pid 9443) in tests/unit/dump.tcl\n"
@@ -839,6 +849,97 @@ class TestTitleFollowsFingerprint:
         assert "\n" not in title_for(f)
 
 
+class TestStartupFailureTitle:
+    """A startup blob's first line names only the executable, which is the
+    same for every startup failure; the title must carry the reason after the
+    ERROR: header so two causes are tellable apart in an issue list."""
+
+    def _failure(self, reason: str) -> UniqueFailure:
+        config = "\n".join(f"directive-{i} value-{i}" for i in range(40))
+        error = (
+            "Can't start /path/to/valkey-server\n"
+            f"CONFIGURATION:\n{config}\nERROR:\n{reason}"
+        )
+        return UniqueFailure(
+            test_name="", test_file="tests/unit/introspection.tcl",
+            failure_type=FailureType.STARTUP, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+
+    def test_title_names_the_reason(self) -> None:
+        title = title_for(self._failure("Unable to bind unix socket: Permission denied"))
+        assert "Unable to bind unix socket" in title
+
+    def test_title_skips_fatal_banner(self) -> None:
+        title = title_for(self._failure(
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Bad directive or wrong number of arguments"
+        ))
+        assert "***" not in title
+        assert "Bad directive" in title
+
+    def test_different_causes_get_different_titles(self) -> None:
+        t1 = title_for(self._failure("Unable to bind unix socket: Permission denied"))
+        t2 = title_for(self._failure("Bad directive or wrong number of arguments"))
+        assert t1 != t2
+
+    def test_blob_without_error_section_falls_back(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="",
+            failure_type=FailureType.STARTUP,
+            error="Can't start /path/to/valkey-server",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        assert "Can't start" in title_for(f)
+
+    def test_title_survives_runner_status_tag_whitespace(self) -> None:
+        """The runner's "[err]: " tag is stripped upstream and leaves a leading
+        space. Without tolerating it the startup branch never fires and the
+        title becomes the executable path truncated mid-word."""
+        f = self._failure("Bad directive or wrong number of arguments")
+        f.error = f" {f.error}"
+        title = title_for(f)
+        assert "Bad directive" in title
+        assert "valkey-serve" not in title
+
+    def test_title_skips_progress_and_position_lines(self) -> None:
+        """The harness's "###" marker and the config loader's position/echo
+        lines precede the reason but name no cause."""
+        title = title_for(self._failure(
+            "### Starting server for test \n\n"
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Reading the configuration file, at line 30\n"
+            ">>> 'invalid-config-key-that-does-not-exist bogus'\n"
+            "Bad directive or wrong number of arguments"
+        ))
+        assert "Bad directive or wrong number of arguments" in title
+        assert "###" not in title
+        assert "at line" not in title
+
+    def test_valgrind_wrapped_startup_matches_plain_startup(self) -> None:
+        """Under valgrind the capture opens with the tool's own banner and
+        interleaves ==PID== markers. It is the same config error, so it must
+        not mint a second issue."""
+        plain = self._failure(
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Reading the configuration file, at line 30\n"
+            "Bad directive or wrong number of arguments"
+        )
+        under_valgrind = self._failure(
+            "### Starting server for test \n"
+            "==6688== Memcheck, a memory error detector\n"
+            "==6688== Using Valgrind-3.22.0 and LibVEX\n\n"
+            "*** FATAL CONFIG FILE ERROR (Version 9.0.0) ***\n"
+            "Reading the configuration file, at line 30\n"
+            "Bad directive or wrong number of arguments\n"
+            "==6688== HEAP SUMMARY:\n"
+        )
+        assert title_for(plain) == title_for(under_valgrind)
+        assert normalize_error_identity(plain.error) == normalize_error_identity(
+            under_valgrind.error
+        )
+
+
 class TestTraceTruncation:
     """GitHub rejects bodies over 65536 chars; oversized traces are capped
     keeping head (names the error) and tail (holds the summary totals)."""
@@ -880,6 +981,40 @@ class TestTraceTruncation:
         renderer.merge_environments(body)
         comment = renderer.render("<!-- m -->", 2).comment
         assert "New error stack trace" not in comment
+
+
+class TestExceptionTitle:
+    """Uncaught test-client exceptions arrive wrapped in the runner's
+    "Executing test client: <message>" prefix. The title must surface the
+    message, not the wrapper."""
+
+    def _failure(self, error: str) -> UniqueFailure:
+        return UniqueFailure(
+            test_name="", test_file="tests/unit/networking.tcl",
+            failure_type=FailureType.EXCEPTION, error=error,
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+
+    def test_strips_executing_test_client_prefix(self) -> None:
+        error = (
+            " Executing test client: Intentional runtime exception for detector testing.\n"
+            " in error at tests/unit/networking.tcl:12\n"
+            " in test at tests/support/test.tcl:262\n"
+        )
+        title = title_for(self._failure(error))
+        assert "Executing test client:" not in title
+        assert "Intentional runtime exception for detector testing." in title
+        assert title.startswith("[TEST-FAILURE] ")
+
+    def test_title_stable_across_volatile_ports_and_pids(self) -> None:
+        """The fingerprint scrubs ports/PIDs, so one recurring exception keeps
+        one issue; the title must scrub them too or the publisher rewrites it
+        with the new port on every recurrence."""
+        template = " Executing test client: couldn't open socket: connection refused, port {port}\n"
+        t1 = title_for(self._failure(template.format(port=21079)))
+        t2 = title_for(self._failure(template.format(port=21987)))
+        assert t1 == t2
+        assert "21079" not in t1
 
 _ASAN_USE_AFTER_FREE = (
     " Sanitizer error: ==1234==ERROR: AddressSanitizer: heap-use-after-free on "
