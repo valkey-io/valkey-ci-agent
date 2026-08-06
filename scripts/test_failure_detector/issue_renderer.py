@@ -25,6 +25,7 @@ from scripts.test_failure_detector.parse_failures import (
     TIMESTAMP_PATTERNS,
     FailureType,
     UniqueFailure,
+    cross_tool_identity,
     is_plumbing_frame,
     normalize_error_identity,
     scrub_volatile_tokens,
@@ -33,6 +34,12 @@ from scripts.test_failure_detector.parse_failures import (
 MARKER_NAMESPACE = "valkey-ci-agent:test-failure"
 
 LABEL_NAME = "test-failure"
+
+# Shared namespace for valgrind and sanitizer failures that carry a determinable
+# cross-tool identity, so one bug both tools caught resolves to one issue
+# instead of one per tool. Failures that do not qualify keep the per-tool
+# namespaces below.
+MEMORY_ERROR_NAMESPACE = "valkey-ci-agent:memory-error"
 
 # Type-specific marker namespaces for fingerprinting and issue search.
 _TYPE_NAMESPACE: dict[FailureType, str] = {
@@ -51,9 +58,32 @@ _TYPE_NAMESPACE: dict[FailureType, str] = {
 # a different type (a valgrind report and a sanitizer report of one bug).
 TITLE_PREFIX = "[TEST-FAILURE]"
 
+# Types eligible for the shared cross-tool identity. macOS /usr/bin/leaks
+# (MEMORY_LEAK) is excluded: it runs on jobs no other leak detector runs on and
+# emits no stack frames, so it has nothing to merge against.
+_CROSS_TOOL_TYPES = frozenset({FailureType.VALGRIND, FailureType.SANITIZER})
+
+
+def _cross_tool_identity(failure: UniqueFailure) -> tuple[str, str] | None:
+    """A valgrind/sanitizer failure's (class, anchor) identity, or None.
+
+    None keeps the failure on its per-tool identity, which costs two issues for
+    one bug; a wrong merge instead hides one bug inside another's issue.
+    """
+    if failure.failure_type not in _CROSS_TOOL_TYPES:
+        return None
+    return cross_tool_identity(failure.error, failure.failure_type)
+
 
 def marker_namespace_for(failure: UniqueFailure) -> str:
-    """Return the marker namespace for a failure's type."""
+    """Return the marker namespace for a failure's type.
+
+    Valgrind and sanitizer failures with a determinable cross-tool identity
+    share one namespace so they can dedup against each other; the rest keep
+    their per-tool namespace.
+    """
+    if _cross_tool_identity(failure) is not None:
+        return MEMORY_ERROR_NAMESPACE
     return _TYPE_NAMESPACE.get(failure.failure_type, MARKER_NAMESPACE)
 
 
@@ -70,15 +100,24 @@ def fingerprint_for(failure: UniqueFailure) -> str:
     """Stable dedup key for a failure.
 
     Keyed on (test_name, test_file) when the failure names a test, on test_file
-    for a nameless timeout (every timeout shares one generic error text), and on
-    the normalized error otherwise.
+    for a nameless timeout (every timeout shares one generic error text), on
+    (class, stack anchor) for a valgrind/sanitizer report with a cross-tool
+    identity, and on the normalized error otherwise.
 
     Identity components go in ``namespace``, never ``shapes``: shapes collapses
     every run of digits, which would merge PSYNC2 with PSYNC3 and a
     use-after-free at cluster_legacy.c:3421 with one at :5109.
 
+    A report whose stack is entirely unsymbolicated has no identity to key on
+    and stays on its per-tool text, which for a macOS leaks blob is shared by
+    every leak in the test file.
     """
     ns = marker_namespace_for(failure)
+
+    cross_tool = _cross_tool_identity(failure)
+    if cross_tool is not None:
+        cls, anchor = cross_tool
+        return compute_fingerprint(namespace=(ns, cls, anchor), shapes=())
 
     if failure.has_test_identity:
         return compute_fingerprint(

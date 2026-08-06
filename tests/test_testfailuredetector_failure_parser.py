@@ -755,6 +755,71 @@ class TestValgrindLeakIdentity:
         assert len(identities) == 1
 
 
+def _asan_uaf(
+    line: int,
+    root: str = "/home/runner/work/valkey/valkey",
+    caller_line: int = 3942,
+) -> str:
+    return (
+        "==1==ERROR: AddressSanitizer: heap-use-after-free\n"
+        f"    #1 0x55 in zslDeleteNode {root}/src/t_zset.c:{line}:9\n"
+        f"    #2 0x55 in call {root}/src/server.c:{caller_line}:5\n"
+    )
+
+
+class TestSourceLocationInStackAnchor:
+    """The stack anchor carries the source location of the frame that names the
+    bug, so two bugs in one function stay distinct, while the caller lines and
+    the runner's workspace layout stay out of the identity so one bug does not
+    become a fresh issue per commit or per platform.
+    """
+
+    def test_caller_line_drift_does_not_split_one_bug(self) -> None:
+        """Frames below the bug are its callers. Their lines move whenever
+        unrelated code in them is edited, which is most commits, so carrying
+        them would refile one leak against every such commit.
+        """
+        first = normalize_error_identity(_asan_uaf(1200, caller_line=3933))
+        second = normalize_error_identity(_asan_uaf(1200, caller_line=3942))
+        assert first == second
+
+    def test_bug_frame_keeps_its_line_and_callers_do_not(self) -> None:
+        identity = normalize_error_identity(_asan_uaf(1200, caller_line=3942))
+        assert "t_zset.c:1200" in identity
+        assert "server.c)" in identity
+        assert "3942" not in identity
+
+    def test_same_function_different_line_stays_distinct(self) -> None:
+        first = normalize_error_identity(_asan_uaf(1200))
+        second = normalize_error_identity(_asan_uaf(3455))
+        assert first != second
+        assert "t_zset.c:1200" in first
+        assert "t_zset.c:3455" in second
+
+    def test_runner_workspace_layout_does_not_split_one_bug(self) -> None:
+        identities = {
+            normalize_error_identity(_asan_uaf(1200, root))
+            for root in (
+                "/home/runner/work/valkey/valkey",
+                "/__w/valkey/valkey",
+                "/Users/runner/work/valkey/valkey",
+            )
+        }
+        assert len(identities) == 1
+
+    def test_four_digit_line_survives_the_bare_number_scrub(self) -> None:
+        """A line number is not noise. The bare-number pattern drops runs of
+        four or more digits, which would erase exactly the line numbers that
+        tell two bugs in one function apart.
+        """
+        assert "t_zset.c:3455" in scrub_volatile_tokens(_asan_uaf(3455))
+
+    def test_pids_are_still_scrubbed(self) -> None:
+        """The line-number carve-out must not spare a genuine PID."""
+        scrubbed = scrub_volatile_tokens("server started with pid 12345 ok")
+        assert "12345" not in scrubbed
+
+
 class TestAccessWidthScrubbing:
     """One out-of-bounds access is reported at whatever width the compiler
     chose for that load, so the width drifts between builds of one bug while
@@ -813,3 +878,123 @@ class TestParenthesizedCountScrubbing:
         first = report("41 byte(s)", "1 object(s)", "1 allocation(s)")
         second = report("52 byte(s)", "2 object(s)", "2 allocation(s)")
         assert normalize_error_identity(first) == normalize_error_identity(second)
+
+
+def _asan_leak(frames: str) -> str:
+    return (
+        " Sanitizer error: \n"
+        "=================================================================\n"
+        "==6349==ERROR: LeakSanitizer: detected memory leaks\n\n"
+        "Direct leak of 41 byte(s) in 1 object(s) allocated from:\n"
+        f"{frames}"
+        "SUMMARY: AddressSanitizer: 41 byte(s) leaked in 1 allocation(s).\n"
+    )
+
+
+class TestSanitizerLeakIdentityAcrossToolchains:
+    """The same leak reported by different compilers differs only in which
+    allocation-plumbing frames were inlined away. Keeping those frames in the
+    identity files one issue per compiler for a single bug."""
+
+    # clang inlines sdsnewlen/sdsdup into their caller and reports the malloc
+    # interceptor as a binary offset.
+    _CLANG = _asan_leak(
+        "    #0 0x55f in malloc (/home/runner/work/valkey/valkey/src/valkey-server+0x20de33)\n"
+        "    #1 0x571 in ztrymalloc_usable_internal /home/runner/work/valkey/valkey/src/zmalloc.c:172:17\n"
+        "    #2 0x571 in zmalloc_usable /home/runner/work/valkey/valkey/src/zmalloc.c:268:17\n"
+        "    #3 0x464 in _sdsnewlen /home/runner/work/valkey/valkey/src/sds.c:102:22\n"
+        "    #4 0x2a4 in debugCommand /home/runner/work/valkey/valkey/src/debug.c:569:9\n"
+        "    #5 0x4b2 in call /home/runner/work/valkey/valkey/src/server.c:3942:5\n"
+    )
+
+    # gcc keeps sdsnewlen/sdsdup as frames and resolves malloc into the
+    # sanitizer's own sources.
+    _GCC = _asan_leak(
+        "    #0 0x7f1 in malloc ../../../../src/libsanitizer/asan/asan_malloc_linux.cpp:69\n"
+        "    #1 0x55d in ztrymalloc_usable_internal /home/runner/work/valkey/valkey/src/zmalloc.c:172\n"
+        "    #2 0x55d in zmalloc_usable /home/runner/work/valkey/valkey/src/zmalloc.c:268\n"
+        "    #3 0x55d in _sdsnewlen /home/runner/work/valkey/valkey/src/sds.c:102\n"
+        "    #4 0x55d in sdsnewlen /home/runner/work/valkey/valkey/src/sds.c:169\n"
+        "    #5 0x55d in sdsdup /home/runner/work/valkey/valkey/src/sds.c:190\n"
+        "    #6 0x55d in debugCommand /home/runner/work/valkey/valkey/src/debug.c:569\n"
+        "    #7 0x552 in call /home/runner/work/valkey/valkey/src/server.c:3942\n"
+    )
+
+    def test_same_leak_across_compilers_same_identity(self) -> None:
+        assert normalize_error_identity(self._CLANG) == normalize_error_identity(self._GCC)
+
+    def test_identity_keeps_the_leaking_code_path(self) -> None:
+        identity = normalize_error_identity(self._CLANG)
+        assert "debugCommand" in identity
+        assert "zmalloc" not in identity
+        assert "sds" not in identity
+        assert "malloc" not in identity
+
+    def test_different_leak_sites_still_distinct(self) -> None:
+        other = self._GCC.replace(
+            "debugCommand /home/runner/work/valkey/valkey/src/debug.c:569",
+            "clusterCommand /home/runner/work/valkey/valkey/src/cluster.c:120",
+        )
+        assert normalize_error_identity(self._GCC) != normalize_error_identity(other)
+
+
+def _leaks_blob(pid: int, root_site: str) -> str:
+    """A macOS /usr/bin/leaks failure as the test proc reports it."""
+    return (
+        f"Check for memory leaks (pid {pid}) in tests/unit/other.tcl\n"
+        f"Expected '*0 leaks*' to equal or match 'Process {pid}: 1 leak for 48 total leaked bytes.\n"
+        f"leaks Report Version: 4.0\n"
+        f"Process {pid}: 1 leak for 48 total leaked bytes.\n"
+        f"    1 (48 bytes) ROOT LEAK: <{root_site} 0x600001d1c100> [48]'"
+    )
+
+
+class TestMacosLeaksIdentity:
+    """macOS leaks blobs carry no stack frames; the ROOT LEAK site lines are
+    the only allocation-site signal and must anchor the identity."""
+
+    def test_same_root_across_runs_same_identity(self) -> None:
+        assert normalize_error_identity(
+            _leaks_blob(9443, "malloc in sdsnewlen")
+        ) == normalize_error_identity(_leaks_blob(7121, "malloc in sdsnewlen"))
+
+    def test_different_roots_same_file_different_identity(self) -> None:
+        assert normalize_error_identity(
+            _leaks_blob(9443, "malloc in sdsnewlen")
+        ) != normalize_error_identity(_leaks_blob(9443, "malloc in clusterInit"))
+
+    def test_identity_names_the_root_site(self) -> None:
+        identity = normalize_error_identity(_leaks_blob(9443, "malloc in sdsnewlen"))
+        assert "malloc in sdsnewlen" in identity
+
+    def test_two_leaks_in_one_file_stay_separate_through_parse(self) -> None:
+        """The runner names the leak check after the server it checked, not the
+        leak, so every leak in a test file arrives under one name. The producer
+        emits these nameless for that reason; parsing has to keep them apart on
+        their root sites, or the second leak is dropped into the first's issue
+        and only the first trace survives.
+        """
+        all_failures = {
+            "test-macos-latest": {
+                "valkey": [
+                    {
+                        "test_name": "",
+                        "test_file": "tests/unit/other.tcl",
+                        "type": "memory-leak",
+                        "error": _leaks_blob(9443, "malloc in sdsnewlen"),
+                    },
+                    {
+                        "test_name": "",
+                        "test_file": "tests/unit/other.tcl",
+                        "type": "memory-leak",
+                        "error": _leaks_blob(7121, "malloc in clusterInit"),
+                    },
+                ]
+            }
+        }
+        results = parse_and_deduplicate(all_failures, {})
+        assert len(results) == 2
+        sites = sorted(
+            "clusterInit" if "clusterInit" in r.error else "sdsnewlen" for r in results
+        )
+        assert sites == ["clusterInit", "sdsnewlen"]

@@ -209,6 +209,251 @@ def is_plumbing_frame(func: str, source_path: str) -> bool:
     )
 
 
+# Cross-tool error classes. Valgrind and the sanitizers report the same bug in
+# different vocabularies, so an identity that spans both needs a class each can
+# be mapped onto. The classes are coarse on purpose: they only have to be equal
+# for one bug seen by both tools, and unequal for different bugs at one site.
+_CLASS_LEAK = "leak"
+_CLASS_USE_AFTER_FREE = "use-after-free"
+_CLASS_BUFFER_OVERFLOW = "buffer-overflow"
+_CLASS_UNINITIALIZED = "uninitialized"
+_CLASS_INVALID_FREE = "invalid-free"
+_CLASS_RUNTIME_ERROR = "runtime-error"
+# A null or wild pointer: the address was never a heap block. Distinct from a
+# use after free, and from an overflow of a real block.
+_CLASS_WILD_POINTER = "wild-pointer"
+
+# Sanitizer diagnostics name their class outright, so a substring is enough.
+# Ordered: the longer, more specific names come first so "use-after-poison" is
+# not shadowed by a bare overflow match.
+_SANITIZER_CLASS_TOKENS: tuple[tuple[str, str], ...] = (
+    ("heap-use-after-free", _CLASS_USE_AFTER_FREE),
+    ("use-after-poison", _CLASS_USE_AFTER_FREE),
+    ("heap-buffer-overflow", _CLASS_BUFFER_OVERFLOW),
+    ("stack-buffer-overflow", _CLASS_BUFFER_OVERFLOW),
+    ("stack-buffer-underflow", _CLASS_BUFFER_OVERFLOW),
+    ("dynamic-stack-buffer-overflow", _CLASS_BUFFER_OVERFLOW),
+    ("global-buffer-overflow", _CLASS_BUFFER_OVERFLOW),
+    ("alloc-dealloc-mismatch", _CLASS_INVALID_FREE),
+    ("attempting double-free", _CLASS_INVALID_FREE),
+    ("bad-free", _CLASS_INVALID_FREE),
+    ("use-of-uninitialized-value", _CLASS_UNINITIALIZED),
+    ("LeakSanitizer", _CLASS_LEAK),
+    ("detected memory leaks", _CLASS_LEAK),
+    ("runtime error", _CLASS_RUNTIME_ERROR),
+)
+
+# Valgrind diagnostics that name their class outright. "Invalid read/write" is
+# absent: it is shared by use-after-free and overflow and needs the follow-up
+# address description to tell them apart (see _valgrind_access_class).
+_VALGRIND_CLASS_TOKENS: tuple[tuple[str, str], ...] = (
+    ("definitely lost", _CLASS_LEAK),
+    ("indirectly lost", _CLASS_LEAK),
+    ("possibly lost", _CLASS_LEAK),
+    ("Mismatched free", _CLASS_INVALID_FREE),
+    ("Invalid free", _CLASS_INVALID_FREE),
+    ("uninitialised value", _CLASS_UNINITIALIZED),
+    ("uninitialized value", _CLASS_UNINITIALIZED),
+    ("Conditional jump", _CLASS_UNINITIALIZED),
+)
+
+_VALGRIND_ACCESS_RE = re.compile(r"\bInvalid (?:read|write)\b")
+
+# Valgrind's address descriptions. The unallocated form has to be tested first:
+# it contains the word "free'd" while meaning the address was never a heap
+# block, so matching on that word alone files a null dereference as a use after
+# free and merges it into an unrelated bug's issue.
+_VALGRIND_UNALLOCATED_RE = re.compile(
+    r"is not stack'd, malloc'd or \(recently\) free'd"
+)
+_VALGRIND_FREED_RE = re.compile(r"\bfree'd\b")
+
+# Valgrind's address description follows the offending access and its stack,
+# and is the only thing distinguishing a use-after-free ("... free'd") from an
+# overflow ("... after a block of size N alloc'd"). It appears within a few
+# lines of the access, so the lookahead is bounded rather than scanning the
+# whole report and picking up an unrelated later error.
+_VALGRIND_ADDRESS_LOOKAHEAD = 15
+
+
+def _valgrind_access_class(lines: list[str], start: int) -> str | None:
+    """Class of a valgrind "Invalid read/write" from its address description.
+
+    Returns None when no description is found in the lookahead window, which
+    keeps the failure on its per-tool identity rather than guessing a class.
+    """
+    for line in lines[start + 1 : start + 1 + _VALGRIND_ADDRESS_LOOKAHEAD]:
+        # "not stack'd, malloc'd or (recently) free'd" contains "free'd" but
+        # means the opposite: the address was never a heap block at all, which
+        # is a null or wild pointer rather than a use after free.
+        if _VALGRIND_UNALLOCATED_RE.search(line):
+            return _CLASS_WILD_POINTER
+        if _VALGRIND_FREED_RE.search(line):
+            return _CLASS_USE_AFTER_FREE
+        if "after a block" in line or "before a block" in line:
+            return _CLASS_BUFFER_OVERFLOW
+    return None
+
+
+def _classified_diagnostics(
+    error: str, failure_type: FailureType,
+) -> list[tuple[str, int]]:
+    """Every classifiable diagnostic in *error*, as ``(class, line index)``.
+
+    The index is where the diagnostic was found, so a caller can take the stack
+    that belongs to it rather than whichever stack comes first in the buffer.
+    """
+    if failure_type == FailureType.VALGRIND:
+        tokens = _VALGRIND_CLASS_TOKENS
+    elif failure_type == FailureType.SANITIZER:
+        tokens = _SANITIZER_CLASS_TOKENS
+    else:
+        return []
+
+    found: list[tuple[str, int]] = []
+    lines = [line.strip() for line in scrub_volatile_tokens(error).split("\n")]
+    for index, line in enumerate(lines):
+        if not line or any(bp in line for bp in _BOILERPLATE_SUBSTRINGS):
+            continue
+        matched = next((cls for token, cls in tokens if token in line), None)
+        if matched is None and failure_type == FailureType.VALGRIND:
+            if _VALGRIND_ACCESS_RE.search(line):
+                matched = _valgrind_access_class(lines, index)
+        if matched is not None:
+            found.append((matched, index))
+    return found
+
+
+def _classified_diagnostic(
+    error: str, failure_type: FailureType,
+) -> tuple[str, int] | None:
+    """The first classifiable diagnostic, or None when there is none."""
+    found = _classified_diagnostics(error, failure_type)
+    return found[0] if found else None
+
+
+def error_class(error: str, failure_type: FailureType) -> str | None:
+    """Cross-tool class of *error*, or None when it cannot be determined.
+
+    Only valgrind and sanitizer errors are classified; every other type keeps
+    its own identity and never participates in a cross-tool merge.
+
+    None is returned rather than a catch-all class whenever the vocabulary is
+    unrecognized, so an unclassifiable report stays separate instead of
+    merging on a guess.
+    """
+    classified = _classified_diagnostic(error, failure_type)
+    return None if classified is None else classified[0]
+
+
+def stack_anchor(error: str) -> str:
+    """Frame chain of *error*'s first stack block, or "" when it has none.
+
+    The same anchor both tools reduce to (see :func:`_extract_stack_anchor`),
+    exposed so the renderer can key a cross-tool identity on it.
+    """
+    text = scrub_volatile_tokens(error)
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    return _extract_stack_anchor(lines)
+
+
+# Frames nearest the bug used to match one bug across tools.
+#
+# Two, and the width is a genuine tradeoff rather than a setting that satisfies
+# everything. Valgrind and the sanitizers stop at different depths on one stack,
+# so a wider chain can disagree between them and leave one bug with an issue per
+# tool. One frame is narrower than a bug: two distinct allocations reached
+# through a shared constructor collapse into one issue, which loses a report
+# outright. Two prefers the recoverable failure: a duplicate issue a maintainer
+# can close, over a bug that is never filed.
+_CROSS_TOOL_ANCHOR_FRAMES = 2
+
+
+def cross_tool_identity(
+    error: str, failure_type: FailureType,
+) -> tuple[str, str] | None:
+    """A valgrind/sanitizer report's ``(class, anchor)`` identity, or None.
+
+    Both halves are read from the same diagnostic, and a report whose
+    diagnostics disagree on the class is refused. A tool hands over its whole
+    stderr buffer, so a report can describe several errors, and there is then no
+    single bug for one identity to name: two distinct use-after-frees whose
+    buffers both opened with a shared uninitialised-value warning reduced to the
+    same identity, which collapsed them into one issue and discarded a report
+    entirely. Such a report keeps its per-tool identity instead.
+
+    Agreeing diagnostics are not refused. A leak report names its leak once per
+    loss record and again in the summary breakdown, so a single bug routinely
+    classifies several times; requiring exactly one match rejected every real
+    valgrind leak.
+
+    Returns None when no diagnostic classifies, when they disagree, or when the
+    first one has no stack.
+
+    Refusing a mixed buffer only keeps it out of the cross-tool pool. The
+    per-tool identity it falls back to anchors on the first stack block too, so
+    two such reports whose leading error is the same still group together; that
+    is the pre-existing granularity of normalize_error_identity, not something
+    the merge introduces.
+    """
+    diagnostics = _classified_diagnostics(error, failure_type)
+    if not diagnostics:
+        return None
+    if len({cls for cls, _ in diagnostics}) > 1:
+        return None
+    cls, index = diagnostics[0]
+
+    lines = [line.strip() for line in scrub_volatile_tokens(error).split("\n")]
+    # Take the stack that follows the classified diagnostic. Valgrind prints the
+    # frames under the diagnostic line; the sanitizers print a line or two of
+    # detail first, which _extract_stack_anchor skips over.
+    anchor = _extract_stack_anchor([line for line in lines[index:] if line])
+    if not anchor:
+        return None
+    frames = _leading_frames(anchor)
+    # A stripped build names no function, so every such report reduces to the
+    # same "??? > ???" chain and unrelated bugs would share one identity.
+    if not _names_any_symbol(frames):
+        return None
+    return cls, frames
+
+
+# A frame valgrind could not symbolicate. The chain is built from these when the
+# build carries no symbols, and they identify nothing.
+_UNSYMBOLICATED_FRAME = "???"
+
+
+def _names_any_symbol(anchor: str) -> bool:
+    """Whether *anchor* names at least one real function."""
+    _, _, chain = anchor.partition(": ")
+    return any(
+        frame.split(" (")[0] != _UNSYMBOLICATED_FRAME
+        for frame in chain.split(" > ")
+    )
+
+
+def _leading_frames(anchor: str) -> str:
+    """The leading :data:`_CROSS_TOOL_ANCHOR_FRAMES` frames of *anchor*."""
+    prefix, _, chain = anchor.partition(": ")
+    frames = chain.split(" > ")[:_CROSS_TOOL_ANCHOR_FRAMES]
+    return f"{prefix}: " + " > ".join(frames)
+
+
+def cross_tool_anchor(error: str) -> str:
+    """The leading :data:`_CROSS_TOOL_ANCHOR_FRAMES` frames of *error*'s stack.
+
+    Returns "" when the error has no stack frames. Shorter chains are returned
+    whole rather than rejected: a stack that ends before the cap is the entire
+    call path the tool reported, so it is the strongest identity available.
+    """
+    anchor = stack_anchor(error)
+    if not anchor:
+        return ""
+    prefix, _, chain = anchor.partition(": ")
+    frames = chain.split(" > ")[:_CROSS_TOOL_ANCHOR_FRAMES]
+    return f"{prefix}: " + " > ".join(frames)
+
+
 def _extract_root_leak_anchor(lines: list[str]) -> str:
     """Allocation-site chain of a macOS leaks report, or "".
 
