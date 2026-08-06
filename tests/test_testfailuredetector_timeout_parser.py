@@ -370,6 +370,48 @@ class TestRunLogs:
         client.download_run_logs.assert_called_once()
 
 
+class TestSharedRunLogsAcrossConsumers:
+    def test_recover_and_enrich_share_one_download(self) -> None:
+        """recover_timeouts and enrich_log_only_errors read the same RunLogs, so
+        the run's log zip is downloaded once, not once per consumer."""
+        log = (
+            b"[TIMEOUT]: clients state report follows.\n"
+            b"*** [TIMEOUT]: SlowTest in tests/unit/slow.tcl\n"
+        )
+        client = MagicMock()
+        client.download_run_logs.return_value = {"1_test-ubuntu.txt": log}
+        job_info = JobInfo(
+            urls={"test-ubuntu": "https://x/job/1"},
+            step_urls={},
+            failed={"test-ubuntu"},
+        )
+        run_logs = RunLogs(client, "owner/repo", 123)
+
+        # A failed job with no captured timeout entry, so a scan is needed.
+        all_failures = {"test-ubuntu": {"valkey": []}}
+        recovered = recover_timeouts(all_failures, job_info, run_logs)
+
+        # A recovered timeout carries its clients-state report, which excludes it
+        # from enrichment. Without a candidate that still holds the bare
+        # placeholder, enrichment returns before consulting the logs at all and
+        # this test would prove nothing about the second consumer.
+        gtest = UniqueFailure(
+            test_name="ListpackTest.Insert",
+            test_file="src/unit/valkey-unit-gtests",
+            failure_type=FailureType.UNITTEST,
+            error="gtest FAIL",
+            jobs=[JobReference(job="test-ubuntu", suite="unittest", url="https://x/job/1")],
+        )
+        consulted: list[int] = []
+        original_get = run_logs.get
+        run_logs.get = lambda: (consulted.append(1), original_get())[1]
+
+        enrich_log_only_errors([*recovered, gtest], job_info, run_logs)
+
+        assert recovered  # the [TIMEOUT] line was recovered
+        assert consulted, "enrichment never consulted the shared RunLogs"
+        client.download_run_logs.assert_called_once()
+
 class TestRecoverAndEnrichTimeouts:
     """recover_timeouts and enrich_log_only_errors over the run's shared logs."""
 
@@ -422,6 +464,59 @@ class TestRecoverAndEnrichTimeouts:
 
         assert "IN PROGRESS) SlowTest" in failure.error
         assert failure.error.startswith("Test timed out")
+
+    def test_an_extracted_gtest_log_is_not_replaced(self) -> None:
+        """The extraction action attaches the test's own log when it finds one.
+        The run log interleaves every worker's output, so enriching over it
+        would trade a full assertion for the progress lines around it.
+        """
+        extracted = (
+            "[6/9] DictTest.Resize (2 ms)\n"
+            "src/unit/test_dict.cpp:88: Failure\n"
+            "Expected equality of these values:\n"
+            "[6/9] DictTest.Resize returned with exit code 1 (2 ms)"
+        )
+        client = MagicMock()
+        client.download_run_logs.return_value = {
+            "1_test-ubuntu.txt": (
+                b"[6/9] DictTest.Resize (2 ms)\n"
+                b"[6/9] DictTest.Resize returned with exit code 1 (2 ms)\n"
+            )
+        }
+        failure = UniqueFailure(
+            test_name="DictTest.Resize",
+            test_file="src/unit/valkey-unit-gtests",
+            failure_type=FailureType.UNITTEST,
+            error=extracted,
+            jobs=[JobReference(job="test-ubuntu", suite="unittest", url="u")],
+        )
+
+        enrich_log_only_errors([failure], self._job_info(), RunLogs(client, "owner/repo", 1))
+
+        assert failure.error == extracted
+
+    def test_a_gtest_verdict_placeholder_gains_its_output(self) -> None:
+        """With no per-test log the action falls back to a bare verdict, which
+        is the case the run log has to fill in."""
+        client = MagicMock()
+        client.download_run_logs.return_value = {
+            "1_test-ubuntu.txt": (
+                b"[6/9] DictTest.Resize (2 ms)\n"
+                b"src/unit/test_dict.cpp:88: Failure\n"
+                b"[6/9] DictTest.Resize returned with exit code 1 (2 ms)\n"
+            )
+        }
+        failure = UniqueFailure(
+            test_name="DictTest.Resize",
+            test_file="src/unit/valkey-unit-gtests",
+            failure_type=FailureType.UNITTEST,
+            error="gtest FAIL",
+            jobs=[JobReference(job="test-ubuntu", suite="unittest", url="u")],
+        )
+
+        enrich_log_only_errors([failure], self._job_info(), RunLogs(client, "owner/repo", 1))
+
+        assert "test_dict.cpp:88" in failure.error
 
     def test_the_run_log_zip_is_downloaded_once(self) -> None:
         """Both consumers read one RunLogs, so a run costs one download."""

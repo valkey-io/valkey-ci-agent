@@ -5,9 +5,9 @@ leaving a timed-out job with no timeout entry in the artifact. This module
 identifies failed jobs without a captured timeout, downloads their console logs,
 and extracts [TIMEOUT] failures that would otherwise be invisible.
 
-It also attaches the runner's clients-state report to timeouts, whose artifact
-entries carry only a verdict, for the same reason: the diagnostic exists only
-in the log.
+It also fills in failures whose artifact entry carries only a verdict, for the
+same reason: a timeout's clients-state report and a gtest failure's assertion
+output both exist only in the log.
 
 Orchestration is separated from parsing: :mod:`timeout_parser` and
 :mod:`gtest_log_parser` handle the regex extraction; this module decides which
@@ -22,6 +22,9 @@ from typing import Any
 
 from scripts.common.workflow_artifacts import ArtifactClient
 from scripts.test_failure_detector.download import JobInfo
+from scripts.test_failure_detector.gtest_log_parser import (
+    parse_gtest_failures_from_log,
+)
 from scripts.test_failure_detector.parse_failures import FailureType, UniqueFailure
 from scripts.test_failure_detector.timeout_parser import (
     clients_state_report_from_log,
@@ -127,9 +130,11 @@ def enrich_log_only_errors(
 ) -> None:
     """Attach console output to failures the artifact records without detail.
 
+    Two types arrive with a placeholder instead of a diagnostic. A gtest failure
+    carries only a verdict, because gtest-parallel's JSON dump holds no output.
     A timeout carries only "Test timed out", because the runner has nothing to
-    report beyond the watchdog firing. The detail exists in the job log, so it
-    is read back and attached in place.
+    report beyond the watchdog firing. In both cases the detail exists in the
+    job log, so it is read back and attached in place.
 
     Best-effort, and mutates *failures* in place. A log that is expired,
     unavailable, or missing the failure's block leaves the placeholder as it
@@ -138,18 +143,29 @@ def enrich_log_only_errors(
     Shares its ``run_logs`` with timeout recovery, so the run's log zip is
     downloaded at most once per run.
     """
+    # The extraction action attaches gtest-parallel's per-test log when it finds
+    # one and falls back to a bare verdict when it does not. Only the fallback is
+    # enriched: the action's own text comes from the test's dedicated log file,
+    # while the run log interleaves every worker's output, so overwriting it
+    # replaced a full assertion with the two progress lines around it.
+    gtest_failures = [
+        f for f in failures
+        if f.failure_type == FailureType.UNITTEST
+        and f.test_name
+        and "\n" not in f.error.strip()
+    ]
     # A timeout recovered from a log already carries its report; only the
     # artifact-derived ones still hold the bare placeholder.
     timeout_failures = [
         f for f in failures
         if f.failure_type == FailureType.TIMEOUT and "\n" not in f.error.strip()
     ]
-    if not timeout_failures:
+    if not gtest_failures and not timeout_failures:
         return
 
     jobs_to_scan = {
         job_ref.job
-        for f in timeout_failures
+        for f in (*gtest_failures, *timeout_failures)
         for job_ref in f.jobs
     } & set(job_info.failed)
     if not jobs_to_scan:
@@ -162,16 +178,25 @@ def enrich_log_only_errors(
 
     # One failure can appear on several jobs. Scan in a stable order so the
     # attached output does not depend on set iteration order.
+    gtest_outputs: dict[str, str] = {}
     timeout_reports: dict[str, str] = {}
     for job_name in sorted(jobs_to_scan):
         log_content = find_job_log(logs, job_name)
         if log_content is None:
             continue
+        for test_name, body in parse_gtest_failures_from_log(log_content).items():
+            gtest_outputs.setdefault(test_name, body)
         report = clients_state_report_from_log(log_content)
         if report:
             timeout_reports.setdefault(job_name, report)
 
     enriched = 0
+    for failure in gtest_failures:
+        recovered_output = gtest_outputs.get(failure.test_name)
+        if recovered_output:
+            failure.error = recovered_output
+            enriched += 1
+
     for failure in timeout_failures:
         for job_ref in failure.jobs:
             job_report = timeout_reports.get(job_ref.job)
