@@ -673,7 +673,6 @@ class TestVolatileTestNameDemotion:
         }
 
 
-
 # Real-shaped Memcheck leak report (issue #91): runner wrapper prefix, tool
 # banner, heap summary, then the loss record with its allocation stack.
 _MEMCHECK_LEAK = """ Valgrind error: ==6554== Memcheck, a memory error detector

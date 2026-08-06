@@ -411,6 +411,7 @@ def _coerce_str(value: Any) -> str:
 def parse_and_deduplicate(
     all_failures: dict[str, Any],
     job_urls: dict[str, str],
+    step_urls: dict[str, dict[str, str]] | None = None,
 ) -> list[UniqueFailure]:
     """Parse the all-test-failures JSON and deduplicate.
 
@@ -418,6 +419,9 @@ def parse_and_deduplicate(
         all_failures: The parsed all-test-failures.json content.
             Structure: {job_name: {suite_name: [{test_name, test_file, type?, error}]}}
         job_urls: Mapping of job name -> HTML URL for CI links.
+        step_urls: Optional job name -> suite -> step-anchored URL. When a
+            suite has an entry, its failures link to that step instead of the
+            plain job URL, which lands on the job's first failed step.
 
     Returns:
         List of UniqueFailure objects, deduplicated across jobs.
@@ -518,11 +522,14 @@ def parse_and_deduplicate(
 
                 failure = grouped[key]
                 if not any(j.job == job_name for j in failure.jobs):
+                    step_url = ""
+                    if step_urls is not None:
+                        step_url = step_urls.get(job_name, {}).get(suite_name, "")
                     failure.jobs.append(
                         JobReference(
                             job=job_name,
                             suite=suite_name,
-                            url=job_urls.get(job_name, ""),
+                            url=step_url or job_urls.get(job_name, ""),
                         )
                     )
                     logger.debug("%s in %s/%s", failure.display_name, job_name, suite_name)

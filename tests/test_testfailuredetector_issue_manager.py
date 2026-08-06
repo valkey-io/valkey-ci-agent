@@ -737,6 +737,43 @@ class TestTypeSpecificRendering:
         assert "valkey-ci-agent:valgrind-error:occurrences:3" in body
 
 
+class TestVolatileTimeoutFingerprint:
+    """Nameless timeouts (volatile PID demoted) must have a stable fingerprint
+    keyed by file, not by the generic error text."""
+
+    def test_nameless_timeout_fingerprint_stable_across_pids(self) -> None:
+        f1 = UniqueFailure(
+            test_name="", test_file="tests/integration/replication.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+        )
+        f2 = UniqueFailure(
+            test_name="", test_file="tests/integration/replication.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+        )
+        assert fingerprint_for(f1) == fingerprint_for(f2)
+
+    def test_nameless_timeouts_in_different_files_differ(self) -> None:
+        f1 = UniqueFailure(
+            test_name="", test_file="tests/integration/replication.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+        )
+        f2 = UniqueFailure(
+            test_name="", test_file="tests/unit/cluster.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+        )
+        assert fingerprint_for(f1) != fingerprint_for(f2)
+
+    def test_nameless_timeout_title_uses_file_not_pid(self) -> None:
+        f = UniqueFailure(
+            test_name="", test_file="tests/integration/replication.tcl",
+            failure_type=FailureType.TIMEOUT, error="Test timed out",
+            jobs=[JobReference(job="j", suite="s", url="u")],
+        )
+        title = title_for(f)
+        assert "pid" not in title.lower()
+        assert "replication.tcl" in title
+
+
 class TestTitleFollowsFingerprint:
     """The publisher re-titles on every update, so two reports of one bug (equal
     fingerprints) must render one title. A token that is volatile in the title
