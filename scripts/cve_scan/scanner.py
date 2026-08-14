@@ -14,7 +14,7 @@ from typing import Any
 
 from scripts.cve_scan.config import DEFAULT_PLATFORMS
 from scripts.cve_scan.models import Finding, Severity
-from scripts.parsers.cve_findings_parser import filter_by_threshold, parse_findings
+from scripts.parsers.cve_findings_parser import ParseError, filter_by_threshold, parse_findings
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +73,18 @@ def _run_scanner(command: list[str], timeout: int = _SCAN_TIMEOUT_SECONDS) -> di
         raise ScanError(f"Scanner produced empty output: {' '.join(command)}")
 
     try:
-        return json.loads(result.stdout)  # type: ignore[no-any-return]
+        parsed = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise ScanError(
             f"Scanner output is not valid JSON: {' '.join(command)}: {exc}"
         ) from exc
+
+    if not isinstance(parsed, dict):
+        raise ScanError(
+            f"Scanner output is not a JSON object: {' '.join(command)}: "
+            f"got {type(parsed).__name__}"
+        )
+    return parsed
 
 
 def scan_image(image: str, scanner: str, platform: str | None = None) -> list[Finding]:
@@ -92,12 +99,18 @@ def scan_image(image: str, scanner: str, platform: str | None = None) -> list[Fi
         List of Finding objects from the scan.
 
     Raises:
-        ScanError: If the scanner fails or produces invalid output.
+        ScanError: If the scanner fails, produces invalid output, or its
+            JSON does not match the expected schema.
         ValueError: If the scanner name is not recognized.
     """
     command = _build_command(scanner, image, platform=platform)
     json_obj = _run_scanner(command)
-    return parse_findings(scanner, json_obj, image, platform=platform or "")
+    try:
+        return parse_findings(scanner, json_obj, image, platform=platform or "")
+    except ParseError as exc:
+        raise ScanError(
+            f"Scanner output failed schema validation for {image}: {exc}"
+        ) from exc
 
 
 def _dedup_findings(findings: list[Finding]) -> list[Finding]:

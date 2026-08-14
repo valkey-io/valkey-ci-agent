@@ -1,10 +1,11 @@
 """Tests for scripts/cve_scan/base_precheck.py.
 
 Covers confirm/downgrade paths, fail-closed behavior, per-(base, platform)
-caching, docker failure handling, and real-format apk/dpkg parsing. The
-docker-based native comparator is patched with a deterministic local stub
-(autouse fixture) to avoid real Docker calls; the real comparator is tested
-in test_version_compare.py.
+caching, docker failure handling, real-format apk/dpkg parsing, and the
+repo-candidate check for packages absent from the base db. The docker-based
+native comparator is patched with a deterministic local stub (autouse
+fixture) to avoid real Docker calls; the real comparator is tested in
+test_version_compare.py.
 """
 
 from __future__ import annotations
@@ -17,8 +18,11 @@ import pytest
 from scripts.cve_scan.base_precheck import (
     BasePrecheckError,
     _parse_apk_installed,
+    _parse_apk_policy,
+    _parse_apt_cache_policy,
     _parse_dpkg_query,
     get_base_packages,
+    get_repo_candidates,
     verify_fixable_in_base,
 )
 from scripts.cve_scan.models import Classification, Finding, Severity
@@ -224,27 +228,292 @@ class TestBaseHasFix:
         assert "Verified: base alpine:3.23 ships 3.0.13-r0" in confirmed[0].rationale
 
 
-class TestPackageAbsentFromBase:
-    """Package not in base image db -> confirmed (installed at build time)."""
+# Canned `apk policy openssl` output (candidate at the fix version)
+SAMPLE_APK_POLICY = """\
+openssl policy:
+  3.0.13-r0:
+    https://dl-cdn.alpinelinux.org/alpine/v3.23/main
+"""
 
-    def test_confirmed_when_package_absent(self) -> None:
-        finding = _make_finding(package="libfoo")
+# Canned `apk policy openssl` output (candidate older than the fix)
+SAMPLE_APK_POLICY_OLD = """\
+openssl policy:
+  3.0.12-r0:
+    https://dl-cdn.alpinelinux.org/alpine/v3.23/main
+"""
+
+# Canned `apk policy` output listing multiple versions
+SAMPLE_APK_POLICY_MULTI = """\
+openssl policy:
+  3.0.12-r0:
+    https://dl-cdn.alpinelinux.org/alpine/v3.22/main
+  3.0.14-r0:
+    https://dl-cdn.alpinelinux.org/alpine/v3.23/main
+"""
+
+# Canned `apt-cache policy` output with a real candidate
+SAMPLE_APT_POLICY = """\
+openssl:
+  Installed: (none)
+  Candidate: 3.0.13
+  Version table:
+     3.0.13 500
+        500 http://deb.debian.org/debian trixie/main amd64 Packages
+"""
+
+# Canned `apt-cache policy` output with no candidate
+SAMPLE_APT_POLICY_NONE = """\
+openssl:
+  Installed: (none)
+  Candidate: (none)
+  Version table:
+"""
+
+
+class TestPackageAbsentFromBase:
+    """Package not in base db -> verified against the distro repo candidate (fail-closed)."""
+
+    BASE_MAP = {"valkey/valkey:9.1-alpine": "alpine:3.23"}
+    # openssl deliberately absent from the base package db
+    BASE_PACKAGES = {"musl": "1.2.5-r0"}
+
+    def test_confirmed_when_repo_candidate_at_fix(self) -> None:
+        """Absent package + repo candidate >= fixed -> confirmed, rationale names the candidate."""
+        finding = _make_finding()  # openssl, fixed 3.0.13-r0
         classification = _make_classification(finding)
-        base_map = {"valkey/valkey:9.1-alpine": "alpine:3.23"}
 
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages"
-        ) as mock_get:
-            mock_get.return_value = {"openssl": "3.0.13-r0", "musl": "1.2.5-r0"}
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.subprocess.run"
+        ) as mock_run:
+            mock_get.return_value = self.BASE_PACKAGES
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=SAMPLE_APK_POLICY, stderr="",
+            )
             confirmed, downgraded = verify_fixable_in_base(
-                [classification], base_map
+                [classification], self.BASE_MAP
             )
 
         assert len(confirmed) == 1
         assert len(downgraded) == 0
         assert confirmed[0].fixable is True
         assert "not in base image" in confirmed[0].rationale
-        assert "installed at build time" in confirmed[0].rationale
+        assert "repo candidate 3.0.13-r0" in confirmed[0].rationale
+
+    def test_confirmed_when_any_listed_candidate_at_fix(self) -> None:
+        """Multiple listed versions: confirmed when any candidate >= fixed."""
+        finding = _make_finding()  # fixed 3.0.13-r0; policy lists 3.0.12 and 3.0.14
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages"
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.subprocess.run"
+        ) as mock_run:
+            mock_get.return_value = self.BASE_PACKAGES
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=SAMPLE_APK_POLICY_MULTI, stderr="",
+            )
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        assert len(confirmed) == 1
+        assert len(downgraded) == 0
+        assert "repo candidate 3.0.14-r0" in confirmed[0].rationale
+
+    def test_downgraded_when_repo_candidate_older(self) -> None:
+        """Absent package + repo candidate older than fix -> downgraded fail-closed."""
+        finding = _make_finding()  # fixed 3.0.13-r0; policy has 3.0.12-r0
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages"
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.subprocess.run"
+        ) as mock_run:
+            mock_get.return_value = self.BASE_PACKAGES
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=SAMPLE_APK_POLICY_OLD, stderr="",
+            )
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert downgraded[0].fixable is False
+        assert "repo candidate unverified/older" in downgraded[0].rationale
+        assert "CVE-2024-1234" in downgraded[0].rationale
+
+    def test_downgraded_when_apt_candidate_none(self) -> None:
+        """Debian base: 'Candidate: (none)' -> downgraded fail-closed."""
+        finding = _make_finding(image="valkey/valkey:8.0", fixed="3.0.13")
+        classification = _make_classification(finding)
+        base_map = {"valkey/valkey:8.0": "debian:trixie-slim"}
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages"
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.subprocess.run"
+        ) as mock_run:
+            mock_get.return_value = {"bash": "5.2.21-2"}
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=SAMPLE_APT_POLICY_NONE, stderr="",
+            )
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], base_map
+            )
+
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert "repo candidate unverified/older" in downgraded[0].rationale
+
+    def test_downgraded_on_network_failure(self) -> None:
+        """Nonzero docker exit (e.g. no network for index update) -> downgraded fail-closed."""
+        finding = _make_finding()
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages"
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.subprocess.run"
+        ) as mock_run:
+            mock_get.return_value = self.BASE_PACKAGES
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="network unreachable",
+            )
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert "repo candidate unverified/older" in downgraded[0].rationale
+
+    def test_downgraded_on_timeout(self) -> None:
+        """Repo query timeout -> downgraded fail-closed."""
+        finding = _make_finding()
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages"
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.subprocess.run"
+        ) as mock_run:
+            mock_get.return_value = self.BASE_PACKAGES
+            mock_run.side_effect = subprocess.TimeoutExpired(
+                cmd=["docker", "run"], timeout=180
+            )
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert "repo candidate unverified/older" in downgraded[0].rationale
+
+    def test_repo_candidate_cached_per_base_platform_package(self) -> None:
+        """Two findings for the same (base, platform, package) -> one repo query."""
+        finding1 = _make_finding(cve_id="CVE-2024-1111")
+        finding2 = _make_finding(cve_id="CVE-2024-2222")
+        classifications = [
+            _make_classification(finding1),
+            _make_classification(finding2),
+        ]
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages"
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.subprocess.run"
+        ) as mock_run:
+            mock_get.return_value = self.BASE_PACKAGES
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=SAMPLE_APK_POLICY, stderr="",
+            )
+            confirmed, downgraded = verify_fixable_in_base(
+                classifications, self.BASE_MAP
+            )
+
+        assert mock_run.call_count == 1
+        assert len(confirmed) == 2
+        assert len(downgraded) == 0
+
+
+class TestGetRepoCandidates:
+    """Command construction (argv-safe) and failure handling for the repo query."""
+
+    def test_package_passed_as_positional_arg_not_interpolated(self) -> None:
+        """Package name goes through "$1", never into the sh -c script."""
+        hostile = 'openssl"; rm -rf /'
+
+        with patch("scripts.cve_scan.base_precheck.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr="",
+            )
+            get_repo_candidates("alpine:3.23", hostile, platform="linux/arm64")
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[:2] == ["docker", "run"]
+        assert "--platform" in cmd and "linux/arm64" in cmd
+        script = cmd[cmd.index("-c") + 1]
+        assert '"$1"' in script
+        assert hostile not in script
+        # Positional args: sh -c <script> _ <pkg>
+        assert cmd[-2] == "_"
+        assert cmd[-1] == hostile
+
+    def test_debian_uses_apt_cache_policy(self) -> None:
+        with patch("scripts.cve_scan.base_precheck.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=SAMPLE_APT_POLICY, stderr="",
+            )
+            candidates = get_repo_candidates("debian:trixie-slim", "openssl")
+
+        script = mock_run.call_args[0][0][mock_run.call_args[0][0].index("-c") + 1]
+        assert "apt-get update" in script
+        assert "apt-cache policy" in script
+        assert candidates == ["3.0.13"]
+
+    def test_unknown_flavor_returns_empty(self) -> None:
+        with patch("scripts.cve_scan.base_precheck.subprocess.run") as mock_run:
+            assert get_repo_candidates("ubuntu:22.04", "openssl") == []
+        mock_run.assert_not_called()
+
+    def test_oserror_returns_empty(self) -> None:
+        with patch("scripts.cve_scan.base_precheck.subprocess.run") as mock_run:
+            mock_run.side_effect = OSError("docker not found")
+            assert get_repo_candidates("alpine:3.23", "openssl") == []
+
+
+class TestApkPolicyParsing:
+    """Parse real-format `apk policy` output."""
+
+    def test_single_version(self) -> None:
+        assert _parse_apk_policy(SAMPLE_APK_POLICY) == ["3.0.13-r0"]
+
+    def test_multiple_versions(self) -> None:
+        assert _parse_apk_policy(SAMPLE_APK_POLICY_MULTI) == ["3.0.12-r0", "3.0.14-r0"]
+
+    def test_garbage_returns_empty(self) -> None:
+        assert _parse_apk_policy("no such package\n") == []
+
+    def test_empty_returns_empty(self) -> None:
+        assert _parse_apk_policy("") == []
+
+
+class TestAptCachePolicyParsing:
+    """Parse real-format `apt-cache policy` output."""
+
+    def test_candidate_extracted(self) -> None:
+        assert _parse_apt_cache_policy(SAMPLE_APT_POLICY) == ["3.0.13"]
+
+    def test_none_candidate_returns_empty(self) -> None:
+        assert _parse_apt_cache_policy(SAMPLE_APT_POLICY_NONE) == []
+
+    def test_missing_candidate_line_returns_empty(self) -> None:
+        assert _parse_apt_cache_policy("openssl:\n  Installed: (none)\n") == []
 
 
 class TestAmbiguousComparison:

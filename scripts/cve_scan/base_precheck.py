@@ -3,9 +3,11 @@
 Verifies a rebuild-fixable CVE is actually patched in the upstream base image
 (advisory FixedVersion may precede a republished base tag). Reads each base's
 package database via one-shot ``docker run`` and compares with native dpkg/apk
-semantics (version_compare), not the pure-Python approximation. Any comparison
-error or ambiguity downgrades conservatively (fail-closed). Deterministic, no
-AI, stdlib only.
+semantics (version_compare), not the pure-Python approximation. Packages
+absent from the raw base db (installed at build time, e.g. Dockerfile
+``apk add``) are verified against the distro repository candidate queried
+inside the base container. Any comparison error or ambiguity downgrades
+conservatively (fail-closed). Deterministic, no AI, stdlib only.
 """
 
 from __future__ import annotations
@@ -131,6 +133,169 @@ def get_base_packages(base_ref: str, platform: str = "") -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Distro repository candidate lookup (for packages absent from the base db)
+# ---------------------------------------------------------------------------
+
+#: Timeout for a repo candidate query (includes network index refresh).
+_REPO_QUERY_TIMEOUT = 180  # seconds
+
+
+def _flavor_for(base_ref: str) -> str:
+    """Map a base image reference to a version-comparison flavor."""
+    if base_ref.startswith("alpine:"):
+        return "alpine"
+    if base_ref.startswith("debian:"):
+        return "debian"
+    return "debian"  # unknown flavor: conservative default
+
+
+def _parse_apk_policy(raw: str) -> list[str]:
+    """Extract candidate versions from ``apk policy <pkg>`` output.
+
+    Format: an unindented ``<pkg> policy:`` header, then two-space-indented
+    ``<version>:`` lines, each followed by deeper-indented source lines.
+    Returns every listed version; [] when none parse (fail-closed).
+    """
+    versions: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("  ") and not line.startswith("    "):
+            stripped = line.strip()
+            if stripped.endswith(":"):
+                versions.append(stripped[:-1])
+    return versions
+
+
+def _parse_apt_cache_policy(raw: str) -> list[str]:
+    """Extract the Candidate version from ``apt-cache policy <pkg>`` output.
+
+    Returns [] when the ``Candidate:`` line is missing, empty, or
+    ``(none)`` (fail-closed).
+    """
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Candidate:"):
+            candidate = stripped[len("Candidate:"):].strip()
+            if not candidate or candidate == "(none)":
+                return []
+            return [candidate]
+    return []
+
+
+def get_repo_candidates(base_ref: str, package: str, platform: str = "") -> list[str]:
+    """Query the distro repository candidate versions for a package inside the base container.
+
+    Refreshes the package index (network access required) and asks the
+    package manager which version(s) the repository currently supplies.
+    The package name is passed as a positional shell argument (``"$1"``),
+    never interpolated into the ``sh -c`` script, so it cannot inject.
+
+    Args:
+        base_ref: Base image reference (e.g. "alpine:3.23", "debian:trixie-slim").
+        package: Package name to query.
+        platform: Optional platform passed as ``--platform`` to docker run.
+
+    Returns:
+        Candidate version strings, or [] on any failure (unknown flavor,
+        docker/network failure, timeout, nonzero exit, unparseable output).
+        Callers must treat [] as fail-closed.
+    """
+    if base_ref.startswith("alpine:"):
+        script = 'apk update -q >/dev/null 2>&1 && apk policy "$1"'
+        parse = _parse_apk_policy
+    elif base_ref.startswith("debian:"):
+        script = 'apt-get update -qq >/dev/null 2>&1 && apt-cache policy "$1"'
+        parse = _parse_apt_cache_policy
+    else:
+        logger.warning(
+            "Repo candidate query: unknown base flavor %r; treating candidate as unavailable.",
+            base_ref,
+        )
+        return []
+
+    cmd = ["docker", "run"]
+    if platform:
+        cmd.extend(["--platform", platform])
+    cmd.extend(["--rm", base_ref, "sh", "-c", script, "_", package])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_REPO_QUERY_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Repo candidate query timed out for %s in %s (timeout=%ds).",
+            package, base_ref, _REPO_QUERY_TIMEOUT,
+        )
+        return []
+    except OSError as exc:
+        logger.warning(
+            "Repo candidate query failed to execute for %s in %s: %s",
+            package, base_ref, exc,
+        )
+        return []
+
+    if result.returncode != 0:
+        logger.warning(
+            "Repo candidate query exited %d for %s in %s: %s",
+            result.returncode, package, base_ref, result.stderr.strip(),
+        )
+        return []
+
+    return parse(result.stdout)
+
+
+def _classify_absent_package(
+    classification: Classification,
+    base_ref: str,
+    flavor: str,
+    candidates: list[str],
+) -> Classification:
+    """Classify a finding whose package is absent from the raw base image db.
+
+    Such packages are installed at build time (e.g. Dockerfile ``apk add``),
+    so absence alone proves nothing about whether a rebuild would pick up the
+    fix. Confirm only when the distro repo currently supplies a candidate at
+    or above the fix version; any other outcome (older candidate, no
+    candidate, query or comparison failure) downgrades fail-closed.
+    """
+    finding = classification.finding
+
+    verified_candidate: str | None = None
+    if finding.fixed_version is not None:
+        # The package manager installs the highest available candidate, so
+        # "any candidate >= fix" is equivalent to "max(candidates) >= fix"
+        # without extra docker calls to order the candidates themselves.
+        for candidate in candidates:
+            cmp = _native_compare(candidate, finding.fixed_version, flavor, base_ref)
+            if cmp is not None and cmp >= 0:
+                verified_candidate = candidate
+                break
+
+    if verified_candidate is not None:
+        rationale = (
+            f"{classification.rationale} "
+            f"Verified: package {finding.package} not in base image "
+            f"{base_ref} (installed at build time); repo candidate "
+            f"{verified_candidate} >= fix {finding.fixed_version}, so a "
+            f"rebuild will pick up the fix."
+        )
+        return Classification(finding=finding, fixable=True, rationale=rationale)
+
+    rationale = (
+        f"Fix for {finding.cve_id} in {finding.package}: package not in "
+        f"base image {base_ref} and repo candidate unverified/older "
+        f"(candidates: {', '.join(candidates) if candidates else 'none'}; "
+        f"fix: {finding.fixed_version}). Downgrading conservatively "
+        f"(fail-closed). Re-check next scan."
+    )
+    return Classification(finding=finding, fixable=False, rationale=rationale)
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -143,7 +308,10 @@ def verify_fixable_in_base(
 
     Reads each distinct (base image, platform) package list once (cached per
     invocation). Findings where the base is still vulnerable or comparison is
-    ambiguous are downgraded (fail-closed).
+    ambiguous are downgraded (fail-closed). Packages absent from the base db
+    (installed at build time) are confirmed only when the distro repository
+    candidate, queried inside the base container, is at or above the fix
+    version; otherwise they are downgraded (fail-closed).
 
     Args:
         fixable: Classifications previously marked as rebuild-fixable.
@@ -160,6 +328,8 @@ def verify_fixable_in_base(
 
     # Cache: (base_ref, platform) -> {package: version}
     base_pkg_cache: dict[tuple[str, str], dict[str, str]] = {}
+    # Cache: (base_ref, platform, package) -> repo candidate versions
+    repo_candidate_cache: dict[tuple[str, str, str], list[str]] = {}
 
     confirmed: list[Classification] = []
     downgraded: list[Classification] = []
@@ -196,21 +366,29 @@ def verify_fixable_in_base(
 
         base_packages = base_pkg_cache[cache_key]
 
+        flavor = _flavor_for(base_ref)
         base_version = base_packages.get(finding.package)
 
         if base_version is None:
-            # Package not in base image (installed at build time)
-            rationale = (
-                f"{classification.rationale} "
-                f"Verified: package {finding.package} not in base image "
-                f"{base_ref} (installed at build time from the package "
-                f"repository); rebuild will fetch the latest version."
+            # Package absent from the raw base db (installed at build time).
+            # Absence alone proves nothing about whether the repo currently
+            # supplies the fix: query the repo candidate (cached, fail-closed).
+            cand_key = (base_ref, finding.platform, finding.package)
+            if cand_key not in repo_candidate_cache:
+                logger.info(
+                    "Package %s absent from base %s; querying repo candidate (platform=%s) ...",
+                    finding.package, base_ref, finding.platform or "native",
+                )
+                repo_candidate_cache[cand_key] = get_repo_candidates(
+                    base_ref, finding.package, platform=finding.platform,
+                )
+            result = _classify_absent_package(
+                classification, base_ref, flavor, repo_candidate_cache[cand_key],
             )
-            confirmed.append(Classification(
-                finding=finding,
-                fixable=True,
-                rationale=rationale,
-            ))
+            if result.fixable:
+                confirmed.append(result)
+            else:
+                downgraded.append(result)
             continue
 
         # Native dpkg/apk comparison; None -> fail-closed (downgrade)
@@ -218,13 +396,6 @@ def verify_fixable_in_base(
             # Should not happen for fixable findings, but be safe
             confirmed.append(classification)
             continue
-
-        if base_ref.startswith("alpine:"):
-            flavor = "alpine"
-        elif base_ref.startswith("debian:"):
-            flavor = "debian"
-        else:
-            flavor = "debian"  # unknown flavor: conservative default
 
         cmp = _native_compare(base_version, finding.fixed_version, flavor, base_ref)
 

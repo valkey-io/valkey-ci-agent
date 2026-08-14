@@ -457,7 +457,9 @@ class TestIntegrationBasePrecheck:
 
 
 class TestStaticModeDispatchDisabled:
-    """Static mode always emits fixable=false regardless of findings."""
+    """Static mode reclassifies candidates as not-fixable and never dispatches."""
+
+    STATIC_RATIONALE = "static image override: base verification unavailable, not auto-fixable"
 
     def test_static_mode_fixable_finding_emits_false(
         self,
@@ -493,6 +495,89 @@ class TestStaticModeDispatchDisabled:
         output = github_output_file.read_text()
         lines = output.strip().splitlines()
         assert "fixable=false" in lines
+
+    def test_static_mode_candidates_reported_as_unresolved(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Static mode: candidates land under unresolved findings with the override rationale; no dispatch section."""
+        github_output = tmp_path / "github_output"
+        github_output.write_text("")
+        summary_file = tmp_path / "step_summary"
+        summary_file.write_text("")
+        monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+        monkeypatch.setenv("CVE_SCAN_IMAGES", "valkey/valkey:8.0-alpine")
+
+        fixable_findings = [
+            Finding(
+                image="valkey/valkey:8.0-alpine",
+                package="openssl",
+                installed_version="3.0.12-r0",
+                cve_id="CVE-2024-1234",
+                severity=Severity.HIGH,
+                fixed_version="3.0.13-r0",
+            ),
+        ]
+        monkeypatch.setattr(
+            "scripts.cve_scan.sweep.scan_images",
+            lambda images, scanner, threshold, **_kw: fixable_findings,
+        )
+
+        settings = load_settings()
+        run_sweep(
+            repo_full_name="valkey-io/valkey-container",
+            settings=settings,
+            dry_run=False,
+        )
+
+        summary = summary_file.read_text()
+        assert "Unresolved findings" in summary
+        assert "CVE-2024-1234" in summary
+        assert self.STATIC_RATIONALE in summary
+        # No dispatch section of any kind in static mode
+        assert "dispatched" not in summary
+        assert "### Confirmed fixable" not in summary
+        assert github_output.read_text().strip().splitlines().count("fixable=false") == 1
+
+    def test_static_mode_dry_run_has_no_dispatch_output(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        github_output_file: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Static mode dry-run: candidates print as NOT-FIXABLE, never as would-dispatch."""
+        monkeypatch.setenv("GITHUB_OUTPUT", str(github_output_file))
+        monkeypatch.setenv("CVE_SCAN_IMAGES", "valkey/valkey:8.0-alpine")
+
+        fixable_findings = [
+            Finding(
+                image="valkey/valkey:8.0-alpine",
+                package="openssl",
+                installed_version="3.0.12-r0",
+                cve_id="CVE-2024-1234",
+                severity=Severity.HIGH,
+                fixed_version="3.0.13-r0",
+            ),
+        ]
+        monkeypatch.setattr(
+            "scripts.cve_scan.sweep.scan_images",
+            lambda images, scanner, threshold, **_kw: fixable_findings,
+        )
+
+        settings = load_settings()
+        run_sweep(
+            repo_full_name="valkey-io/valkey-container",
+            settings=settings,
+            dry_run=True,
+        )
+
+        captured = capsys.readouterr()
+        assert "NOT-FIXABLE" in captured.out
+        assert self.STATIC_RATIONALE in captured.out
+        assert "DISPATCH BEHAVIOR" not in captured.out
+        assert "Would dispatch" not in captured.out
 
 
 class TestSweepOutputNoEnvVar:

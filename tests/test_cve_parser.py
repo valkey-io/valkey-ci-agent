@@ -1,15 +1,20 @@
 """Tests for scripts/parsers/cve_findings_parser.py (Req 1.4/1.5).
 
-Covers parse_trivy, parse_findings dispatcher, and
-filter_by_threshold. All use small inline JSON fixtures.
+Covers parse_trivy (including strict schema validation via ParseError),
+parse_findings dispatcher, filter_by_threshold, and the scan_image
+ParseError-to-ScanError wrapping. All use small inline JSON fixtures.
 """
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from scripts.cve_scan.models import Finding, Severity
+from scripts.cve_scan.scanner import ScanError, scan_image
 from scripts.parsers.cve_findings_parser import (
+    ParseError,
     filter_by_threshold,
     parse_findings,
     parse_trivy,
@@ -21,6 +26,7 @@ IMAGE = "valkey/valkey:7.2"
 class TestParseTrivy:
     def test_basic_finding(self) -> None:
         trivy_json = {
+            "SchemaVersion": 2,
             "Results": [
                 {
                     "Vulnerabilities": [
@@ -47,6 +53,7 @@ class TestParseTrivy:
 
     def test_missing_fixed_version_becomes_none(self) -> None:
         trivy_json = {
+            "SchemaVersion": 2,
             "Results": [
                 {
                     "Vulnerabilities": [
@@ -65,6 +72,7 @@ class TestParseTrivy:
 
     def test_empty_fixed_version_becomes_none(self) -> None:
         trivy_json = {
+            "SchemaVersion": 2,
             "Results": [
                 {
                     "Vulnerabilities": [
@@ -84,6 +92,7 @@ class TestParseTrivy:
 
     def test_multiple_results_and_vulns(self) -> None:
         trivy_json = {
+            "SchemaVersion": 2,
             "Results": [
                 {
                     "Vulnerabilities": [
@@ -121,21 +130,24 @@ class TestParseTrivy:
         assert findings[2].fixed_version is None
 
     def test_empty_results_returns_empty_list(self) -> None:
-        assert parse_trivy({"Results": []}, IMAGE) == []
+        assert parse_trivy({"SchemaVersion": 2, "Results": []}, IMAGE) == []
 
-    def test_missing_results_key_returns_empty_list(self) -> None:
-        assert parse_trivy({}, IMAGE) == []
+    def test_missing_results_key_is_valid_clean_scan(self) -> None:
+        """Trivy omits 'Results' on a clean scan: valid, returns []."""
+        assert parse_trivy({"SchemaVersion": 2}, IMAGE) == []
 
-    def test_results_not_a_list_returns_empty(self) -> None:
-        assert parse_trivy({"Results": "invalid"}, IMAGE) == []
-
-    def test_vulnerabilities_not_a_list_skipped(self) -> None:
-        trivy_json = {"Results": [{"Vulnerabilities": "not-a-list"}]}
+    def test_vulnerabilities_absent_or_none_is_valid(self) -> None:
+        """A result target without 'Vulnerabilities' (or null) is valid."""
+        trivy_json = {
+            "SchemaVersion": 2,
+            "Results": [{"Target": "img"}, {"Vulnerabilities": None}],
+        }
         assert parse_trivy(trivy_json, IMAGE) == []
 
     @pytest.mark.parametrize("sev", ["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"])
     def test_severity_mapping(self, sev: str) -> None:
         trivy_json = {
+            "SchemaVersion": 2,
             "Results": [
                 {
                     "Vulnerabilities": [
@@ -154,9 +166,122 @@ class TestParseTrivy:
         assert findings[0].severity == Severity[sev]
 
 
+class TestParseTrivyStrictValidation:
+    """Malformed Trivy output raises ParseError instead of a silent all-clear."""
+
+    def test_top_level_not_a_dict_raises(self) -> None:
+        with pytest.raises(ParseError, match="top-level must be a JSON object"):
+            parse_trivy([], IMAGE)  # type: ignore[arg-type]
+
+    def test_missing_schema_version_raises(self) -> None:
+        with pytest.raises(ParseError, match="SchemaVersion"):
+            parse_trivy({}, IMAGE)
+
+    def test_non_integer_schema_version_raises(self) -> None:
+        with pytest.raises(ParseError, match="SchemaVersion"):
+            parse_trivy({"SchemaVersion": "2"}, IMAGE)
+
+    def test_boolean_schema_version_raises(self) -> None:
+        with pytest.raises(ParseError, match="SchemaVersion"):
+            parse_trivy({"SchemaVersion": True}, IMAGE)
+
+    def test_results_not_a_list_raises(self) -> None:
+        with pytest.raises(ParseError, match="'Results' must be a list"):
+            parse_trivy({"SchemaVersion": 2, "Results": "invalid"}, IMAGE)
+
+    def test_result_entry_not_a_dict_raises(self) -> None:
+        with pytest.raises(ParseError, match=r"Results\[0\] must be an object"):
+            parse_trivy({"SchemaVersion": 2, "Results": ["not-a-dict"]}, IMAGE)
+
+    def test_vulnerabilities_not_a_list_raises(self) -> None:
+        trivy_json = {"SchemaVersion": 2, "Results": [{"Vulnerabilities": "not-a-list"}]}
+        with pytest.raises(ParseError, match=r"Results\[0\].Vulnerabilities\s+must be a list"):
+            parse_trivy(trivy_json, IMAGE)
+
+    def test_vulnerability_entry_not_a_dict_raises(self) -> None:
+        trivy_json = {"SchemaVersion": 2, "Results": [{"Vulnerabilities": ["CVE-as-string"]}]}
+        with pytest.raises(ParseError, match=r"Results\[0\].Vulnerabilities\[0\] must be an object"):
+            parse_trivy(trivy_json, IMAGE)
+
+    def test_vulnerability_missing_pkgname_raises(self) -> None:
+        trivy_json = {
+            "SchemaVersion": 2,
+            "Results": [
+                {
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2024-1234",
+                            "InstalledVersion": "3.0.12-r0",
+                            "Severity": "HIGH",
+                        }
+                    ]
+                }
+            ],
+        }
+        with pytest.raises(ParseError, match=r"Results\[0\].Vulnerabilities\[0\].*'PkgName'"):
+            parse_trivy(trivy_json, IMAGE)
+
+    def test_vulnerability_mistyped_required_key_raises(self) -> None:
+        trivy_json = {
+            "SchemaVersion": 2,
+            "Results": [
+                {
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2024-1234",
+                            "PkgName": 12345,
+                            "InstalledVersion": "3.0.12-r0",
+                            "Severity": "HIGH",
+                        }
+                    ]
+                }
+            ],
+        }
+        with pytest.raises(ParseError, match="'PkgName'"):
+            parse_trivy(trivy_json, IMAGE)
+
+    def test_unknown_severity_raises_parse_error(self) -> None:
+        trivy_json = {
+            "SchemaVersion": 2,
+            "Results": [
+                {
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2024-1234",
+                            "PkgName": "openssl",
+                            "InstalledVersion": "3.0.12-r0",
+                            "Severity": "BOGUS",
+                        }
+                    ]
+                }
+            ],
+        }
+        with pytest.raises(ParseError, match="Unknown severity"):
+            parse_trivy(trivy_json, IMAGE)
+
+
+class TestScanImageWrapsParseError:
+    """scan_image surfaces parser schema violations as ScanError (fail loudly)."""
+
+    def test_malformed_output_raises_scan_error(self) -> None:
+        with patch(
+            "scripts.cve_scan.scanner._run_scanner",
+            return_value={"SchemaVersion": 2, "Results": "invalid"},
+        ):
+            with pytest.raises(ScanError, match="schema validation") as exc_info:
+                scan_image("valkey/valkey:8.0-alpine", "trivy")
+        assert isinstance(exc_info.value.__cause__, ParseError)
+
+    def test_missing_schema_version_raises_scan_error(self) -> None:
+        with patch("scripts.cve_scan.scanner._run_scanner", return_value={}):
+            with pytest.raises(ScanError, match="SchemaVersion"):
+                scan_image("valkey/valkey:8.0-alpine", "trivy")
+
+
 class TestParseFindings:
     def test_dispatches_trivy(self) -> None:
         trivy_json = {
+            "SchemaVersion": 2,
             "Results": [
                 {
                     "Vulnerabilities": [
@@ -186,6 +311,7 @@ class TestParseFindings:
     def test_platform_stamped_on_findings(self) -> None:
         """Platform argument is stamped on each Finding."""
         trivy_json = {
+            "SchemaVersion": 2,
             "Results": [
                 {
                     "Vulnerabilities": [
@@ -207,6 +333,7 @@ class TestParseFindings:
     def test_platform_defaults_to_empty(self) -> None:
         """Platform defaults to empty string when not provided."""
         trivy_json = {
+            "SchemaVersion": 2,
             "Results": [
                 {
                     "Vulnerabilities": [

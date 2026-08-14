@@ -4,7 +4,8 @@ Entry point for the CVE scan workflow. Scans images across configured
 platforms, classifies findings, verifies fixes against base images
 (dynamic mode), and reports everything in the job summary. Emits job
 outputs ``fixable`` and ``versions`` for the rebuild job. Static override
-mode always emits fixable=false to prevent unverified rebuilds.
+mode reclassifies all rebuild candidates as not-fixable (base verification
+unavailable) and always emits fixable=false to prevent unverified rebuilds.
 
 Usage: python -m scripts.cve_scan.sweep --repo valkey-io/valkey-container [--dry-run]
 """
@@ -133,11 +134,11 @@ def _emit_run_summary(
     lines.append("")
 
     if fixable:
-        versions = dispatched_versions or []
-        if dry_run:
-            lines.append(f"### Confirmed fixable (rebuild would be dispatched for versions: {' '.join(versions) or '(none)'})")
-        else:
-            lines.append(f"### Confirmed fixable (rebuild will be dispatched for versions: {' '.join(versions) or '(none)'})")
+        # Static mode never reaches here: its candidates are reclassified as
+        # not fixable before the summary is rendered.
+        versions = " ".join(dispatched_versions or [])
+        verb = "would be" if dry_run else "will be"
+        lines.append(f"### Confirmed fixable (rebuild {verb} dispatched for versions: {versions})")
         lines.append("")
         lines.append(render_findings_table(fixable))
         lines.append("")
@@ -213,8 +214,26 @@ def run_sweep(
         len(not_fixable),
     )
 
-    # Base pre-check (dynamic mode only): verify fixes are present in base
-    if fixable and not static_mode:
+    # Base pre-check (dynamic mode) or static-mode reclassification, BEFORE
+    # outputs/summary/dry-run rendering so reporting reflects reality.
+    if fixable and static_mode:
+        # Static override: base verification is unavailable, so nothing is
+        # auto-fixable. Reclassify candidates instead of leaving them in
+        # `fixable` (which would render a bogus dispatch section).
+        logger.info(
+            "Static mode: rebuild dispatch disabled; reclassifying %d candidate(s) as not fixable.",
+            len(fixable),
+        )
+        not_fixable = not_fixable + [
+            Classification(
+                finding=c.finding,
+                fixable=False,
+                rationale="static image override: base verification unavailable, not auto-fixable",
+            )
+            for c in fixable
+        ]
+        fixable = []
+    elif fixable:
         logger.info("Running base package check for %d fixable finding(s)...", len(fixable))
         confirmed, downgraded = verify_fixable_in_base(fixable, base_map)
         logger.info(
@@ -224,14 +243,10 @@ def run_sweep(
         )
         fixable = confirmed
         not_fixable = not_fixable + downgraded
-    elif fixable and static_mode:
-        logger.info(
-            "Static mode: rebuild dispatch disabled, findings not verified against base."
-        )
     else:
         logger.info("Skipping base pre-check (no fixable findings).")
 
-    versions = _fixable_versions(fixable) if fixable and not static_mode else []
+    versions = _fixable_versions(fixable)
 
     # Static mode always emits fixable=false (no unverified rebuild)
     if static_mode:
