@@ -16,7 +16,7 @@ import pytest
 from scripts.cve_scan.config import CveScanSettings
 from scripts.cve_scan.image_matrix import (
     MatrixResolutionError,
-    _derive_images,
+    _derive_base_map,
     _fetch_versions_json,
     resolve_matrix,
 )
@@ -272,24 +272,81 @@ class TestDynamicErrors:
             with pytest.raises(MatrixResolutionError, match="must be a JSON object"):
                 resolve_matrix(settings)
 
+    def test_empty_manifest_raises(self) -> None:
+        """Manifest that is an empty JSON object raises MatrixResolutionError."""
+        settings = _make_settings()
 
-class TestDeriveImages:
-    """Direct tests for the _derive_images helper."""
+        with patch("scripts.cve_scan.image_matrix.urllib.request.urlopen") as mock_open:
+            mock_open.return_value = _mock_urlopen({})
+            with pytest.raises(MatrixResolutionError, match="empty JSON object"):
+                resolve_matrix(settings)
+
+
+class TestDeriveBaseMap:
+    """Direct tests for the _derive_base_map helper (image list = sorted keys)."""
 
     def test_deterministic_sort(self) -> None:
-        """Output is always sorted regardless of input ordering."""
+        """Sorted keys are stable regardless of input ordering."""
         versions = {
-            "9.0": {"debian": {}, "alpine": {}},
-            "7.2": {"debian": {}, "alpine": {}},
+            "9.0": {"debian": {"version": "trixie"}, "alpine": {"version": "3.23"}},
+            "7.2": {"debian": {"version": "trixie"}, "alpine": {"version": "3.23"}},
         }
-        result = _derive_images(versions, "r", include_unstable=False)
+        result = sorted(_derive_base_map(versions, "r", include_unstable=False))
         assert result == ["r:7.2", "r:7.2-alpine", "r:9.0", "r:9.0-alpine"]
 
     def test_non_dict_version_value_skipped(self) -> None:
-        """Non-dict values in the manifest are silently skipped."""
-        versions = {"7.2": {"debian": {}}, "meta": "not a dict"}
-        result = _derive_images(versions, "r", include_unstable=False)
+        """Non-dict values in the manifest are skipped (logged, not fatal)."""
+        versions = {"7.2": {"debian": {"version": "trixie"}}, "meta": "not a dict"}
+        result = sorted(_derive_base_map(versions, "r", include_unstable=False))
         assert result == ["r:7.2"]
+
+
+class TestVariantValidation:
+    """Malformed variant objects raise MatrixResolutionError (fail-closed)."""
+
+    def _resolve(self, payload: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+        settings = _make_settings()
+        with patch("scripts.cve_scan.image_matrix.urllib.request.urlopen") as mock_open:
+            mock_open.return_value = _mock_urlopen(payload)
+            return resolve_matrix(settings)
+
+    def test_variant_value_is_string_raises(self) -> None:
+        """An alpine value that is a string (not an object) raises with key + variant named."""
+        payload = {"9.1": {"alpine": "3.23"}}
+        with pytest.raises(MatrixResolutionError, match=r"entry '9.1' variant 'alpine'"):
+            self._resolve(payload)
+
+    def test_variant_version_missing_raises(self) -> None:
+        """A variant object without a 'version' key raises."""
+        payload = {"9.1": {"debian": {}}}
+        with pytest.raises(MatrixResolutionError, match=r"entry '9.1' variant 'debian'"):
+            self._resolve(payload)
+
+    def test_variant_version_empty_string_raises(self) -> None:
+        """A variant 'version' that is an empty string raises."""
+        payload = {"8.0": {"alpine": {"version": ""}}}
+        with pytest.raises(MatrixResolutionError, match=r"entry '8.0' variant 'alpine'"):
+            self._resolve(payload)
+
+    def test_variant_version_whitespace_only_raises(self) -> None:
+        """A variant 'version' that is whitespace-only raises."""
+        payload = {"8.0": {"debian": {"version": "   "}}}
+        with pytest.raises(MatrixResolutionError, match=r"entry '8.0' variant 'debian'"):
+            self._resolve(payload)
+
+    def test_variant_version_non_string_raises(self) -> None:
+        """A variant 'version' that is not a string (e.g. a number) raises."""
+        payload = {"8.0": {"alpine": {"version": 3.23}}}
+        with pytest.raises(MatrixResolutionError, match=r"entry '8.0' variant 'alpine'"):
+            self._resolve(payload)
+
+    def test_valid_mixed_entry_still_resolves(self) -> None:
+        """A well-formed entry with both variants resolves both refs."""
+        payload = {"9.1": {"version": "9.1.0", "debian": {"version": "trixie"}, "alpine": {"version": "3.23"}}}
+        images, base_map = self._resolve(payload)
+        assert images == ["valkey/valkey:9.1", "valkey/valkey:9.1-alpine"]
+        assert base_map["valkey/valkey:9.1-alpine"] == "alpine:3.23"
+        assert base_map["valkey/valkey:9.1"] == "debian:trixie-slim"
 
 
 # RC-era snapshot: derivation must key off version-line keys, not full versions.
@@ -304,19 +361,30 @@ RC_ERA_VERSIONS: dict[str, Any] = {
 
 
 class TestRcEraDerivation:
-    """During an RC window, derivation must still yield the version-line tags."""
+    """During an RC window, derivation must still yield the version-line tags.
+
+    Asserted through resolve_matrix (mocked fetch), the production
+    derivation path, after the removal of the direct-derivation helper.
+    """
+
+    def _resolve_images(self) -> list[str]:
+        settings = _make_settings(include_unstable=False)
+        with patch("scripts.cve_scan.image_matrix.urllib.request.urlopen") as mock_open:
+            mock_open.return_value = _mock_urlopen(RC_ERA_VERSIONS)
+            images, _base_map = resolve_matrix(settings)
+        return images
 
     def test_rc_line_derives_bare_and_alpine_line_tags(self) -> None:
-        images = _derive_images(RC_ERA_VERSIONS, "valkey/valkey", include_unstable=False)
+        images = self._resolve_images()
         assert "valkey/valkey:9.1" in images
         assert "valkey/valkey:9.1-alpine" in images
 
     def test_rc_full_version_never_used_in_tags(self) -> None:
-        images = _derive_images(RC_ERA_VERSIONS, "valkey/valkey", include_unstable=False)
+        images = self._resolve_images()
         assert not any("rc" in img for img in images)
 
     def test_rc_era_matrix_is_complete(self) -> None:
-        images = _derive_images(RC_ERA_VERSIONS, "valkey/valkey", include_unstable=False)
+        images = self._resolve_images()
         assert images == sorted(
             [
                 "valkey/valkey:7.2",

@@ -417,7 +417,9 @@ sweep.py
   → summary.py (render grouped findings tables for job summary)
   → emit GITHUB_OUTPUT: fixable=true/false, versions=<space-separated lines>
 
-Job 2 - rebuild (runs only if fixable == 'true' AND versions != '' AND not dry_run)
+Job 2 - rebuild (runs only on valkey-io/valkey-ci-agent main, inside the
+         cve-rebuild-dispatch Environment, if fixable == 'true' AND
+         versions != '' AND not dry_run)
   → mint Valkeyrie Bot App token (actions:write, scoped to valkey-container)
   → gh workflow run ci.yml --repo valkey-io/valkey-container
          --field "version=<versions from scan output>"
@@ -454,7 +456,7 @@ This matches valkey-container's existing posture: the same `ci.yml` workflow alr
 
 ### Authentication
 
-The rebuild job authenticates as the **Valkeyrie Bot GitHub App** by minting a short-lived, repo-scoped installation token (via `actions/create-github-app-token`) with `actions:write` scope. The scan job requires only `contents:read`. A fork-safe fallback uses `AUTOMATION_PAT` when org secrets are unavailable.
+The rebuild job authenticates as the **Valkeyrie Bot GitHub App** by minting a short-lived, repo-scoped installation token (via `actions/create-github-app-token`) with `actions:write` scope. The scan job requires only `contents:read`. The rebuild job is restricted to `valkey-io/valkey-ci-agent` on `refs/heads/main` and runs inside the `cve-rebuild-dispatch` protected Environment, a credential boundary (not an approval gate) that scopes the App credentials and dispatch permission to `main`. There is no PAT fallback: forks are scan/dry-run only and cannot dispatch.
 
 ### Idempotency
 

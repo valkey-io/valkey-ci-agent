@@ -7,7 +7,7 @@ outputs ``fixable`` and ``versions`` for the rebuild job. Static override
 mode reclassifies all rebuild candidates as not-fixable (base verification
 unavailable) and always emits fixable=false to prevent unverified rebuilds.
 
-Usage: python -m scripts.cve_scan.sweep --repo valkey-io/valkey-container [--dry-run]
+Usage: python -m scripts.cve_scan.sweep [--dry-run]
 """
 
 from __future__ import annotations
@@ -161,14 +161,12 @@ def _emit_run_summary(
 
 def run_sweep(
     *,
-    repo_full_name: str,
     settings: CveScanSettings,
     dry_run: bool = False,
 ) -> None:
     """Execute the CVE scan sweep pipeline.
 
     Args:
-        repo_full_name: Target repo (e.g. "valkey-io/valkey-container").
         settings: Loaded CveScanSettings instance.
         dry_run: If True, print findings and skip dispatch.
     """
@@ -277,11 +275,6 @@ def main() -> None:
         description="CVE Scan Sweep: scan images, classify findings, report in job summary.",
     )
     parser.add_argument(
-        "--repo",
-        required=True,
-        help="Target repository (owner/repo), e.g. valkey-io/valkey-container",
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print findings to stdout; skip dispatch.",
@@ -301,7 +294,6 @@ def main() -> None:
     settings = load_settings()
 
     run_sweep(
-        repo_full_name=args.repo,
         settings=settings,
         dry_run=args.dry_run,
     )

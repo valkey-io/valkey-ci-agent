@@ -119,7 +119,6 @@ class TestIntegrationFixable:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -169,7 +168,6 @@ class TestIntegrationFixable:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -210,7 +208,6 @@ class TestIntegrationNotFixable:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -237,7 +234,6 @@ class TestIntegrationNotFixable:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -308,7 +304,6 @@ class TestIntegrationDynamic:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -362,7 +357,6 @@ class TestIntegrationBasePrecheck:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -404,7 +398,6 @@ class TestIntegrationBasePrecheck:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -447,7 +440,6 @@ class TestIntegrationBasePrecheck:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -487,7 +479,6 @@ class TestStaticModeDispatchDisabled:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -527,7 +518,6 @@ class TestStaticModeDispatchDisabled:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=False,
         )
@@ -568,7 +558,6 @@ class TestStaticModeDispatchDisabled:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -615,7 +604,6 @@ class TestSweepOutputNoEnvVar:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -641,7 +629,6 @@ class TestSweepOutputNoEnvVar:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=True,
         )
@@ -691,7 +678,6 @@ class TestJobSummaryContent:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=False,
         )
@@ -735,7 +721,6 @@ class TestJobSummaryContent:
 
         settings = load_settings()
         run_sweep(
-            repo_full_name="valkey-io/valkey-container",
             settings=settings,
             dry_run=False,
         )

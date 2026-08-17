@@ -582,7 +582,7 @@ A single workflow (`.github/workflows/cve-scan.yml`) with two jobs:
 
 **Job 2: `rebuild`** (conditional, automatic)
 
-1. **Condition**: runs only when the scan job emits `fixable == 'true'` AND `versions != ''` and the run is not a dry run.
+1. **Condition**: runs only on the canonical repository's `main` branch (`github.repository == 'valkey-io/valkey-ci-agent'` and `github.ref == 'refs/heads/main'`), and only when the scan job emits `fixable == 'true'` AND `versions != ''` and the run is not a dry run. The job also runs in the `cve-rebuild-dispatch` protected Environment, which acts as a credential boundary (not an approval gate): it scopes the App credentials and dispatch permission to `main` only.
 2. **Dispatch**: the job mints a scoped Valkeyrie Bot App token (`actions:write` on valkey-container) and dispatches the rebuild workflow (`gh workflow run ci.yml --repo valkey-io/valkey-container --field version="<versions>"`), where `<versions>` is the space-separated list of version lines from the `versions` output (e.g. `8.0 9.1`). This targets only the affected versions rather than rebuilding everything.
 
 The trigger condition is verified evidence: the distro published a fix, the base pre-check confirmed the fix is present in the current base image tag using native package-manager comparison, and the published container image still lacks it. This is consistent with valkey-container's publishing model, which builds and publishes on cron and on versions.json merges.
@@ -607,7 +607,11 @@ On the repo hosting the agent workflows:
 | Secret | `VALKEYRIE_BOT_APP_ID` | Valkeyrie Bot GitHub App ID |
 | Secret | `VALKEYRIE_BOT_PRIVATE_KEY` | App private key |
 
-For forks without org secrets, the workflow falls back to `AUTOMATION_PAT`.
+Forks are scan/dry-run only: there is no PAT fallback, so without the org App secrets the rebuild job's guards keep it from running and no token is minted.
+
+#### Step 2: Create the protected Environment
+
+Create a `cve-rebuild-dispatch` Environment in repo Settings with a deployment-branch rule limited to `main`. It is a credential boundary (not an approval gate): it scopes the App credentials and dispatch permission so no other ref can access them.
 
 ### Configuration
 
@@ -641,7 +645,7 @@ Runs weekly on the configured schedule (default: Monday 06:00 UTC). Scans all im
 gh workflow run cve-scan.yml --repo <agent-repo>
 ```
 
-Supports a `dry_run` input that prints findings without dispatching a rebuild. Supports a `severity_threshold` input for ad-hoc investigation.
+Supports a `dry_run` input that prints findings without dispatching a rebuild. It defaults to `true`: a manual run never triggers a real rebuild unless you explicitly set `dry_run=false`. Supports a `severity_threshold` input for ad-hoc investigation; it affects classification and therefore rebuild dispatch, not just reporting.
 
 #### Reviewing results
 

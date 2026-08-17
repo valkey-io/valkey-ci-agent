@@ -55,24 +55,34 @@ def _fetch_versions_json(url: str) -> dict:
         raise MatrixResolutionError(
             f"Versions manifest must be a JSON object, got {type(data).__name__}"
         )
+    if not data:
+        raise MatrixResolutionError(
+            f"Versions manifest from {url} is an empty JSON object"
+        )
     return data
 
 
-def _derive_images(
-    versions: dict,
-    repository: str,
-    include_unstable: bool,
-) -> list[str]:
-    """Derive the sorted image tag list (keys of _derive_base_map, single source of truth).
+def _variant_version(version_key: str, variant: str, value: object) -> str:
+    """Validate a variant object and return its version string.
 
-    Raises MatrixResolutionError if derivation produces an empty list.
+    The variant value must be a dict whose "version" is a non-empty,
+    non-whitespace string. Anything else (wrong type, missing, empty)
+    raises MatrixResolutionError naming the offending version key and
+    variant, so a malformed manifest can never produce an invalid or
+    empty base image reference.
     """
-    images = sorted(_derive_base_map(versions, repository, include_unstable))
-    if not images:
+    if not isinstance(value, dict):
         raise MatrixResolutionError(
-            "Dynamic resolution produced zero images from versions manifest"
+            f"Malformed versions manifest: entry {version_key!r} variant {variant!r} "
+            f"must be an object, got {type(value).__name__}"
         )
-    return images
+    version = value.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise MatrixResolutionError(
+            f"Malformed versions manifest: entry {version_key!r} variant {variant!r} "
+            f"'version' must be a non-empty string, got {version!r}"
+        )
+    return version
 
 
 def _derive_base_map(
@@ -84,19 +94,28 @@ def _derive_base_map(
 
     Base conventions (valkey-container Dockerfiles): alpine:<version> for
     -alpine tags, debian:<version>-slim otherwise.
+
+    Non-dict version entries are skipped with a log (tolerated metadata
+    keys). Malformed variant objects raise MatrixResolutionError via
+    _variant_version (fail-closed).
     """
     base_map: dict[str, str] = {}
     for version_key, value in versions.items():
         if version_key == "unstable" and not include_unstable:
             continue
         if not isinstance(value, dict):
+            logger.warning(
+                "Skipping non-object versions manifest entry %r (%s)",
+                version_key,
+                type(value).__name__,
+            )
             continue
         if "alpine" in value:
-            alpine_ver = value["alpine"].get("version", "")
+            alpine_ver = _variant_version(version_key, "alpine", value["alpine"])
             image_ref = f"{repository}:{version_key}-alpine"
             base_map[image_ref] = f"alpine:{alpine_ver}"
         if "debian" in value:
-            debian_ver = value["debian"].get("version", "")
+            debian_ver = _variant_version(version_key, "debian", value["debian"])
             image_ref = f"{repository}:{version_key}"
             base_map[image_ref] = f"debian:{debian_ver}-slim"
     return base_map
