@@ -583,7 +583,9 @@ A single workflow (`.github/workflows/cve-scan.yml`) with two jobs:
 **Job 2: `rebuild`** (conditional, automatic)
 
 1. **Condition**: runs only on the canonical repository's `main` branch (`github.repository == 'valkey-io/valkey-ci-agent'` and `github.ref == 'refs/heads/main'`), and only when the scan job emits `fixable == 'true'` AND `versions != ''` and the run is not a dry run. The job also runs in the `cve-rebuild-dispatch` protected Environment, which acts as a credential boundary (not an approval gate): it scopes the App credentials and dispatch permission to `main` only.
-2. **Dispatch**: the job mints a scoped Valkeyrie Bot App token (`actions:write` on valkey-container) and dispatches the rebuild workflow (`gh workflow run ci.yml --repo valkey-io/valkey-container --field version="<versions>"`), where `<versions>` is the space-separated list of version lines from the `versions` output (e.g. `8.0 9.1`). This targets only the affected versions rather than rebuilding everything.
+2. **Dispatch**: the job mints a scoped Valkeyrie Bot App token (`actions:write` on valkey-container) and dispatches the rebuild workflow (`gh workflow run ci.yml --repo valkey-io/valkey-container --field version="<versions>"`), where `<versions>` is the space-separated list of version lines from the `versions` output (e.g. `8.0 9.1`). This targets only the affected versions rather than rebuilding everything. It records a UTC timestamp immediately before dispatching so the triggered run can be found.
+3. **Locate and wait**: the job then polls (`gh run list --repo valkey-io/valkey-container --workflow ci.yml --event workflow_dispatch --created ">=<timestamp>"`) for the run it triggered, selecting the oldest run in the window so an unrelated later dispatch is not picked up. If no run surfaces after the retries it fails loudly (the build outcome is unknown; a green rebuild is never reported on a run that cannot be seen). Once found, it waits for completion with `gh run watch --exit-status`, which fails this job when the downstream build fails, and captures the run's `conclusion`.
+4. **Report the build result**: the job summary and the Slack notification report the actual downstream build outcome (not just that the dispatch was accepted) and include the valkey-container run URL. The job carries a generous `timeout-minutes` (120) because a 4-arch build of up to ~10 image lines is long-running; the runner is billed while it watches, which is the deliberate cost of verifying the build rather than only the dispatch.
 
 The trigger condition is verified evidence: the distro published a fix, the base pre-check confirmed the fix is present in the current base image tag using native package-manager comparison, and the published container image still lacks it. This is consistent with valkey-container's publishing model, which builds and publishes on cron and on versions.json merges.
 
@@ -649,7 +651,7 @@ Supports a `dry_run` input that prints findings without dispatching a rebuild. I
 
 #### Reviewing results
 
-After each scan, check the workflow run's job summary in GitHub Actions. The summary lists all findings (confirmed-fixable and not-fixable) as grouped markdown tables. Confirmed-fixable findings trigger a targeted rebuild automatically.
+After each scan, check the workflow run's job summary in GitHub Actions. The summary lists all findings (confirmed-fixable and not-fixable) as grouped markdown tables. Confirmed-fixable findings trigger a targeted rebuild automatically; the rebuild job then waits for the downstream valkey-container build and reports its actual conclusion and run URL in the job summary and Slack, so a failed rebuild is visible rather than masked by a successful dispatch.
 
 ## Safety
 

@@ -421,8 +421,13 @@ Job 2 - rebuild (runs only on valkey-io/valkey-ci-agent main, inside the
          cve-rebuild-dispatch Environment, if fixable == 'true' AND
          versions != '' AND not dry_run)
   → mint Valkeyrie Bot App token (actions:write, scoped to valkey-container)
-  → gh workflow run ci.yml --repo valkey-io/valkey-container
+  → record UTC dispatch timestamp, then
+    gh workflow run ci.yml --repo valkey-io/valkey-container
          --field "version=<versions from scan output>"
+  → locate the triggered run (gh run list --created ">=<timestamp>",
+       oldest in window; fail loud if none appears after retries)
+  → gh run watch <run-id> --exit-status  (wait; a failed build fails the job)
+  → capture conclusion; report build result + run URL in job summary and Slack
 ```
 
 The rebuild dispatches automatically because the trigger condition is verified
@@ -431,6 +436,15 @@ present in the current base tag using native dpkg/apk comparison semantics, and 
 published image still lacks it. This is consistent with the publishing model of
 valkey-container, which builds and publishes on cron (daily unstable builds) and on
 versions.json merges.
+
+The rebuild job does not stop at the dispatch: it locates the run it triggered
+(bounding the `gh run list` search with a pre-dispatch UTC timestamp and taking the
+oldest run in the window so a concurrent unrelated dispatch is not mistaken for
+ours), waits for it with `gh run watch --exit-status`, and reports the actual build
+conclusion and run URL. A failed downstream build therefore fails this job, and a
+run that cannot be located fails loud rather than reporting an unverified success.
+The job's `timeout-minutes` is 120 to outlast a 4-arch build of up to ~10 image
+lines (the runner is billed while watching, the deliberate cost of verification).
 
 ### Entry Points
 

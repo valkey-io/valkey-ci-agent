@@ -17,6 +17,7 @@ import pytest
 
 from scripts.cve_scan.config import CveScanConfigError, load_settings
 from scripts.cve_scan.models import Finding, Severity
+from scripts.cve_scan.scanner import ScanError
 from scripts.cve_scan.sweep import run_sweep
 
 
@@ -354,6 +355,12 @@ class TestIntegrationBasePrecheck:
             "scripts.cve_scan.base_precheck.get_base_packages",
             lambda base_ref, platform="": {"openssl": "3.0.12-r0"},
         )
+        # Stale base now consults the repo candidate (Item 6); unavailable
+        # here keeps the finding downgraded.
+        monkeypatch.setattr(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            lambda base_ref, package, platform="": [],
+        )
 
         settings = load_settings()
         run_sweep(
@@ -394,6 +401,10 @@ class TestIntegrationBasePrecheck:
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
             lambda base_ref, platform="": {"openssl": "3.0.12-r0"},
+        )
+        monkeypatch.setattr(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            lambda base_ref, package, platform="": [],
         )
 
         settings = load_settings()
@@ -685,7 +696,7 @@ class TestJobSummaryContent:
         summary = summary_file.read_text()
         assert "CVE Scan Summary" in summary
         assert "CVE-2024-1234" in summary
-        assert "Confirmed fixable (rebuild will be dispatched" in summary
+        assert "Confirmed fixable (eligible for rebuild:" in summary
 
     def test_not_fixable_findings_appear_in_job_summary(
         self,
@@ -729,3 +740,38 @@ class TestJobSummaryContent:
         assert "CVE Scan Summary" in summary
         assert "CVE-2024-9999" in summary
         assert "Unresolved findings" in summary
+
+
+class TestScanFailureSummary:
+    """A ScanError re-raises but first records a failure section in the summary."""
+
+    def test_scan_error_emits_summary_and_reraises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """scan_images raising ScanError -> failure summary written, then re-raised."""
+        github_output = tmp_path / "github_output"
+        github_output.write_text("")
+        summary_file = tmp_path / "step_summary"
+        summary_file.write_text("")
+        monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+        def _raise(images, scanner, threshold, **_kw):
+            raise ScanError("Scanner exited with code 1: trivy image valkey/valkey:8.0-alpine")
+
+        monkeypatch.setattr("scripts.cve_scan.sweep.scan_images", _raise)
+        monkeypatch.setattr(
+            "scripts.cve_scan.image_matrix.urllib.request.urlopen",
+            lambda *a, **kw: _mock_urlopen_response(SAMPLE_VERSIONS),
+        )
+
+        settings = load_settings()
+        with pytest.raises(ScanError, match="valkey/valkey:8.0-alpine"):
+            run_sweep(settings=settings, dry_run=False)
+
+        summary = summary_file.read_text()
+        assert "Scan failed" in summary
+        assert "no rebuild will be dispatched" in summary
+        assert "valkey/valkey:8.0-alpine" in summary

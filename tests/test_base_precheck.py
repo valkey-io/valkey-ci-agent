@@ -150,7 +150,12 @@ zlib1g 1:1.2.13.dfsg-1
 
 
 class TestBaseOlderThanFix:
-    """Base has an older version than the fix -> downgrade."""
+    """Base has an older version than the fix.
+
+    The base being older is no longer fatal on its own (Item 6): a rebuild
+    reinstalls Dockerfile-managed packages from the distro repo, so these
+    downgrade only when the repo candidate also fails to satisfy the fix.
+    """
 
     def test_downgraded_when_base_has_old_version(self) -> None:
         finding = _make_finding()
@@ -159,8 +164,12 @@ class TestBaseOlderThanFix:
 
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages"
-        ) as mock_get:
-            # Base has openssl 3.0.12-r0 (older than fix 3.0.13-r0)
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=[],
+        ):
+            # Base has openssl 3.0.12-r0 (older than fix 3.0.13-r0) and the
+            # repo candidate is unavailable -> stays downgraded.
             mock_get.return_value = {"openssl": "3.0.12-r0", "musl": "1.2.5-r0"}
             confirmed, downgraded = verify_fixable_in_base(
                 [classification], base_map
@@ -181,13 +190,111 @@ class TestBaseOlderThanFix:
 
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages"
-        ) as mock_get:
+        ) as mock_get, patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=[],
+        ):
             mock_get.return_value = {"zlib": "1.2.13-r0"}
             _, downgraded = verify_fixable_in_base(
                 [classification], base_map
             )
 
         assert "zlib" in downgraded[0].rationale
+
+
+class TestStaleBaseRepoCandidate:
+    """Item 6: base ships an older version -> consult the distro repo candidate.
+
+    A rebuild reinstalls Dockerfile-managed packages (e.g. Debian
+    libssl3t64) from the repo, so a stale base only blocks a rebuild when the
+    repo candidate also fails to satisfy the fix. Fail-closed otherwise.
+    """
+
+    BASE_MAP = {"valkey/valkey:9.1-alpine": "alpine:3.23"}
+
+    def test_confirmed_when_repo_candidate_satisfies_fix(self) -> None:
+        """present-but-older + candidate >= fixed -> confirmed."""
+        finding = _make_finding()  # openssl, fixed 3.0.13-r0
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            return_value={"openssl": "3.0.12-r0"},
+        ), patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=["3.0.14-r0"],
+        ):
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        assert len(confirmed) == 1
+        assert len(downgraded) == 0
+        assert confirmed[0].fixable is True
+        assert "repo candidate 3.0.14-r0 satisfies the fix" in confirmed[0].rationale
+        assert "3.0.12-r0" in confirmed[0].rationale
+
+    def test_downgraded_when_repo_candidate_older(self) -> None:
+        """present-but-older + candidate older -> downgraded."""
+        finding = _make_finding()
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            return_value={"openssl": "3.0.12-r0"},
+        ), patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=["3.0.12-r0"],
+        ):
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert downgraded[0].fixable is False
+        assert "older or unavailable" in downgraded[0].rationale
+        assert "still ships" in downgraded[0].rationale
+
+    def test_downgraded_when_repo_query_fails(self) -> None:
+        """present-but-older + candidate query fails (empty) -> downgraded."""
+        finding = _make_finding()
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            return_value={"openssl": "3.0.12-r0"},
+        ), patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=[],
+        ):
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert downgraded[0].fixable is False
+        assert "older or unavailable" in downgraded[0].rationale
+
+    def test_repo_query_not_performed_when_base_has_fix(self) -> None:
+        """cmp >= 0 (base already ships the fix) -> repo candidate never queried."""
+        finding = _make_finding()  # fixed 3.0.13-r0
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            return_value={"openssl": "3.0.14-r0"},
+        ), patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates"
+        ) as mock_repo:
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        mock_repo.assert_not_called()
+        assert len(confirmed) == 1
+        assert len(downgraded) == 0
 
 
 class TestBaseHasFix:
@@ -639,6 +746,11 @@ class TestBaseCaching:
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages",
             side_effect=mock_get,
+        ), patch(
+            # arm64 base is stale -> the stale-base path now queries the repo
+            # candidate; unavailable here keeps it downgraded (Item 6).
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=[],
         ):
             confirmed, downgraded = verify_fixable_in_base(
                 classifications, base_map

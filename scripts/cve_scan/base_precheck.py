@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import subprocess
 
-from scripts.cve_scan.models import Classification
+from scripts.cve_scan.models import Classification, Finding
 from scripts.cve_scan.version_compare import compare_versions as _native_compare
 
 logger = logging.getLogger(__name__)
@@ -248,50 +248,110 @@ def get_repo_candidates(base_ref: str, package: str, platform: str = "") -> list
     return parse(result.stdout)
 
 
-def _classify_absent_package(
-    classification: Classification,
+def _find_satisfying_candidate(
+    finding: Finding,
     base_ref: str,
     flavor: str,
     candidates: list[str],
-) -> Classification:
-    """Classify a finding whose package is absent from the raw base image db.
+) -> str | None:
+    """Return the first repo candidate at or above the fix version, else None.
 
-    Such packages are installed at build time (e.g. Dockerfile ``apk add``),
-    so absence alone proves nothing about whether a rebuild would pick up the
-    fix. Confirm only when the distro repo currently supplies a candidate at
-    or above the fix version; any other outcome (older candidate, no
-    candidate, query or comparison failure) downgrades fail-closed.
+    The package manager installs the highest available candidate, so "any
+    candidate >= fix" is equivalent to "max(candidates) >= fix" without extra
+    docker calls to order the candidates themselves. Returns None when the fix
+    version is unknown, no candidate satisfies it, or every comparison is
+    ambiguous (fail-closed).
+    """
+    if finding.fixed_version is None:
+        return None
+    for candidate in candidates:
+        cmp = _native_compare(candidate, finding.fixed_version, flavor, base_ref)
+        if cmp is not None and cmp >= 0:
+            return candidate
+    return None
+
+
+def _repo_candidates_cached(
+    base_ref: str,
+    finding: Finding,
+    cache: dict[tuple[str, str, str], list[str]],
+) -> list[str]:
+    """Query the distro repo candidates for a finding's package, memoized.
+
+    Shared by the absent-from-base and stale-base paths. The cache is keyed by
+    (base_ref, platform, package) so the same package is queried at most once
+    per base image and platform. Returns [] on any failure (fail-closed).
+    """
+    cand_key = (base_ref, finding.platform, finding.package)
+    if cand_key not in cache:
+        logger.info(
+            "Querying repo candidate for %s in base %s (platform=%s) ...",
+            finding.package, base_ref, finding.platform or "native",
+        )
+        cache[cand_key] = get_repo_candidates(
+            base_ref, finding.package, platform=finding.platform,
+        )
+    return cache[cand_key]
+
+
+def _verify_via_repo_candidate(
+    classification: Classification,
+    base_ref: str,
+    flavor: str,
+    base_version: str | None,
+    cache: dict[tuple[str, str, str], list[str]],
+) -> Classification:
+    """Confirm or downgrade a finding by consulting the distro repo candidate.
+
+    Shared by the two paths where the base image alone does not prove the fix:
+    the package is absent from the raw base db (installed at build time, so
+    ``base_version`` is None), or the base ships an older version
+    (``base_version`` < fix). A rebuild reinstalls the Dockerfile-managed
+    package from the distro repo, so confirm only when the repo currently
+    supplies a candidate at or above the fix version; any other outcome (older
+    candidate, no candidate, query or comparison failure) downgrades
+    fail-closed. The rationale wording distinguishes the absent and stale
+    cases so the job summary explains why each finding landed where it did.
     """
     finding = classification.finding
+    candidates = _repo_candidates_cached(base_ref, finding, cache)
+    satisfying = _find_satisfying_candidate(finding, base_ref, flavor, candidates)
+    candidate_list = ", ".join(candidates) if candidates else "none"
 
-    verified_candidate: str | None = None
-    if finding.fixed_version is not None:
-        # The package manager installs the highest available candidate, so
-        # "any candidate >= fix" is equivalent to "max(candidates) >= fix"
-        # without extra docker calls to order the candidates themselves.
-        for candidate in candidates:
-            cmp = _native_compare(candidate, finding.fixed_version, flavor, base_ref)
-            if cmp is not None and cmp >= 0:
-                verified_candidate = candidate
-                break
-
-    if verified_candidate is not None:
-        rationale = (
-            f"{classification.rationale} "
-            f"Verified: package {finding.package} not in base image "
-            f"{base_ref} (installed at build time); repo candidate "
-            f"{verified_candidate} >= fix {finding.fixed_version}, so a "
-            f"rebuild will pick up the fix."
+    if satisfying is not None:
+        if base_version is None:
+            detail = (
+                f"package {finding.package} not in base image {base_ref} "
+                f"(installed at build time); repo candidate {satisfying} >= "
+                f"fix {finding.fixed_version}, so a rebuild will pick up the fix."
+            )
+        else:
+            detail = (
+                f"base {base_ref} ships {base_version} "
+                f"(< {finding.fixed_version}), but repo candidate {satisfying} "
+                f"satisfies the fix, so a rebuild will pick it up."
+            )
+        return Classification(
+            finding=finding,
+            fixable=True,
+            rationale=f"{classification.rationale} Verified: {detail}",
         )
-        return Classification(finding=finding, fixable=True, rationale=rationale)
 
-    rationale = (
-        f"Fix for {finding.cve_id} in {finding.package}: package not in "
-        f"base image {base_ref} and repo candidate unverified/older "
-        f"(candidates: {', '.join(candidates) if candidates else 'none'}; "
-        f"fix: {finding.fixed_version}). Downgrading conservatively "
-        f"(fail-closed). Re-check next scan."
-    )
+    if base_version is None:
+        rationale = (
+            f"Fix for {finding.cve_id} in {finding.package}: package not in "
+            f"base image {base_ref} and repo candidate unverified/older "
+            f"(candidates: {candidate_list}; fix: {finding.fixed_version}). "
+            f"Downgrading conservatively (fail-closed). Re-check next scan."
+        )
+    else:
+        rationale = (
+            f"Fix for {finding.cve_id} in {finding.package} is published "
+            f"upstream but base image {base_ref} still ships {base_version} "
+            f"(< {finding.fixed_version}) and the repo candidate was older or "
+            f"unavailable (candidates: {candidate_list}); a rebuild would not "
+            f"pick it up. Re-check next scan."
+        )
     return Classification(finding=finding, fixable=False, rationale=rationale)
 
 
@@ -307,11 +367,12 @@ def verify_fixable_in_base(
     """Verify fixable findings against their base images' package databases.
 
     Reads each distinct (base image, platform) package list once (cached per
-    invocation). Findings where the base is still vulnerable or comparison is
-    ambiguous are downgraded (fail-closed). Packages absent from the base db
-    (installed at build time) are confirmed only when the distro repository
-    candidate, queried inside the base container, is at or above the fix
-    version; otherwise they are downgraded (fail-closed).
+    invocation). A finding is confirmed when the base already ships the fix.
+    When the base ships an older version, or the package is absent from the
+    base db (installed at build time), the distro repository candidate is
+    queried inside the base container and the finding is confirmed only when
+    that candidate is at or above the fix version; otherwise it is downgraded
+    (fail-closed). Ambiguous comparisons also downgrade (fail-closed).
 
     Args:
         fixable: Classifications previously marked as rebuild-fixable.
@@ -372,23 +433,11 @@ def verify_fixable_in_base(
         if base_version is None:
             # Package absent from the raw base db (installed at build time).
             # Absence alone proves nothing about whether the repo currently
-            # supplies the fix: query the repo candidate (cached, fail-closed).
-            cand_key = (base_ref, finding.platform, finding.package)
-            if cand_key not in repo_candidate_cache:
-                logger.info(
-                    "Package %s absent from base %s; querying repo candidate (platform=%s) ...",
-                    finding.package, base_ref, finding.platform or "native",
-                )
-                repo_candidate_cache[cand_key] = get_repo_candidates(
-                    base_ref, finding.package, platform=finding.platform,
-                )
-            result = _classify_absent_package(
-                classification, base_ref, flavor, repo_candidate_cache[cand_key],
+            # supplies the fix: verify against the repo candidate (fail-closed).
+            result = _verify_via_repo_candidate(
+                classification, base_ref, flavor, None, repo_candidate_cache,
             )
-            if result.fixable:
-                confirmed.append(result)
-            else:
-                downgraded.append(result)
+            (confirmed if result.fixable else downgraded).append(result)
             continue
 
         # Native dpkg/apk comparison; None -> fail-closed (downgrade)
@@ -413,18 +462,15 @@ def verify_fixable_in_base(
                 rationale=rationale,
             ))
         elif cmp < 0:
-            # Base still ships an older version: stale base
-            rationale = (
-                f"Fix for {finding.cve_id} in {finding.package} is published "
-                f"upstream but base image {base_ref} still ships "
-                f"{base_version} (< {finding.fixed_version}); a rebuild "
-                f"would not pick it up. Re-check next scan."
+            # Base ships an older version. For packages the Dockerfile
+            # explicitly (re)installs from the distro repo (e.g. Debian
+            # libssl3t64), a rebuild would still upgrade them if the repo
+            # candidate satisfies the fix, so consult the repo candidate
+            # before downgrading (cached, fail-closed).
+            result = _verify_via_repo_candidate(
+                classification, base_ref, flavor, base_version, repo_candidate_cache,
             )
-            downgraded.append(Classification(
-                finding=finding,
-                fixable=False,
-                rationale=rationale,
-            ))
+            (confirmed if result.fixable else downgraded).append(result)
         else:
             # Base ships the fix
             rationale = (

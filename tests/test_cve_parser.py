@@ -240,6 +240,27 @@ class TestParseTrivyStrictValidation:
         with pytest.raises(ParseError, match="'PkgName'"):
             parse_trivy(trivy_json, IMAGE)
 
+    def test_non_string_fixed_version_raises(self) -> None:
+        """A non-string FixedVersion (e.g. 123) is rejected before it can reach subprocess args."""
+        trivy_json = {
+            "SchemaVersion": 2,
+            "Results": [
+                {
+                    "Vulnerabilities": [
+                        {
+                            "VulnerabilityID": "CVE-2024-1234",
+                            "PkgName": "openssl",
+                            "InstalledVersion": "3.0.12-r0",
+                            "FixedVersion": 123,
+                            "Severity": "HIGH",
+                        }
+                    ]
+                }
+            ],
+        }
+        with pytest.raises(ParseError, match=r"Results\[0\].Vulnerabilities\[0\].*FixedVersion"):
+            parse_trivy(trivy_json, IMAGE)
+
     def test_unknown_severity_raises_parse_error(self) -> None:
         trivy_json = {
             "SchemaVersion": 2,

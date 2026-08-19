@@ -21,24 +21,16 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.common.job_summary import emit_job_summary
 from scripts.cve_scan.base_precheck import verify_fixable_in_base
 from scripts.cve_scan.config import CveScanSettings, load_settings
 from scripts.cve_scan.image_matrix import resolve_matrix
 from scripts.cve_scan.models import Classification
 from scripts.cve_scan.rebuild_decider import classify_all
-from scripts.cve_scan.scanner import scan_images
+from scripts.cve_scan.scanner import ScanError, scan_images
 from scripts.cve_scan.summary import render_findings_table
 
 logger = logging.getLogger(__name__)
-
-
-def _split_classifications(
-    classifications: list[Classification],
-) -> tuple[list[Classification], list[Classification]]:
-    """Split classifications into fixable and not-fixable groups."""
-    fixable = [c for c in classifications if c.fixable]
-    not_fixable = [c for c in classifications if not c.fixable]
-    return fixable, not_fixable
 
 
 def _fixable_versions(fixable: list[Classification]) -> list[str]:
@@ -117,8 +109,6 @@ def _emit_run_summary(
     dispatched_versions: list[str] | None = None,
 ) -> None:
     """Write a run summary to the GitHub Actions job summary page."""
-    from scripts.common.job_summary import emit_job_summary
-
     lines = ["## CVE Scan Summary", ""]
     mode_bits = []
     if dry_run:
@@ -137,8 +127,12 @@ def _emit_run_summary(
         # Static mode never reaches here: its candidates are reclassified as
         # not fixable before the summary is rendered.
         versions = " ".join(dispatched_versions or [])
-        verb = "would be" if dry_run else "will be"
-        lines.append(f"### Confirmed fixable (rebuild {verb} dispatched for versions: {versions})")
+        # The scan job cannot know a rebuild was actually dispatched (that is
+        # decided by the downstream job), so live mode states eligibility.
+        if dry_run:
+            lines.append(f"### Confirmed fixable (rebuild would be dispatched for versions: {versions})")
+        else:
+            lines.append(f"### Confirmed fixable (eligible for rebuild: {versions})")
         lines.append("")
         lines.append(render_findings_table(fixable))
         lines.append("")
@@ -156,6 +150,27 @@ def _emit_run_summary(
             lines.append("No findings at or above the severity threshold.")
         lines.append("")
 
+    emit_job_summary("\n".join(lines))
+
+
+def _emit_scan_failure_summary(exc: ScanError) -> None:
+    """Write a job summary reporting that the scan itself failed.
+
+    The exception message identifies the failing image/platform. No rebuild is
+    dispatched: the failure is reported here, then re-raised so the job fails
+    loudly.
+    """
+    lines = [
+        "## CVE Scan Summary",
+        "",
+        "### Scan failed",
+        "",
+        "The CVE scan did not complete, so no findings were classified and "
+        "no rebuild will be dispatched.",
+        "",
+        f"Error: {exc}",
+        "",
+    ]
     emit_job_summary("\n".join(lines))
 
 
@@ -186,10 +201,19 @@ def run_sweep(
         "Scanning %d image(s) x %d platform(s) with %s...",
         len(images), len(settings.platforms), settings.scanner,
     )
-    findings = scan_images(
-        images, settings.scanner, settings.severity_threshold,
-        platforms=settings.platforms,
-    )
+    try:
+        findings = scan_images(
+            images, settings.scanner, settings.severity_threshold,
+            platforms=settings.platforms,
+        )
+    except ScanError as exc:
+        # A single image/platform scan failure would otherwise abort the run
+        # before any summary is emitted, discarding the whole report. Emit a
+        # failure summary (the message names the failing image/platform), then
+        # re-raise so the job still fails loudly. Do not swallow the error.
+        logger.error("Scan failed: %s", exc)
+        _emit_scan_failure_summary(exc)
+        raise
     logger.info("Found %d finding(s) above %s threshold.", len(findings), settings.severity_threshold.name)
 
     if not findings:
@@ -205,7 +229,8 @@ def run_sweep(
         return
 
     classifications = classify_all(findings)
-    fixable, not_fixable = _split_classifications(classifications)
+    fixable = [c for c in classifications if c.fixable]
+    not_fixable = [c for c in classifications if not c.fixable]
     logger.info(
         "Classification: %d fixable, %d not fixable.",
         len(fixable),

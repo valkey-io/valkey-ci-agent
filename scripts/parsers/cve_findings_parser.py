@@ -33,8 +33,9 @@ def parse_trivy(json_obj: dict[str, Any], image: str, platform: str = "") -> lis
         ParseError: If the document is not a dict with an integer
             'SchemaVersion', if 'Results' is present but not a list of
             dicts, if 'Vulnerabilities' is present but not a list of
-            dicts, or if a vulnerability entry is missing (or mistypes)
-            a required key.
+            dicts, if a vulnerability entry is missing (or mistypes)
+            a required key, or if 'FixedVersion' is present but neither
+            null nor a string.
     """
     if not isinstance(json_obj, dict):
         raise ParseError(
@@ -102,7 +103,12 @@ def parse_trivy(json_obj: dict[str, Any], image: str, platform: str = "") -> lis
                     f"Trivy output for {image}: {context}: {exc}"
                 ) from exc
 
-            fixed = vuln.get("FixedVersion", "")
+            fixed = vuln.get("FixedVersion")
+            if fixed is not None and not isinstance(fixed, str):
+                raise ParseError(
+                    f"Trivy output for {image}: {context} has a non-string "
+                    f"'FixedVersion' (got {fixed!r})."
+                )
             findings.append(
                 Finding(
                     image=image,
