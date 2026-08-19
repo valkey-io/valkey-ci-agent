@@ -400,7 +400,7 @@ class TestIntegrationBasePrecheck:
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            lambda base_ref, platform="": {"openssl": "3.0.12-r0"},
+            lambda base_ref, platform="": {"openssl": "3.0.11-r0"},
         )
         monkeypatch.setattr(
             "scripts.cve_scan.base_precheck.get_repo_candidates",

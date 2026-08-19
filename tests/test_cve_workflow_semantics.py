@@ -171,8 +171,12 @@ def test_rebuild_reports_run_url() -> None:
     """The summary and Slack notification surface the located run URL, not just the dispatch."""
     summary = next(s for s in _rebuild_steps() if s.get("name") == "Job summary")
     assert "RUN_URL" in summary["run"]
+    # The run URL reaches Slack through the compose step, which feeds the Slack
+    # message body via steps.slack.outputs.text.
+    compose = next(s for s in _rebuild_steps() if s.get("id") == "slack")
+    assert "steps.locate.outputs.run_url" in yaml.safe_dump(compose)
     slack = next(s for s in _rebuild_steps() if "notify-slack-action" in s.get("uses", ""))
-    assert "steps.locate.outputs.run_url" in yaml.safe_dump(slack)
+    assert "steps.slack.outputs.text" in yaml.safe_dump(slack)
 
 
 def test_rebuild_timeout_outlasts_multiarch_build() -> None:
@@ -181,3 +185,128 @@ def test_rebuild_timeout_outlasts_multiarch_build() -> None:
     assert isinstance(timeout, int)
     assert timeout >= 200
     assert timeout <= 360
+
+
+def _compose_step() -> dict:
+    """Return the 'Compose Slack notification' step (id 'slack')."""
+    return next(s for s in _rebuild_steps() if s.get("id") == "slack")
+
+
+def _slack_step() -> dict:
+    """Return the notify-slack-action step."""
+    return next(s for s in _rebuild_steps() if "notify-slack-action" in s.get("uses", ""))
+
+
+def test_compose_step_precedes_slack_step() -> None:
+    """A compose step (id 'slack') exists and runs before the Slack notify step."""
+    steps = _rebuild_steps()
+    compose_idx = next(i for i, s in enumerate(steps) if s.get("id") == "slack")
+    slack_idx = next(i for i, s in enumerate(steps) if "notify-slack-action" in s.get("uses", ""))
+    assert compose_idx < slack_idx
+
+
+def test_compose_step_reads_downstream_conclusion() -> None:
+    """The compose step derives its outputs from the downstream build conclusion."""
+    assert "steps.conclusion.outputs.conclusion" in yaml.safe_dump(_compose_step())
+
+
+def test_slack_status_uses_compose_output_not_job_status() -> None:
+    """The Slack step's status comes from the compose step, never job.status."""
+    slack = _slack_step()
+    assert slack["with"]["status"] == "${{ steps.slack.outputs.status }}"
+    assert "job.status" not in yaml.safe_dump(slack)
+
+
+def test_slack_message_uses_compose_text() -> None:
+    """The Slack message body is the composed single-line text output."""
+    assert _slack_step()["with"]["message_format"] == "${{ steps.slack.outputs.text }}"
+
+
+def test_slack_action_pin_and_secret_unchanged() -> None:
+    """The Slack action pin and webhook secret name are preserved."""
+    slack = _slack_step()
+    assert slack["uses"] == "ravsamhq/notify-slack-action@042f29088bb3bdbda5b4ff7b4818466a277fa8f7"
+    assert "SLACK_NOTIFICATIONS_WEBHOOK_URL" in yaml.safe_dump(slack["env"])
+
+
+def test_slack_step_continue_on_error() -> None:
+    """A missing webhook must never fail the rebuild job."""
+    assert _slack_step()["continue-on-error"] is True
+
+
+def test_single_slack_step_lives_in_rebuild_job() -> None:
+    """The workflow's only Slack step is in the rebuild job."""
+    workflow = _load_workflow()
+    for job_name, job in workflow["jobs"].items():
+        slack_steps = [s for s in job["steps"] if "notify-slack-action" in s.get("uses", "")]
+        if job_name == "rebuild":
+            assert len(slack_steps) == 1
+        else:
+            assert slack_steps == []
+
+
+def _rebuild_step(step_id: str) -> dict:
+    """Return the rebuild step with the given id."""
+    return next(s for s in _rebuild_steps() if s.get("id") == step_id)
+
+
+def test_no_workflow_level_concurrency() -> None:
+    """Concurrency is declared per job, not workflow-level (fix 4): a workflow-level
+    group would cover the rebuild job and let a newer scan cancel the watcher."""
+    workflow = _load_workflow()
+    assert "concurrency" not in workflow
+
+
+def test_scan_job_concurrency_cancels_in_progress() -> None:
+    """The scan job cancels superseded runs (a redo is cheap)."""
+    concurrency = _load_workflow()["jobs"]["scan"]["concurrency"]
+    assert concurrency["group"] == "cve-scan-scan-${{ github.ref }}"
+    assert concurrency["cancel-in-progress"] is True
+
+
+def test_rebuild_job_concurrency_does_not_cancel_in_progress() -> None:
+    """The rebuild job must NOT cancel in-progress: a newer scan cannot kill a
+    container build already dispatched and being watched (fix 4)."""
+    concurrency = _load_workflow()["jobs"]["rebuild"]["concurrency"]
+    assert concurrency["group"] == "cve-scan-rebuild-${{ github.ref }}"
+    assert concurrency["cancel-in-progress"] is False
+
+
+def test_scan_and_rebuild_concurrency_groups_differ() -> None:
+    """Distinct groups keep the scan and rebuild jobs independent."""
+    workflow = _load_workflow()
+    scan_group = workflow["jobs"]["scan"]["concurrency"]["group"]
+    rebuild_group = workflow["jobs"]["rebuild"]["concurrency"]["group"]
+    assert scan_group != rebuild_group
+
+
+def test_dispatch_step_uses_app_token() -> None:
+    """The dispatch step (the sole step needing actions:write on another repo)
+    still uses the short-lived App token (fix 1)."""
+    dispatch = _rebuild_step("dispatch")
+    assert dispatch["env"]["GH_TOKEN"] == "${{ steps.token.outputs.token }}"
+
+
+def test_locate_watch_conclusion_use_default_github_token() -> None:
+    """locate/watch/conclusion use GITHUB_TOKEN, not the 1h App token (fix 1):
+    valkey-container is public and GITHUB_TOKEN outlives a 130-150 min build."""
+    for step_id in ("locate", "watch", "conclusion"):
+        gh_token = _rebuild_step(step_id)["env"]["GH_TOKEN"]
+        assert gh_token == "${{ secrets.GITHUB_TOKEN }}"
+        assert "steps.token.outputs.token" not in gh_token
+
+
+def test_dispatch_step_captures_bot_login() -> None:
+    """The dispatch step exposes the bot login as an output for actor filtering (fix 3)."""
+    run = _rebuild_step("dispatch")["run"]
+    assert "gh api user --jq .login" in run
+    assert "bot_login=" in run
+
+
+def test_locate_step_filters_by_actor() -> None:
+    """The locate step narrows the run window to the dispatching bot via --user (fix 3)."""
+    locate = _rebuild_step("locate")
+    run = locate["run"]
+    assert "--user" in run
+    # The bot login flows in from the dispatch step's output.
+    assert locate["env"]["BOT_LOGIN"] == "${{ steps.dispatch.outputs.bot_login }}"

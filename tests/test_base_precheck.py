@@ -168,9 +168,10 @@ class TestBaseOlderThanFix:
             "scripts.cve_scan.base_precheck.get_repo_candidates",
             return_value=[],
         ):
-            # Base has openssl 3.0.12-r0 (older than fix 3.0.13-r0) and the
-            # repo candidate is unavailable -> stays downgraded.
-            mock_get.return_value = {"openssl": "3.0.12-r0", "musl": "1.2.5-r0"}
+            # Base has openssl 3.0.11-r0 (older than image's 3.0.12-r0, so the
+            # build manages it) but older than fix 3.0.13-r0, and the repo
+            # candidate is unavailable -> stays downgraded.
+            mock_get.return_value = {"openssl": "3.0.11-r0", "musl": "1.2.5-r0"}
             confirmed, downgraded = verify_fixable_in_base(
                 [classification], base_map
             )
@@ -179,7 +180,7 @@ class TestBaseOlderThanFix:
         assert len(downgraded) == 1
         assert downgraded[0].fixable is False
         assert "still ships" in downgraded[0].rationale
-        assert "3.0.12-r0" in downgraded[0].rationale
+        assert "3.0.11-r0" in downgraded[0].rationale
         assert "alpine:3.23" in downgraded[0].rationale
         assert "CVE-2024-1234" in downgraded[0].rationale
 
@@ -213,13 +214,13 @@ class TestStaleBaseRepoCandidate:
     BASE_MAP = {"valkey/valkey:9.1-alpine": "alpine:3.23"}
 
     def test_confirmed_when_repo_candidate_satisfies_fix(self) -> None:
-        """present-but-older + candidate >= fixed -> confirmed."""
-        finding = _make_finding()  # openssl, fixed 3.0.13-r0
+        """present-but-older + image newer than base + candidate >= fixed -> confirmed."""
+        finding = _make_finding()  # openssl, installed 3.0.12-r0, fixed 3.0.13-r0
         classification = _make_classification(finding)
 
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            return_value={"openssl": "3.0.12-r0"},
+            return_value={"openssl": "3.0.11-r0"},
         ), patch(
             "scripts.cve_scan.base_precheck.get_repo_candidates",
             return_value=["3.0.14-r0"],
@@ -232,16 +233,16 @@ class TestStaleBaseRepoCandidate:
         assert len(downgraded) == 0
         assert confirmed[0].fixable is True
         assert "repo candidate 3.0.14-r0 satisfies the fix" in confirmed[0].rationale
-        assert "3.0.12-r0" in confirmed[0].rationale
+        assert "3.0.11-r0" in confirmed[0].rationale
 
     def test_downgraded_when_repo_candidate_older(self) -> None:
-        """present-but-older + candidate older -> downgraded."""
+        """present-but-older + image newer than base + candidate older -> downgraded."""
         finding = _make_finding()
         classification = _make_classification(finding)
 
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            return_value={"openssl": "3.0.12-r0"},
+            return_value={"openssl": "3.0.11-r0"},
         ), patch(
             "scripts.cve_scan.base_precheck.get_repo_candidates",
             return_value=["3.0.12-r0"],
@@ -257,13 +258,13 @@ class TestStaleBaseRepoCandidate:
         assert "still ships" in downgraded[0].rationale
 
     def test_downgraded_when_repo_query_fails(self) -> None:
-        """present-but-older + candidate query fails (empty) -> downgraded."""
+        """present-but-older + image newer than base + candidate query fails (empty) -> downgraded."""
         finding = _make_finding()
         classification = _make_classification(finding)
 
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages",
-            return_value={"openssl": "3.0.12-r0"},
+            return_value={"openssl": "3.0.11-r0"},
         ), patch(
             "scripts.cve_scan.base_precheck.get_repo_candidates",
             return_value=[],
@@ -295,6 +296,120 @@ class TestStaleBaseRepoCandidate:
         mock_repo.assert_not_called()
         assert len(confirmed) == 1
         assert len(downgraded) == 0
+
+
+class TestBuildManagedGate:
+    """Repo-candidate promotion is gated on build-managed evidence.
+
+    In the stale-base branch (base older than fix) the repo candidate is
+    consulted only when the scanned image ships newer than the base
+    (installed_version > base_version), proving the build installs/upgrades the
+    package. installed == base (build never touched it) or an ambiguous
+    installed-vs-base comparison downgrades fail-closed WITHOUT a repo query,
+    even if the repo has a satisfying candidate (the zlib1g false positive).
+    """
+
+    BASE_MAP = {"valkey/valkey:9.1-alpine": "alpine:3.23"}
+
+    def test_zlib_installed_equals_base_downgraded_no_repo_query(self) -> None:
+        """Base older than fix, image ships the base version -> downgrade, repo not queried."""
+        finding = _make_finding(package="zlib1g", installed="1.2.13-r0", fixed="1.2.14-r0")
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            return_value={"zlib1g": "1.2.13-r0"},  # base == installed, both < fix
+        ), patch(
+            # Repo HAS the fix, but a rebuild would not pick it up since the
+            # build never installs/upgrades zlib1g. Must not be consulted.
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=["1.2.14-r0"],
+        ) as mock_repo:
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        mock_repo.assert_not_called()
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert downgraded[0].fixable is False
+        assert "same version" in downgraded[0].rationale
+        assert "base image update" in downgraded[0].rationale
+
+    def test_installed_newer_than_base_repo_satisfies_confirmed(self) -> None:
+        """Base older than fix, image newer than base, repo candidate >= fix -> confirmed."""
+        finding = _make_finding(installed="3.0.12-r0", fixed="3.0.13-r0")  # openssl
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            return_value={"openssl": "3.0.11-r0"},  # older than image 3.0.12
+        ), patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=["3.0.14-r0"],
+        ) as mock_repo:
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        mock_repo.assert_called_once()
+        assert len(confirmed) == 1
+        assert len(downgraded) == 0
+        assert confirmed[0].fixable is True
+        assert "repo candidate 3.0.14-r0 satisfies the fix" in confirmed[0].rationale
+
+    def test_installed_newer_than_base_repo_older_downgraded(self) -> None:
+        """Base older than fix, image newer than base, repo candidate older -> downgraded."""
+        finding = _make_finding(installed="3.0.12-r0", fixed="3.0.13-r0")
+        classification = _make_classification(finding)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            return_value={"openssl": "3.0.11-r0"},
+        ), patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+            return_value=["3.0.12-r0"],  # < fix 3.0.13
+        ) as mock_repo:
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        mock_repo.assert_called_once()
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert downgraded[0].fixable is False
+        assert "older or unavailable" in downgraded[0].rationale
+
+    def test_ambiguous_installed_vs_base_downgraded_no_repo_query(self) -> None:
+        """Base older than fix, installed-vs-base ambiguous -> downgrade, repo not queried."""
+        finding = _make_finding(installed="3.0.12-r0", fixed="3.0.13-r0")
+        classification = _make_classification(finding)
+
+        def compare(a: str, b: str, flavor: str, base_image: str | None = None) -> int | None:
+            # base(3.0.11) vs fix(3.0.13): older -> enter the cmp<0 branch.
+            # installed(3.0.12) vs base(3.0.11): ambiguous -> None.
+            if a == "3.0.12-r0" and b == "3.0.11-r0":
+                return None
+            return _stub_compare(a, b, flavor, base_image)
+
+        with patch(
+            "scripts.cve_scan.base_precheck.get_base_packages",
+            return_value={"openssl": "3.0.11-r0"},
+        ), patch(
+            "scripts.cve_scan.base_precheck._native_compare",
+            side_effect=compare,
+        ), patch(
+            "scripts.cve_scan.base_precheck.get_repo_candidates",
+        ) as mock_repo:
+            confirmed, downgraded = verify_fixable_in_base(
+                [classification], self.BASE_MAP
+            )
+
+        mock_repo.assert_not_called()
+        assert len(confirmed) == 0
+        assert len(downgraded) == 1
+        assert downgraded[0].fixable is False
+        assert "ambiguous" in downgraded[0].rationale
 
 
 class TestBaseHasFix:
@@ -741,7 +856,7 @@ class TestBaseCaching:
             if platform == "linux/amd64":
                 return {"openssl": "3.0.13-r0"}  # amd64 has the fix
             else:
-                return {"openssl": "3.0.12-r0"}  # arm64 base is stale
+                return {"openssl": "3.0.11-r0"}  # arm64 base older than image
 
         with patch(
             "scripts.cve_scan.base_precheck.get_base_packages",

@@ -3,11 +3,14 @@
 Verifies a rebuild-fixable CVE is actually patched in the upstream base image
 (advisory FixedVersion may precede a republished base tag). Reads each base's
 package database via one-shot ``docker run`` and compares with native dpkg/apk
-semantics (version_compare), not the pure-Python approximation. Packages
-absent from the raw base db (installed at build time, e.g. Dockerfile
-``apk add``) are verified against the distro repository candidate queried
-inside the base container. Any comparison error or ambiguity downgrades
-conservatively (fail-closed). Deterministic, no AI, stdlib only.
+semantics (version_compare), not the pure-Python approximation. The distro
+repository candidate is consulted only for packages the build demonstrably
+manages: those absent from the raw base db, or present in the base but shipped
+newer in the scanned image (installed_version > base_version), which proves the
+build installed or upgraded them. A package the base ships at the same version
+the image ships is left untouched by the build, so a rebuild cannot change it
+and it downgrades without a repo query. Any comparison error or ambiguity
+downgrades conservatively (fail-closed). Deterministic, no AI, stdlib only.
 """
 
 from __future__ import annotations
@@ -303,15 +306,17 @@ def _verify_via_repo_candidate(
 ) -> Classification:
     """Confirm or downgrade a finding by consulting the distro repo candidate.
 
-    Shared by the two paths where the base image alone does not prove the fix:
-    the package is absent from the raw base db (installed at build time, so
-    ``base_version`` is None), or the base ships an older version
-    (``base_version`` < fix). A rebuild reinstalls the Dockerfile-managed
-    package from the distro repo, so confirm only when the repo currently
-    supplies a candidate at or above the fix version; any other outcome (older
-    candidate, no candidate, query or comparison failure) downgrades
-    fail-closed. The rationale wording distinguishes the absent and stale
-    cases so the job summary explains why each finding landed where it did.
+    Shared by the two paths where the base image alone does not prove the fix
+    AND the build is known to manage the package: the package is absent from
+    the raw base db (installed at build time, so ``base_version`` is None), or
+    the base ships an older version than the fix while the scanned image ships
+    newer than the base (installed_version > base_version, so the build
+    upgraded it). A rebuild reinstalls such build-managed packages from the
+    distro repo, so confirm only when the repo currently supplies a candidate
+    at or above the fix version; any other outcome (older candidate, no
+    candidate, query or comparison failure) downgrades fail-closed. The
+    rationale wording distinguishes the absent and stale cases so the job
+    summary explains why each finding landed where it did.
     """
     finding = classification.finding
     candidates = _repo_candidates_cached(base_ref, finding, cache)
@@ -368,11 +373,16 @@ def verify_fixable_in_base(
 
     Reads each distinct (base image, platform) package list once (cached per
     invocation). A finding is confirmed when the base already ships the fix.
-    When the base ships an older version, or the package is absent from the
-    base db (installed at build time), the distro repository candidate is
-    queried inside the base container and the finding is confirmed only when
-    that candidate is at or above the fix version; otherwise it is downgraded
-    (fail-closed). Ambiguous comparisons also downgrade (fail-closed).
+    When the base ships an older version, the distro repository candidate is
+    consulted only if the scanned image ships newer than the base
+    (installed_version > base_version), which proves the build manages the
+    package; if the image ships the same version as the base (or older, or the
+    comparison is ambiguous) the finding downgrades without a repo query. When
+    the package is absent from the base db (installed at build time) the repo
+    candidate is queried directly. In every repo-candidate case the finding is
+    confirmed only when that candidate is at or above the fix version;
+    otherwise it is downgraded (fail-closed). Ambiguous comparisons also
+    downgrade (fail-closed).
 
     Args:
         fixable: Classifications previously marked as rebuild-fixable.
@@ -462,15 +472,59 @@ def verify_fixable_in_base(
                 rationale=rationale,
             ))
         elif cmp < 0:
-            # Base ships an older version. For packages the Dockerfile
-            # explicitly (re)installs from the distro repo (e.g. Debian
-            # libssl3t64), a rebuild would still upgrade them if the repo
-            # candidate satisfies the fix, so consult the repo candidate
-            # before downgrading (cached, fail-closed).
-            result = _verify_via_repo_candidate(
-                classification, base_ref, flavor, base_version, repo_candidate_cache,
-            )
-            (confirmed if result.fixable else downgraded).append(result)
+            # Base ships an older version than the fix. Consulting the repo
+            # candidate is only legitimate when the build actually manages this
+            # package; use the scanned image's installed_version as evidence.
+            # (Fix: repo-candidate promotion was too broad and marked packages
+            # the Dockerfile never installs/upgrades, e.g. zlib1g, as fixable.)
+            installed = finding.installed_version
+            build_cmp = _native_compare(installed, base_version, flavor, base_ref)
+            if build_cmp is not None and build_cmp > 0:
+                # Image ships newer than base: the build demonstrably upgraded
+                # this package, so it is build-managed. The repo candidate is a
+                # legitimate signal for what a rebuild would install.
+                result = _verify_via_repo_candidate(
+                    classification, base_ref, flavor, base_version, repo_candidate_cache,
+                )
+                (confirmed if result.fixable else downgraded).append(result)
+            elif build_cmp == 0:
+                # Image ships exactly the base version: the build never touched
+                # this package, so a rebuild from the same base cannot upgrade
+                # it. Downgrade fail-closed without querying the repo.
+                rationale = (
+                    f"Fix for {finding.cve_id} in {finding.package} is "
+                    f"published upstream but base image {base_ref} ships "
+                    f"{base_version} and the scanned image ships the same "
+                    f"version, so the build does not upgrade it and a rebuild "
+                    f"would not change it. Needs a base image update. "
+                    f"Re-check next scan."
+                )
+                downgraded.append(Classification(
+                    finding=finding, fixable=False, rationale=rationale,
+                ))
+            else:
+                # Image older than base, or the comparison is ambiguous/None:
+                # no evidence the build manages this package. Downgrade
+                # fail-closed without querying the repo.
+                if build_cmp is None:
+                    reason = (
+                        f"the image-vs-base comparison ({installed} vs "
+                        f"{base_version}) is ambiguous"
+                    )
+                else:
+                    reason = (
+                        f"the scanned image ships {installed}, older than base "
+                        f"{base_version}"
+                    )
+                rationale = (
+                    f"Fix for {finding.cve_id} in {finding.package}: {reason}, "
+                    f"so there is no evidence the build upgrades this package "
+                    f"beyond the base. Downgrading conservatively "
+                    f"(fail-closed). Re-check next scan."
+                )
+                downgraded.append(Classification(
+                    finding=finding, fixable=False, rationale=rationale,
+                ))
         else:
             # Base ships the fix
             rationale = (

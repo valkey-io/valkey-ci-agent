@@ -413,6 +413,8 @@ sweep.py
   → base_precheck.py (dynamic mode only)
       reads each distinct base image's package database (apk/dpkg)
       compares versions using native dpkg/apk tools via docker (authoritative, correct Debian semantics)
+      stale-base path: fixable only when the image's installed version is newer than the base's
+        (proof the build touched the package); equal-to-base is fail-closed as needing a base update
       downgrades findings where base is still vulnerable (fail-closed)
   → summary.py (render grouped findings tables for job summary)
   → emit GITHUB_OUTPUT: fixable=true/false, versions=<space-separated lines>
@@ -420,11 +422,13 @@ sweep.py
 Job 2 - rebuild (runs only on valkey-io/valkey-ci-agent main, inside the
          cve-rebuild-dispatch Environment, if fixable == 'true' AND
          versions != '' AND not dry_run)
-  → mint Valkeyrie Bot App token (actions:write, scoped to valkey-container)
+  → mint Valkeyrie Bot App token (actions:write, scoped to valkey-container) - dispatch step only
   → record UTC dispatch timestamp, then
     gh workflow run ci.yml --repo valkey-io/valkey-container
          --field "version=<versions from scan output>"
+  (locate/watch/conclusion use the built-in GITHUB_TOKEN, valid for the whole job)
   → locate the triggered run (gh run list --created ">=<timestamp>",
+       filtered by triggering actor (bot) + workflow_dispatch event,
        oldest in window; fail loud if none appears after retries)
   → gh run watch <run-id> --exit-status  (wait; a failed build fails the job)
   → capture conclusion; report build result + run URL in job summary and Slack
@@ -438,13 +442,19 @@ valkey-container, which builds and publishes on cron (daily unstable builds) and
 versions.json merges.
 
 The rebuild job does not stop at the dispatch: it locates the run it triggered
-(bounding the `gh run list` search with a pre-dispatch UTC timestamp and taking the
-oldest run in the window so a concurrent unrelated dispatch is not mistaken for
-ours), waits for it with `gh run watch --exit-status`, and reports the actual build
-conclusion and run URL. A failed downstream build therefore fails this job, and a
-run that cannot be located fails loud rather than reporting an unverified success.
-The job's `timeout-minutes` is 120 to outlast a 4-arch build of up to ~10 image
-lines (the runner is billed while watching, the deliberate cost of verification).
+(bounding the `gh run list` search with a pre-dispatch UTC timestamp, filtering
+candidates by triggering actor so a human or other-bot dispatch in the same
+window is excluded, and taking the oldest remaining run; exact identification
+would require valkey-container's ci.yml to echo a correlation input into its run
+name, a follow-up), waits for it with `gh run watch --exit-status`, and reports the actual build
+conclusion and run URL in the job summary and Slack. A failed downstream build
+therefore fails this job, and a run that cannot be located fails loud rather than
+reporting an unverified success. The Slack status is success only when the dispatch,
+run location, and build all succeed; every other case (including cancelled or
+timed-out) normalizes to failure, so a non-success rebuild always notifies instead
+of going silent.
+The job's `timeout-minutes` is 240 to outlast observed full-matrix `ci.yml` builds
+of about 130 to 150 minutes (the runner is billed while watching, the deliberate cost of verification).
 
 ### Entry Points
 
@@ -463,19 +473,21 @@ The design relies on verified evidence and deterministic code:
 - **Targeted version dispatch**: the rebuild job passes `--field version="<versions>"` with only the affected version lines (e.g. `8.0 9.1`) rather than rebuilding all images, minimizing blast radius.
 - **Multi-arch coverage**: each image is scanned on all 4 published platforms (amd64, arm64, arm/v7, ppc64le). Findings are deduplicated across platforms so a CVE present on all architectures is reported once. Base package versions are assumed arch-uniform per tag (validated indirectly by the multi-arch scan).
 - **Deterministic code path**: scanning, classification, base pre-check, and dispatch are all deterministic code with no AI in the loop. The pipeline is stdlib Python plus a scanner subprocess.
-- **Least-privilege tokens**: the scan job needs only `contents:read`. The rebuild job mints a separate token scoped to `actions:write` + `metadata:read`. Neither token is broader than required.
+- **Least-privilege tokens**: the scan job needs only `contents:read`. The rebuild job mints a separate App token scoped to `actions:write` + `metadata:read` for the dispatch step only; the run-tracking steps use the built-in `GITHUB_TOKEN`. Neither token is broader than required.
 - **Audit trail**: every automatic dispatch is recorded in the workflow run log and the job summary. All findings are visible in the run summary as grouped markdown tables.
 
 This matches valkey-container's existing posture: the same `ci.yml` workflow already runs automatically on cron and on push. The CVE scanner dispatches it through the same path with the same effect, triggered by verified vulnerability evidence rather than a timer.
 
 ### Authentication
 
-The rebuild job authenticates as the **Valkeyrie Bot GitHub App** by minting a short-lived, repo-scoped installation token (via `actions/create-github-app-token`) with `actions:write` scope. The scan job requires only `contents:read`. The rebuild job is restricted to `valkey-io/valkey-ci-agent` on `refs/heads/main` and runs inside the `cve-rebuild-dispatch` protected Environment, a credential boundary (not an approval gate) that scopes the App credentials and dispatch permission to `main`. There is no PAT fallback: forks are scan/dry-run only and cannot dispatch.
+The rebuild job authenticates as the **Valkeyrie Bot GitHub App** by minting a short-lived, repo-scoped installation token (via `actions/create-github-app-token`) with `actions:write` scope, used only by the dispatch step. The locate, watch, and conclusion steps instead use the built-in `GITHUB_TOKEN`, because App installation tokens expire after one hour while the watched build runs 130 to 150 minutes; valkey-container is public, so `GITHUB_TOKEN` can read its Actions runs and no privileged App credential is held for the full wait. The scan job requires only `contents:read`. The rebuild job is restricted to `valkey-io/valkey-ci-agent` on `refs/heads/main` and runs inside the `cve-rebuild-dispatch` protected Environment, a credential boundary (not an approval gate) that scopes the App credentials and dispatch permission to `main`. There is no PAT fallback: forks are scan/dry-run only and cannot dispatch.
 
 ### Idempotency
 
-The concurrency group (`cancel-in-progress: true`) supersedes stale workflow runs
-so only the latest scan result drives the dispatch decision.
+Concurrency is declared per job. The scan job's group uses `cancel-in-progress: true`
+so only the latest scan result drives the dispatch decision; the rebuild job uses a
+separate group with `cancel-in-progress: false` so an in-flight rebuild watcher is
+never cancelled while the container build continues.
 
 ### Configuration
 
