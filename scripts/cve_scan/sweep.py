@@ -1,11 +1,17 @@
-"""CVE scan sweep: scheduled scan + decision + job summary reporting.
+"""CVE scan sweep: scheduled scan + classification + contract emission.
 
 Entry point for the CVE scan workflow. Scans images across configured
-platforms, classifies findings, verifies fixes against base images
-(dynamic mode), and reports everything in the job summary. Emits job
-outputs ``fixable`` and ``versions`` for the rebuild job. Static override
-mode reclassifies all rebuild candidates as not-fixable (base verification
-unavailable) and always emits fixable=false to prevent unverified rebuilds.
+platforms, classifies findings (a published fix makes a finding a rebuild
+CANDIDATE), and reports everything in the job summary. Emits the job outputs
+the build-and-verify workflow codes against: ``fixable`` (true/false),
+``versions`` (space-separated affected lines), and ``targets`` (a base64
+contract of the candidate (image, line, variant, platform, cve, package,
+fixed_version) tuples).
+
+Verification is no longer predicted here: the downstream workflow BUILDS the
+candidate image, SCANS the real artifact, and proves the targeted CVEs are
+gone before valkey-container does its normal build-and-publish. So these
+findings are candidates pending artifact verification, not confirmed fixes.
 
 Usage: python -m scripts.cve_scan.sweep [--dry-run]
 """
@@ -22,33 +28,61 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.common.job_summary import emit_job_summary
-from scripts.cve_scan.base_precheck import BasePrecheckError, verify_fixable_in_base
 from scripts.cve_scan.config import CveScanSettings, load_settings
 from scripts.cve_scan.image_matrix import resolve_matrix
 from scripts.cve_scan.models import Classification
 from scripts.cve_scan.rebuild_decider import classify_all
 from scripts.cve_scan.scanner import ScanError, scan_images
 from scripts.cve_scan.summary import render_findings_table
+from scripts.cve_scan.targets import Target, encode_targets, line_variant_from_image
 
 logger = logging.getLogger(__name__)
 
 
 def _fixable_versions(fixable: list[Classification]) -> list[str]:
-    """Derive sorted deduplicated version lines from confirmed-fixable images.
+    """Derive sorted deduplicated version lines from fixable-candidate images.
 
     'valkey/valkey:8.0-alpine' -> '8.0' (for --field version= to ci.yml).
     """
     versions: set[str] = set()
     for c in fixable:
-        tag = c.finding.image.rsplit(":", 1)[-1] if ":" in c.finding.image else c.finding.image
-        line = tag.replace("-alpine", "")
+        line, _variant = line_variant_from_image(c.finding.image)
         if line:
             versions.add(line)
     return sorted(versions)
 
 
-def _emit_outputs(fixable: bool, versions: list[str] | None = None) -> None:
-    """Emit GitHub Actions job outputs (fixable, versions) to $GITHUB_OUTPUT.
+def _build_targets(fixable: list[Classification]) -> list[Target]:
+    """Build the verification targets contract from fixable candidates.
+
+    One Target per fixable finding, carrying its (image, line, variant,
+    platform, cve, package, fixed_version). classify() only marks a finding
+    fixable when a fixed_version is published, so fixed_version is always set.
+    """
+    targets: list[Target] = []
+    for c in fixable:
+        f = c.finding
+        line, variant = line_variant_from_image(f.image)
+        targets.append(
+            Target(
+                image=f.image,
+                line=line,
+                variant=variant,
+                platform=f.platform,
+                cve=f.cve_id,
+                package=f.package,
+                fixed_version=f.fixed_version or "",
+            )
+        )
+    return targets
+
+
+def _emit_outputs(
+    fixable: bool,
+    versions: list[str] | None = None,
+    targets_b64: str = "",
+) -> None:
+    """Emit GitHub Actions job outputs (fixable, versions, targets) to $GITHUB_OUTPUT.
 
     When GITHUB_OUTPUT is unset (local/dry-run), prints the values instead.
     """
@@ -60,13 +94,17 @@ def _emit_outputs(fixable: bool, versions: list[str] | None = None) -> None:
         with open(github_output, "a") as f:
             f.write(f"fixable={fixable_str}\n")
             f.write(f"versions={versions_str}\n")
+            f.write(f"targets={targets_b64}\n")
         logger.info(
-            "Wrote outputs to GITHUB_OUTPUT: fixable=%s versions=%s",
-            fixable_str, versions_str or "(empty)",
+            "Wrote outputs to GITHUB_OUTPUT: fixable=%s versions=%s targets=%s",
+            fixable_str,
+            versions_str or "(empty)",
+            targets_b64 or "(empty)",
         )
     else:
         print(f"fixable={fixable_str}")
         print(f"versions={versions_str}")
+        print(f"targets={targets_b64}")
 
 
 def _print_dry_run(
@@ -86,9 +124,12 @@ def _print_dry_run(
         versions = _fixable_versions(fixable)
         table = render_findings_table(fixable)
         print("=" * 72)
-        print("[DRY RUN] DISPATCH BEHAVIOR")
+        print("[DRY RUN] VERIFICATION TARGETS")
         print("=" * 72)
-        print(f"Would dispatch rebuild for versions: {' '.join(versions)}")
+        print(
+            "Would emit verification targets (pending artifact verification) "
+            f"for versions: {' '.join(versions)}"
+        )
         print("-" * 72)
         print(table)
         print()
@@ -105,34 +146,32 @@ def _emit_run_summary(
     not_fixable: list[Classification],
     threshold_name: str,
     dry_run: bool,
-    static_mode: bool,
-    dispatched_versions: list[str] | None = None,
+    candidate_versions: list[str] | None = None,
 ) -> None:
     """Write a run summary to the GitHub Actions job summary page."""
     lines = ["## CVE Scan Summary", ""]
-    mode_bits = []
     if dry_run:
-        mode_bits.append("dry run")
-    if static_mode:
-        mode_bits.append("static image override")
-    if mode_bits:
-        lines.append(f"Mode: {', '.join(mode_bits)}")
+        lines.append("Mode: dry run")
         lines.append("")
-    lines.append(f"| Images scanned | Findings ({threshold_name}+) | Confirmed fixable | Not fixable |")
+    lines.append(
+        f"| Images scanned | Findings ({threshold_name}+) "
+        "| Fixable candidates | Not fixable |"
+    )
     lines.append("|---|---|---|---|")
-    lines.append(f"| {len(images)} | {findings_count} | {len(fixable)} | {len(not_fixable)} |")
+    lines.append(
+        f"| {len(images)} | {findings_count} | {len(fixable)} | {len(not_fixable)} |"
+    )
     lines.append("")
 
     if fixable:
-        # Static mode never reaches here: its candidates are reclassified as
-        # not fixable before the summary is rendered.
-        versions = " ".join(dispatched_versions or [])
-        # The scan job cannot know a rebuild was actually dispatched (that is
-        # decided by the downstream job), so live mode states eligibility.
-        if dry_run:
-            lines.append(f"### Confirmed fixable (rebuild would be dispatched for versions: {versions})")
-        else:
-            lines.append(f"### Confirmed fixable (eligible for rebuild: {versions})")
+        versions = " ".join(candidate_versions or [])
+        # These are candidates pending artifact verification: the downstream
+        # workflow builds the image and rescans it before any rebuild. The
+        # scan job never claims a fix is confirmed.
+        lines.append(
+            "### Fixable candidates (pending artifact verification for "
+            f"versions: {versions})"
+        )
         lines.append("")
         lines.append(render_findings_table(fixable))
         lines.append("")
@@ -145,7 +184,9 @@ def _emit_run_summary(
 
     if not fixable and not not_fixable:
         if findings_count > 0:
-            lines.append("No rebuild dispatched: no finding has a fix verified present in the base image.")
+            lines.append(
+                "No fixable candidates: no finding has a published upstream fix."
+            )
         else:
             lines.append("No findings at or above the severity threshold.")
         lines.append("")
@@ -156,10 +197,10 @@ def _emit_run_summary(
 def _emit_failure_summary(stage: str, exc: Exception) -> None:
     """Write a job summary reporting that a pipeline stage failed.
 
-    ``stage`` names the failing stage ("Scan" or "Base verification"); the
-    exception message identifies the failing image/platform. No rebuild is
-    dispatched: the failure is reported here, then re-raised by the caller so
-    the job fails loudly.
+    ``stage`` names the failing stage (currently only "Scan"); the exception
+    message identifies the failing image/platform. No contract is emitted: the
+    failure is reported here, then re-raised by the caller so the job fails
+    loudly.
     """
     lines = [
         "## CVE Scan Summary",
@@ -184,7 +225,9 @@ def run_sweep(
 
     Args:
         settings: Loaded CveScanSettings instance.
-        dry_run: If True, print findings and skip dispatch.
+        dry_run: If True, print findings and suppress the contract emission
+            side of dispatch (outputs are still written so the caller can
+            inspect them).
     """
     logger.info(
         "Loaded settings: scanner=%s, threshold=%s, platforms=%s",
@@ -193,9 +236,10 @@ def run_sweep(
         ",".join(settings.platforms),
     )
 
-    # Resolve image matrix (static override or dynamic from versions manifest)
-    images, base_map = resolve_matrix(settings)
-    static_mode = bool(settings.images)
+    # Resolve image matrix (static override or dynamic from versions manifest).
+    # base_map is no longer consumed (base verification was removed); the image
+    # list is all the sweep needs.
+    images, _base_map = resolve_matrix(settings)
     logger.info("Resolved %d image(s) to scan: %s", len(images), ", ".join(images))
 
     logger.info(
@@ -215,7 +259,10 @@ def run_sweep(
         logger.error("Scan failed: %s", exc)
         _emit_failure_summary("Scan", exc)
         raise
-    logger.info("Found %d finding(s) above %s threshold.", len(findings), settings.severity_threshold.name)
+    logger.info(
+        "Found %d finding(s) above %s threshold.",
+        len(findings), settings.severity_threshold.name,
+    )
 
     if not findings:
         logger.info("No findings above threshold. Exiting cleanly.")
@@ -225,7 +272,7 @@ def run_sweep(
         _emit_run_summary(
             images=images, findings_count=0, fixable=[], not_fixable=[],
             threshold_name=settings.severity_threshold.name,
-            dry_run=dry_run, static_mode=static_mode,
+            dry_run=dry_run,
         )
         return
 
@@ -233,74 +280,31 @@ def run_sweep(
     fixable = [c for c in classifications if c.fixable]
     not_fixable = [c for c in classifications if not c.fixable]
     logger.info(
-        "Classification: %d fixable, %d not fixable.",
+        "Classification: %d fixable candidate(s), %d not fixable.",
         len(fixable),
         len(not_fixable),
     )
 
-    # Base pre-check (dynamic mode) or static-mode reclassification, BEFORE
-    # outputs/summary/dry-run rendering so reporting reflects reality.
-    if fixable and static_mode:
-        # Static override: base verification is unavailable, so nothing is
-        # auto-fixable. Reclassify candidates instead of leaving them in
-        # `fixable` (which would render a bogus dispatch section).
-        logger.info(
-            "Static mode: rebuild dispatch disabled; reclassifying %d candidate(s) as not fixable.",
-            len(fixable),
-        )
-        not_fixable = not_fixable + [
-            Classification(
-                finding=c.finding,
-                fixable=False,
-                rationale="static image override: base verification unavailable, not auto-fixable",
-            )
-            for c in fixable
-        ]
-        fixable = []
-    elif fixable:
-        logger.info("Running base package check for %d fixable finding(s)...", len(fixable))
-        try:
-            confirmed, downgraded = verify_fixable_in_base(fixable, base_map)
-        except BasePrecheckError as exc:
-            # The base pre-check runs after the scan and shells out to docker
-            # across many image/platform combinations, so it has its own
-            # failure mode. Emit a summary naming this stage (the message names
-            # the failing base image), then re-raise so the job fails loudly.
-            logger.error("Base verification failed: %s", exc)
-            _emit_failure_summary("Base verification", exc)
-            raise
-        logger.info(
-            "Base pre-check: %d confirmed, %d downgraded (base not yet updated).",
-            len(confirmed),
-            len(downgraded),
-        )
-        fixable = confirmed
-        not_fixable = not_fixable + downgraded
-    else:
-        logger.info("Skipping base pre-check (no fixable findings).")
-
     versions = _fixable_versions(fixable)
+    targets_b64 = encode_targets(_build_targets(fixable)) if fixable else ""
 
-    # Static mode always emits fixable=false (no unverified rebuild)
-    if static_mode:
-        _emit_outputs(False)
-    else:
-        _emit_outputs(len(fixable) > 0, versions)
+    _emit_outputs(len(fixable) > 0, versions, targets_b64)
 
     if dry_run:
         _print_dry_run(fixable, not_fixable)
         _emit_run_summary(
             images=images, findings_count=len(findings), fixable=fixable,
             not_fixable=not_fixable, threshold_name=settings.severity_threshold.name,
-            dry_run=True, static_mode=static_mode, dispatched_versions=versions,
+            dry_run=True, candidate_versions=versions,
         )
         return
 
-    # Live mode: rebuild dispatch happens in the workflow YAML
+    # Live mode: rebuild dispatch happens in the workflow YAML after the
+    # candidate image is built and its artifact verified.
     _emit_run_summary(
         images=images, findings_count=len(findings), fixable=fixable,
         not_fixable=not_fixable, threshold_name=settings.severity_threshold.name,
-        dry_run=False, static_mode=static_mode, dispatched_versions=versions,
+        dry_run=False, candidate_versions=versions,
     )
 
 

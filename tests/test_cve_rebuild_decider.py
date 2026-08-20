@@ -1,9 +1,9 @@
 """Tests for scripts/cve_scan/rebuild_decider.py.
 
 Two-rule contract: no fixed_version -> not fixable; fixed_version present ->
-candidate fixable, pending base pre-check verification. Version ordering
-semantics live only in version_compare.py (native dpkg/apk), which has its
-own tests.
+candidate fixable, pending artifact verification. Candidates are proven only
+downstream by building the image and rescanning the artifact
+(verify_candidate.py), never by version math here.
 """
 
 from __future__ import annotations
@@ -53,9 +53,9 @@ class TestCandidateFixable:
         result = classify(_make_finding(installed="1.0.0", fixed="1.0.1"))
         assert result.fixable is True
 
-    def test_rationale_mentions_pending_base_verification(self) -> None:
+    def test_rationale_mentions_pending_artifact_verification(self) -> None:
         result = classify(_make_finding())
-        assert "pending base verification" in result.rationale
+        assert "pending artifact verification" in result.rationale
 
     def test_rationale_mentions_versions(self) -> None:
         result = classify(_make_finding(installed="3.0.12-r0", fixed="3.0.13-r0"))
