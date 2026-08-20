@@ -95,8 +95,6 @@ def _mock_urlopen(data: Any, status: int = 200):
     body = json.dumps(data).encode("utf-8") if not isinstance(data, bytes) else data
     resp = BytesIO(body)
     resp.status = status  # type: ignore[attr-defined]
-    resp.__enter__ = lambda self: self  # type: ignore[attr-defined]
-    resp.__exit__ = lambda self, *a: None  # type: ignore[attr-defined]
     return resp
 
 

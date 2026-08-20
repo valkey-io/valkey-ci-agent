@@ -22,7 +22,7 @@ from pathlib import Path
 
 import yaml
 
-_WORKFLOW = Path(".github/workflows/cve-scan.yml")
+_WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/cve-scan.yml"
 
 _USE_RE = re.compile(r"uses:\s*([^@\s]+)@([^#\s]+)")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -84,18 +84,24 @@ def test_scan_job_has_no_app_token_step() -> None:
 
 
 def test_scan_job_has_no_write_permissions() -> None:
-    """Neither the scan job nor the workflow default grants issues/actions write."""
+    """Neither the scan job nor the workflow default grants issues/actions write.
+
+    Handles both the mapping form and the scalar form: a scalar ``write-all``
+    grants issues and actions write, so it must fail this test rather than slip
+    through (an ``isinstance(dict)`` guard would skip the exact config the test
+    exists to reject).
+    """
+    def _assert_no_write(perms: object) -> None:
+        if isinstance(perms, str):
+            # Scalar form: write-all grants every write scope, incl. issues/actions.
+            assert perms != "write-all"
+        elif isinstance(perms, dict):
+            assert perms.get("issues") != "write"
+            assert perms.get("actions") != "write"
+
     workflow = _load_workflow()
-
-    workflow_perms = workflow.get("permissions", {})
-    if isinstance(workflow_perms, dict):
-        assert workflow_perms.get("issues") != "write"
-        assert workflow_perms.get("actions") != "write"
-
-    scan_perms = workflow["jobs"]["scan"].get("permissions", {})
-    if isinstance(scan_perms, dict):
-        assert scan_perms.get("issues") != "write"
-        assert scan_perms.get("actions") != "write"
+    _assert_no_write(workflow.get("permissions", {}))
+    _assert_no_write(workflow["jobs"]["scan"].get("permissions", {}))
 
 
 def test_workflow_dispatch_dry_run_defaults_true() -> None:
@@ -124,11 +130,6 @@ def test_all_external_actions_are_sha_pinned() -> None:
 def _rebuild_steps() -> list[dict]:
     """Return the rebuild job's steps."""
     return _load_workflow()["jobs"]["rebuild"]["steps"]
-
-
-def _step_run_text() -> str:
-    """Concatenate every rebuild step's `run` script for substring assertions."""
-    return "\n".join(step.get("run", "") for step in _rebuild_steps())
 
 
 def test_rebuild_dispatch_step_records_timestamp() -> None:
@@ -296,11 +297,21 @@ def test_locate_watch_conclusion_use_default_github_token() -> None:
         assert "steps.token.outputs.token" not in gh_token
 
 
-def test_dispatch_step_captures_bot_login() -> None:
-    """The dispatch step exposes the bot login as an output for actor filtering (fix 3)."""
-    run = _rebuild_step("dispatch")["run"]
-    assert "gh api user --jq .login" in run
+def test_dispatch_step_derives_bot_login_from_app_slug() -> None:
+    """The dispatch step derives the bot login from the token action's app-slug
+    output as <app-slug>[bot] (fix 1), with no API call: GET /user rejects App
+    installation tokens, so the old `gh api user` path was always empty and the
+    actor filter was inert. This fails if that inert path ever returns."""
+    dispatch = _rebuild_step("dispatch")
+    run = dispatch["run"]
+    # Login is built from the app-slug output ...
+    assert dispatch["env"]["APP_SLUG"] == "${{ steps.token.outputs.app-slug }}"
+    assert "[bot]" in run
     assert "bot_login=" in run
+    # ... not from an API call that App tokens cannot make.
+    assert "gh api user" not in run
+    # An empty app-slug is surfaced, not silently swallowed.
+    assert "::warning::" in run
 
 
 def test_locate_step_filters_by_actor() -> None:
@@ -310,3 +321,15 @@ def test_locate_step_filters_by_actor() -> None:
     assert "--user" in run
     # The bot login flows in from the dispatch step's output.
     assert locate["env"]["BOT_LOGIN"] == "${{ steps.dispatch.outputs.bot_login }}"
+
+
+def test_watch_step_timeout_leaves_reporting_headroom() -> None:
+    """The watch step has its own timeout below the job timeout, with >= 10 min
+    headroom, so a watcher timeout is a STEP failure that still lets the
+    always() reporting steps run rather than GitHub cancelling the whole job."""
+    workflow = _load_workflow()
+    job_timeout = workflow["jobs"]["rebuild"]["timeout-minutes"]
+    step_timeout = _rebuild_step("watch")["timeout-minutes"]
+    assert isinstance(step_timeout, int)
+    assert step_timeout < job_timeout
+    assert job_timeout - step_timeout >= 10

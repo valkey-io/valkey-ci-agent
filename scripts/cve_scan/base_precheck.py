@@ -1,22 +1,34 @@
 """Base-image pre-check for CVE rebuild decisions.
 
-Verifies a rebuild-fixable CVE is actually patched in the upstream base image
-(advisory FixedVersion may precede a republished base tag). Reads each base's
-package database via one-shot ``docker run`` and compares with native dpkg/apk
-semantics (version_compare), not the pure-Python approximation. The distro
-repository candidate is consulted only for packages the build demonstrably
-manages: those absent from the raw base db, or present in the base but shipped
-newer in the scanned image (installed_version > base_version), which proves the
-build installed or upgraded them. A package the base ships at the same version
-the image ships is left untouched by the build, so a rebuild cannot change it
-and it downgrades without a repo query. Any comparison error or ambiguity
-downgrades conservatively (fail-closed). Deterministic, no AI, stdlib only.
+Answers one question per fixable finding: if we rebuild this image, will the
+affected package land at or above the CVE's fixed version? Version numbers
+alone cannot tell whether a rebuild upgrades a package (e.g. Debian's
+``libssl-dev`` drags a newer ``libssl3t64``; Alpine's ``openssl`` drags newer
+``libcrypto3``/``libssl3``) or leaves it untouched (e.g. ``zlib1g``, referenced
+by no Dockerfile install). So instead of guessing, we simulate the Dockerfile's
+own install transaction inside the base image and read the version the rebuild
+would land on.
+
+Decision, per finding:
+  * base already ships the fix -> confirmed (fast path, no simulation).
+  * package is in the simulated install plan at or above the fix -> confirmed.
+  * package is in the plan but below the fix -> downgraded.
+  * package is not in the plan -> the rebuild leaves the base version, so
+    confirm only when the base already satisfies the fix, else downgrade
+    (needs a base image update).
+  * any fetch/parse/simulation/comparison failure -> downgraded (fail-closed).
+
+Comparisons use native dpkg/apk semantics (version_compare), not a pure-Python
+approximation. Deterministic, no AI, stdlib only.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
+import urllib.request
+from urllib.error import URLError
 
 from scripts.cve_scan.models import Classification, Finding
 from scripts.cve_scan.version_compare import compare_versions as _native_compare
@@ -25,14 +37,26 @@ logger = logging.getLogger(__name__)
 
 
 class BasePrecheckError(Exception):
-    """Raised when the base image package database cannot be read."""
+    """Raised when a base image package database or rebuild plan cannot be read."""
+
+
+#: Timeout for reading a base image's package database.
+_DOCKER_TIMEOUT = 300  # seconds
+#: Timeout for a rebuild install simulation (includes network index refresh).
+_SIMULATE_TIMEOUT = 180  # seconds
+#: Timeout for fetching a Dockerfile.
+_FETCH_TIMEOUT = 15  # seconds
+
+#: valkey-container Dockerfiles live at deterministic paths on branch mainline.
+_DOCKERFILE_URL_TEMPLATE = (
+    "https://raw.githubusercontent.com/valkey-io/valkey-container"
+    "/mainline/{line}/{variant}/Dockerfile"
+)
 
 
 # ---------------------------------------------------------------------------
 # Package database readers
 # ---------------------------------------------------------------------------
-
-_DOCKER_TIMEOUT = 300  # seconds
 
 
 def _parse_apk_installed(raw: str) -> dict[str, str]:
@@ -84,7 +108,9 @@ def get_base_packages(base_ref: str, platform: str = "") -> dict[str, str]:
         Mapping of package name to installed version string.
 
     Raises:
-        BasePrecheckError: On unknown base flavor, docker failure, or empty output.
+        BasePrecheckError: On unknown base flavor, docker failure (including
+            OSError launching docker), timeout, empty output, or nonempty
+            output that parses to zero packages.
     """
     if base_ref.startswith("alpine:"):
         cmd = ["docker", "run"]
@@ -120,6 +146,10 @@ def get_base_packages(base_ref: str, platform: str = "") -> dict[str, str]:
             f"Timed out reading package database from {base_ref} "
             f"(timeout={_DOCKER_TIMEOUT}s)."
         ) from exc
+    except OSError as exc:
+        raise BasePrecheckError(
+            f"Failed to run docker to read package database from {base_ref}: {exc}"
+        ) from exc
 
     if result.returncode != 0:
         raise BasePrecheckError(
@@ -132,15 +162,15 @@ def get_base_packages(base_ref: str, platform: str = "") -> dict[str, str]:
             f"Empty package database output from {base_ref}."
         )
 
-    return parser(result.stdout)
-
-
-# ---------------------------------------------------------------------------
-# Distro repository candidate lookup (for packages absent from the base db)
-# ---------------------------------------------------------------------------
-
-#: Timeout for a repo candidate query (includes network index refresh).
-_REPO_QUERY_TIMEOUT = 180  # seconds
+    packages = parser(result.stdout)
+    if not packages:
+        # Nonempty but unparseable: treating this as an empty db would make
+        # every package look absent and confirmable with no base evidence.
+        raise BasePrecheckError(
+            f"Read {len(result.stdout)} bytes from {base_ref} package database "
+            f"but parsed zero packages (unrecognized format)."
+        )
+    return packages
 
 
 def _flavor_for(base_ref: str) -> str:
@@ -152,212 +182,269 @@ def _flavor_for(base_ref: str) -> str:
     return "debian"  # unknown flavor: conservative default
 
 
-def _parse_apk_policy(raw: str) -> list[str]:
-    """Extract candidate versions from ``apk policy <pkg>`` output.
+# ---------------------------------------------------------------------------
+# Dockerfile fetch and install-list parsing
+# ---------------------------------------------------------------------------
 
-    Format: an unindented ``<pkg> policy:`` header, then two-space-indented
-    ``<version>:`` lines, each followed by deeper-indented source lines.
-    Returns every listed version; [] when none parse (fail-closed).
+
+def _dockerfile_target(image: str) -> tuple[str, str]:
+    """Derive (line, variant) from a valkey image ref.
+
+    ``valkey/valkey:9.0`` -> ``("9.0", "debian")``;
+    ``valkey/valkey:9.0-alpine`` -> ``("9.0", "alpine")``. Strips the
+    ``-alpine`` suffix only, not any other occurrence.
     """
-    versions: list[str] = []
-    for line in raw.splitlines():
-        if line.startswith("  ") and not line.startswith("    "):
-            stripped = line.strip()
-            if stripped.endswith(":"):
-                versions.append(stripped[:-1])
-    return versions
+    tag = image.rsplit(":", 1)[-1] if ":" in image else image
+    if tag.endswith("-alpine"):
+        return tag[: -len("-alpine")], "alpine"
+    return tag, "debian"
 
 
-def _parse_apt_cache_policy(raw: str) -> list[str]:
-    """Extract the Candidate version from ``apt-cache policy <pkg>`` output.
+def _fetch_dockerfile(line: str, variant: str) -> str:
+    """Fetch a valkey-container Dockerfile for the given line and variant.
 
-    Returns [] when the ``Candidate:`` line is missing, empty, or
-    ``(none)`` (fail-closed).
+    Reuses the urllib pattern (and timeout style) from image_matrix; no new
+    HTTP dependency. Raises BasePrecheckError on any network or status error.
     """
+    url = _DOCKERFILE_URL_TEMPLATE.format(line=line, variant=variant)
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "valkey-ci-agent/cve-scan"}
+        )
+        with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT) as resp:
+            if resp.status != 200:
+                raise BasePrecheckError(
+                    f"Failed to fetch Dockerfile: HTTP {resp.status} from {url}"
+                )
+            return resp.read().decode("utf-8")
+    except (URLError, OSError, TimeoutError) as exc:
+        raise BasePrecheckError(
+            f"Failed to fetch Dockerfile from {url}: {exc}"
+        ) from exc
+
+
+def _packages_from_segment(tokens: list[str]) -> list[str]:
+    """Extract package tokens from a single ``apk add`` / ``apt-get install`` command.
+
+    Skips flags (``-*``), the ``-t``/``--virtual`` argument, apk virtual names
+    (``.build-deps``), and shell variables (``$...``). Returns [] when the
+    segment is not an install command.
+    """
+    start: int | None = None
+    for i in range(len(tokens) - 1):
+        if tokens[i] == "apk" and tokens[i + 1] == "add":
+            start = i + 2
+            break
+        if tokens[i] == "apt-get" and tokens[i + 1] == "install":
+            start = i + 2
+            break
+    if start is None:
+        return []
+
+    packages: list[str] = []
+    skip_next = False
+    for tok in tokens[start:]:
+        if skip_next:
+            skip_next = False  # consume the --virtual/-t name argument
+            continue
+        if tok in ("-t", "--virtual"):
+            skip_next = True
+            continue
+        if tok.startswith(("-", ".", "$")):
+            continue  # flag, apk virtual name, or shell variable
+        packages.append(tok)
+    return packages
+
+
+def _parse_install_list(dockerfile: str) -> list[str]:
+    """Collect package tokens from every ``apk add`` / ``apt-get install`` block.
+
+    Strips comment lines FIRST: the real valkey-container Dockerfiles put a
+    ``#`` comment inside the install block, and it carries no trailing
+    backslash, so merging continuations first would both absorb the comment
+    prose as packages and orphan the real package names onto a segment with no
+    install verb. Then merges backslash continuations, splits into command
+    segments on ``;``, ``&&``, and newlines, and unions the packages from every
+    install segment (build-stage packages are harmless: Trivy only scans the
+    final image). Order-preserving and de-duplicated.
+    """
+    without_comments = "\n".join(
+        line for line in dockerfile.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    merged = re.sub(r"\\\r?\n", " ", without_comments)
+    packages: list[str] = []
+    seen: set[str] = set()
+    for segment in re.split(r";|&&|\n", merged):
+        for pkg in _packages_from_segment(segment.split()):
+            if pkg not in seen:
+                seen.add(pkg)
+                packages.append(pkg)
+    return packages
+
+
+# ---------------------------------------------------------------------------
+# Rebuild install simulation
+# ---------------------------------------------------------------------------
+
+#: apt --dry-run: ``Inst <pkg> [old] (<ver> ...`` or ``Conf <pkg> (<ver> ...``.
+_APT_PLAN_RE = re.compile(r"^(Inst|Conf)\s+(\S+)\s+(?:\[[^\]]*\]\s+)?\(([^\s)]+)")
+#: apk --simulate: ``(1/5) Installing <pkg> (<ver>)`` / ``Upgrading <pkg> (<old> -> <new>)``.
+_APK_PLAN_RE = re.compile(
+    r"^\(\d+/\d+\)\s+(?:Installing|Upgrading|Reinstalling)\s+(\S+)\s+\((.+?)\)\s*$"
+)
+
+
+def _parse_apt_plan(raw: str) -> dict[str, str]:
+    """Parse ``apt-get install --dry-run`` output into {package: planned_version}.
+
+    ``Inst`` lines (the version being installed/upgraded) take precedence over
+    ``Conf`` lines.
+    """
+    plan: dict[str, str] = {}
+    conf: dict[str, str] = {}
     for line in raw.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Candidate:"):
-            candidate = stripped[len("Candidate:"):].strip()
-            if not candidate or candidate == "(none)":
-                return []
-            return [candidate]
-    return []
+        m = _APT_PLAN_RE.match(line.strip())
+        if not m:
+            continue
+        kind, pkg, ver = m.group(1), m.group(2), m.group(3)
+        if kind == "Inst":
+            plan[pkg] = ver
+        else:
+            conf.setdefault(pkg, ver)
+    for pkg, ver in conf.items():
+        plan.setdefault(pkg, ver)
+    return plan
 
 
-def get_repo_candidates(base_ref: str, package: str, platform: str = "") -> list[str]:
-    """Query the distro repository candidate versions for a package inside the base container.
+def _parse_apk_plan(raw: str) -> dict[str, str]:
+    """Parse ``apk add --simulate`` output into {package: planned_version}.
 
-    Refreshes the package index (network access required) and asks the
-    package manager which version(s) the repository currently supplies.
-    The package name is passed as a positional shell argument (``"$1"``),
-    never interpolated into the ``sh -c`` script, so it cannot inject.
+    For ``Upgrading <pkg> (<old> -> <new>)`` the post-arrow version is kept.
+    """
+    plan: dict[str, str] = {}
+    for line in raw.splitlines():
+        m = _APK_PLAN_RE.match(line.strip())
+        if not m:
+            continue
+        pkg, ver = m.group(1), m.group(2)
+        if "->" in ver:
+            ver = ver.split("->")[-1].strip()
+        plan[pkg] = ver
+    return plan
+
+
+def simulate_install(
+    base_ref: str, packages: list[str], platform: str = "",
+) -> dict[str, str]:
+    """Simulate the Dockerfile install transaction inside the base image.
+
+    Runs the package manager in dry-run/simulate mode via one-shot docker run
+    and returns the versions the rebuild would land on. Package names are
+    passed as positional shell arguments (``"$@"``), never interpolated into
+    the script, so they cannot inject.
 
     Args:
         base_ref: Base image reference (e.g. "alpine:3.23", "debian:trixie-slim").
-        package: Package name to query.
+        packages: Install list parsed from the Dockerfile.
         platform: Optional platform passed as ``--platform`` to docker run.
 
     Returns:
-        Candidate version strings, or [] on any failure (unknown flavor,
-        docker/network failure, timeout, nonzero exit, unparseable output).
-        Callers must treat [] as fail-closed.
+        Mapping of package name to the version a rebuild would install.
+
+    Raises:
+        BasePrecheckError: On empty install list, unknown base flavor, docker
+            failure (including OSError), timeout, nonzero exit, or a plan that
+            parses to zero packages.
     """
-    if base_ref.startswith("alpine:"):
-        script = 'apk update -q >/dev/null 2>&1 && apk policy "$1"'
-        parse = _parse_apk_policy
-    elif base_ref.startswith("debian:"):
-        script = 'apt-get update -qq >/dev/null 2>&1 && apt-cache policy "$1"'
-        parse = _parse_apt_cache_policy
-    else:
-        logger.warning(
-            "Repo candidate query: unknown base flavor %r; treating candidate as unavailable.",
-            base_ref,
+    if not packages:
+        raise BasePrecheckError(
+            f"No install packages parsed for {base_ref}; cannot simulate rebuild."
         )
-        return []
+
+    if base_ref.startswith("alpine:"):
+        script = 'apk update -q && apk add --simulate "$@"'
+        parse = _parse_apk_plan
+    elif base_ref.startswith("debian:"):
+        script = (
+            'apt-get update -qq && '
+            'apt-get install --dry-run --no-install-recommends "$@"'
+        )
+        parse = _parse_apt_plan
+    else:
+        raise BasePrecheckError(
+            f"Unknown base image flavor: {base_ref!r}. "
+            f"Expected prefix 'alpine:' or 'debian:'."
+        )
 
     cmd = ["docker", "run"]
     if platform:
         cmd.extend(["--platform", platform])
-    cmd.extend(["--rm", base_ref, "sh", "-c", script, "_", package])
+    cmd.extend(["--rm", base_ref, "sh", "-c", script, "_", *packages])
 
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=_REPO_QUERY_TIMEOUT,
+            timeout=_SIMULATE_TIMEOUT,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            "Repo candidate query timed out for %s in %s (timeout=%ds).",
-            package, base_ref, _REPO_QUERY_TIMEOUT,
-        )
-        return []
+    except subprocess.TimeoutExpired as exc:
+        raise BasePrecheckError(
+            f"Timed out simulating install in {base_ref} "
+            f"(timeout={_SIMULATE_TIMEOUT}s)."
+        ) from exc
     except OSError as exc:
-        logger.warning(
-            "Repo candidate query failed to execute for %s in %s: %s",
-            package, base_ref, exc,
-        )
-        return []
+        raise BasePrecheckError(
+            f"Failed to run docker to simulate install in {base_ref}: {exc}"
+        ) from exc
 
     if result.returncode != 0:
-        logger.warning(
-            "Repo candidate query exited %d for %s in %s: %s",
-            result.returncode, package, base_ref, result.stderr.strip(),
+        raise BasePrecheckError(
+            f"Install simulation failed for {base_ref} (exit {result.returncode}): "
+            f"{result.stderr.strip()}"
         )
-        return []
 
-    return parse(result.stdout)
+    # apt prints the plan to stdout; apk emits progress to stdout or stderr.
+    plan = parse(result.stdout + "\n" + result.stderr)
+    if not plan:
+        raise BasePrecheckError(
+            f"Parsed an empty install plan from the {base_ref} simulation "
+            f"({len(result.stdout)} stdout bytes)."
+        )
+    return plan
 
 
-def _find_satisfying_candidate(
+def _rebuild_plan(
     finding: Finding,
     base_ref: str,
-    flavor: str,
-    candidates: list[str],
-) -> str | None:
-    """Return the first repo candidate at or above the fix version, else None.
+    install_list_cache: dict[tuple[str, str], list[str]],
+    plan_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]],
+) -> dict[str, str]:
+    """Fetch + parse the Dockerfile and simulate its install, with caching.
 
-    The package manager installs the highest available candidate, so "any
-    candidate >= fix" is equivalent to "max(candidates) >= fix" without extra
-    docker calls to order the candidates themselves. Returns None when the fix
-    version is unknown, no candidate satisfies it, or every comparison is
-    ambiguous (fail-closed).
+    The install list is cached per (line, variant); the simulated plan is
+    cached per (base_ref, platform, install-list). Raises BasePrecheckError on
+    any fetch, parse, or simulation failure (caller downgrades fail-closed).
     """
-    if finding.fixed_version is None:
-        return None
-    for candidate in candidates:
-        cmp = _native_compare(candidate, finding.fixed_version, flavor, base_ref)
-        if cmp is not None and cmp >= 0:
-            return candidate
-    return None
+    line, variant = _dockerfile_target(finding.image)
+    df_key = (line, variant)
+    if df_key not in install_list_cache:
+        dockerfile = _fetch_dockerfile(line, variant)
+        install_list_cache[df_key] = _parse_install_list(dockerfile)
+    install_list = install_list_cache[df_key]
 
-
-def _repo_candidates_cached(
-    base_ref: str,
-    finding: Finding,
-    cache: dict[tuple[str, str, str], list[str]],
-) -> list[str]:
-    """Query the distro repo candidates for a finding's package, memoized.
-
-    Shared by the absent-from-base and stale-base paths. The cache is keyed by
-    (base_ref, platform, package) so the same package is queried at most once
-    per base image and platform. Returns [] on any failure (fail-closed).
-    """
-    cand_key = (base_ref, finding.platform, finding.package)
-    if cand_key not in cache:
+    plan_key = (base_ref, finding.platform, tuple(install_list))
+    if plan_key not in plan_cache:
         logger.info(
-            "Querying repo candidate for %s in base %s (platform=%s) ...",
-            finding.package, base_ref, finding.platform or "native",
+            "Simulating rebuild install for %s in base %s (platform=%s) ...",
+            finding.image, base_ref, finding.platform or "native",
         )
-        cache[cand_key] = get_repo_candidates(
-            base_ref, finding.package, platform=finding.platform,
+        plan_cache[plan_key] = simulate_install(
+            base_ref, install_list, platform=finding.platform,
         )
-    return cache[cand_key]
-
-
-def _verify_via_repo_candidate(
-    classification: Classification,
-    base_ref: str,
-    flavor: str,
-    base_version: str | None,
-    cache: dict[tuple[str, str, str], list[str]],
-) -> Classification:
-    """Confirm or downgrade a finding by consulting the distro repo candidate.
-
-    Shared by the two paths where the base image alone does not prove the fix
-    AND the build is known to manage the package: the package is absent from
-    the raw base db (installed at build time, so ``base_version`` is None), or
-    the base ships an older version than the fix while the scanned image ships
-    newer than the base (installed_version > base_version, so the build
-    upgraded it). A rebuild reinstalls such build-managed packages from the
-    distro repo, so confirm only when the repo currently supplies a candidate
-    at or above the fix version; any other outcome (older candidate, no
-    candidate, query or comparison failure) downgrades fail-closed. The
-    rationale wording distinguishes the absent and stale cases so the job
-    summary explains why each finding landed where it did.
-    """
-    finding = classification.finding
-    candidates = _repo_candidates_cached(base_ref, finding, cache)
-    satisfying = _find_satisfying_candidate(finding, base_ref, flavor, candidates)
-    candidate_list = ", ".join(candidates) if candidates else "none"
-
-    if satisfying is not None:
-        if base_version is None:
-            detail = (
-                f"package {finding.package} not in base image {base_ref} "
-                f"(installed at build time); repo candidate {satisfying} >= "
-                f"fix {finding.fixed_version}, so a rebuild will pick up the fix."
-            )
-        else:
-            detail = (
-                f"base {base_ref} ships {base_version} "
-                f"(< {finding.fixed_version}), but repo candidate {satisfying} "
-                f"satisfies the fix, so a rebuild will pick it up."
-            )
-        return Classification(
-            finding=finding,
-            fixable=True,
-            rationale=f"{classification.rationale} Verified: {detail}",
-        )
-
-    if base_version is None:
-        rationale = (
-            f"Fix for {finding.cve_id} in {finding.package}: package not in "
-            f"base image {base_ref} and repo candidate unverified/older "
-            f"(candidates: {candidate_list}; fix: {finding.fixed_version}). "
-            f"Downgrading conservatively (fail-closed). Re-check next scan."
-        )
-    else:
-        rationale = (
-            f"Fix for {finding.cve_id} in {finding.package} is published "
-            f"upstream but base image {base_ref} still ships {base_version} "
-            f"(< {finding.fixed_version}) and the repo candidate was older or "
-            f"unavailable (candidates: {candidate_list}); a rebuild would not "
-            f"pick it up. Re-check next scan."
-        )
-    return Classification(finding=finding, fixable=False, rationale=rationale)
+    return plan_cache[plan_key]
 
 
 # ---------------------------------------------------------------------------
@@ -365,24 +452,30 @@ def _verify_via_repo_candidate(
 # ---------------------------------------------------------------------------
 
 
+def _confirmed(finding: Finding, rationale: str) -> Classification:
+    """Build a confirmed (fixable) classification."""
+    return Classification(finding=finding, fixable=True, rationale=rationale)
+
+
+def _downgraded(finding: Finding, rationale: str) -> Classification:
+    """Build a downgraded (not fixable) classification."""
+    return Classification(finding=finding, fixable=False, rationale=rationale)
+
+
 def verify_fixable_in_base(
     fixable: list[Classification],
     base_map: dict[str, str],
 ) -> tuple[list[Classification], list[Classification]]:
-    """Verify fixable findings against their base images' package databases.
+    """Verify fixable findings against a simulated rebuild of their base images.
 
-    Reads each distinct (base image, platform) package list once (cached per
-    invocation). A finding is confirmed when the base already ships the fix.
-    When the base ships an older version, the distro repository candidate is
-    consulted only if the scanned image ships newer than the base
-    (installed_version > base_version), which proves the build manages the
-    package; if the image ships the same version as the base (or older, or the
-    comparison is ambiguous) the finding downgrades without a repo query. When
-    the package is absent from the base db (installed at build time) the repo
-    candidate is queried directly. In every repo-candidate case the finding is
-    confirmed only when that candidate is at or above the fix version;
-    otherwise it is downgraded (fail-closed). Ambiguous comparisons also
-    downgrade (fail-closed).
+    Each distinct (base image, platform) package list is read once, and each
+    distinct (base, platform, install-list) rebuild is simulated once (both
+    cached per invocation). A finding is confirmed when the base already ships
+    the fix (fast path, no simulation) or when the simulated rebuild install
+    plan lands the package at or above the fix. A package absent from the plan
+    stays at the base version, so it confirms only when the base already
+    satisfies the fix. Any fetch, parse, simulation, or comparison failure
+    downgrades fail-closed.
 
     Args:
         fixable: Classifications previously marked as rebuild-fixable.
@@ -397,10 +490,9 @@ def verify_fixable_in_base(
     if not fixable:
         return [], []
 
-    # Cache: (base_ref, platform) -> {package: version}
     base_pkg_cache: dict[tuple[str, str], dict[str, str]] = {}
-    # Cache: (base_ref, platform, package) -> repo candidate versions
-    repo_candidate_cache: dict[tuple[str, str, str], list[str]] = {}
+    install_list_cache: dict[tuple[str, str], list[str]] = {}
+    plan_cache: dict[tuple[str, str, tuple[str, ...]], dict[str, str]] = {}
 
     confirmed: list[Classification] = []
     downgraded: list[Classification] = []
@@ -412,129 +504,112 @@ def verify_fixable_in_base(
         if base_ref is None:
             logger.warning(
                 "No base image mapping for %s; downgrading %s/%s conservatively.",
-                finding.image,
-                finding.cve_id,
-                finding.package,
+                finding.image, finding.cve_id, finding.package,
             )
-            downgraded.append(Classification(
-                finding=finding,
-                fixable=False,
-                rationale=(
-                    f"No base image mapping for {finding.image}; cannot verify "
-                    f"fix presence. Downgrading conservatively (fail-closed)."
-                ),
+            downgraded.append(_downgraded(
+                finding,
+                f"No base image mapping for {finding.image}; cannot verify fix "
+                f"presence. Downgrading conservatively (fail-closed).",
             ))
             continue
 
-        # Read base package database (cached per base_ref + platform)
+        # Read base package database (cached per base_ref + platform).
+        # BasePrecheckError here propagates (unreadable base db is fatal).
         cache_key = (base_ref, finding.platform)
         if cache_key not in base_pkg_cache:
             logger.info(
                 "Reading base image package database: %s (platform=%s) ...",
                 base_ref, finding.platform or "native",
             )
-            base_pkg_cache[cache_key] = get_base_packages(base_ref, platform=finding.platform)
-
+            base_pkg_cache[cache_key] = get_base_packages(
+                base_ref, platform=finding.platform,
+            )
         base_packages = base_pkg_cache[cache_key]
 
         flavor = _flavor_for(base_ref)
         base_version = base_packages.get(finding.package)
+        fixed = finding.fixed_version
 
-        if base_version is None:
-            # Package absent from the raw base db (installed at build time).
-            # Absence alone proves nothing about whether the repo currently
-            # supplies the fix: verify against the repo candidate (fail-closed).
-            result = _verify_via_repo_candidate(
-                classification, base_ref, flavor, None, repo_candidate_cache,
-            )
-            (confirmed if result.fixable else downgraded).append(result)
-            continue
-
-        # Native dpkg/apk comparison; None -> fail-closed (downgrade)
-        if finding.fixed_version is None:
-            # Should not happen for fixable findings, but be safe
-            confirmed.append(classification)
-            continue
-
-        cmp = _native_compare(base_version, finding.fixed_version, flavor, base_ref)
-
-        if cmp is None:
-            # Ambiguous comparison: fail closed
-            rationale = (
-                f"Fix for {finding.cve_id} in {finding.package}: version "
-                f"comparison between base version {base_version} and fix "
-                f"version {finding.fixed_version} is ambiguous. "
-                f"Downgrading conservatively. Re-check next scan."
-            )
-            downgraded.append(Classification(
-                finding=finding,
-                fixable=False,
-                rationale=rationale,
+        # Item B: no known fixed version -> fail-closed (unreachable via
+        # classify today; kept as an explicit downgrade, not a silent confirm).
+        if fixed is None:
+            downgraded.append(_downgraded(
+                finding,
+                f"Fix for {finding.cve_id} in {finding.package} has no known "
+                f"fixed version; cannot verify a rebuild resolves it. "
+                f"Downgrading conservatively (fail-closed).",
             ))
-        elif cmp < 0:
-            # Base ships an older version than the fix. Consulting the repo
-            # candidate is only legitimate when the build actually manages this
-            # package; use the scanned image's installed_version as evidence.
-            # (Fix: repo-candidate promotion was too broad and marked packages
-            # the Dockerfile never installs/upgrades, e.g. zlib1g, as fixable.)
-            installed = finding.installed_version
-            build_cmp = _native_compare(installed, base_version, flavor, base_ref)
-            if build_cmp is not None and build_cmp > 0:
-                # Image ships newer than base: the build demonstrably upgraded
-                # this package, so it is build-managed. The repo candidate is a
-                # legitimate signal for what a rebuild would install.
-                result = _verify_via_repo_candidate(
-                    classification, base_ref, flavor, base_version, repo_candidate_cache,
-                )
-                (confirmed if result.fixable else downgraded).append(result)
-            elif build_cmp == 0:
-                # Image ships exactly the base version: the build never touched
-                # this package, so a rebuild from the same base cannot upgrade
-                # it. Downgrade fail-closed without querying the repo.
-                rationale = (
-                    f"Fix for {finding.cve_id} in {finding.package} is "
-                    f"published upstream but base image {base_ref} ships "
-                    f"{base_version} and the scanned image ships the same "
-                    f"version, so the build does not upgrade it and a rebuild "
-                    f"would not change it. Needs a base image update. "
-                    f"Re-check next scan."
-                )
-                downgraded.append(Classification(
-                    finding=finding, fixable=False, rationale=rationale,
+            continue
+
+        # Fast path: base already ships the fix (no simulation needed).
+        if base_version is not None:
+            cmp = _native_compare(base_version, fixed, flavor, base_ref)
+            if cmp is None:
+                downgraded.append(_downgraded(
+                    finding,
+                    f"Fix for {finding.cve_id} in {finding.package}: comparison "
+                    f"between base version {base_version} and fix {fixed} is "
+                    f"ambiguous. Downgrading conservatively (fail-closed). "
+                    f"Re-check next scan.",
                 ))
-            else:
-                # Image older than base, or the comparison is ambiguous/None:
-                # no evidence the build manages this package. Downgrade
-                # fail-closed without querying the repo.
-                if build_cmp is None:
-                    reason = (
-                        f"the image-vs-base comparison ({installed} vs "
-                        f"{base_version}) is ambiguous"
-                    )
-                else:
-                    reason = (
-                        f"the scanned image ships {installed}, older than base "
-                        f"{base_version}"
-                    )
-                rationale = (
-                    f"Fix for {finding.cve_id} in {finding.package}: {reason}, "
-                    f"so there is no evidence the build upgrades this package "
-                    f"beyond the base. Downgrading conservatively "
-                    f"(fail-closed). Re-check next scan."
-                )
-                downgraded.append(Classification(
-                    finding=finding, fixable=False, rationale=rationale,
+                continue
+            if cmp >= 0:
+                confirmed.append(_confirmed(
+                    finding,
+                    f"{classification.rationale} Verified: base {base_ref} "
+                    f"ships {base_version} (>= fix {fixed}).",
                 ))
+                continue
+
+        # Base is absent or older than the fix: simulate the rebuild install.
+        try:
+            plan = _rebuild_plan(finding, base_ref, install_list_cache, plan_cache)
+        except BasePrecheckError as exc:
+            downgraded.append(_downgraded(
+                finding,
+                f"Fix for {finding.cve_id} in {finding.package}: could not "
+                f"simulate the rebuild ({exc}). Downgrading conservatively "
+                f"(fail-closed). Re-check next scan.",
+            ))
+            continue
+
+        planned = plan.get(finding.package)
+
+        if planned is None:
+            # The rebuild neither installs nor upgrades this package, so it
+            # stays at the base version (which is < fix here, since the fast
+            # path already confirmed base >= fix). This is the zlib1g case.
+            shipped = base_version if base_version is not None else "absent"
+            downgraded.append(_downgraded(
+                finding,
+                f"Fix for {finding.cve_id} in {finding.package}: a rebuild does "
+                f"not install or upgrade it (not in the Dockerfile install "
+                f"plan), so it stays at the base version {shipped} (< fix "
+                f"{fixed}) and needs a base image update. Re-check next scan.",
+            ))
+            continue
+
+        cmp_plan = _native_compare(planned, fixed, flavor, base_ref)
+        if cmp_plan is None:
+            downgraded.append(_downgraded(
+                finding,
+                f"Fix for {finding.cve_id} in {finding.package}: comparison "
+                f"between planned rebuild version {planned} and fix {fixed} is "
+                f"ambiguous. Downgrading conservatively (fail-closed). "
+                f"Re-check next scan.",
+            ))
+        elif cmp_plan >= 0:
+            confirmed.append(_confirmed(
+                finding,
+                f"{classification.rationale} Verified: a rebuild installs "
+                f"{finding.package} {planned} (>= fix {fixed}).",
+            ))
         else:
-            # Base ships the fix
-            rationale = (
-                f"{classification.rationale} "
-                f"Verified: base {base_ref} ships {base_version}."
-            )
-            confirmed.append(Classification(
-                finding=finding,
-                fixable=True,
-                rationale=rationale,
+            downgraded.append(_downgraded(
+                finding,
+                f"Fix for {finding.cve_id} in {finding.package}: a rebuild "
+                f"installs {planned}, below fix {fixed}. Downgrading "
+                f"conservatively (fail-closed). Re-check next scan.",
             ))
 
     return confirmed, downgraded

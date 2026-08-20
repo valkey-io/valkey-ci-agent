@@ -74,7 +74,7 @@ class TestMultiArchScanAndDedup:
         assert results[0].cve_id == "CVE-2024-1234"
         assert results[0].platform == "linux/amd64"
 
-    def test_two_platforms_same_findings_deduped_to_one(self) -> None:
+    def test_two_platforms_same_finding_kept_distinct(self) -> None:
         """Same finding on two platforms -> kept distinct (per-platform verification)."""
         from scripts.cve_scan.scanner import scan_images
 
@@ -163,7 +163,7 @@ class TestMultiArchScanAndDedup:
         assert len(results) == 2
         assert call_count[0] == 2  # one call per platform
 
-    def test_four_platforms_same_finding_deduped(self) -> None:
+    def test_four_platforms_same_finding_kept_distinct(self) -> None:
         """Same finding across 4 platforms -> four results (per-platform)."""
         from scripts.cve_scan.scanner import scan_images
 

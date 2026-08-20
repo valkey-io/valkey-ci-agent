@@ -22,7 +22,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.common.job_summary import emit_job_summary
-from scripts.cve_scan.base_precheck import verify_fixable_in_base
+from scripts.cve_scan.base_precheck import BasePrecheckError, verify_fixable_in_base
 from scripts.cve_scan.config import CveScanSettings, load_settings
 from scripts.cve_scan.image_matrix import resolve_matrix
 from scripts.cve_scan.models import Classification
@@ -153,20 +153,21 @@ def _emit_run_summary(
     emit_job_summary("\n".join(lines))
 
 
-def _emit_scan_failure_summary(exc: ScanError) -> None:
-    """Write a job summary reporting that the scan itself failed.
+def _emit_failure_summary(stage: str, exc: Exception) -> None:
+    """Write a job summary reporting that a pipeline stage failed.
 
-    The exception message identifies the failing image/platform. No rebuild is
-    dispatched: the failure is reported here, then re-raised so the job fails
-    loudly.
+    ``stage`` names the failing stage ("Scan" or "Base verification"); the
+    exception message identifies the failing image/platform. No rebuild is
+    dispatched: the failure is reported here, then re-raised by the caller so
+    the job fails loudly.
     """
     lines = [
         "## CVE Scan Summary",
         "",
-        "### Scan failed",
+        f"### {stage} failed",
         "",
-        "The CVE scan did not complete, so no findings were classified and "
-        "no rebuild will be dispatched.",
+        f"The CVE {stage.lower()} stage did not complete, so no rebuild "
+        "will be dispatched.",
         "",
         f"Error: {exc}",
         "",
@@ -212,7 +213,7 @@ def run_sweep(
         # failure summary (the message names the failing image/platform), then
         # re-raise so the job still fails loudly. Do not swallow the error.
         logger.error("Scan failed: %s", exc)
-        _emit_scan_failure_summary(exc)
+        _emit_failure_summary("Scan", exc)
         raise
     logger.info("Found %d finding(s) above %s threshold.", len(findings), settings.severity_threshold.name)
 
@@ -258,7 +259,16 @@ def run_sweep(
         fixable = []
     elif fixable:
         logger.info("Running base package check for %d fixable finding(s)...", len(fixable))
-        confirmed, downgraded = verify_fixable_in_base(fixable, base_map)
+        try:
+            confirmed, downgraded = verify_fixable_in_base(fixable, base_map)
+        except BasePrecheckError as exc:
+            # The base pre-check runs after the scan and shells out to docker
+            # across many image/platform combinations, so it has its own
+            # failure mode. Emit a summary naming this stage (the message names
+            # the failing base image), then re-raise so the job fails loudly.
+            logger.error("Base verification failed: %s", exc)
+            _emit_failure_summary("Base verification", exc)
+            raise
         logger.info(
             "Base pre-check: %d confirmed, %d downgraded (base not yet updated).",
             len(confirmed),

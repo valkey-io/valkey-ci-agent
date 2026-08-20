@@ -131,3 +131,15 @@ class TestStrictRejection:
         monkeypatch.setenv("CVE_SCAN_INCLUDE_UNSTABLE", "treu")
         with pytest.raises(CveScanConfigError, match="Invalid CVE_SCAN_INCLUDE_UNSTABLE"):
             load_settings()
+
+    def test_empty_platforms_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty CVE_SCAN_PLATFORMS must fail, not silently scan zero platforms."""
+        monkeypatch.setenv("CVE_SCAN_PLATFORMS", "")
+        with pytest.raises(CveScanConfigError, match="at least one non-empty platform"):
+            load_settings()
+
+    def test_whitespace_only_platforms_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A platforms value of only separators/whitespace parses empty and must fail."""
+        monkeypatch.setenv("CVE_SCAN_PLATFORMS", "  ,  , ")
+        with pytest.raises(CveScanConfigError, match="at least one non-empty platform"):
+            load_settings()

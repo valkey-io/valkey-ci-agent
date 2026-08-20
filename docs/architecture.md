@@ -408,13 +408,16 @@ sweep.py
       (e.g. valkey/valkey:9.1-alpine → alpine:3.23)
   → scanner.py (Trivy subprocess per image per platform)
       scans each image on each published platform (amd64, arm64, arm/v7, ppc64le)
-      deduplicates findings by (image, package, cve_id, installed_version)
+      deduplicates findings by (image, package, cve_id, installed_version, platform)
+        (exact duplicates within a platform collapse; the same CVE on different
+         platforms stays distinct for per-platform base verification)
   → rebuild_decider.py (classify: fix published → rebuild candidate; no fix → not fixable)
   → base_precheck.py (dynamic mode only)
       reads each distinct base image's package database (apk/dpkg)
       compares versions using native dpkg/apk tools via docker (authoritative, correct Debian semantics)
-      stale-base path: fixable only when the image's installed version is newer than the base's
-        (proof the build touched the package); equal-to-base is fail-closed as needing a base update
+      stale-base path: fetches the image's Dockerfile, extracts its install list, and simulates it
+        in the base (apk add --simulate / apt-get install --dry-run) to read the version a rebuild
+        would install; not in the plan means it stays at the base version (needs a base update)
       downgrades findings where base is still vulnerable (fail-closed)
   → summary.py (render grouped findings tables for job summary)
   → emit GITHUB_OUTPUT: fixable=true/false, versions=<space-separated lines>
@@ -428,7 +431,8 @@ Job 2 - rebuild (runs only on valkey-io/valkey-ci-agent main, inside the
          --field "version=<versions from scan output>"
   (locate/watch/conclusion use the built-in GITHUB_TOKEN, valid for the whole job)
   → locate the triggered run (gh run list --created ">=<timestamp>",
-       filtered by triggering actor (bot) + workflow_dispatch event,
+       filtered by dispatching bot login (derived from the App token action's
+       app-slug output as "<app-slug>[bot]", no API call) + workflow_dispatch event,
        oldest in window; fail loud if none appears after retries)
   → gh run watch <run-id> --exit-status  (wait; a failed build fails the job)
   → capture conclusion; report build result + run URL in job summary and Slack
@@ -443,10 +447,15 @@ versions.json merges.
 
 The rebuild job does not stop at the dispatch: it locates the run it triggered
 (bounding the `gh run list` search with a pre-dispatch UTC timestamp, filtering
-candidates by triggering actor so a human or other-bot dispatch in the same
-window is excluded, and taking the oldest remaining run; exact identification
-would require valkey-container's ci.yml to echo a correlation input into its run
-name, a follow-up), waits for it with `gh run watch --exit-status`, and reports the actual build
+candidates by the dispatching bot login so a human or other-bot dispatch in the
+same window is excluded, and taking the oldest remaining run; exact
+identification would require valkey-container's ci.yml to echo a correlation
+input into its run name, a follow-up). The bot login is derived from the App
+token action's `app-slug` output as `<app-slug>[bot]` with no API call, because
+`GET /user` does not accept App installation tokens; if the app-slug is
+unavailable the job logs a warning and searches the unfiltered window rather
+than filtering on an empty login. It then waits for the run with `gh run watch
+--exit-status`, and reports the actual build
 conclusion and run URL in the job summary and Slack. A failed downstream build
 therefore fails this job, and a run that cannot be located fails loud rather than
 reporting an unverified success. The Slack status is success only when the dispatch,
@@ -471,7 +480,7 @@ The design relies on verified evidence and deterministic code:
 
 - **Verified-evidence trigger (fail-closed)**: rebuild dispatch requires three conditions simultaneously: (1) the distro published a fix (fixed_version exists), (2) the base-image pre-check confirms the patched package is present in the current base tag by reading the base image package database and comparing versions using the native dpkg/apk tools (correct Debian/Alpine semantics, fail-closed on any comparison error), and (3) the published container image still carries the vulnerable version. If any condition is ambiguous or unverifiable, the finding is downgraded rather than triggering a rebuild.
 - **Targeted version dispatch**: the rebuild job passes `--field version="<versions>"` with only the affected version lines (e.g. `8.0 9.1`) rather than rebuilding all images, minimizing blast radius.
-- **Multi-arch coverage**: each image is scanned on all 4 published platforms (amd64, arm64, arm/v7, ppc64le). Findings are deduplicated across platforms so a CVE present on all architectures is reported once. Base package versions are assumed arch-uniform per tag (validated indirectly by the multi-arch scan).
+- **Multi-arch coverage**: each image is scanned on all 4 published platforms (amd64, arm64, arm/v7, ppc64le). `platform` is part of the dedup key, so the same CVE on different architectures stays distinct and each finding gets its own per-platform base verification; only exact duplicates within a single platform collapse. Base package versions are assumed arch-uniform per tag (validated indirectly by the multi-arch scan).
 - **Deterministic code path**: scanning, classification, base pre-check, and dispatch are all deterministic code with no AI in the loop. The pipeline is stdlib Python plus a scanner subprocess.
 - **Least-privilege tokens**: the scan job needs only `contents:read`. The rebuild job mints a separate App token scoped to `actions:write` + `metadata:read` for the dispatch step only; the run-tracking steps use the built-in `GITHUB_TOKEN`. Neither token is broader than required.
 - **Audit trail**: every automatic dispatch is recorded in the workflow run log and the job summary. All findings are visible in the run summary as grouped markdown tables.

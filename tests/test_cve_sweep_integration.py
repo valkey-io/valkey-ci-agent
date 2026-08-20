@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.cve_scan.base_precheck import BasePrecheckError
 from scripts.cve_scan.config import CveScanConfigError, load_settings
 from scripts.cve_scan.models import Finding, Severity
 from scripts.cve_scan.scanner import ScanError
@@ -68,8 +69,6 @@ def _mock_urlopen_response(data: dict) -> BytesIO:
     body = json.dumps(data).encode("utf-8")
     resp = BytesIO(body)
     resp.status = 200  # type: ignore[attr-defined]
-    resp.__enter__ = lambda self: self  # type: ignore[attr-defined]
-    resp.__exit__ = lambda self, *a: None  # type: ignore[attr-defined]
     return resp
 
 
@@ -355,11 +354,11 @@ class TestIntegrationBasePrecheck:
             "scripts.cve_scan.base_precheck.get_base_packages",
             lambda base_ref, platform="": {"openssl": "3.0.12-r0"},
         )
-        # Stale base now consults the repo candidate (Item 6); unavailable
-        # here keeps the finding downgraded.
+        # Stale base: the rebuild plan does not install openssl, so the
+        # finding stays downgraded (needs a base image update).
         monkeypatch.setattr(
-            "scripts.cve_scan.base_precheck.get_repo_candidates",
-            lambda base_ref, package, platform="": [],
+            "scripts.cve_scan.base_precheck._rebuild_plan",
+            lambda finding, base_ref, install_list_cache, plan_cache: {},
         )
 
         settings = load_settings()
@@ -403,8 +402,8 @@ class TestIntegrationBasePrecheck:
             lambda base_ref, platform="": {"openssl": "3.0.11-r0"},
         )
         monkeypatch.setattr(
-            "scripts.cve_scan.base_precheck.get_repo_candidates",
-            lambda base_ref, package, platform="": [],
+            "scripts.cve_scan.base_precheck._rebuild_plan",
+            lambda finding, base_ref, install_list_cache, plan_cache: {},
         )
 
         settings = load_settings()
@@ -416,7 +415,10 @@ class TestIntegrationBasePrecheck:
         captured = capsys.readouterr()
         assert "NOT-FIXABLE" in captured.out
         assert "CVE-2024-5555" in captured.out
-        assert "still ships" in captured.out
+        # Rationale must explain why a rebuild will not help: the plan does
+        # not install it, so it stays at the stale base version.
+        assert "base version 3.0.11-r0" in captured.out
+        assert "needs a base image update" in captured.out
 
     def test_confirmed_base_keeps_fixable_true(
         self,
@@ -775,3 +777,61 @@ class TestScanFailureSummary:
         assert "Scan failed" in summary
         assert "no rebuild will be dispatched" in summary
         assert "valkey/valkey:8.0-alpine" in summary
+
+
+class TestBasePrecheckFailureSummary:
+    """A BasePrecheckError re-raises but first records a failure section naming
+    the base-verification stage.
+
+    The base pre-check runs after the scan and shells out to docker across many
+    image/platform combinations, so its failure must not escape without a job
+    summary the way it did before (only ScanError was handled).
+    """
+
+    def test_base_precheck_error_emits_summary_and_reraises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """verify_fixable_in_base raising BasePrecheckError -> base-verification
+        failure summary written, then re-raised."""
+        github_output = tmp_path / "github_output"
+        github_output.write_text("")
+        summary_file = tmp_path / "step_summary"
+        summary_file.write_text("")
+        monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+        fixable_finding = Finding(
+            image="valkey/valkey:9.1-alpine",
+            package="openssl",
+            installed_version="3.0.12-r0",
+            cve_id="CVE-2024-5555",
+            severity=Severity.HIGH,
+            fixed_version="3.0.13-r0",
+        )
+        monkeypatch.setattr(
+            "scripts.cve_scan.sweep.scan_images",
+            lambda images, scanner, threshold, **_kw: [fixable_finding],
+        )
+        monkeypatch.setattr(
+            "scripts.cve_scan.image_matrix.urllib.request.urlopen",
+            lambda *a, **kw: _mock_urlopen_response(SAMPLE_VERSIONS),
+        )
+
+        def _raise(*_a, **_kw):
+            raise BasePrecheckError(
+                "docker run failed for alpine:3.23 (exit 1): could not pull image"
+            )
+
+        monkeypatch.setattr("scripts.cve_scan.sweep.verify_fixable_in_base", _raise)
+
+        settings = load_settings()
+        with pytest.raises(BasePrecheckError, match="alpine:3.23"):
+            run_sweep(settings=settings, dry_run=False)
+
+        summary = summary_file.read_text()
+        # Failure section names the base-verification stage (not the scan).
+        assert "Base verification failed" in summary
+        assert "no rebuild will be dispatched" in summary
+        assert "alpine:3.23" in summary
