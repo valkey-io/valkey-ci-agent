@@ -87,4 +87,6 @@ jobs:
       security_from_advisories: ${{ inputs.security_from_advisories }}
       force_ready: ${{ inputs.force_ready }}
       dry_run: ${{ inputs.dry_run }}
-    secrets: inherit
+    # release-notes-cut selects the branch-restricted release-control
+    # environment and resolves its credentials there. Never inherit the
+    # repository's unrelated secret set into a manually selectable ref.

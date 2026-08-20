@@ -107,15 +107,6 @@ on:
         required: false
         type: boolean
         default: true
-    secrets:
-      VALKEYRIE_BOT_APP_ID:
-        required: false
-      VALKEYRIE_BOT_PRIVATE_KEY:
-        required: false
-      VALKEY_GITHUB_TOKEN:
-        required: false
-      AWS_ROLE_ARN:
-        required: true
 
 permissions: {}
 
@@ -124,8 +115,10 @@ env:
 
 jobs:
   cut:
+    if: github.repository == 'valkey-io/valkey-ci-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    environment: release-control
     permissions:
       contents: read
       id-token: write
@@ -138,8 +131,9 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       CLAUDE_CODE_USE_BEDROCK: "1"
       # secrets.* is not readable in step `if:` expressions; surface presence
-      # here so the token steps can be skipped on a fork without App creds.
-      HAS_APP_CREDS: ${{ secrets.VALKEYRIE_BOT_APP_ID != '' && secrets.VALKEYRIE_BOT_PRIVATE_KEY != '' }}
+      # here so the token steps can be skipped when the release-control App
+      # credentials are absent.
+      HAS_APP_CREDS: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID != '' && secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY != '' }}
     steps:
       - name: Check out agent repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -172,8 +166,8 @@ jobs:
 
       # Two token steps, selected by whether this cut reads advisories, so a
       # normal cut never depends on the advisory grant. Both steps are skipped
-      # when the App credentials are absent (a fork without VALKEYRIE_BOT_*):
-      # the cut step then falls back to VALKEY_GITHUB_TOKEN for READ-ONLY dry
+      # when the release-control App credentials are absent: the cut step then
+      # falls back to VALKEY_GITHUB_TOKEN for READ-ONLY dry
       # runs and refuses to publish. repository-advisories:read
       # is only requested when --security-from-advisories is on; create-github-app-token
       # fails if the App installation lacks a requested permission, so requesting it
@@ -185,8 +179,8 @@ jobs:
         if: ${{ !inputs.security_from_advisories && env.HAS_APP_CREDS == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          app-id: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY }}
           owner: valkey-io
           repositories: ${{ inputs.repo }}
           # contents:write to push the agent-namespaced prep branch;
@@ -200,8 +194,8 @@ jobs:
         if: ${{ inputs.security_from_advisories && env.HAS_APP_CREDS == 'true' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          app-id: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY }}
           owner: valkey-io
           repositories: ${{ inputs.repo }}
           # Same as above plus repository-advisories:read, which --security-from-advisories
@@ -250,17 +244,17 @@ jobs:
             exit 1
           fi
           export RELEASE_NOTES_REPO="valkey-io/${RELEASE_NOTES_TARGET_REPO_NAME}"
-          # Fork testing: with no App credentials, a personal-token fallback
+          # With no App credentials, a personal-token fallback
           # (VALKEY_GITHUB_TOKEN) may run READ-ONLY dry runs. It must never
           # publish: a PAT push would bypass the App's audited identity.
           if [[ "${RELEASE_NOTES_DRY_RUN_FALLBACK_TOKEN}" == "true" && "${RELEASE_NOTES_DRY_RUN}" != "true" ]]; then
             echo "Refusing a non-dry-run cut with the personal-token fallback;" \
-                 "publishing requires the App credentials (VALKEYRIE_BOT_*)." >&2
+                 "publishing requires the release-control App credentials." >&2
             exit 1
           fi
           if [[ -z "${RELEASE_NOTES_GITHUB_TOKEN}" ]]; then
-            echo "No token available: set VALKEYRIE_BOT_APP_ID/PRIVATE_KEY, or" \
-                 "VALKEY_GITHUB_TOKEN for a dry run on a fork." >&2
+            echo "No token available: set VALKEY_RELEASE_CONTROL_APP_ID/_PRIVATE_KEY," \
+                 "or VALKEY_GITHUB_TOKEN for a dry run." >&2
             exit 1
           fi
           # Validate a value used in a git ref position. These inputs flow into git

@@ -1,0 +1,255 @@
+name: Publish Release
+run-name: "Publish release on ${{ inputs.branch }} @ ${{ inputs.candidate_sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Release line, e.g. 9.1"
+        required: true
+        type: string
+      candidate_sha:
+        description: "Exact current release-branch commit (full 40-character SHA)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-publish-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate candidate and render plan
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-control
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      plan_digest: ${{ steps.plan.outputs.plan_digest }}
+    steps:
+      - name: Validate SHA shape
+        env:
+          SHA: ${{ inputs.candidate_sha }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "candidate_sha must be a full lowercase 40-character SHA" >&2
+            exit 1
+          }
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-agent
+
+      - name: Create validation token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          permission-administration: read
+          permission-actions: read
+          permission-checks: read
+          permission-contents: read
+          permission-metadata: read
+          permission-pull-requests: read
+
+      - name: Validate and plan
+        id: plan
+        env:
+          RELEASE_GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+          BRANCH: ${{ inputs.branch }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          python -m scripts.release.main plan \
+            --branch "$BRANCH" --candidate-sha "$CANDIDATE_SHA"
+
+  qualify:
+    name: Qualify exact candidate
+    needs: validate
+    # A native reusable-workflow call is synchronous and does not depend on a
+    # one-hour App token surviving a multi-hour package matrix. No secrets are
+    # passed; candidate-code jobs in the called workflow downgrade themselves
+    # to contents:read and never receive OIDC.
+    permissions:
+      contents: write
+      id-token: write
+    # Deliberately follows the separately reviewed, branch-protected workflow
+    # in the Valkey organization. Unlike third-party actions, this is a
+    # first-party release component that must evolve with production; it is
+    # secretless and candidate-code jobs receive contents:read only.
+    uses: valkey-io/valkey-release-automation/.github/workflows/qualify-release.yml@main
+    with:
+      version: ${{ needs.validate.outputs.version }}
+      source_sha: ${{ needs.validate.outputs.sha }}
+      request_id: ${{ format('{0}-{1}', github.run_id, github.run_attempt) }}
+
+  approval-plan:
+    name: Bind qualification revision to approval plan
+    needs: [validate, qualify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      approval_digest: ${{ steps.receipt.outputs.approval_digest }}
+    steps:
+      - name: Render qualification receipt
+        id: receipt
+        env:
+          PLAN_DIGEST: ${{ needs.validate.outputs.plan_digest }}
+          AUTOMATION_SHA: ${{ needs.qualify.outputs.automation_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PLAN_DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid plan digest" >&2; exit 1; }
+          [[ "$AUTOMATION_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid automation SHA" >&2; exit 1; }
+          APPROVAL_DIGEST=$(printf '%s\n%s\n' "$PLAN_DIGEST" "$AUTOMATION_SHA" | sha256sum | cut -d' ' -f1)
+          echo "approval_digest=$APPROVAL_DIGEST" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Approval receipt"
+            echo
+            echo "- Release plan: \`$PLAN_DIGEST\`"
+            echo "- Qualification automation: \`$AUTOMATION_SHA\`"
+            echo "- Combined receipt: \`$APPROVAL_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish approved release
+    needs: [validate, qualify, approval-plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-agent
+
+      - name: Resolve approving human
+        id: approver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA=$(gh api "repos/${REPO}/commits/main" --jq '.sha')
+          [[ "$CURRENT_SHA" == "$GITHUB_SHA" ]] || {
+            echo "Controller main moved from $GITHUB_SHA to $CURRENT_SHA; rerun publication" >&2
+            exit 1
+          }
+          ENVIRONMENT=$(gh api "repos/${REPO}/environments/release")
+          REVIEWERS=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length' <<< "$ENVIRONMENT")
+          PREVENT_SELF=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | .prevent_self_review] | any' <<< "$ENVIRONMENT")
+          ADMIN_BYPASS=$(jq -r '.can_admins_bypass // true' <<< "$ENVIRONMENT")
+          CUSTOM_POLICY=$(jq -r '.deployment_branch_policy.custom_branch_policies // false' <<< "$ENVIRONMENT")
+          POLICY_NAMES=$(gh api --paginate "repos/${REPO}/environments/release/deployment-branch-policies" --jq '.branch_policies[].name' | sort -u)
+          [[ "$REVIEWERS" -ge 1 ]] || { echo "release must require a reviewer" >&2; exit 1; }
+          [[ "$PREVENT_SELF" == "true" ]] || { echo "release must prevent self-review" >&2; exit 1; }
+          [[ "$ADMIN_BYPASS" == "false" ]] || { echo "release must disable admin bypass" >&2; exit 1; }
+          [[ "$CUSTOM_POLICY" == "true" && "$POLICY_NAMES" == "main" ]] || {
+            echo "release must allow exactly the main branch; found: ${POLICY_NAMES:-<none>}" >&2
+            exit 1
+          }
+          APPROVER=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/approvals" \
+            --jq '[.[] | select(.state == "approved") | select([.environments[]?.name] | index("release"))] | last.user.login // empty')
+          [[ -n "$APPROVER" ]] || {
+            echo "No human approval record exists for the release environment" >&2
+            exit 1
+          }
+          [[ "$APPROVER" != "$TRIGGERING_ACTOR" ]] || {
+            echo "The workflow dispatcher cannot approve their own release" >&2
+            exit 1
+          }
+          echo "login=$APPROVER" >> "$GITHUB_OUTPUT"
+
+      - name: Create publication token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.VALKEY_RELEASE_PUBLISH_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_PUBLISH_APP_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          permission-administration: read
+          permission-actions: read
+          permission-checks: read
+          permission-contents: write
+          permission-members: read
+          permission-metadata: read
+          permission-pull-requests: read
+
+      - name: Revalidate and publish
+        env:
+          RELEASE_GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+          BRANCH: ${{ inputs.branch }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          APPROVER: ${{ steps.approver.outputs.login }}
+          EXPECTED_DIGEST: ${{ needs.validate.outputs.plan_digest }}
+          APPROVAL_DIGEST: ${{ needs.approval-plan.outputs.approval_digest }}
+          PUBLISH_APP_ID: ${{ secrets.VALKEY_RELEASE_PUBLISH_APP_ID }}
+        run: |
+          [[ "$APPROVAL_DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "missing qualification approval receipt" >&2; exit 1; }
+          [[ "$PUBLISH_APP_ID" =~ ^[1-9][0-9]*$ ]] || { echo "invalid publication App id" >&2; exit 1; }
+          python -m scripts.release.main publish \
+            --branch "$BRANCH" --candidate-sha "$CANDIDATE_SHA" \
+            --actor "$APPROVER" --expected-digest "$EXPECTED_DIGEST" \
+            --expected-bypass-integration-id "$PUBLISH_APP_ID"
+
+  onboard-backports:
+    name: Onboard first-GA backport automation
+    needs: [validate, publish]
+    if: ${{ endsWith(needs.validate.outputs.tag, '.0') && !contains(needs.validate.outputs.tag, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: release-control
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-agent
+
+      - name: Create bounded onboarding token
+        id: token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey-ci-agent
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-metadata: read
+          permission-organization-projects: read
+
+      - name: Open onboarding issue and registry PR
+        continue-on-error: true
+        env:
+          ONBOARDING_GITHUB_TOKEN: ${{ steps.token.outputs.token || '' }}
+          ONBOARDING_BOT_LOGIN: ${{ steps.token.outputs.app-slug && format('{0}[bot]', steps.token.outputs.app-slug) || '' }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          AGENT_REPO: ${{ github.repository }}
+        run: python -m scripts.backport.onboarding --tag "$TAG" --agent-repo "$AGENT_REPO"

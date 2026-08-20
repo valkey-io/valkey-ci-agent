@@ -1,0 +1,72 @@
+name: Refresh Release Progress
+run-name: Refresh active release dashboards
+
+on:
+  schedule:
+    # Start one runner per hour. It stays alive for 55 minutes and polls every
+    # five minutes, bridging GitHub's often-delayed scheduled-workflow starts
+    # while remaining below the App token's one-hour lifetime.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: release-progress
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Refresh dashboards and continue merged releases
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    environment: release-control
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-agent
+
+      - name: Create Valkey dashboard token
+        id: target-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          permission-contents: read
+          permission-issues: write
+          permission-metadata: read
+          permission-pull-requests: read
+
+      # Keep issues:write out of the automation repository token. This token
+      # can only observe the production workflow run used by the dashboard.
+      - name: Create production status token
+        id: automation-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey-release-automation
+          permission-actions: read
+          permission-contents: read
+          permission-metadata: read
+
+      - name: Refresh progress
+        env:
+          TARGET_GITHUB_TOKEN: ${{ steps.target-token.outputs.token }}
+          AGENT_GITHUB_TOKEN: ${{ github.token }}
+          AUTOMATION_GITHUB_TOKEN: ${{ steps.automation-token.outputs.token }}
+          POLL_INTERVAL_SECONDS: ${{ github.event_name == 'schedule' && '300' || '0' }}
+          POLL_DURATION_SECONDS: ${{ github.event_name == 'schedule' && '3300' || '0' }}
+        run: |
+          python -m scripts.release.tracker sync \
+            --poll-interval-seconds "${POLL_INTERVAL_SECONDS}" \
+            --poll-duration-seconds "${POLL_DURATION_SECONDS}"

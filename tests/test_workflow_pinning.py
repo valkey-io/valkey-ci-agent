@@ -14,6 +14,16 @@ _DIRECT_AGENT_SETUP_RE = re.compile(
     rf"actions/setup-python@|{_PIP_INSTALL_RE} \.|{_PIP_INSTALL_RE} -e|npm install -g @anthropic-ai/claude-code"
 )
 _EXPECTED_CLAUDE_CODE_VERSION = "2.1.175"
+_TRUSTED_REUSABLE_WORKFLOW_REFS = {
+    # Qualification is an organization-owned workflow, not a third-party
+    # action. It intentionally follows the automation repository's protected
+    # main branch so the two release components can evolve together without a
+    # tag-management bootstrap cycle. The called workflow pins all of its
+    # implementation checkouts to github.workflow_sha, the exact commit this
+    # reference resolved to. It receives no secrets, and candidate-code jobs
+    # are constrained to contents:read.
+    "valkey-io/valkey-release-automation/.github/workflows/qualify-release.yml@main",
+}
 
 
 def _workflow_files():
@@ -45,6 +55,8 @@ def test_external_actions_are_pinned_to_shas():
                 continue
             action, ref = match.groups()
             if action.startswith("./"):
+                continue
+            if f"{action}@{ref}" in _TRUSTED_REUSABLE_WORKFLOW_REFS:
                 continue
             if not _SHA_RE.fullmatch(ref):
                 offenders.append(f"{path}:{line_no}: {action}@{ref}")
@@ -140,11 +152,13 @@ def test_push_capable_app_tokens_can_update_workflows():
 def test_backport_workflows_refresh_credentials_after_validation():
     for filename in ("backport-sweep.yml", "backport-poll.yml"):
         text = (Path(".github/workflows") / filename).read_text(encoding="utf-8")
-        assert text.index("- name: Generate preparation token") < text.index(
-            "- name: Prepare backport sweep"
-        ) < text.index("- name: Generate publication token") < text.index(
-            "- name: Publish backport sweep"
-        ) < text.index("- name: Clean up prepared sweep")
+        assert (
+            text.index("- name: Generate preparation token")
+            < text.index("- name: Prepare backport sweep")
+            < text.index("- name: Generate publication token")
+            < text.index("- name: Publish backport sweep")
+            < text.index("- name: Clean up prepared sweep")
+        )
         assert "role-duration-seconds: 10800" in text
         assert "TARGET_TOKEN: ${{ steps.prepare-token.outputs.token }}" in text
         assert "TARGET_TOKEN: ${{ steps.publish-token.outputs.token }}" in text

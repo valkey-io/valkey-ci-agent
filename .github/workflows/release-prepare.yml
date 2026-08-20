@@ -1,0 +1,182 @@
+name: Prepare Release
+run-name: "Prepare ${{ inputs.intent }} release on ${{ inputs.branch }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Release line, e.g. 9.1"
+        required: true
+        type: string
+      intent:
+        description: "Release kind"
+        required: true
+        type: choice
+        options: [rc, ga, patch]
+      urgency:
+        description: "Upgrade urgency"
+        required: true
+        type: choice
+        options: [LOW, MODERATE, HIGH, CRITICAL, SECURITY]
+      dry_run:
+        description: "Derive and display the release without opening a PR"
+        required: false
+        type: boolean
+        default: false
+      initiator:
+        description: "Maintainer login forwarded by the Valkey Start Release workflow"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-prepare-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  authorize-start:
+    name: Verify Valkey handoff
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require the release-control App actor
+        env:
+          ACTOR: ${{ github.triggering_actor }}
+          EXPECTED_ACTOR: ${{ vars.VALKEY_RELEASE_START_ACTOR }}
+        run: |
+          set -euo pipefail
+          [[ -n "$EXPECTED_ACTOR" ]] || { echo "VALKEY_RELEASE_START_ACTOR is not configured" >&2; exit 1; }
+          [[ "$ACTOR" == "$EXPECTED_ACTOR" ]] || {
+            echo "Prepare Release can be started only through valkey-io/valkey Start Release" >&2
+            exit 1
+          }
+
+  derive:
+    name: Authorize and derive release
+    needs: authorize-start
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-control
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      stage: ${{ steps.release.outputs.stage }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-agent
+
+      - name: Create read-only control token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          permission-contents: read
+          permission-members: read
+          permission-metadata: read
+
+      - name: Derive release identity
+        id: release
+        env:
+          RELEASE_GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+          BRANCH: ${{ inputs.branch }}
+          INTENT: ${{ inputs.intent }}
+          ACTOR: ${{ inputs.initiator }}
+        run: |
+          python -m scripts.release.main prepare \
+            --branch "$BRANCH" --intent "$INTENT" --actor "$ACTOR"
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ inputs.branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "## Release preparation"
+            echo
+            echo "- Release: \`$TAG\`"
+            echo "- Branch: \`$BRANCH\`"
+            echo "- Dry run: \`$DRY_RUN\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cut-notes:
+    name: Open release preparation PR
+    needs: derive
+    if: ${{ inputs.dry_run != true }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-notes-cut.yml
+    with:
+      version: ${{ needs.derive.outputs.version }}
+      stage: ${{ needs.derive.outputs.stage }}
+      urgency: ${{ inputs.urgency }}
+      dry_run: false
+
+  tracker:
+    name: Open release dashboard
+    needs: derive
+    if: ${{ inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-control
+    permissions:
+      contents: read
+    outputs:
+      issue_url: ${{ steps.tracker.outputs.issue_url }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: ./.github/actions/setup-agent
+
+      - name: Create dashboard token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID }}
+          private-key: ${{ secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          permission-issues: write
+          permission-metadata: read
+
+      - name: Create or refresh release dashboard
+        id: tracker
+        env:
+          TARGET_GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+          BRANCH: ${{ inputs.branch }}
+          VERSION: ${{ needs.derive.outputs.version }}
+          STAGE: ${{ needs.derive.outputs.stage }}
+          TAG: ${{ needs.derive.outputs.tag }}
+        run: |
+          python -m scripts.release.tracker ensure \
+            --repo valkey-io/valkey --branch "$BRANCH" \
+            --version "$VERSION" --stage "$STAGE" --tag "$TAG" \
+            --prep-branch "agent/release-cut/${VERSION}-${STAGE}" \
+            --prepare-run-id "$GITHUB_RUN_ID" --agent-repo "$GITHUB_REPOSITORY"
+
+      - name: Link release dashboard
+        env:
+          ISSUE_URL: ${{ steps.tracker.outputs.issue_url }}
+          TAG: ${{ needs.derive.outputs.tag }}
+        run: |
+          {
+            echo "## Maintainer release dashboard"
+            echo
+            echo "Track **$TAG** at $ISSUE_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

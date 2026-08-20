@@ -581,3 +581,69 @@ Future sibling modules and extensions:
   detects red backport PRs (or test-failure issues) instead of a maintainer
   `@`-mention. Same pipeline, a different front door.
 - **Additional Daily CI Analysis** - detect flaky tests, generate fix PRs
+
+
+## Release automation
+
+Release automation is a short pipeline whose durable identities are the
+preparation PR and the exact release-branch commit:
+
+```
+Start Release (Valkey repository UI)
+  -> narrowly scoped App dispatches Prepare Release with the initiating login
+
+Prepare Release
+  -> derive version from branch + tags
+  -> create/update non-authoritative Release <tag> tracking issue
+  -> open/update agent/release-cut/<version>-<stage> PR
+  -> maintainer review and merge
+
+Refresh Release Progress (one hourly runner; five-minute polls for 55 minutes)
+  -> derive status from live PR, branch, workflow, and release APIs
+  -> if canonical preparation PR merged and merge SHA is still branch HEAD:
+       dispatch Publish Release <branch, merge SHA> once
+  -> update the tracking issue with failure and next action
+
+Publish Release <branch, candidate SHA>
+  -> require candidate == canonical preparation PR merge commit
+  -> require candidate == current branch head
+  -> validate version.h, release notes, tag availability, and report ci.yml status
+  -> call the secretless no-publish qualification workflow synchronously
+  -> protected release environment approval
+  -> live core-team authorization of the recorded approver
+  -> recompute and compare the complete plan digest
+  -> atomically create tag at candidate SHA
+  -> publish GitHub release
+  -> existing Valkey release event starts production automation
+       -> archives + RPM/DEB + hashes + container + docs + website + Try Valkey
+       -> wait for exact public container images, then update Bundle
+       -> draft Helm bump for GA; make ready after its image is public
+  -> for X.Y.0, open the bounded backport-registry onboarding issue/PR
+```
+
+There is no controller-owned state. The bot-owned status comment holds the
+tracker identity; the issue body is a projection for humans. Deleting or editing
+the body cannot authorize publication, select a SHA, or
+skip a gate. A moved branch, failed check, or failed qualification is recovered
+by fixing the repository state and rerunning the appropriate workflow. GitHub
+Actions supplies execution history; the canonical release preparation PR
+supplies review history; the exact SHA binds both.
+
+The asynchronous container-to-chart ordering is kept explicit: production
+automation opens the Helm change as a draft, and a maintainer makes it ready
+after the public image exists. This keeps the Helm output without requiring
+durable receipts or a cross-repository state machine. The progress watcher is
+intentionally narrower: one hourly runner remains alive for 55 minutes and
+polls every five minutes, observes live state, performs the one idempotent
+notes-merge-to-publication dispatch, and refreshes the issue. The bounded loop
+bridges delayed cron starts without outliving its short-lived App tokens.
+
+The control App is available only through the default-branch-restricted
+`release-control` environment and is not a release-tag ruleset bypass actor.
+The publication App is separate and exists only in the reviewer-protected
+`release` environment. The production automation repository retains its
+`release-publish` approval before public uploads and downstream writes, giving
+the flow two deployment approvals without a relay App, HMAC, or shared secret.
+The thin Valkey Start Release workflow reuses the control App with only
+Actions-write access to the CI-agent; it has no receiver service or payload
+authentication protocol.
