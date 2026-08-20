@@ -417,30 +417,29 @@ sweep.py
       no fixed_version → not fixable
       (a candidacy signal, NOT a prediction a rebuild will resolve it; proof is verify)
   → summary.py (render grouped findings tables for job summary)
-  → emit GITHUB_OUTPUT: fixable=true/false, versions=<space-separated lines>,
-      targets=<base64 JSON of {image,line,variant,platform,cve,package,fixed_version}>,
-      matrix=<expected verify legs, consumed as fromJSON(needs.scan.outputs.matrix)>
+  → emit GITHUB_OUTPUT: versions=<space-separated lines>,
+      plan=<JSON legs {line,variant,platform,cves[]}>
 
-Job 2 - verify (needs: scan; matrix = fromJSON(needs.scan.outputs.matrix),
+Job 2 - verify (needs: scan; matrix = fromJSON(needs.scan.outputs.plan),
          max-parallel 8, fail-fast false, timeout 180; one leg per affected
          (line, variant, platform); runs only on valkey-io/valkey-ci-agent main,
-         if fixable == 'true' AND versions != '' AND not dry_run; no creds)
+         if plan is non-empty AND versions != '' AND not dry_run; no creds)
   → checkout valkey-io/valkey-container @ mainline into ./container
   → call ./container/.github/actions/build-image, the same action ci.yml publishes with:
        explicit context ./container, dockerfile <line>/<variant>/Dockerfile,
        platforms <one>, push false, load true,
        tag cve-candidate:<line>-<variant>-<platform-slug>
-  → verify_candidate.py --image-ref ... --targets ... --line/--variant/--platform
+  → verify_candidate.py --image-ref ... --cves-json ... --line/--variant/--platform
        records a marker with the leg outcome (verified / survivors / error);
        exit 2 (error) fails the leg loud, exit 1 (survivors) does not
 
 Job 3 - collect (needs: [scan, verify], timeout 10)
   → collect_verification.py
-      downloads all leg markers and reconciles them against the expected matrix from scan
+      downloads uniquely named leg markers and reconciles them against the plan from scan
         (a leg with no marker = missing; an unexpected leg is rejected)
       decides dispatchable version lines (any-architecture: qualify when at least one
         affected arch is proven fixed)
-  → emit GITHUB_OUTPUT: verified_versions, fixable, arch_report (per-arch proof status)
+  → emit GITHUB_OUTPUT: verified_versions, arch_report (per-arch proof status)
 
 Job 4 - rebuild (needs: [scan, collect]; dispatches collect.verified_versions on
          valkey-io/valkey-ci-agent main, inside the cve-rebuild-dispatch Environment,
@@ -487,12 +486,11 @@ runner is billed while watching, the deliberate cost of verification).
 
 ### Entry Points
 
-- `scripts/cve_scan/sweep.py`: orchestrates the scan pipeline (scan, classify, job summary, output emission of fixable/versions/targets/matrix)
+- `scripts/cve_scan/sweep.py`: orchestrates scanning, classification, summaries, and the grouped verification plan
 - `scripts/cve_scan/rebuild_decider.py`: two-rule fixability classification (fixed_version present means candidate; absent means not fixable)
 - `scripts/cve_scan/summary.py`: renders grouped findings tables for the job summary
-- `scripts/cve_scan/targets.py`: turns the scan's targets blob into verify-matrix entries
-- `scripts/cve_scan/verify_candidate.py`: scans the candidate image we built and records the leg outcome, failing the leg only on a verification error
-- `scripts/cve_scan/collect_verification.py`: reconciles the per-leg markers against the expected matrix and emits verified_versions/fixable/arch_report for the rebuild job
+- `scripts/cve_scan/verify_candidate.py`: scans a candidate for the leg's CVE IDs, independent of package names
+- `scripts/cve_scan/collect_verification.py`: reconciles per-leg markers against the plan and emits verified_versions/arch_report
 - `scripts/cve_scan/image_matrix.py`: resolves image tags from versions.json
 - `scripts/cve_scan/scanner.py`: per-image per-platform Trivy invocation with finding deduplication
 
