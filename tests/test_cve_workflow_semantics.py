@@ -3,17 +3,10 @@
 Parses the workflow with yaml and asserts the behavior-level invariants of the
 verification-instead-of-prediction architecture: the scan job emits candidates
 (fixable/versions/targets) with no write access and no App token; a verify job
-builds the candidate image itself (one platform per finding, mirroring
-valkey-container's build with no registry credentials) and gates the rebuild
-job; and the rebuild job dispatches valkey-container's plain ci.yml only on
-proof, correlating the downstream run by an EXACT run name (not a timestamp
-window or actor filter) and waiting for its real outcome.
-
-These assert behavior, not just wiring: the drift check must precede the build,
-the build must be push-less/load-only/single-platform with no ``context:``
-override, the verify job must carry no registry secret, and the locate step
-must match on the correlation run name while using none of the deleted
-``--created`` / ``--user`` / ``gh api user`` heuristics.
+builds the candidate image itself through valkey-container's canonical local
+build action and gates the rebuild job; and the rebuild job dispatches
+valkey-container's plain ci.yml only on proof, correlating the downstream run
+by an EXACT run name and waiting for its real outcome.
 """
 
 from __future__ import annotations
@@ -27,16 +20,6 @@ _WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/cve-scan
 
 _USE_RE = re.compile(r"uses:\s*([^@\s]+)@([^#\s]+)")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-
-# valkey-container ci.yml build pins the verify job must mirror (SHA -> action).
-# Kept here so the semantics test asserts the exact documented SHAs; the runtime
-# drift check reads them from both YAML files instead of restating them.
-_VALKEY_CONTAINER_PINS = {
-    "docker/build-push-action": "f9f3042f7e2789586610d6e8b85c8f03e5195baf",
-    "docker/setup-qemu-action": "06116385d9baf250c9f4dcb4858b16962ea869c3",
-    "docker/setup-buildx-action": "d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5",
-}
-
 
 def _load_workflow() -> dict:
     """Parse the CVE scan workflow YAML into a dict."""
@@ -80,8 +63,12 @@ def _rebuild_step(step_id: str) -> dict:
 
 
 def _verify_build_step() -> dict:
-    """Return the verify job's docker build step."""
-    return next(s for s in _verify_steps() if "build-push-action" in s.get("uses", ""))
+    """Return the verify job's shared valkey-container build step."""
+    return next(
+        s
+        for s in _verify_steps()
+        if s.get("uses") == "./container/.github/actions/build-image"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -229,123 +216,28 @@ def test_verify_timeout_covers_emulated_source_compile() -> None:
     assert timeout <= 360
 
 
-def _all_drift_check_steps() -> list[tuple[str, dict]]:
-    """Return (job_name, step) for every step that runs the build_conformance drift check."""
-    workflow = _load_workflow()
-    hits: list[tuple[str, dict]] = []
-    for job_name, job in workflow["jobs"].items():
-        for step in job.get("steps", []):
-            if "build_conformance" in str(step.get("run", "")):
-                hits.append((job_name, step))
-    return hits
-
-
-def test_drift_check_runs_exactly_once_in_whole_workflow() -> None:
-    """The build-conformance drift check appears EXACTLY ONCE across all jobs.
-
-    The bug: it used to be a step inside the verify job, which fans out to the
-    matrix, so it ran once per leg (up to 40 redundant ci.yml fetches, each an
-    independent chance for a transient failure to kill a leg and silently drop a
-    platform). Assert the behavior (runs once), not where it lives.
-    """
-    assert len(_all_drift_check_steps()) == 1
-
-
-def test_drift_check_not_inside_verify_job() -> None:
-    """The drift check is NOT a step of the verify job (the job that fans out per platform)."""
-    assert all(
-        "build_conformance" not in str(s.get("run", "")) for s in _verify_steps()
-    )
-
-
-def test_drift_check_job_gates_verify_via_needs() -> None:
-    """The job that runs the drift check gates verify: verify `needs` it (assert the needs
-    chain), and it is a distinct job, so one check blocks every build leg on drift."""
-    hits = _all_drift_check_steps()
-    assert len(hits) == 1
-    drift_job = hits[0][0]
-    assert drift_job != "verify"
-    verify_needs = _load_workflow()["jobs"]["verify"]["needs"]
-    verify_needs = [verify_needs] if isinstance(verify_needs, str) else verify_needs
-    assert drift_job in verify_needs
-
-
-def test_drift_check_is_fail_closed_and_gated_like_verify() -> None:
-    """The drift-check step is fail-closed (`set -euo pipefail`, so drift or a fetch error
-    fails the job) and its job runs only when a real build is imminent (same repo/ref/fixable/
-    dry-run guards as verify), so a transient ci.yml fetch never fails a routine scan."""
-    hits = _all_drift_check_steps()
-    assert len(hits) == 1
-    drift_job, step = hits[0]
-    assert "set -euo pipefail" in step["run"]
-    if_expr = _load_workflow()["jobs"][drift_job]["if"]
-    assert "github.repository == 'valkey-io/valkey-ci-agent'" in if_expr
-    assert "github.ref == 'refs/heads/main'" in if_expr
-    assert "needs.scan.outputs.fixable == 'true'" in if_expr
-    assert "github.event.inputs.dry_run != 'true'" in if_expr
-
-
-def test_drift_check_has_no_platform_literal() -> None:
-    """The drift-check step passes NO platform literal: the expected list is
-    single-sourced from scripts/cve_scan/config.py via build_conformance's
-    default. The old CVE_VERIFY_PLATFORMS env and the 4-platform literal are gone
-    from the whole workflow, so the repo holds exactly one copy of the list."""
-    hits = _all_drift_check_steps()
-    assert len(hits) == 1
-    _, step = hits[0]
-    run = step["run"]
-    assert "--platforms" not in run
-    assert "CVE_VERIFY_PLATFORMS" not in run
-    text = _raw_text()
-    assert "CVE_VERIFY_PLATFORMS" not in text
-    assert "linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le" not in text
-
-
-def test_verify_build_action_pins_match_valkey_container() -> None:
-    """The verify job's build-push / setup-qemu / setup-buildx pins equal the
-    documented valkey-container ci.yml SHAs, so the verification build uses the
-    same BuildKit and QEMU as the publishing build (drift check enforces it)."""
-    verify = _load_workflow()["jobs"]["verify"]
-    pins: dict[str, str] = {}
-    for step in verify["steps"]:
-        uses = step.get("uses", "")
-        for action in _VALKEY_CONTAINER_PINS:
-            if uses.startswith(f"{action}@"):
-                pins[action] = uses.split("@", 1)[1].split()[0]
-    assert pins == _VALKEY_CONTAINER_PINS
-
-
-def test_scan_job_qemu_pin_left_independent_of_verify() -> None:
-    """The scan job's QEMU pin is intentionally NOT forced to valkey-container's
-    build SHA: it serves a different purpose (multi-arch scanning of published
-    images, not building), so it may differ while staying SHA-pinned."""
-    scan = _load_workflow()["jobs"]["scan"]
-    scan_qemu = next(
-        s["uses"] for s in scan["steps"] if "setup-qemu-action" in s.get("uses", "")
-    )
-    assert "setup-qemu-action@" in scan_qemu
-    assert _VALKEY_CONTAINER_PINS["docker/setup-qemu-action"] not in scan_qemu
-
-
 def test_verify_build_step_is_local_single_platform() -> None:
-    """The candidate build pushes nothing, loads locally, has no context override,
-    disables provenance, and builds exactly one platform."""
+    """The canonical action builds one platform from the explicit container context."""
     with_block = _verify_build_step()["with"]
     assert with_block["push"] is False
     assert with_block["load"] is True
-    assert with_block["provenance"] is False
-    # No context override: mirror valkey-container's build (context = repo root).
-    assert "context" not in with_block
-    # Exactly one platform per matrix entry (the matrix value, no comma-list).
+    assert with_block["context"] == "./container"
     platforms = str(with_block["platforms"])
     assert platforms == "${{ matrix.platform }}"
     assert "," not in platforms
 
 
-def test_verify_build_step_mirrors_dockerfile_path() -> None:
-    """The build points at ./<line>/<variant>/Dockerfile, mirroring valkey-container exactly."""
-    file_ref = _verify_build_step()["with"]["file"]
-    assert file_ref == "./${{ matrix.line }}/${{ matrix.variant }}/Dockerfile"
+def test_verify_build_step_uses_checked_out_container_action_and_dockerfile() -> None:
+    """The build definition and Dockerfile both come from the container checkout."""
+    checkout = next(
+        step
+        for step in _verify_steps()
+        if step.get("name") == "Checkout valkey-container"
+    )
+    assert checkout["with"]["path"] == "container"
+    assert _verify_build_step()["with"]["dockerfile"] == (
+        "./container/${{ matrix.line }}/${{ matrix.variant }}/Dockerfile"
+    )
 
 
 def test_verify_job_has_no_registry_credentials() -> None:
