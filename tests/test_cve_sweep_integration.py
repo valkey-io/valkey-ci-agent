@@ -152,6 +152,7 @@ def test_dry_run_prints_plan_and_candidate_language(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary"))
     monkeypatch.setattr(
         "scripts.cve_scan.image_matrix.urllib.request.urlopen",
