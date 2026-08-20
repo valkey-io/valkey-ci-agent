@@ -617,12 +617,11 @@ variable to change behavior for forks or testing.
 | `CVE_SCAN_VERSIONS_URL` | `https://raw.githubusercontent.com/valkey-io/valkey-container/mainline/versions.json` | URL to the versions.json manifest for dynamic image resolution |
 | `CVE_SCAN_REPOSITORY` | `valkey/valkey` | Docker Hub repository prefix for derived image tags |
 | `CVE_SCAN_INCLUDE_UNSTABLE` | `false` | Include the `unstable` version line (truthy: `1`, `true`, `yes`, `on`; falsy: `0`, `false`, `no`, `off`, empty) |
-| `CVE_SCAN_SCANNER` | `trivy` | Vulnerability scanner (trivy only; env var kept for forward compatibility) |
 | `CVE_SCAN_SEVERITY_THRESHOLD` | `HIGH` | Ignore findings below this severity (`UNKNOWN`, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`). |
 | `CVE_SCAN_IMAGES` | *(empty)* | Optional static image list (comma-separated). When set, overrides dynamic resolution from versions.json. Testing/escape hatch. |
 | `CVE_SCAN_PLATFORMS` | `linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le` | Comma-separated platforms to scan per image. Defaults to the verified published set for valkey images. |
 
-Invalid values (unknown scanner, bad severity, empty labels) raise immediately:
+Invalid values (bad severity, malformed booleans, or empty platform lists) raise immediately:
 a typo must not silently scan nothing.
 
 ### Usage

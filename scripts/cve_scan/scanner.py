@@ -14,7 +14,7 @@ from typing import Any
 
 from scripts.cve_scan.config import DEFAULT_PLATFORMS
 from scripts.cve_scan.models import Finding, Severity
-from scripts.parsers.cve_findings_parser import ParseError, filter_by_threshold, parse_findings
+from scripts.parsers.cve_findings_parser import ParseError, filter_by_threshold, parse_trivy
 
 logger = logging.getLogger(__name__)
 
@@ -26,18 +26,21 @@ class ScanError(Exception):
     """Raised when a scanner subprocess fails or produces unparseable output."""
 
 
-def _build_command(scanner: str, image: str, platform: str | None = None) -> list[str]:
-    """Build the scanner command as an argument list (no shell interpolation)."""
-    if scanner == "trivy":
-        cmd = [
-            "trivy", "image", "--format", "json", "--quiet",
-            "--scanners", "vuln", "--pkg-types", "os",
-        ]
-        if platform:
-            cmd.extend(["--platform", platform])
-        cmd.append(image)
-        return cmd
-    raise ValueError(f"Unsupported scanner: {scanner!r}. Must be 'trivy'.")
+def _build_command(
+    image: str,
+    platform: str | None = None,
+    *,
+    trivy_bin: str = "trivy",
+) -> list[str]:
+    """Build the Trivy command as an argument list (no shell interpolation)."""
+    cmd = [
+        trivy_bin, "image", "--format", "json", "--quiet",
+        "--scanners", "vuln", "--pkg-types", "os",
+    ]
+    if platform:
+        cmd.extend(["--platform", platform])
+    cmd.append(image)
+    return cmd
 
 
 def _run_scanner(command: list[str], timeout: int = _SCAN_TIMEOUT_SECONDS) -> dict[str, Any]:
@@ -87,12 +90,17 @@ def _run_scanner(command: list[str], timeout: int = _SCAN_TIMEOUT_SECONDS) -> di
     return parsed
 
 
-def scan_image(image: str, scanner: str, platform: str | None = None) -> list[Finding]:
-    """Scan a single image (optionally per platform) and return all findings.
+def scan_image(
+    image: str,
+    platform: str | None = None,
+    *,
+    trivy_bin: str = "trivy",
+    timeout: int = _SCAN_TIMEOUT_SECONDS,
+) -> list[Finding]:
+    """Scan one image with Trivy and return all findings.
 
     Args:
         image: Container image reference (e.g. "valkey/valkey:8.0-alpine").
-        scanner: Scanner to use ("trivy").
         platform: Optional platform (e.g. "linux/amd64") passed as ``--platform``.
 
     Returns:
@@ -101,12 +109,11 @@ def scan_image(image: str, scanner: str, platform: str | None = None) -> list[Fi
     Raises:
         ScanError: If the scanner fails, produces invalid output, or its
             JSON does not match the expected schema.
-        ValueError: If the scanner name is not recognized.
     """
-    command = _build_command(scanner, image, platform=platform)
-    json_obj = _run_scanner(command)
+    command = _build_command(image, platform, trivy_bin=trivy_bin)
+    json_obj = _run_scanner(command, timeout)
     try:
-        return parse_findings(scanner, json_obj, image, platform=platform or "")
+        return parse_trivy(json_obj, image, platform=platform or "")
     except ParseError as exc:
         raise ScanError(
             f"Scanner output failed schema validation for {image}: {exc}"
@@ -131,7 +138,6 @@ def _dedup_findings(findings: list[Finding]) -> list[Finding]:
 
 def scan_images(
     images: list[str],
-    scanner: str,
     threshold: Severity,
     platforms: list[str] | None = None,
 ) -> list[Finding]:
@@ -139,7 +145,6 @@ def scan_images(
 
     Args:
         images: List of container image references to scan.
-        scanner: Scanner to use ("trivy").
         threshold: Minimum severity level; findings below this are excluded.
         platforms: Platforms to scan per image. Defaults to DEFAULT_PLATFORMS.
 
@@ -148,7 +153,6 @@ def scan_images(
 
     Raises:
         ScanError: If any scanner invocation fails.
-        ValueError: If the scanner name is not recognized.
     """
     if platforms is None:
         platforms = DEFAULT_PLATFORMS
@@ -162,7 +166,7 @@ def scan_images(
                 "Scanning image %d/%d: %s (platform=%s)",
                 idx, total, image, platform,
             )
-            platform_findings = scan_image(image, scanner, platform=platform)
+            platform_findings = scan_image(image, platform)
             logger.info(
                 "  %s [%s]: %d finding(s) total",
                 image, platform, len(platform_findings),

@@ -6,10 +6,9 @@ import argparse
 import json
 import logging
 import os
-import subprocess
 import sys
 
-from scripts.parsers.cve_findings_parser import ParseError, parse_findings
+from scripts.cve_scan.scanner import ScanError, scan_image
 
 logger = logging.getLogger(__name__)
 _SCAN_TIMEOUT_SECONDS = 300
@@ -34,57 +33,18 @@ def parse_cves(raw: str) -> list[str]:
     return value
 
 
-def _trivy_command(binary: str, image: str, platform: str) -> list[str]:
-    return [
-        binary,
-        "image",
-        "--format",
-        "json",
-        "--quiet",
-        "--scanners",
-        "vuln",
-        "--pkg-types",
-        "os",
-        "--platform",
-        platform,
-        image,
-    ]
-
-
-def _scan(command: list[str]) -> dict:
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=_SCAN_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise VerifyError(f"Trivy timed out after {_SCAN_TIMEOUT_SECONDS}s") from exc
-    except OSError as exc:
-        raise VerifyError(f"failed to execute Trivy: {exc}") from exc
-    if result.returncode:
-        raise VerifyError(f"Trivy exited with code {result.returncode}: {(result.stderr or '(no stderr)')[:500]}")
-    if not result.stdout.strip():
-        raise VerifyError("Trivy produced empty output")
-    try:
-        value = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise VerifyError(f"Trivy output is not valid JSON: {exc}") from exc
-    if not isinstance(value, dict):
-        raise VerifyError("Trivy output is not a JSON object")
-    return value
-
-
 def verify(*, image_ref: str, cves_json: str, platform: str, trivy_bin: str = "trivy") -> list[tuple[str, str, str]]:
     """Return targeted findings still present as (CVE, package, version)."""
     targeted = set(parse_cves(cves_json))
-    document = _scan(_trivy_command(trivy_bin, image_ref, platform))
     try:
-        findings = parse_findings("trivy", document, image_ref, platform=platform)
-    except ParseError as exc:
-        raise VerifyError(f"Trivy output failed schema validation: {exc}") from exc
+        findings = scan_image(
+            image_ref,
+            platform,
+            trivy_bin=trivy_bin,
+            timeout=_SCAN_TIMEOUT_SECONDS,
+        )
+    except ScanError as exc:
+        raise VerifyError(str(exc)) from exc
     return sorted(
         (finding.cve_id, finding.package, finding.installed_version)
         for finding in findings

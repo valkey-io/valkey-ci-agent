@@ -417,13 +417,12 @@ sweep.py
       no fixed_version → not fixable
       (a candidacy signal, NOT a prediction a rebuild will resolve it; proof is verify)
   → summary.py (render grouped findings tables for job summary)
-  → emit GITHUB_OUTPUT: versions=<space-separated lines>,
-      plan=<JSON legs {line,variant,platform,cves[]}>
+  → emit GITHUB_OUTPUT: plan=<JSON legs {line,variant,platform,cves[]}>
 
 Job 2 - verify (needs: scan; matrix = fromJSON(needs.scan.outputs.plan),
          max-parallel 8, fail-fast false, timeout 180; one leg per affected
          (line, variant, platform); runs only on valkey-io/valkey-ci-agent main,
-         if plan is non-empty AND versions != '' AND not dry_run; no creds)
+         if plan is non-empty AND not dry_run; no creds)
   → checkout valkey-io/valkey-container @ mainline into ./container
   → call ./container/.github/actions/build-image, the same action ci.yml publishes with:
        explicit context ./container, dockerfile <line>/<variant>/Dockerfile,

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.cve_scan import verify_candidate
+from scripts.cve_scan import scanner, verify_candidate
 
 _CVES = '["CVE-2024-1234"]'
 
@@ -50,7 +50,7 @@ class _Result:
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, result: _Result) -> None:
-    monkeypatch.setattr(verify_candidate.subprocess, "run", lambda *a, **k: result)
+    monkeypatch.setattr(scanner.subprocess, "run", lambda *a, **k: result)
 
 
 def _args(cves: str = _CVES) -> list[str]:
@@ -84,6 +84,28 @@ def test_detects_targeted_cve_after_package_rename(
     )
     assert survivors == [("CVE-2024-1234", "libssl3", "1")]
     assert verify_candidate.main(_args()) == 1
+
+
+def test_uses_shared_scanner_with_verification_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    call: dict[str, object] = {}
+
+    def scan(image: str, platform: str, **kwargs: object) -> list:
+        call.update(image=image, platform=platform, **kwargs)
+        return []
+
+    monkeypatch.setattr(verify_candidate, "scan_image", scan)
+    assert verify_candidate.verify(
+        image_ref="candidate:8.0-alpine",
+        cves_json=_CVES,
+        platform="linux/amd64",
+        trivy_bin="custom-trivy",
+    ) == []
+    assert call == {
+        "image": "candidate:8.0-alpine",
+        "platform": "linux/amd64",
+        "trivy_bin": "custom-trivy",
+        "timeout": 300,
+    }
 
 
 @pytest.mark.parametrize("cves", ["not json", "[]", '["CVE-1", "CVE-1"]', "[1]"])

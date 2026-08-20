@@ -3,8 +3,7 @@
 Entry point for the CVE scan workflow. Scans images across configured
 platforms, classifies findings (a published fix makes a finding a rebuild
 CANDIDATE), and reports everything in the job summary. Emits the job outputs
-the build-and-verify workflow codes against: ``versions`` (space-separated
-affected lines) and ``plan`` (JSON matrix legs
+the build-and-verify workflow codes against: ``plan`` (JSON matrix legs
 whose ``cves`` list is verified against that leg's rebuilt artifact).
 
 Verification is no longer predicted here: the downstream workflow BUILDS the
@@ -82,26 +81,14 @@ def _verification_plan(fixable: list[Classification]) -> str:
     return json.dumps(list(legs.values()), separators=(",", ":"))
 
 
-def _emit_outputs(
-    versions: list[str] | None = None,
-    plan: str = "[]",
-) -> None:
-    """Emit GitHub Actions job outputs (versions and plan)."""
-
-    versions_str = " ".join(versions or [])
-
+def _emit_outputs(plan: str = "[]") -> None:
+    """Emit the GitHub Actions verification plan."""
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
         with open(github_output, "a") as f:
-            f.write(f"versions={versions_str}\n")
             f.write(f"plan={plan}\n")
-        logger.info(
-            "Wrote outputs to GITHUB_OUTPUT: versions=%s plan_legs=%d",
-            versions_str or "(empty)",
-            len(json.loads(plan)),
-        )
+        logger.info("Wrote %d plan leg(s) to GITHUB_OUTPUT", len(json.loads(plan)))
     else:
-        print(f"versions={versions_str}")
         print(f"plan={plan}")
 
 
@@ -214,8 +201,7 @@ def run_sweep(
             inspect them).
     """
     logger.info(
-        "Loaded settings: scanner=%s, threshold=%s, platforms=%s",
-        settings.scanner,
+        "Loaded settings: threshold=%s, platforms=%s",
         settings.severity_threshold.name,
         ",".join(settings.platforms),
     )
@@ -224,15 +210,13 @@ def run_sweep(
     logger.info("Resolved %d image(s) to scan: %s", len(images), ", ".join(images))
 
     logger.info(
-        "Scanning %d image(s) x %d platform(s) with %s...",
+        "Scanning %d image(s) x %d platform(s) with Trivy...",
         len(images),
         len(settings.platforms),
-        settings.scanner,
     )
     try:
         findings = scan_images(
             images,
-            settings.scanner,
             settings.severity_threshold,
             platforms=settings.platforms,
         )
@@ -276,7 +260,7 @@ def run_sweep(
 
     versions = _fixable_versions(fixable)
     plan = _verification_plan(fixable)
-    _emit_outputs(versions, plan)
+    _emit_outputs(plan)
 
     if dry_run:
         _print_dry_run(fixable, not_fixable)

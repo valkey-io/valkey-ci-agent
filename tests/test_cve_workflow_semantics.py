@@ -40,7 +40,7 @@ def test_safe_trigger_permissions_and_pins() -> None:
 
 def test_scan_emits_one_plan_contract() -> None:
     outputs = _job("scan")["outputs"]
-    assert set(outputs) == {"versions", "plan"}
+    assert set(outputs) == {"plan"}
     assert outputs["plan"] == "${{ steps.scan.outputs.plan }}"
     assert not any("create-github-app-token" in step.get("uses", "") for step in _job("scan")["steps"])
 
@@ -147,6 +147,10 @@ def test_dispatch_is_correlated_and_real_result_is_waited_for() -> None:
 def test_reports_use_collects_per_architecture_result() -> None:
     report = _step("rebuild", step_id="report")
     assert report["env"]["ARCH_REPORT"] == "${{ needs.collect.outputs.arch_report }}"
+    workflow = yaml.safe_dump(_workflow())
+    assert "needs.scan.outputs.versions" not in workflow
+    assert "SCAN_VERSIONS" not in report["env"]
+    assert ".dispatched == false" in report["run"]
     assert "proven fixed on" in report["run"]
     assert "still vulnerable" in report["run"]
     assert "Per-arch:" in report["run"]

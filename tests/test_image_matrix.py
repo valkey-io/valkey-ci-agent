@@ -23,7 +23,6 @@ def _settings(**changes: object) -> CveScanSettings:
         "versions_url": "https://example.com/versions.json",
         "repository": "valkey/valkey",
         "include_unstable": False,
-        "scanner": "trivy",
         "severity_threshold": Severity.HIGH,
         "images": [],
         "platforms": ["linux/amd64"],

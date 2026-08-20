@@ -123,13 +123,6 @@ def parse_trivy(json_obj: dict[str, Any], image: str, platform: str = "") -> lis
     return findings
 
 
-def parse_findings(scanner: str, json_obj: dict[str, Any], image: str, platform: str = "") -> list[Finding]:
-    """Dispatch to the correct parser based on scanner name; raises ValueError if unrecognized."""
-    if scanner == "trivy":
-        return parse_trivy(json_obj, image, platform=platform)
-    raise ValueError(f"Unsupported scanner: {scanner!r}. Must be 'trivy'.")
-
-
 def filter_by_threshold(findings: list[Finding], threshold: Severity) -> list[Finding]:
     """Return findings at or above the given severity threshold (inclusive)."""
     return [f for f in findings if f.severity >= threshold]

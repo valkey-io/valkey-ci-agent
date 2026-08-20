@@ -11,7 +11,6 @@ from scripts.cve_scan.scanner import ScanError, scan_image
 from scripts.parsers.cve_findings_parser import (
     ParseError,
     filter_by_threshold,
-    parse_findings,
     parse_trivy,
 )
 
@@ -148,14 +147,8 @@ def test_scan_image_wraps_schema_error() -> None:
         return_value={"SchemaVersion": 2, "Results": "bad"},
     ):
         with pytest.raises(ScanError, match="schema validation") as error:
-            scan_image(_IMAGE, "trivy")
+            scan_image(_IMAGE)
     assert isinstance(error.value.__cause__, ParseError)
-
-
-def test_dispatcher_accepts_trivy_and_rejects_unknown_scanners() -> None:
-    assert parse_findings("trivy", {"SchemaVersion": 2}, _IMAGE) == []
-    with pytest.raises(ValueError, match="Unsupported scanner"):
-        parse_findings("grype", {}, _IMAGE)
 
 
 @pytest.mark.parametrize(

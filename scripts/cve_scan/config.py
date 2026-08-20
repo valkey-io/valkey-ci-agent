@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 
 from scripts.cve_scan.models import Severity
 
-_VALID_SCANNERS = frozenset({"trivy"})
 _TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSY_STRINGS = frozenset({"0", "false", "no", "off", ""})
 
@@ -21,7 +20,6 @@ _DEFAULT_VERSIONS_URL = (
     "/mainline/versions.json"
 )
 _DEFAULT_REPOSITORY = "valkey/valkey"
-_DEFAULT_SCANNER = "trivy"
 _DEFAULT_SEVERITY_THRESHOLD = "HIGH"
 
 # Verified published platforms for valkey images (via buildx imagetools inspect).
@@ -47,7 +45,6 @@ class CveScanSettings:
     versions_url: str
     repository: str
     include_unstable: bool
-    scanner: str
     severity_threshold: Severity
     images: list[str] = field(default_factory=list)
     platforms: list[str] = field(default_factory=list)
@@ -71,12 +68,6 @@ def load_settings() -> CveScanSettings:
             f"Invalid CVE_SCAN_INCLUDE_UNSTABLE: {include_unstable_raw!r}. "
             f"Must be one of (case-insensitive): "
             f"truthy {sorted(_TRUTHY_STRINGS)}, falsy {sorted(_FALSY_STRINGS)}"
-        )
-
-    scanner = os.environ.get("CVE_SCAN_SCANNER", _DEFAULT_SCANNER).strip().lower()
-    if scanner not in _VALID_SCANNERS:
-        raise CveScanConfigError(
-            f"Invalid CVE_SCAN_SCANNER: {scanner!r}. Must be 'trivy'."
         )
 
     severity_raw = os.environ.get(
@@ -103,7 +94,6 @@ def load_settings() -> CveScanSettings:
         versions_url=versions_url,
         repository=repository,
         include_unstable=include_unstable,
-        scanner=scanner,
         severity_threshold=severity_threshold,
         images=images,
         platforms=platforms,

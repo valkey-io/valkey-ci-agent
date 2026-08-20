@@ -22,21 +22,22 @@ def _finding(platform: str, *, severity: Severity = Severity.HIGH) -> Finding:
 
 
 def test_trivy_command_scopes_scan_to_platform() -> None:
-    command = _build_command("trivy", "valkey/valkey:8.0", "linux/arm64")
+    command = _build_command("valkey/valkey:8.0", "linux/arm64")
     assert command[-3:] == ["--platform", "linux/arm64", "valkey/valkey:8.0"]
-    assert "--platform" not in _build_command("trivy", "image", None)
+    assert "--platform" not in _build_command("image")
+    assert _build_command("image", trivy_bin="custom-trivy")[0] == "custom-trivy"
 
 
 def test_all_published_platforms_are_scanned_and_preserved() -> None:
     calls: list[str] = []
 
-    def scan(_image: str, _scanner: str, platform: str | None = None) -> list[Finding]:
+    def scan(_image: str, platform: str | None = None) -> list[Finding]:
         assert platform
         calls.append(platform)
         return [_finding(platform)]
 
     with patch("scripts.cve_scan.scanner.scan_image", side_effect=scan):
-        findings = scan_images(["valkey/valkey:8.0"], "trivy", Severity.HIGH)
+        findings = scan_images(["valkey/valkey:8.0"], Severity.HIGH)
     assert calls == DEFAULT_PLATFORMS
     assert {finding.platform for finding in findings} == set(DEFAULT_PLATFORMS)
     assert "linux/386" not in calls
@@ -56,7 +57,6 @@ def test_threshold_filtering_is_applied_after_multi_arch_scan() -> None:
         assert (
             scan_images(
                 ["valkey/valkey:8.0"],
-                "trivy",
                 Severity.HIGH,
                 platforms=["linux/amd64"],
             )
