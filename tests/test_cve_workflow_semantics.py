@@ -107,6 +107,15 @@ def test_collect_reconciles_markers_against_same_plan() -> None:
     assert set(collect["outputs"]) == {"verified_versions", "arch_report"}
 
 
+def test_verify_concurrency_does_not_collide_between_matrix_legs() -> None:
+    concurrency = _job("verify")["concurrency"]
+    group = concurrency["group"]
+    assert "${{ matrix.line }}" in group
+    assert "${{ matrix.variant }}" in group
+    assert "${{ matrix.platform }}" in group
+    assert concurrency["cancel-in-progress"] is False
+
+
 def test_repo_branch_and_dry_run_guard_all_mutating_paths() -> None:
     for name in ("verify", "collect", "rebuild"):
         condition = _job(name)["if"]
