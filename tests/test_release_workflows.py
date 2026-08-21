@@ -14,10 +14,12 @@ def test_prepare_opens_dashboard_and_notes_pr_in_parallel() -> None:
     assert inputs["dry_run"]["default"] == "false"
     assert list(workflow["jobs"]) == ["authorize-start", "derive", "cut-notes", "tracker"]
     assert inputs["initiator"]["required"] == "true"
+    assert workflow["jobs"]["cut-notes"]["with"]["release_owner"] == "${{ inputs.initiator }}"
     assert workflow["jobs"]["derive"]["needs"] == "authorize-start"
     assert "VALKEY_RELEASE_START_ACTOR" in str(workflow["jobs"]["authorize-start"])
     assert workflow["jobs"]["derive"]["environment"] == "release-control"
     assert workflow["jobs"]["cut-notes"]["uses"] == "./.github/workflows/release-notes-cut.yml"
+    assert workflow["jobs"]["cut-notes"]["secrets"] == "inherit"
     assert workflow["jobs"]["tracker"]["needs"] == "derive"
     assert workflow["jobs"]["tracker"]["environment"] == "release-control"
     assert "permission-issues" in str(workflow["jobs"]["tracker"])
@@ -36,6 +38,9 @@ def test_publish_waits_for_qualification_before_protected_write() -> None:
     assert "VALKEY_RELEASE_PUBLISH_APP_PRIVATE_KEY" not in str(jobs["qualify"])
     assert "TRIGGERING_ACTOR" in str(jobs["publish"])
     assert '"$APPROVER" != "$TRIGGERING_ACTOR"' in str(jobs["publish"])
+    assert "release must disable admin bypass" in str(jobs["publish"])
+    assert 'if has("can_admins_bypass") then .can_admins_bypass else true end' in str(jobs["publish"])
+    assert ".can_admins_bypass // true" not in str(jobs["publish"])
     assert jobs["onboard-backports"]["continue-on-error"] == "true"
 
 

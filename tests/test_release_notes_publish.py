@@ -69,6 +69,19 @@ class TestOpenOrUpdatePr:
         assert url == "https://x/9"
         repo.create_pull.assert_called_once()
 
+    def test_notifies_release_owner_once(self) -> None:
+        repo = MagicMock()
+        pr = MagicMock(number=9, html_url="https://x/9")
+        pr.get_issue_comments.return_value = []
+        repo.create_pull.return_value = pr
+        open_or_update_pr(
+            repo, base_repo="o/r", push_repo=None,
+            branch="agent/release-cut/9.1.0-rc1", base_branch="9.1",
+            title="t", body="b", existing=None, release_owner="alice",
+        )
+        comment = pr.create_issue_comment.call_args.args[0]
+        assert comment == "@alice, please review this automated release PR."
+
     def test_create_passes_draft_true_to_hold(self) -> None:
         # A held cut opens the PR as a draft so GitHub refuses to merge it.
         repo = MagicMock()

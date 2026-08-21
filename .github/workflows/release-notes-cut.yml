@@ -102,6 +102,11 @@ on:
         required: false
         type: boolean
         default: false
+      release_owner:
+        description: "GitHub login to notify when the release PR is opened"
+        required: false
+        type: string
+        default: ""
       dry_run:
         description: "Preview without pushing or opening a PR"
         required: false
@@ -233,6 +238,7 @@ jobs:
           RELEASE_NOTES_SECURITY_FIXES: ${{ inputs.security_fixes || '' }}
           RELEASE_NOTES_SECURITY_FROM_ADVISORIES: ${{ inputs.security_from_advisories && 'true' || 'false' }}
           RELEASE_NOTES_FORCE_READY: ${{ inputs.force_ready && 'true' || 'false' }}
+          RELEASE_NOTES_RELEASE_OWNER: ${{ inputs.release_owner || github.actor }}
           RELEASE_NOTES_DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
         run: |
           set -euo pipefail

@@ -119,10 +119,12 @@ jobs:
       contents: read
       id-token: write
     uses: ./.github/workflows/release-notes-cut.yml
+    secrets: inherit
     with:
       version: ${{ needs.derive.outputs.version }}
       stage: ${{ needs.derive.outputs.stage }}
       urgency: ${{ inputs.urgency }}
+      release_owner: ${{ inputs.initiator }}
       dry_run: false
 
   tracker:

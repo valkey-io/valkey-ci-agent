@@ -157,7 +157,7 @@ jobs:
           ENVIRONMENT=$(gh api "repos/${REPO}/environments/release")
           REVIEWERS=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length' <<< "$ENVIRONMENT")
           PREVENT_SELF=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | .prevent_self_review] | any' <<< "$ENVIRONMENT")
-          ADMIN_BYPASS=$(jq -r '.can_admins_bypass // true' <<< "$ENVIRONMENT")
+          ADMIN_BYPASS=$(jq -r 'if has("can_admins_bypass") then .can_admins_bypass else true end' <<< "$ENVIRONMENT")
           CUSTOM_POLICY=$(jq -r '.deployment_branch_policy.custom_branch_policies // false' <<< "$ENVIRONMENT")
           POLICY_NAMES=$(gh api --paginate "repos/${REPO}/environments/release/deployment-branch-policies" --jq '.branch_policies[].name' | sort -u)
           [[ "$REVIEWERS" -ge 1 ]] || { echo "release must require a reviewer" >&2; exit 1; }

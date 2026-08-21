@@ -748,6 +748,7 @@ def cut(
     security_from_advisories: bool = False,
     force_ready: bool = False,
     profile: projects_mod.ProjectProfile,
+    release_owner: str = "",
 ) -> int:
     """Cut a release: generate notes with AI, render onto the release line, open PRs.
 
@@ -954,6 +955,7 @@ def cut(
             git_env=git_env, force_ready=force_ready,
             expected_base_sha=pinned_head_sha,
             profile=profile,
+            release_owner=release_owner,
         )
         logger.info("Release PR: %s", release_url)
 
@@ -1074,6 +1076,7 @@ def _commit_push_release_pr(
     prep_branch: str, notes_meta: "_NotesMeta", git_env: dict[str, str],
     force_ready: bool = False, expected_base_sha: str = "",
     profile: projects_mod.ProjectProfile,
+    release_owner: str = "",
 ) -> str:
     """Commit the cut on the prep branch, push it, and open/update a PR into the line.
 
@@ -1149,7 +1152,7 @@ def _commit_push_release_pr(
     return publish_mod.open_or_update_pr(
         repo, base_repo=repo_full_name, push_repo=None, branch=prep_branch,
         base_branch=plan.target, title=title, body=body, existing=existing,
-        draft=hold,
+        draft=hold, release_owner=release_owner,
     )
 
 
