@@ -1,9 +1,10 @@
 name: CI Fix Comment Poll
 
-# Scans recent valkey-io/valkey PR comments for "@valkeyrie-ops fix <ci-link>"
-# and dispatches the ci-fix workflow for each new one. The trigger only; the
-# fix itself runs in ci-fix.yml. Idempotency is a reaction marker on the
-# comment, so overlapping or replayed ticks never double-dispatch.
+# Scans recent PR comments on valkey-io/valkey and valkey-io/valkey-search for
+# "@valkeyrie-ops fix <ci-link>" and dispatches the ci-fix workflow for each new
+# one. The trigger only; the fix itself runs in ci-fix.yml. Idempotency is a
+# reaction marker on the comment, so overlapping or replayed ticks never
+# double-dispatch.
 
 on:
   schedule:
@@ -50,6 +51,7 @@ jobs:
           owner: valkey-io
           repositories: |
             valkey
+            valkey-search
             valkey-ci-agent
           permission-members: read
           permission-issues: write

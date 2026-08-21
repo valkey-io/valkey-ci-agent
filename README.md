@@ -177,12 +177,13 @@ gh workflow run ci-fix.yml \
   --field run_url=https://github.com/valkey-io/valkey/actions/runs/<run_id>
 ```
 
-The workflow is scoped to `valkey-io/valkey`, matching the GitHub App token it
-mints. Maintainers can dispatch it manually, or comment on a `valkey-io/valkey`
-PR and let `ci-fix-comment-poll.yml` dispatch it. The invocation must start the
-comment, and the hint is only the rest of that line, so a conversational comment
-that merely quotes or mentions the command does not trigger a run. The intended
-comment shape is:
+The workflow is scoped to `valkey-io/valkey` and `valkey-io/valkey-search`,
+matching the GitHub App token it mints (pass `--field repo=valkey-io/valkey-search`
+for a search backport PR). Maintainers can dispatch it manually, or comment on a
+PR in either repo and let `ci-fix-comment-poll.yml` dispatch it. The invocation
+must start the comment, and the hint is only the rest of that line, so a
+conversational comment that merely quotes or mentions the command does not
+trigger a run. The intended comment shape is:
 
 ```text
 @valkeyrie-bot fix https://github.com/valkey-io/valkey/actions/runs/<run_id>
@@ -253,9 +254,11 @@ Reuses the same secrets and OIDC role as the other workflows (see
 [Step 1](#step-1-configure-secrets-and-variables)). The workflow mints two
 short-lived App tokens:
 
-- On `valkey-io/valkey`: `members:read` (team authorization), `actions:read`
-  (run logs and failed-job listing), `contents:write` (push the fix),
-  `issues:write` (PR comments), `pull-requests:write` (PR metadata).
+- On `valkey-io/valkey` and `valkey-io/valkey-search`: `members:read` (team
+  authorization), `actions:read` (run logs and failed-job listing),
+  `contents:write` (push the fix), `issues:write` (PR comments),
+  `pull-requests:write` (PR metadata). The comment poller mints the same
+  scopes on both repos so a fix can be driven from either.
 - On `valkey-io/valkey-ci-agent`: `actions:write` (dispatch and read the
   macOS verification workflow). Used only for the macOS backend.
 

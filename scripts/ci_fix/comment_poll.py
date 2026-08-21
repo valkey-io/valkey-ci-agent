@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from github import Auth, Github
+from github.GithubException import GithubException
 
 from scripts.ci_fix.gate import ParsedCommand, is_authorized, parse_command
 from scripts.common.github_client import retry_github_call
@@ -263,6 +264,21 @@ def _lookback_minutes() -> int:
     )
 
 
+# Comma-separated so the same poller can scan several target repos in one tick.
+_DEFAULT_TARGET_REPOS = "valkey-io/valkey,valkey-io/valkey-search"
+
+
+def _target_repos() -> tuple[str, ...]:
+    raw = os.environ.get("CI_FIX_POLL_TARGET_REPO", _DEFAULT_TARGET_REPOS)
+    repos = [entry.strip() for entry in raw.split(",") if entry.strip()]
+    # An override of only commas/whitespace would otherwise silently poll
+    # nothing; fall back to the default rather than no-op the whole tick.
+    if not repos:
+        repos = [entry.strip() for entry in _DEFAULT_TARGET_REPOS.split(",")]
+    # Preserve order, drop duplicates.
+    return tuple(dict.fromkeys(repos))
+
+
 def _bot_login() -> str:
     """The login whose claim reaction the poller recognizes as its own.
 
@@ -293,7 +309,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     token = os.environ["CI_FIX_POLL_TOKEN"]
-    target_repo = os.environ.get("CI_FIX_POLL_TARGET_REPO", "valkey-io/valkey")
+    target_repos = _target_repos()
     agent_repo = os.environ.get("CI_FIX_POLL_AGENT_REPO", "valkey-io/valkey-ci-agent")
     workflow = os.environ.get("CI_FIX_POLL_WORKFLOW", "ci-fix.yml")
     ref = os.environ.get("CI_FIX_POLL_REF", "main")
@@ -308,15 +324,14 @@ def main() -> int:
     dispatch = dispatch_ci_fix(gh, agent_repo=agent_repo, workflow=workflow, ref=ref)
 
     def _poll() -> int:
-        return poll_once(
+        return _poll_all_repos(
             gh,
-            target_repo=target_repo,
+            target_repos=target_repos,
             org=org,
             team_slug=team_slug,
             bot_login=bot_login,
             lookback_minutes=_lookback_minutes(),
             dispatch=dispatch,
-            claim=claim_via_status,
         )
 
     results = run_poll_loop(
@@ -331,6 +346,51 @@ def main() -> int:
         len(results),
     )
     return 0
+
+
+def _poll_all_repos(
+    gh: Github,
+    *,
+    target_repos: tuple[str, ...],
+    org: str,
+    team_slug: str,
+    bot_login: str,
+    lookback_minutes: int,
+    dispatch: DispatchFn,
+) -> int:
+    """Poll every target repo once, isolating per-repo failures.
+
+    A single repo's read failure (e.g. a missing installation on that repo)
+    is caught so the others still get polled — the reaction claim keeps this
+    idempotent. But if *every* repo fails, the cause is almost certainly a bad
+    token/config rather than one flaky repo, so we re-raise to fail the tick
+    loudly instead of silently reporting "dispatched 0".
+    """
+    dispatched = 0
+    failures: list[tuple[str, Exception]] = []
+    for target_repo in target_repos:
+        try:
+            dispatched += poll_once(
+                gh,
+                target_repo=target_repo,
+                org=org,
+                team_slug=team_slug,
+                bot_login=bot_login,
+                lookback_minutes=lookback_minutes,
+                dispatch=dispatch,
+                claim=claim_via_status,
+            )
+        except GithubException as exc:
+            logger.warning("Skipping repo %s after error: %s", target_repo, exc)
+            failures.append((target_repo, exc))
+
+    if failures and len(failures) == len(target_repos):
+        repos = ", ".join(repo for repo, _ in failures)
+        raise RuntimeError(
+            f"All {len(target_repos)} target repo(s) failed to poll ({repos}); "
+            "check the App installation and token scopes."
+        ) from failures[0][1]
+    return dispatched
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       repo:
-        description: "PR repository, e.g. valkey-io/valkey"
+        description: "PR repository: valkey-io/valkey or valkey-io/valkey-search"
         required: true
         type: string
       pr:
@@ -48,10 +48,12 @@ jobs:
       id-token: write
     concurrency:
       # Serialize ci-fix runs for the same PR so two dispatches don't push at
-      # once. This does not coordinate with other workflows that write the same
-      # branch; the fast-forward-only push (see push.py) is what keeps a
-      # concurrent branch update from being clobbered.
-      group: ci-fix-${{ inputs.pr }}
+      # once. The key includes the repo so PRs sharing a number across repos
+      # (valkey#123 vs valkey-search#123) don't block each other. This does not
+      # coordinate with other workflows that write the same branch; the
+      # fast-forward-only push (see push.py) is what keeps a concurrent branch
+      # update from being clobbered.
+      group: ci-fix-${{ inputs.repo }}-${{ inputs.pr }}
       cancel-in-progress: false
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
@@ -76,7 +78,9 @@ jobs:
           app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
           private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
           owner: valkey-io
-          repositories: valkey
+          repositories: |
+            valkey
+            valkey-search
           # members:read for the contributors-team auth check; contents:write
           # to push the fix; pull-requests:write + issues:write to comment (the
           # PR comment uses the Issues comments API); actions:read for logs.
@@ -133,10 +137,13 @@ jobs:
             echo "Invalid repo: ${CI_FIX_REPO}" >&2
             exit 1
           fi
-          if [[ "${CI_FIX_REPO}" != "valkey-io/valkey" ]]; then
-            echo "ci-fix.yml is currently scoped to valkey-io/valkey (got: ${CI_FIX_REPO})" >&2
-            exit 1
-          fi
+          case "${CI_FIX_REPO}" in
+            valkey-io/valkey|valkey-io/valkey-search) ;;
+            *)
+              echo "ci-fix.yml is scoped to valkey-io/valkey and valkey-io/valkey-search (got: ${CI_FIX_REPO})" >&2
+              exit 1
+              ;;
+          esac
           if [[ ! "${CI_FIX_PR}" =~ ^[0-9]+$ ]]; then
             echo "Invalid PR number: ${CI_FIX_PR}" >&2
             exit 1
