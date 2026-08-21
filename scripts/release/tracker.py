@@ -42,6 +42,10 @@ _PHASES = (
     "Production",
     "Follow-up",
 )
+_FOLLOW_UP_ACTION = (
+    "Release owner: review and merge every linked downstream PR, verify the remaining linked outputs, "
+    "then close this tracker."
+)
 
 
 @dataclass(frozen=True)
@@ -494,12 +498,12 @@ def _render_status(
     if production_run is not None:
         production_link = f"[Production run {production_run.id}]({production_run.html_url})"
         production_evidence = production_link
-        follow_up_evidence = f"{production_link}<br>{_downstream_links(tracker)}"
+        follow_up_evidence = f"{production_link}<br>**Manual follow-up:** {_downstream_links(tracker)}"
         if production_run.status == "completed" and production_run.conclusion == "success":
             production_status = _status_badge("Passed", "1a7f37")
             production_action = "Complete"
-            follow_up_status = _status_badge("Action needed", "8250df")
-            follow_up_action = "Review downstream PRs, confirm Bundle, then close this tracker."
+            follow_up_status = _status_badge("Release owner review", "8250df")
+            follow_up_action = _FOLLOW_UP_ACTION
             current = "Production automation completed."
             next_action = follow_up_action
             summary = "production automation completed"
@@ -688,7 +692,7 @@ def _issue_body(tracker: Tracker, agent_repo: str, *, include_marker: bool = Tru
         "- Review and merge the canonical release-notes PR when the live status links it.",
         "- Review the rendered release plan before approving the `release` environment.",
         "- Review production evidence before approving the `release-publish` environment.",
-        "- Review downstream PRs, confirm Bundle, and close this tracker after follow-up completes.",
+        f"- {_FOLLOW_UP_ACTION}",
     )
     if include_marker:
         lines = (tracker.marker(), *lines)

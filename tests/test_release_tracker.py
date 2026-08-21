@@ -152,7 +152,40 @@ def test_downstream_follow_up_links_cover_ga_outputs_without_new_api_access() ->
     assert "valkey-io.github.io/pulls?q=is%3Apr+head%3Aupdate-website-9.1.2" in body
     assert "valkey-helm/pulls?q=is%3Apr+head%3Aupdate-valkey-9.1.2" in body
     assert "valkey-bundle/pulls?q=is%3Apr+head%3Avalkey-bundle-update" in body
-    assert "Review downstream PRs, confirm Bundle, then close this tracker" in body
+    assert "**Manual follow-up:**" in body
+    assert "Release owner review" in body
+    assert "review and merge every linked downstream PR" in body
+
+
+def test_8_0_follow_up_omits_bundle_and_requires_manual_pr_merges() -> None:
+    tracker = tracker_mod.Tracker(
+        **{
+            **TRACKER.__dict__,
+            "branch": "8.0",
+            "version": "8.0.12",
+            "tag": "8.0.12",
+            "prep_branch": "agent/release-cut/8.0.12-ga",
+        }
+    )
+    body, summary = tracker_mod._render_status(
+        tracker,
+        prepare_run=_run(),
+        pr=None,
+        branch_head=SHA,
+        candidate_sha="",
+        candidate_ci=None,
+        publish_run=None,
+        release=SimpleNamespace(html_url="https://example/releases/8.0.12"),
+        production_run=_run(),
+        agent_repo="valkey-io/valkey-ci-agent",
+        dispatched=False,
+    )
+
+    assert summary == "production automation completed"
+    assert "**Manual follow-up:**" in body
+    assert "review and merge every linked downstream PR" in body
+    assert "valkey-bundle" not in body
+    assert "Bundle" not in body
 
 
 def test_rc_follow_up_omits_ga_only_outputs() -> None:
@@ -182,6 +215,8 @@ def test_issue_body_is_a_compact_maintainer_control_center() -> None:
     assert "Prepare run 123" in body
     assert "## Human checkpoints" in body
     assert "- [ ]" not in body
+    assert "review and merge every linked downstream PR" in body
+    assert "confirm Bundle" not in body
     assert "Editing this issue never authorizes" in body
     assert "—" not in body
 
