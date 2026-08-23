@@ -580,7 +580,13 @@ and requires the edit to touch only the current dated notes section. It applies
 the approved patch in a clean clone, rechecks the PR head and review batch, then
 uses a normal fast-forward push. On success it updates the PR comment, replies
 with the commit, and resolves only unchanged threads. Failed operations remain
-visible on the PR and can be retried by a later poll.
+visible on the PR and can be retried by a later poll. Addressing markers expire
+after 90 minutes so a job that never reaches its handler cannot block the PR
+forever. Batch identities include the complete review payload, so editing a
+comment creates a new batch. Before pushing, the handler records the proposed
+commit and review-thread identities; if the push succeeds but the job loses its
+response or fails during bookkeeping, the poller finishes the replies and
+resolutions idempotently without running another AI edit.
 
 ## CVE Scan Workflow
 

@@ -15,6 +15,7 @@ from scripts.release_notes.review import (
     parse_request,
     parse_status,
     resolve_review_thread,
+    review_batch_id,
     review_payload_json,
     selected_reviews,
     status_body,
@@ -208,6 +209,21 @@ def test_selects_every_actionable_thread_and_latest_human_comment() -> None:
         for review in reviews
     ] == [("one", 2), ("two", 4)]
     assert '"selected_comment_id": 2' in review_payload_json(reviews)
+
+
+def test_batch_identity_changes_when_comment_body_is_edited() -> None:
+    before = selected_reviews(
+        (_thread("one", (_comment(1, body="Ambiguous feedback."),)),),
+        "00-RELEASENOTES",
+        lambda _login: True,
+    )
+    after = selected_reviews(
+        (_thread("one", (_comment(1, body="Use this exact wording."),)),),
+        "00-RELEASENOTES",
+        lambda _login: True,
+    )
+
+    assert review_batch_id(before) != review_batch_id(after)
 
 
 def test_review_thread_graphql_contract_and_resolution() -> None:

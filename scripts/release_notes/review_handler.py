@@ -34,9 +34,10 @@ from scripts.release_notes.review import (
     list_review_threads,
     parse_request,
     parse_status,
-    resolve_review_thread,
+    reconcile_review_targets,
     review_batch_id,
     review_payload_json,
+    review_targets,
     selected_reviews,
     status_body,
     validate_notes_edit,
@@ -47,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 EditAgentFn = Callable[[str, str], AgentRunResult]
 AuthorizeFn = Callable[[str], bool]
-BeforePushFn = Callable[[], None]
+BeforePushFn = Callable[[str], None]
 PublishFn = Callable[..., str]
 
 
@@ -128,6 +129,8 @@ def load_batch(
     review_payload_json(reviews)
     if review_batch_id(reviews) != marker.batch_id:
         raise StaleReview("release-review batch changed before handling")
+    if marker.targets and marker.targets != review_targets(reviews):
+        raise StaleReview("release-review targets changed before handling")
     return LiveBatch(
         release=release,
         pull_request=pr,
@@ -214,7 +217,7 @@ def publish_patch(
             "Address release note review comments",
         )
         commit_sha = git_output(str(repo_dir), "rev-parse", "HEAD").strip()
-        before_push()
+        before_push(commit_sha)
         run_git(
             str(repo_dir),
             "remote",
@@ -265,7 +268,7 @@ def handle_review_request(
                 edit_agent=edit_agent,
             )
 
-            def revalidate() -> None:
+            def revalidate(commit_sha: str) -> None:
                 try:
                     current = load_batch(
                         gh,
@@ -278,6 +281,7 @@ def handle_review_request(
                     raise StaleReview(str(exc)) from exc
                 if _batch_signature(current) != initial_signature:
                     raise StaleReview("release PR or review comments changed")
+                _set_status(batch, "addressing", commit_sha=commit_sha)
 
             commit_sha = publish(
                 batch.release,
@@ -298,12 +302,18 @@ def handle_review_request(
         return HandlerOutcome(False, reason)
 
     try:
-        _set_status(batch, "addressed", commit_sha=commit_sha)
+        _set_status(
+            batch,
+            "addressed",
+            commit_sha=commit_sha,
+            marker_head_sha=commit_sha,
+        )
         replied, resolved, failures = _reply_and_resolve(
             gh,
             gql,
             batch,
             commit_sha,
+            bot_login,
         )
     except Exception as exc:  # noqa: BLE001 - the commit is already published
         return HandlerOutcome(
@@ -375,15 +385,17 @@ def _set_status(
     *,
     reason: str = "",
     commit_sha: str = "",
+    marker_head_sha: str = "",
 ) -> None:
     body = status_body(
         status,
-        batch.release.head_sha,
+        marker_head_sha or batch.release.head_sha,
         review_batch_id(batch.reviews),
         len(batch.reviews),
         reason=reason,
         commit_sha=commit_sha,
         repo_full_name=batch.release.repo_full_name,
+        targets=review_targets(batch.reviews),
     )
     retry_github_call(
         lambda: batch.status_comment.edit(body),
@@ -402,6 +414,31 @@ def _set_failure(
 ) -> None:
     try:
         if batch is not None:
+            marker = parse_status(batch.status_comment, bot_login)
+            if marker is not None and marker.commit_sha:
+                try:
+                    live_pr = retry_github_call(
+                        lambda: gh.get_repo(request.repo_full_name).get_pull(
+                            request.pr_number
+                        ),
+                        retries=3,
+                        description="check release-review head after push failure",
+                    )
+                except Exception as exc:  # noqa: BLE001 - preserve recovery marker
+                    logger.error(
+                        "Could not determine whether release-review commit published: %s",
+                        exc,
+                    )
+                    return
+                live_head = str(getattr(getattr(live_pr, "head", None), "sha", ""))
+                if live_head == marker.commit_sha:
+                    _set_status(
+                        batch,
+                        "addressed",
+                        commit_sha=marker.commit_sha,
+                        marker_head_sha=marker.commit_sha,
+                    )
+                    return
             _set_status(batch, status, reason=reason)
             return
         pr = gh.get_repo(request.repo_full_name).get_pull(request.pr_number)
@@ -416,6 +453,8 @@ def _set_failure(
                 marker.batch_id,
                 marker.count,
                 reason=reason,
+                commit_sha=marker.commit_sha,
+                targets=marker.targets,
             )
         )
     except Exception as exc:  # noqa: BLE001 - preserve the primary failure
@@ -427,63 +466,23 @@ def _reply_and_resolve(
     gql: GitHubGraphQLClient,
     batch: LiveBatch,
     commit_sha: str,
+    bot_login: str,
 ) -> tuple[int, int, list[str]]:
     repo = gh.get_repo(batch.release.repo_full_name)
     pr = repo.get_pull(batch.release.number)
-    current = {
-        thread.node_id: thread
-        for thread in list_review_threads(
+    return reconcile_review_targets(
+        pr,
+        gql,
+        targets=review_targets(batch.reviews),
+        commit_sha=commit_sha,
+        bot_login=bot_login,
+        repo_full_name=batch.release.repo_full_name,
+        load_threads=lambda: list_review_threads(
             gql,
             batch.release.repo_full_name,
             batch.release.number,
-        )
-    }
-    commit_url = (
-        f"https://github.com/{batch.release.repo_full_name}/commit/{commit_sha}"
+        ),
     )
-    replied = 0
-    resolved = 0
-    failures: list[str] = []
-    pending_resolution: dict[str, SelectedReview] = {}
-    for review in batch.reviews:
-        thread = current.get(review.thread.node_id)
-        if thread is None or thread.latest_human_comment() != review.comment:
-            continue
-        if thread.resolved:
-            resolved += 1
-            continue
-        try:
-            pr.create_review_comment_reply(
-                thread.root_comment_id,
-                f"Addressed in [`{commit_sha[:12]}`]({commit_url}).",
-            )
-            replied += 1
-            pending_resolution[thread.node_id] = review
-        except Exception as exc:  # noqa: BLE001 - continue with sibling threads
-            failures.append(f"thread {thread.node_id}: {exc}")
-
-    if pending_resolution:
-        refreshed = {
-            thread.node_id: thread
-            for thread in list_review_threads(
-                gql,
-                batch.release.repo_full_name,
-                batch.release.number,
-            )
-        }
-        for thread_id, review in pending_resolution.items():
-            thread = refreshed.get(thread_id)
-            if thread is None or thread.latest_human_comment() != review.comment:
-                continue
-            if thread.resolved:
-                resolved += 1
-                continue
-            try:
-                resolve_review_thread(gql, thread_id)
-                resolved += 1
-            except Exception as exc:  # noqa: BLE001 - continue with sibling threads
-                failures.append(f"thread {thread_id}: {exc}")
-    return replied, resolved, failures
 
 
 def main() -> int:

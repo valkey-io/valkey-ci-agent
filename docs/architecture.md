@@ -384,12 +384,17 @@ as the runner reaches the poll step, then targets five-minute intervals. PR
 creation does not start a separate timer. Workflow concurrency serializes poll
 runs, and the per-PR handler concurrency serializes edits.
 
-The PR comment doubles as deduplication state through a hidden status, head SHA,
-and short batch identifier. Failed batches are retryable; a deterministic
-refusal remains blocked until the batch changes. Prompt and GraphQL bounds fail
-explicitly rather than processing a partial batch. The publication token is
-never placed in the AI checkout, and the shared AI runtime excludes it from the
-Claude subprocess environment.
+The PR comment doubles as deduplication and recovery state through a hidden
+status, head SHA, content-bound batch identifier, target thread identities, and
+the proposed commit once it has been created. Addressing markers use a 90-minute
+lease so a cancelled or setup-failed job cannot block the PR forever. Failed
+batches are retryable; editing feedback changes the batch identity, while an
+unchanged deterministic refusal remains blocked. The handler records the commit
+before pushing, allowing the poller to detect an accepted push and idempotently
+finish replies and resolutions after a timeout or crash without another AI
+edit. Prompt and GraphQL bounds fail explicitly rather than processing a partial
+batch. The publication token is never placed in the AI checkout, and the shared
+AI runtime excludes it from the Claude subprocess environment.
 
 Signals fall into two tiers. Malformed inputs, a missing target branch, an
 already-released/backward target, or a target branch that advances during

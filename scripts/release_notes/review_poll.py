@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from github import Auth, Github
@@ -15,12 +16,16 @@ from scripts.common.github_client import retry_github_call
 from scripts.common.polling import env_seconds, run_poll_loop
 from scripts.release_notes.review import (
     REPOSITORIES,
+    BatchMarker,
     ReleasePR,
     ReviewRefused,
     list_review_threads,
     parse_status,
+    reconcile_review_targets,
     review_batch_id,
+    review_comment_sha256,
     review_payload_json,
+    review_targets,
     selected_reviews,
     status_body,
     validate_release_pr,
@@ -29,6 +34,7 @@ from scripts.release_notes.review import (
 logger = logging.getLogger(__name__)
 
 _MAX_LOOP_SECONDS = 55 * 60
+_ADDRESSING_LEASE = timedelta(minutes=90)
 DispatchFn = Callable[[ReleasePR, int], None]
 
 
@@ -111,28 +117,88 @@ def _process_pr(
     authorized: Callable[[str], bool],
     dispatch: DispatchFn,
 ) -> bool:
+    threads = list_review_threads(gql, release.repo_full_name, release.number)
     reviews = selected_reviews(
-        list_review_threads(gql, release.repo_full_name, release.number),
+        threads,
         release.notes_path,
         authorized,
     )
-    if not reviews:
-        return False
-    review_payload_json(reviews)
-    batch_id = review_batch_id(reviews)
-
     comments = retry_github_call(
         lambda: list(pr.get_issue_comments()),
         retries=3,
         description=f"list status comments on {release.repo_full_name}#{release.number}",
     )
+
+    reconciled = False
+    for comment in comments:
+        marker = parse_status(comment, bot_login)
+        if (
+            marker is None
+            or not marker.commit_sha
+            or marker.commit_sha != release.head_sha
+            or marker.status not in {"addressing", "addressed"}
+            or not marker.targets
+        ):
+            continue
+        if marker.status == "addressing":
+            recovered_body = status_body(
+                "addressed",
+                release.head_sha,
+                marker.batch_id,
+                marker.count,
+                commit_sha=marker.commit_sha,
+                repo_full_name=release.repo_full_name,
+                targets=marker.targets,
+            )
+
+            def update_recovered_status() -> Any:
+                return comment.edit(recovered_body)
+
+            retry_github_call(
+                update_recovered_status,
+                retries=3,
+                description="recover published release-review status",
+            )
+        if not _needs_reconciliation(marker, threads):
+            continue
+        _replied, _resolved, failures = reconcile_review_targets(
+            pr,
+            gql,
+            targets=marker.targets,
+            commit_sha=marker.commit_sha,
+            bot_login=bot_login,
+            repo_full_name=release.repo_full_name,
+            load_threads=lambda: list_review_threads(
+                gql,
+                release.repo_full_name,
+                release.number,
+            ),
+        )
+        reconciled = True
+        if failures:
+            logger.warning(
+                "Could not finish release-review bookkeeping for %s#%d: %s",
+                release.repo_full_name,
+                release.number,
+                "; ".join(failures),
+            )
+            return False
+
+    if reconciled:
+        threads = list_review_threads(gql, release.repo_full_name, release.number)
+        reviews = selected_reviews(threads, release.notes_path, authorized)
+    if not reviews:
+        return False
+    review_payload_json(reviews)
+    batch_id = review_batch_id(reviews)
+
     for comment in comments:
         marker = parse_status(comment, bot_login)
         if (
             marker is not None
             and marker.head_sha == release.head_sha
             and (
-                marker.status == "addressing"
+                (marker.status == "addressing" and _lease_is_active(comment))
                 or (
                     marker.batch_id == batch_id
                     and marker.status in {"addressed", "refused"}
@@ -148,6 +214,7 @@ def _process_pr(
                 release.head_sha,
                 batch_id,
                 len(reviews),
+                targets=review_targets(reviews),
             )
         ),
         retries=3,
@@ -168,6 +235,7 @@ def _process_pr(
                     batch_id,
                     len(reviews),
                     reason=reason,
+                    targets=review_targets(reviews),
                 )
             ),
             retries=3,
@@ -175,6 +243,35 @@ def _process_pr(
         )
         raise
     return True
+
+
+def _lease_is_active(comment: Any, *, now: datetime | None = None) -> bool:
+    updated_at = getattr(comment, "updated_at", None)
+    if not isinstance(updated_at, datetime):
+        return True
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return current - updated_at <= _ADDRESSING_LEASE
+
+
+def _needs_reconciliation(
+    marker: BatchMarker,
+    threads: tuple[Any, ...],
+) -> bool:
+    current = {thread.node_id: thread for thread in threads}
+    for target in marker.targets:
+        thread = current.get(target.node_id)
+        latest = thread.latest_human_comment() if thread is not None else None
+        if (
+            thread is not None
+            and not thread.resolved
+            and latest is not None
+            and latest.database_id == target.selected_comment_id
+            and review_comment_sha256(latest) == target.selected_comment_sha256
+        ):
+            return True
+    return False
 
 
 def dispatch_release_review(

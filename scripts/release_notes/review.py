@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from binascii import Error as BinasciiError
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +30,9 @@ _MARKER_RE = re.compile(
     r"(?P<status>addressing|addressed|refused|failed):"
     r"(?P<head>[0-9a-f]{40}):(?P<batch>[0-9a-f]{16}):"
     r"(?P<count>[1-9]\d*) -->"
+)
+_STATE_RE = re.compile(
+    r"<!-- valkey-ci-agent:release-review-state:(?P<payload>[A-Za-z0-9_-]+) -->"
 )
 _CONTRIBUTORS_RE = re.compile(r"^###\s+Contributors\s*$", re.MULTILINE)
 
@@ -114,11 +119,21 @@ class SelectedReview:
 
 
 @dataclass(frozen=True)
+class ReviewTarget:
+    node_id: str
+    root_comment_id: int
+    selected_comment_id: int
+    selected_comment_sha256: str
+
+
+@dataclass(frozen=True)
 class BatchMarker:
     status: str
     head_sha: str
     batch_id: str
     count: int
+    commit_sha: str = ""
+    targets: tuple[ReviewTarget, ...] = ()
 
 
 def parse_request(
@@ -214,6 +229,7 @@ def status_body(
     reason: str = "",
     commit_sha: str = "",
     repo_full_name: str = "",
+    targets: Iterable[ReviewTarget] = (),
 ) -> str:
     if status not in {"addressing", "addressed", "refused", "failed"}:
         raise ReviewRefused(f"invalid review status: {status}")
@@ -242,7 +258,9 @@ def status_body(
         f"<!-- valkey-ci-agent:release-review:"
         f"{status}:{head_sha}:{batch_id}:{count} -->"
     )
-    return f"{visible}\n\n{marker}"
+    target_tuple = tuple(targets)
+    state = _encode_marker_state(commit_sha, target_tuple)
+    return f"{visible}\n\n{marker}\n{state}"
 
 
 def parse_status(comment: Any, bot_login: str) -> BatchMarker | None:
@@ -252,12 +270,92 @@ def parse_status(comment: Any, bot_login: str) -> BatchMarker | None:
     if len(matches) != 1:
         return None
     status, head_sha, batch_id, count = matches[0]
+    state_matches = _STATE_RE.findall(str(getattr(comment, "body", "")))
+    if len(state_matches) > 1:
+        return None
+    try:
+        commit_sha, targets = (
+            _decode_marker_state(state_matches[0])
+            if state_matches
+            else ("", ())
+        )
+    except (
+        BinasciiError,
+        ReviewRefused,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        return None
     return BatchMarker(
         status=status,
         head_sha=head_sha,
         batch_id=batch_id,
         count=int(count),
+        commit_sha=commit_sha,
+        targets=targets,
     )
+
+
+def _encode_marker_state(
+    commit_sha: str,
+    targets: tuple[ReviewTarget, ...],
+) -> str:
+    if commit_sha and not _SHA_RE.fullmatch(commit_sha):
+        raise ReviewRefused("invalid release-review commit SHA")
+    if len(targets) > _BATCH_LIMIT:
+        raise ReviewRefused("release-review marker has too many targets")
+    payload = {
+        "commit": commit_sha,
+        "targets": [
+            [
+                target.node_id,
+                target.root_comment_id,
+                target.selected_comment_id,
+                target.selected_comment_sha256,
+            ]
+            for target in targets
+        ],
+    }
+    encoded = urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"<!-- valkey-ci-agent:release-review-state:{encoded} -->"
+
+
+def _decode_marker_state(payload: str) -> tuple[str, tuple[ReviewTarget, ...]]:
+    padding = "=" * (-len(payload) % 4)
+    raw = json.loads(urlsafe_b64decode(payload + padding).decode("utf-8"))
+    if not isinstance(raw, dict):
+        raise ReviewRefused("malformed release-review marker state")
+    commit_sha = raw.get("commit", "")
+    if not isinstance(commit_sha, str) or (
+        commit_sha and not _SHA_RE.fullmatch(commit_sha)
+    ):
+        raise ReviewRefused("malformed release-review marker commit")
+    raw_targets = raw.get("targets", [])
+    if not isinstance(raw_targets, list) or len(raw_targets) > _BATCH_LIMIT:
+        raise ReviewRefused("malformed release-review marker targets")
+    targets: list[ReviewTarget] = []
+    for item in raw_targets:
+        if (
+            not isinstance(item, list)
+            or len(item) != 4
+            or not isinstance(item[0], str)
+            or not item[0]
+            or len(item[0]) > 200
+            or isinstance(item[1], bool)
+            or not isinstance(item[1], int)
+            or item[1] <= 0
+            or isinstance(item[2], bool)
+            or not isinstance(item[2], int)
+            or item[2] <= 0
+            or not isinstance(item[3], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", item[3])
+        ):
+            raise ReviewRefused("malformed release-review marker target")
+        targets.append(ReviewTarget(item[0], item[1], item[2], item[3]))
+    return commit_sha, tuple(targets)
 
 
 _THREADS_QUERY = """
@@ -374,6 +472,81 @@ def resolve_review_thread(gql: GitHubGraphQLClient, thread_id: str) -> None:
         raise RuntimeError(f"GitHub did not resolve review thread {thread_id}")
 
 
+def reconcile_review_targets(
+    pr: Any,
+    gql: GitHubGraphQLClient,
+    *,
+    targets: Iterable[ReviewTarget],
+    commit_sha: str,
+    bot_login: str,
+    repo_full_name: str,
+    load_threads: Callable[[], tuple[ReviewThread, ...]],
+) -> tuple[int, int, list[str]]:
+    """Idempotently reply to and resolve a previously published review batch."""
+
+    if not _SHA_RE.fullmatch(commit_sha):
+        raise ReviewRefused("review reconciliation requires a commit SHA")
+    target_tuple = tuple(targets)
+    current = {thread.node_id: thread for thread in load_threads()}
+    commit_url = f"https://github.com/{repo_full_name}/commit/{commit_sha}"
+    reply_body = f"Addressed in [`{commit_sha[:12]}`]({commit_url})."
+    replied = 0
+    resolved = 0
+    failures: list[str] = []
+    pending_resolution: list[ReviewTarget] = []
+
+    for target in target_tuple:
+        thread = current.get(target.node_id)
+        latest = thread.latest_human_comment() if thread is not None else None
+        if thread is None or latest is None:
+            continue
+        if (
+            latest.database_id != target.selected_comment_id
+            or review_comment_sha256(latest) != target.selected_comment_sha256
+        ):
+            continue
+        if thread.resolved:
+            resolved += 1
+            continue
+        already_replied = any(
+            comment.author_login == bot_login and comment.body == reply_body
+            for comment in thread.comments
+        )
+        if not already_replied:
+            try:
+                pr.create_review_comment_reply(
+                    target.root_comment_id,
+                    reply_body,
+                )
+                replied += 1
+            except Exception as exc:  # noqa: BLE001 - continue with sibling threads
+                failures.append(f"thread {target.node_id}: {exc}")
+                continue
+        pending_resolution.append(target)
+
+    if pending_resolution:
+        refreshed = {thread.node_id: thread for thread in load_threads()}
+        for target in pending_resolution:
+            thread = refreshed.get(target.node_id)
+            latest = thread.latest_human_comment() if thread is not None else None
+            if thread is None or latest is None:
+                continue
+            if (
+                latest.database_id != target.selected_comment_id
+                or review_comment_sha256(latest) != target.selected_comment_sha256
+            ):
+                continue
+            if thread.resolved:
+                resolved += 1
+                continue
+            try:
+                resolve_review_thread(gql, target.node_id)
+                resolved += 1
+            except Exception as exc:  # noqa: BLE001 - continue with sibling threads
+                failures.append(f"thread {target.node_id}: {exc}")
+    return replied, resolved, failures
+
+
 def selected_reviews(
     threads: Iterable[ReviewThread],
     notes_path: str,
@@ -399,13 +572,39 @@ def selected_reviews(
 
 
 def review_batch_id(reviews: Iterable[SelectedReview]) -> str:
-    identity = "\n".join(
-        f"{review.thread.node_id}:{review.comment.database_id}"
+    review_tuple = tuple(reviews)
+    if not review_tuple:
+        raise ReviewRefused("release-review batch is empty")
+    payload = review_payload_json(review_tuple)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def review_targets(reviews: Iterable[SelectedReview]) -> tuple[ReviewTarget, ...]:
+    return tuple(
+        ReviewTarget(
+            node_id=review.thread.node_id,
+            root_comment_id=review.thread.root_comment_id,
+            selected_comment_id=review.comment.database_id,
+            selected_comment_sha256=review_comment_sha256(review.comment),
+        )
         for review in reviews
     )
-    if not identity:
-        raise ReviewRefused("release-review batch is empty")
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
+def review_comment_sha256(comment: ReviewComment) -> str:
+    payload = json.dumps(
+        {
+            "author_login": comment.author_login,
+            "author_type": comment.author_type,
+            "body": comment.body,
+            "created_at": comment.created_at,
+            "diff_hunk": comment.diff_hunk,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def review_payload_json(reviews: Iterable[SelectedReview]) -> str:

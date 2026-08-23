@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +19,9 @@ from scripts.release_notes.review import (
     ReviewThread,
     SelectedReview,
     parse_request,
+    parse_status,
+    review_batch_id,
+    review_targets,
     status_body,
     validate_release_pr,
 )
@@ -33,13 +35,20 @@ from scripts.release_notes.review_handler import (
 
 _BOT = "valkeyrie-ops[bot]"
 _HEAD = "a" * 40
-_BATCH = hashlib.sha256(b"PRRT_thread:10").hexdigest()[:16]
 
 
 class StatusComment:
     def __init__(self) -> None:
         self.id = 99
-        self.body = status_body("addressing", _HEAD, _BATCH, 1)
+        thread = _thread()
+        reviews = (SelectedReview(thread, thread.comments[0]),)
+        self.body = status_body(
+            "addressing",
+            _HEAD,
+            review_batch_id(reviews),
+            1,
+            targets=review_targets(reviews),
+        )
         self.user = SimpleNamespace(login=_BOT)
 
     def edit(self, body: str) -> None:
@@ -229,7 +238,7 @@ def test_handler_revalidates_complete_batch_before_push(
     )
 
     def publish(**kwargs) -> str:
-        kwargs["before_push"]()
+        kwargs["before_push"]("c" * 40)
         return "c" * 40
 
     outcome = handle_review_request(
@@ -268,7 +277,7 @@ def test_handler_updates_status_replies_and_resolves(
     )
 
     def publish(_release, **kwargs) -> str:
-        kwargs["before_push"]()
+        kwargs["before_push"]("c" * 40)
         return "c" * 40
 
     outcome = handle_review_request(
@@ -283,20 +292,71 @@ def test_handler_updates_status_replies_and_resolves(
     assert outcome.success is True
     assert (outcome.replied, outcome.resolved) == (1, 1)
     assert batch.status_comment.body.startswith("Addressed 1 release-note")
+    marker = parse_status(batch.status_comment, _BOT)
+    assert marker is not None
+    assert marker.head_sha == marker.commit_sha == "c" * 40
 
 
-def test_new_comment_after_reply_prevents_thread_resolution(
+def test_handler_preserves_recovery_state_when_push_result_is_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     batch = _batch()
-    newest = _thread(_comment(11, "A new follow-up."))
+    monkeypatch.setattr(
+        review_handler,
+        "load_batch",
+        MagicMock(side_effect=[batch, batch]),
+    )
+    monkeypatch.setattr(review_handler, "_clone", lambda *_args: None)
+    monkeypatch.setattr(
+        review_handler,
+        "run_review_edit",
+        lambda *_args, **_kwargs: ("patch", "candidate"),
+    )
+    gh = MagicMock()
+    gh.get_repo.return_value.get_pull.return_value = SimpleNamespace(
+        head=SimpleNamespace(sha="c" * 40)
+    )
+
+    def publish(_release, **kwargs) -> str:
+        kwargs["before_push"]("c" * 40)
+        raise RuntimeError("push connection closed")
+
+    outcome = handle_review_request(
+        gh,
+        MagicMock(),
+        parse_request("valkey", "42", _HEAD, "99"),
+        token="token",
+        bot_login=_BOT,
+        publish=publish,
+    )
+
+    assert outcome.success is False
+    marker = parse_status(batch.status_comment, _BOT)
+    assert marker is not None
+    assert marker.status == "addressed"
+    assert marker.head_sha == marker.commit_sha == "c" * 40
+
+
+@pytest.mark.parametrize(
+    "newest_comment",
+    [
+        _comment(11, "A new follow-up."),
+        _comment(10, "Edited feedback with the same GitHub id."),
+    ],
+)
+def test_changed_comment_after_reply_prevents_thread_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    newest_comment: ReviewComment,
+) -> None:
+    batch = _batch()
+    newest = _thread(newest_comment)
     monkeypatch.setattr(
         review_handler,
         "list_review_threads",
         MagicMock(side_effect=[(batch.reviews[0].thread,), (newest,)]),
     )
     resolve = MagicMock()
-    monkeypatch.setattr(review_handler, "resolve_review_thread", resolve)
+    monkeypatch.setattr("scripts.release_notes.review.resolve_review_thread", resolve)
     gh = _github(batch.pull_request)
 
     replied, resolved, failures = review_handler._reply_and_resolve(
@@ -304,10 +364,53 @@ def test_new_comment_after_reply_prevents_thread_resolution(
         MagicMock(),
         batch,
         "c" * 40,
+        _BOT,
     )
 
     assert (replied, resolved, failures) == (1, 0, [])
     resolve.assert_not_called()
+
+
+def test_existing_bot_reply_is_not_duplicated_during_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = _batch()
+    human = batch.reviews[0].comment
+    commit_sha = "c" * 40
+    reply = ReviewComment(
+        database_id=11,
+        body=(
+            "Addressed in "
+            f"[`{commit_sha[:12]}`](https://github.com/valkey-io/valkey/commit/{commit_sha})."
+        ),
+        created_at="2026-08-21T00:00:11Z",
+        diff_hunk="@@ -10 +10 @@",
+        author_login=_BOT,
+        author_type="Bot",
+    )
+    thread = _thread()
+    thread = replace(thread, comments=(human, reply))
+    monkeypatch.setattr(
+        review_handler,
+        "list_review_threads",
+        MagicMock(side_effect=[(thread,), (thread,)]),
+    )
+    resolve = MagicMock()
+    monkeypatch.setattr("scripts.release_notes.review.resolve_review_thread", resolve)
+    gh = _github(batch.pull_request)
+
+    replied, resolved, failures = review_handler._reply_and_resolve(
+        gh,
+        MagicMock(),
+        batch,
+        commit_sha,
+        _BOT,
+    )
+
+    assert (replied, resolved, failures) == (0, 1, [])
+    batch.pull_request.create_review_comment_reply.assert_not_called()
+    resolve.assert_called_once()
+    assert resolve.call_args.args[1] == thread.node_id
 
 
 def test_publish_applies_patch_in_clean_clone_and_pushes_normally(
@@ -348,7 +451,7 @@ def test_publish_applies_patch_in_clean_clone_and_pushes_normally(
         before_push=before_push,
     )
 
-    before_push.assert_called_once()
+    before_push.assert_called_once_with(commit_sha)
     pushed = subprocess.run(
         [
             "git",

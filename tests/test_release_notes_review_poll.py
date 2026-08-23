@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -9,6 +9,10 @@ import pytest
 from scripts.release_notes.review import (
     ReviewComment,
     ReviewThread,
+    SelectedReview,
+    parse_status,
+    review_batch_id,
+    review_targets,
     status_body,
     validate_release_pr,
 )
@@ -22,16 +26,22 @@ _HEAD = "a" * 40
 
 
 def _batch_id(thread_id: str = "thread-one", comment_id: int = 1) -> str:
-    return hashlib.sha256(
-        f"{thread_id}:{comment_id}".encode("utf-8")
-    ).hexdigest()[:16]
+    thread = _thread(thread_id, comment_id)
+    return review_batch_id((SelectedReview(thread, thread.comments[0]),))
 
 
 class StatusComment:
-    def __init__(self, body: str, comment_id: int = 99) -> None:
+    def __init__(
+        self,
+        body: str,
+        comment_id: int = 99,
+        *,
+        updated_at: datetime | None = None,
+    ) -> None:
         self.id = comment_id
         self.body = body
         self.user = SimpleNamespace(login=_BOT)
+        self.updated_at = updated_at or datetime.now(timezone.utc)
 
     def edit(self, body: str) -> None:
         self.body = body
@@ -199,6 +209,58 @@ def test_failed_status_is_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
         dispatch,
     ) == 1
     dispatch.assert_called_once()
+
+
+def test_expired_addressing_status_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = _pr(
+        [
+            StatusComment(
+                status_body("addressing", _HEAD, _batch_id(), 1),
+                updated_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            )
+        ]
+    )
+    dispatch = MagicMock()
+
+    assert _poll(
+        monkeypatch,
+        pr,
+        (_thread("thread-one", 1),),
+        dispatch,
+    ) == 1
+    dispatch.assert_called_once()
+
+
+def test_poller_recovers_bookkeeping_after_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    thread = _thread("thread-one", 1)
+    selected = (SelectedReview(thread, thread.comments[0]),)
+    status = StatusComment(
+        status_body(
+            "addressing",
+            "b" * 40,
+            review_batch_id(selected),
+            1,
+            commit_sha=_HEAD,
+            targets=review_targets(selected),
+        )
+    )
+    pr = _pr([status])
+    reconcile = MagicMock(return_value=(1, 1, []))
+    monkeypatch.setattr(
+        "scripts.release_notes.review_poll.reconcile_review_targets",
+        reconcile,
+    )
+
+    assert _poll(monkeypatch, pr, (thread,), MagicMock()) == 0
+    marker = parse_status(status, _BOT)
+    assert marker is not None
+    assert marker.status == "addressed"
+    assert marker.head_sha == marker.commit_sha == _HEAD
+    reconcile.assert_called_once()
 
 
 def test_refusal_does_not_block_a_new_comment_batch(
