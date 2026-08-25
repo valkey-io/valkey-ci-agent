@@ -39,6 +39,7 @@ def open_or_update_pr(
     body: str,
     existing: Any | None,
     draft: bool = False,
+    release_owner: str = "",
 ) -> str:
     """Update *existing* PR in place, or create a new one. Returns the PR URL.
 
@@ -58,6 +59,13 @@ def open_or_update_pr(
         lambda: repo.create_pull(title=title, body=body, head=head_ref, base=base_branch, draft=draft),
         retries=3, description="create release PR",
     )
+    if release_owner:
+        retry_github_call(
+            lambda: pr.create_issue_comment(
+                f"@{release_owner}, please review this automated release PR."
+            ),
+            retries=3, description=f"notify release owner on PR #{pr.number}",
+        )
     logger.info("Opened release PR #%s (draft=%s)", pr.number, draft)
     return pr.html_url
 

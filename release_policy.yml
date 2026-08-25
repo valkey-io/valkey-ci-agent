@@ -1,0 +1,20 @@
+# Small allow-list used by both release workflows. Operational state lives in
+# the release preparation PR and exact candidate SHA, not in this file.
+schema_version: 1
+repo: valkey-io/valkey
+authorized_team: valkey-io/core-team
+checks_workflow: ci.yml
+branches:
+  - "7.2"
+  - "8.0"
+  - "8.1"
+  - "9.0"
+  - "9.1"
+required_checks:
+  - test-ubuntu-latest
+  - test-sanitizer-address
+  - build-32bit
+  - build-macos-latest
+  - build-debian-old
+  - build-libc-malloc
+  - build-almalinux8-jemalloc

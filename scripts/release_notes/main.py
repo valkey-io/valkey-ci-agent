@@ -124,6 +124,11 @@ def main(argv: list[str] | None = None) -> int:
                              "version into Security Fixes (merged with any --security-fix bullets)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute and print the cut without pushing or opening a PR")
+    parser.add_argument(
+        "--release-owner",
+        default=os.environ.get("RELEASE_NOTES_RELEASE_OWNER", ""),
+        help="GitHub login to notify on the automated release PR",
+    )
     parser.add_argument("--force-ready", action="store_true",
                         default=_env_flag("RELEASE_NOTES_FORCE_READY"),
                         help="Open the release PR ready for review even when the cut raised "
@@ -153,6 +158,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--urgency must be one of {', '.join(_VALID_URGENCIES)}, got {args.urgency!r}")
     if args.date and not _is_iso_date(args.date):
         parser.error(f"--date must be ISO YYYY-MM-DD (e.g. 2026-06-30), got {args.date!r}")
+    release_owner = args.release_owner.strip()
+    if release_owner and not re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", release_owner
+    ):
+        parser.error(f"--release-owner must be a valid GitHub login, got {args.release_owner!r}")
 
     base_ref = args.base_ref or None
 
@@ -183,6 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             security_from_advisories=args.security_from_advisories,
             dry_run=args.dry_run,
             force_ready=args.force_ready,
+            release_owner=release_owner,
             resolve_rc1_baseline=resolve_rc1_baseline,
             profile=profile,
         )
@@ -293,6 +304,7 @@ def _run_cut(
     security_from_advisories: bool,
     dry_run: bool,
     force_ready: bool = False,
+    release_owner: str = "",
     resolve_rc1_baseline: bool = False,
     profile: projects_mod.ProjectProfile,
 ) -> int:
@@ -346,6 +358,7 @@ def _run_cut(
                 security_fixes=security_fixes, security_from_advisories=security_from_advisories,
                 token=token, git_env=git_env, dry_run=dry_run,
                 force_ready=force_ready,
+                release_owner=release_owner,
                 baseline_unanchored=baseline_unanchored,
                 profile=profile,
             )

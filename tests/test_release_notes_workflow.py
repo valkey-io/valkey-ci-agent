@@ -48,6 +48,7 @@ def test_shared_workflow_keeps_advanced_inputs_available() -> None:
         "security_fixes",
         "security_from_advisories",
         "force_ready",
+        "release_owner",
         "dry_run",
     }
     assert inputs["repo"]["default"] == "valkey"
@@ -75,7 +76,10 @@ def test_advanced_dispatch_delegates_to_the_shared_release_job() -> None:
     }
     assert inputs["dry_run"]["default"] == "true"
     assert job["uses"] == "./.github/workflows/release-notes-cut.yml"
-    assert job["secrets"] == "inherit"
+    # The called job resolves credentials from its branch-restricted
+    # release-control environment; a manually selected ref must not inherit
+    # the repository's unrelated secret set.
+    assert "secrets" not in job
     assert set(job["with"]) == set(inputs)
     for name in inputs:
         assert job["with"][name] == f"${{{{ inputs.{name} }}}}"
@@ -92,8 +96,8 @@ def test_app_credentials_require_both_secrets() -> None:
     job_env = _workflow(_SIMPLE)["jobs"]["cut"]["env"]
 
     assert job_env["HAS_APP_CREDS"] == (
-        "${{ secrets.VALKEYRIE_BOT_APP_ID != '' && "
-        "secrets.VALKEYRIE_BOT_PRIVATE_KEY != '' }}"
+        "${{ secrets.VALKEY_RELEASE_CONTROL_APP_ID != '' && "
+        "secrets.VALKEY_RELEASE_CONTROL_APP_PRIVATE_KEY != '' }}"
     )
 
 
