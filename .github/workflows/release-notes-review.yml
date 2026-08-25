@@ -1,0 +1,103 @@
+name: Address Release Note Reviews
+
+# Dispatched by the poller after it posts a PR-level progress comment.
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Target repository name
+        required: true
+        type: choice
+        options:
+          - valkey
+          - valkey-search
+          - valkey-json
+          - valkey-bloom
+      pr:
+        description: Release pull request number
+        required: true
+        type: string
+      head_sha:
+        description: Release pull request head at poll time
+        required: true
+        type: string
+      status_comment_id:
+        description: Bot PR progress comment
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  address:
+    name: Address release-note reviews
+    if: >-
+      github.repository == 'valkey-io/valkey-ci-agent' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.sender.id == 284117741
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: release-notes-review-${{ inputs.repo }}-${{ inputs.pr }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC for configure-aws-credentials and Bedrock only.
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      CLAUDE_CODE_USE_BEDROCK: "1"
+      CI_AGENT_EVIDENCE_DIR: agent-evidence
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+        with:
+          install-claude: "true"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: release-notes-review-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate target token
+        id: target-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: ${{ inputs.repo }}
+          permission-members: read
+          permission-contents: write
+          permission-pull-requests: write
+          permission-metadata: read
+
+      - name: Address review comments
+        shell: bash
+        env:
+          RELEASE_NOTES_REVIEW_TOKEN: ${{ steps.target-token.outputs.token }}
+          RELEASE_NOTES_REVIEW_APP_SLUG: ${{ steps.target-token.outputs.app-slug }}
+          RELEASE_NOTES_REVIEW_REPO: ${{ inputs.repo }}
+          RELEASE_NOTES_REVIEW_PR: ${{ inputs.pr }}
+          RELEASE_NOTES_REVIEW_HEAD_SHA: ${{ inputs.head_sha }}
+          RELEASE_NOTES_REVIEW_STATUS_COMMENT_ID: ${{ inputs.status_comment_id }}
+        run: python3 -m scripts.release_notes.review_handler
+
+      - name: Upload agent evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes-review-agent-evidence-${{ github.run_id }}
+          path: agent-evidence
+          if-no-files-found: ignore
+          retention-days: 30

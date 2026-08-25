@@ -12,7 +12,7 @@ scripts/
   backport/    Automated backports (active)
   fuzzer/      Fuzzer run monitoring (active)
   ci_fix/      On-demand CI test-fix bot (active)
-  release_notes/  Release cutter: AI notes + version bump (active)
+  release_notes/  Release cutter + guarded review-comment edits (active)
   cve_scan/    CVE scanning + verified rebuild dispatch (build-and-prove, active)
   common/      Shared infrastructure (git auth, GitHub client, safety guards)
 .github/actions/setup-agent
@@ -31,6 +31,7 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 | CI Fix | Active | On-demand `@valkeyrie-bot fix <ci-link>` - diagnoses and fixes a failing test on a backport PR |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
 | Release Notes | Active | Cuts a release for valkey core or a module repo (search/json/bloom): AI-generates notes from `release-notes` PRs plus AI-triaged candidates without that label, promotes them onto a release line branch, bumps the repo's version file, opens a PR (held as a draft when the cut flags issues) |
+| Release Note Review | Active | Polls unresolved inline comments on automated release PRs, applies a guarded AI edit to the current dated section, replies, and resolves addressed threads |
 | CVE Scan | Active | Scans container images for vulnerabilities, builds and scans the candidate image itself to prove the fix, then dispatches a targeted rebuild |
 | PR Reviewer | Planned | Two-stage code review with skeptic pass |
 | Additional Daily CI Analysis | Planned | Detects flaky tests, generates fix PRs |
@@ -559,6 +560,33 @@ and `metadata:read`. The advanced workflow exposes
 cut, so an ordinary cut is never blocked when the App installation lacks it.
 The App installation must hold `repository-advisories:read` for an advisory cut
 to read the advisories.
+
+### Automated review comments
+
+Leave an inline comment on the current `00-RELEASENOTES` change in an automated
+release PR; no bot command is required. The hourly poll workflow scans
+immediately, then every five minutes for 55 minutes. PR creation does not start
+a timer, so a comment is normally found by the next scan plus any Actions queue
+delay.
+
+The poller batches every unresolved, current notes comment whose latest human
+author is an active `valkey-io/contributors` member. It posts
+`Addressing N release-note review comments.` on the PR and dispatches one
+serialized handler run. A hidden head-SHA and batch marker prevents duplicate
+work.
+
+The handler re-fetches the PR and complete batch, runs one edit-only Claude pass,
+and requires the edit to touch only the current dated notes section. It applies
+the approved patch in a clean clone, rechecks the PR head and review batch, then
+uses a normal fast-forward push. On success it updates the PR comment, replies
+with the commit, and resolves only unchanged threads. Failed operations remain
+visible on the PR and can be retried by a later poll. Addressing markers expire
+after 90 minutes so a job that never reaches its handler cannot block the PR
+forever. Batch identities include the complete review payload, so editing a
+comment creates a new batch. Before pushing, the handler records the proposed
+commit and review-thread identities; if the push succeeds but the job loses its
+response or fails during bookkeeping, the poller finishes the replies and
+resolutions idempotently without running another AI edit.
 
 ## CVE Scan Workflow
 

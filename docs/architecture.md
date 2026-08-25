@@ -239,6 +239,8 @@ Profiles registered today:
 - `conflict_resolve_edit_only` - backport conflict resolution (Read/Edit/Bash, writes allowed)
 - `fuzzer_analysis_readonly` - fuzzer triage (Read/Grep/Glob only, no writes)
 - `ci_fix_diagnose_readonly` - CI-fix diagnosis and skeptic review (Read/Grep/Glob only, no writes)
+- `release_notes_review_edit_only` - one-file current-section release-note edits
+  (Read/Edit/MultiEdit/Grep/Glob; no shell or file creation)
 
 ## Common Infrastructure
 
@@ -358,6 +360,42 @@ updates the existing PR. Full regeneration is intentional: it includes new
 merges and also re-evaluates changed labels and PR metadata without treating a
 previous AI-generated branch as durable input.
 
+Review handling is a second, narrower flow over those generated PRs:
+
+```text
+release-notes-review-poll.yml (hourly runner; immediate + five-minute ticks)
+  -> review_poll.poll_once()
+       -> validate automated release PR and authorized review threads
+       -> batch every actionable thread on the PR
+       -> post `Addressing N release-note review comments.`
+       -> dispatch release-notes-review.yml
+
+release-notes-review.yml (serialized per repo/PR; trusted App sender only)
+  -> re-fetch PR, head, status comment, threads, and author membership
+  -> public clone at the exact head -> one edit-only AI pass
+  -> require only the current dated notes section to change
+  -> apply the patch in a clean clone
+  -> re-fetch the complete batch -> commit -> normal fast-forward push
+  -> update status, reply, and resolve unchanged threads
+```
+
+The poll job runs for 55 minutes. `run_poll_loop` invokes the first scan as soon
+as the runner reaches the poll step, then targets five-minute intervals. PR
+creation does not start a separate timer. Workflow concurrency serializes poll
+runs, and the per-PR handler concurrency serializes edits.
+
+The PR comment doubles as deduplication and recovery state through a hidden
+status, head SHA, content-bound batch identifier, target thread identities, and
+the proposed commit once it has been created. Addressing markers use a 90-minute
+lease so a cancelled or setup-failed job cannot block the PR forever. Failed
+batches are retryable; editing feedback changes the batch identity, while an
+unchanged deterministic refusal remains blocked. The handler records the commit
+before pushing, allowing the poller to detect an accepted push and idempotently
+finish replies and resolutions after a timeout or crash without another AI
+edit. Prompt and GraphQL bounds fail explicitly rather than processing a partial
+batch. The publication token is never placed in the AI checkout, and the shared
+AI runtime excludes it from the Claude subprocess environment.
+
 Signals fall into two tiers. Malformed inputs, a missing target branch, an
 already-released/backward target, or a target branch that advances during
 generation are hard errors that abort before any PR. Warnings (out-of-sequence
@@ -391,6 +429,13 @@ calendar date.
 - `scripts/release_notes/release_format.py` - `00-RELEASENOTES` dated-section rendering
 - `scripts/release_notes/version_bump.py` - `src/version.h` macro rewriting
 - `scripts/release_notes/contributors.py` - contributor discovery; reconciles display-name, login, co-author trailers, and PR-resolved logins
+- `.github/workflows/release-notes-review-poll.yml` - discover, authorize,
+  batch, mark, and dispatch unresolved inline review comments
+- `.github/workflows/release-notes-review.yml` - guarded AI edit/publication job
+- `scripts/release_notes/review_poll.py` - multi-repository poll orchestration
+- `scripts/release_notes/review.py` - shared PR, thread, marker, and edit contracts
+- `scripts/release_notes/review_handler.py` - revalidation, one AI pass, fresh-clone
+  publication, replies, and resolution
 
 ## CVE Scan Flow
 

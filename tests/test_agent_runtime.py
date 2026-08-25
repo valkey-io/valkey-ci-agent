@@ -75,3 +75,12 @@ def test_fuzzer_profile_is_readonly() -> None:
     assert "Edit" not in profile.allowed_tools
     assert "Bash" not in profile.allowed_tools
     assert "Read" in profile.allowed_tools
+
+
+def test_release_notes_review_profile_is_edit_only() -> None:
+    edit = agent_runtime.AGENT_PROFILES["release_notes_review_edit_only"]
+
+    assert edit.writes_allowed is True
+    assert edit.allowed_tools == "Read,Edit,MultiEdit,Grep,Glob"
+    assert edit.disallowed_tools == "Bash,Write"
+    assert edit.timeout <= 10 * 60

@@ -1,0 +1,61 @@
+name: Release Notes Review Poll
+
+# One hourly runner scans immediately and every five minutes for 55 minutes.
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  poll:
+    name: Poll release-note review comments
+    if: >-
+      github.repository == 'valkey-io/valkey-ci-agent' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    concurrency:
+      group: release-notes-review-poll
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+
+      - name: Generate App token
+        id: token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: |
+            valkey
+            valkey-search
+            valkey-json
+            valkey-bloom
+            valkey-ci-agent
+          permission-actions: write
+          permission-members: read
+          permission-pull-requests: write
+          permission-metadata: read
+
+      - name: Poll and dispatch
+        env:
+          RELEASE_NOTES_REVIEW_TOKEN: ${{ steps.token.outputs.token }}
+          RELEASE_NOTES_REVIEW_APP_SLUG: ${{ steps.token.outputs.app-slug }}
+          RELEASE_NOTES_REVIEW_POLL_INTERVAL_SECONDS: ${{ github.event_name == 'schedule' && '300' || '0' }}
+          RELEASE_NOTES_REVIEW_POLL_DURATION_SECONDS: ${{ github.event_name == 'schedule' && '3300' || '0' }}
+        run: python3 -m scripts.release_notes.review_poll

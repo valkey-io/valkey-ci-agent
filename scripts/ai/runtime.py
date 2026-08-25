@@ -22,6 +22,7 @@ AgentProfileName = Literal[
     "validation_repair_edit_only",
     "fuzzer_analysis_readonly",
     "ci_fix_diagnose_readonly",
+    "release_notes_review_edit_only",
 ]
 
 
@@ -105,6 +106,16 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         max_turns=200,
         writes_allowed=False,
         output_schema="text",
+    ),
+    "release_notes_review_edit_only": AgentProfile(
+        name="release_notes_review_edit_only",
+        allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
+        timeout=600,
+        effort="max",
+        max_turns=120,
+        writes_allowed=True,
+        output_schema="edited-files",
+        disallowed_tools="Bash,Write",
     ),
 }
 
