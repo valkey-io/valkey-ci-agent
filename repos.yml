@@ -3,9 +3,38 @@ repos:
     project_owner: valkey-io
     project_owner_type: organization
     language: c
+    validation_setup_commands:
+      - "sudo apt-get update && sudo apt-get install -y clang-format-18 libssl-dev tcl8.6 tclx"
+      - "python3 -m pip install -r utils/req-res-validator/requirements.txt"
     build_commands:
-      - "make -j$(nproc)"
+      - "make -j$(nproc) BUILD_TLS=yes"
+    validation_profile: valkey-core
+    validation_rules:
+      - paths:
+          - "src/rdb.c"
+          - "src/rio.c"
+          - "src/t_stream.c"
+          - "src/stream.h"
+          - "src/listpack.c"
+        commands:
+          - "./runtest --single unit/dump --clients 1"
+      - paths:
+          - "src/tls.c"
+          - "src/tls.h"
+        commands:
+          - "./runtest --single unit/tls --clients 1"
+    generated_file_rules:
+      - paths:
+          - "src/unit/*.c"
+          - "utils/generate-unit-test-header.py"
+        command: "python3 utils/generate-unit-test-header.py"
+        outputs:
+          - "src/unit/test_files.h"
     repair_validation_failures: true
+    automatic_ci_followup: true
+    ci_followup_ignored_jobs:
+      - "*dco*"
+      - "*developer certificate of origin*"
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100

@@ -7,6 +7,7 @@ import yaml
 
 from scripts.backport.registry import (
     BranchEntry,
+    GeneratedFileRule,
     Registry,
     RepoEntry,
     ValidationRule,
@@ -56,8 +57,12 @@ class TestLoadRegistry:
         assert entry.build_commands == ()
         assert entry.validation_setup_commands == ()
         assert entry.validation_rules == ()
+        assert entry.validation_profile == ""
+        assert entry.generated_file_rules == ()
         assert entry.test_path_patterns == ()
         assert entry.repair_validation_failures is False
+        assert entry.automatic_ci_followup is False
+        assert entry.ci_followup_ignored_jobs == ()
         assert entry.backport_label == "backport"
         assert entry.llm_conflict_label == "ai-resolved-conflicts"
         assert entry.max_conflicting_files == 100
@@ -73,7 +78,17 @@ class TestLoadRegistry:
                     "commands": ["./runtest --single unit/cluster/slot-migration"],
                 }
             ],
+            validation_profile="valkey-core",
+            generated_file_rules=[
+                {
+                    "paths": ["src/unit/*.c"],
+                    "command": "python3 generate.py",
+                    "outputs": ["src/unit/test_files.h"],
+                }
+            ],
             repair_validation_failures=True,
+            automatic_ci_followup=True,
+            ci_followup_ignored_jobs=["*dco*"],
             test_path_patterns=["testing/*.cc", "integration/test_*.py"],
             backport_label="bp",
             llm_conflict_label="ai",
@@ -96,7 +111,17 @@ class TestLoadRegistry:
                 commands=("./runtest --single unit/cluster/slot-migration",),
             ),
         )
+        assert entry.validation_profile == "valkey-core"
+        assert entry.generated_file_rules == (
+            GeneratedFileRule(
+                paths=("src/unit/*.c",),
+                command="python3 generate.py",
+                outputs=("src/unit/test_files.h",),
+            ),
+        )
         assert entry.repair_validation_failures is True
+        assert entry.automatic_ci_followup is True
+        assert entry.ci_followup_ignored_jobs == ("*dco*",)
         assert entry.test_path_patterns == (
             "testing/*.cc",
             "integration/test_*.py",
@@ -129,6 +154,19 @@ class TestLoadRegistry:
         reg = load_registry(path)
         with pytest.raises(KeyError, match="9.9"):
             reg.get_branch("org/repo", "9.9")
+
+    def test_generated_outputs_must_stay_in_repository(self, tmp_path):
+        data = _minimal_registry(repos=[_minimal_repo(
+            generated_file_rules=[{
+                "paths": ["src/*.c"],
+                "command": "python3 generate.py",
+                "outputs": ["../outside.txt"],
+            }],
+        )])
+        path = _write_registry(tmp_path, data)
+
+        with pytest.raises(ValueError, match="must stay within the repository"):
+            load_registry(path)
 
 
 class TestValidation:

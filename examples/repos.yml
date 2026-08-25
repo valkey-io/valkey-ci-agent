@@ -4,7 +4,7 @@
 # Standard deployment model:
 #
 # The agent pushes `agent/backport/...` branches directly to repo and opens
-# draft PRs in that same upstream repository. `push_repo` is optional and only
+# normal PRs in that same upstream repository. `push_repo` is optional and only
 # for a different-owner fork escape hatch.
 
 repos:

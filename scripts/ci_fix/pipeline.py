@@ -91,11 +91,52 @@ def run_ci_fix(
     if isinstance(request, GateRejection):
         return FixOutcome(kind=OutcomeKind.REFUSED, summary=request.reason)
 
-    failed_jobs = tuple(j.name for j in failed_jobs_for_run(gh, request.repo_full_name, request.run_id))
+    return run_ci_fix_request(
+        gh,
+        request=request,
+        git_env=git_env,
+        artifact_client=artifact_client,
+        verify_runs=verify_runs,
+        diagnose_func=diagnose_func,
+        run_loop_func=run_loop_func,
+        push_func=push_func,
+        port_push_func=port_push_func,
+        macos_verifier=macos_verifier,
+    )
+
+
+def run_ci_fix_request(
+    gh: Any,
+    *,
+    request: FixRequest,
+    git_env: dict[str, str],
+    artifact_client: ArtifactClient,
+    verify_runs: int = DEFAULT_VERIFY_RUNS,
+    diagnose_func: Diagnose = diagnose_failure,
+    run_loop_func: RunLoop = run_fix_loop,
+    push_func: Push = commit_and_push_fix,
+    port_push_func: PortPush = commit_and_push_port,
+    macos_verifier: VerifyBackend | None = None,
+    failed_jobs: tuple[str, ...] | None = None,
+) -> FixOutcome:
+    """Run the fix engine for a request already validated by a trusted caller.
+
+    Interactive invocations reach this only after ``build_fix_request``. The
+    automatic backport follow-up has its own stricter gate (bot-owned sweep PR,
+    exact branch/base/SHA, completed current-head run) and uses this shared
+    execution path so diagnosis, verification, review, and fast-forward push
+    semantics cannot drift.
+    """
+    confirmed_jobs = failed_jobs
+    if confirmed_jobs is None:
+        confirmed_jobs = tuple(
+            job.name
+            for job in failed_jobs_for_run(gh, request.repo_full_name, request.run_id)
+        )
 
     with tempfile.TemporaryDirectory(prefix="ci-fix-") as workdir_str:
         outcome = _run_in_workspace(
-            Path(workdir_str), request, failed_jobs,
+            Path(workdir_str), request, confirmed_jobs,
             artifact_client=artifact_client, git_env=git_env,
             diagnose_func=diagnose_func, run_loop_func=run_loop_func, push_func=push_func,
             port_push_func=port_push_func, macos_verifier=macos_verifier,

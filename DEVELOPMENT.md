@@ -227,3 +227,11 @@ reference for multi-repository configuration.
 Registry-configured `build_commands` run before pushing a generated backport
 branch. A non-zero exit blocks the push. Repositories with no `build_commands`
 configured rely on their upstream CI for validation.
+
+Use `validation_rules` for static path-to-command mappings and a supported
+`validation_profile` when checks must be derived from exact changed files.
+`generated_file_rules` must list every tracked output a generator may edit;
+the validator runs the generator twice and fails if it touches anything else
+or does not converge. `automatic_ci_followup` is opt-in per repository, and
+`ci_followup_ignored_jobs` should include informational failures that the bot
+must never try to repair (for Valkey core, DCO).

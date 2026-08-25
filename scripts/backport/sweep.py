@@ -294,6 +294,8 @@ def prepare_backport_sweep(
         language=repo_entry.language,
         build_commands=list(repo_entry.build_commands) or None,
         validation_rules=validation_rules,
+        validation_profile=repo_entry.validation_profile,
+        generated_file_rules=list(repo_entry.generated_file_rules),
         test_path_patterns=repo_entry.test_path_patterns,
         repair_validation_failures=repo_entry.repair_validation_failures,
         max_conflicting_files=repo_entry.max_conflicting_files,
@@ -317,6 +319,8 @@ def _process_branch(
     language: str = "c",
     build_commands: list[str] | None = None,
     validation_rules: list[Any] | None = None,
+    validation_profile: str = "",
+    generated_file_rules: list[Any] | None = None,
     test_path_patterns: tuple[str, ...] | list[str] | None = None,
     repair_validation_failures: bool = False,
     max_conflicting_files: int = 100,
@@ -337,6 +341,8 @@ def _process_branch(
         language=language,
         build_commands=build_commands,
         validation_rules=validation_rules,
+        validation_profile=validation_profile,
+        generated_file_rules=generated_file_rules,
         test_path_patterns=test_path_patterns,
         repair_validation_failures=repair_validation_failures,
         max_conflicting_files=max_conflicting_files,
@@ -362,6 +368,8 @@ def _prepare_branch(
     language: str = "c",
     build_commands: list[str] | None = None,
     validation_rules: list[Any] | None = None,
+    validation_profile: str = "",
+    generated_file_rules: list[Any] | None = None,
     test_path_patterns: tuple[str, ...] | list[str] | None = None,
     repair_validation_failures: bool = False,
     max_conflicting_files: int = 100,
@@ -523,6 +531,9 @@ def _prepare_branch(
                 test_commands,
                 validation_rules or [],
                 repair=repair_validation_failures,
+                validation_profile=validation_profile,
+                generated_file_rules=generated_file_rules,
+                base_ref=pre_candidate_head,
                 run_git=_run_git,
             )
             ok, output = validation_outcome
@@ -536,6 +547,9 @@ def _prepare_branch(
                     target_branch,
                 )
                 continue
+
+            if validation_outcome.amended_commit_sha:
+                candidate_result.resolved_commit_sha = validation_outcome.amended_commit_sha
 
             repair_resolutions = list(validation_outcome.resolutions)
             if repair_resolutions:

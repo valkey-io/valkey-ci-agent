@@ -6,25 +6,29 @@ import difflib
 import json
 import logging
 import os
+import subprocess
 import tempfile
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable, Union
 
 from scripts.ai.runtime import run_agent
 from scripts.backport.git_commands import (
     has_staged_changes,
+    head_sha,
 )
 from scripts.backport.git_commands import (
     run_git as run_git_default,
 )
 from scripts.backport.models import ResolutionResult
-from scripts.backport.sweep_git import worktree_changed_paths
+from scripts.backport.sweep_git import untracked_paths, worktree_changed_paths
 from scripts.backport.validation import (
     changed_paths_since_base,
     select_validation_commands,
 )
 from scripts.common.build_validator import run_build_commands
+from scripts.common.proc import git_output
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +48,8 @@ class ValidationOutcome:
     output: str
     resolutions: tuple[ResolutionResult, ...] = ()
     ai_summary: str = ""
+    generated_paths: tuple[str, ...] = ()
+    amended_commit_sha: str = ""
 
     def __iter__(self):
         """Preserve the historical ``ok, output = ...`` calling convention."""
@@ -64,12 +70,18 @@ def validate_backport_branch(
     target_branch: str,
     test_commands: list[str],
     validation_rules: list[Any],
+    validation_profile: str = "",
+    base_ref: str = "",
     log_path: str | None = None,
 ) -> tuple[bool, str]:
+    comparison_ref = base_ref or f"origin/{target_branch}"
     commands = select_validation_commands(
         test_commands,
         validation_rules,
-        changed_paths_since_base(repo_dir, f"origin/{target_branch}"),
+        changed_paths_since_base(repo_dir, comparison_ref),
+        validation_profile=validation_profile,
+        repo_dir=repo_dir,
+        base_ref=comparison_ref,
     )
     return run_test_commands(repo_dir, commands, log_path=log_path)
 
@@ -81,6 +93,9 @@ def validate_branch_with_optional_repair(
     validation_rules: list[Any],
     *,
     repair: bool,
+    validation_profile: str = "",
+    generated_file_rules: list[Any] | None = None,
+    base_ref: str = "",
     run_git: RunGit = run_git_default,
 ) -> ValidationOutcome:
     """Validate the current branch, attempting one Claude repair if enabled.
@@ -91,6 +106,16 @@ def validate_branch_with_optional_repair(
     up. The repair helper removes its own repair commit on failure, so on a red
     return the branch is left exactly as the caller handed it in.
     """
+    comparison_ref = base_ref or f"origin/{target_branch}"
+    generated = prepare_generated_files(
+        repo_dir,
+        tuple(changed_paths_since_base(repo_dir, comparison_ref)),
+        generated_file_rules or [],
+        run_git=run_git,
+    )
+    if not generated.ok:
+        return generated
+
     log_path = create_validation_log_path() if repair else None
     try:
         ok, output = validate_backport_branch(
@@ -98,18 +123,35 @@ def validate_branch_with_optional_repair(
             target_branch,
             test_commands,
             validation_rules,
+            validation_profile=validation_profile,
+            base_ref=comparison_ref,
             log_path=log_path,
         )
         if ok or not repair:
-            return ValidationOutcome(ok, output)
-        return repair_validation_failure_with_claude(
+            return ValidationOutcome(
+                ok,
+                output,
+                generated_paths=generated.generated_paths,
+                amended_commit_sha=generated.amended_commit_sha,
+            )
+        repaired = repair_validation_failure_with_claude(
             repo_dir,
             target_branch,
             test_commands,
             validation_rules,
             output,
+            validation_profile=validation_profile,
+            base_ref=comparison_ref,
             validation_log_path=log_path,
             run_git=run_git,
+        )
+        return ValidationOutcome(
+            repaired.ok,
+            repaired.output,
+            resolutions=repaired.resolutions,
+            ai_summary=repaired.ai_summary,
+            generated_paths=generated.generated_paths,
+            amended_commit_sha=generated.amended_commit_sha,
         )
     finally:
         remove_validation_log_path(log_path)
@@ -122,6 +164,8 @@ def repair_validation_failure_with_claude(
     validation_rules: list[Any],
     validation_output: str,
     *,
+    validation_profile: str = "",
+    base_ref: str = "",
     validation_log_path: str | None = None,
     run_git: RunGit = run_git_default,
     run_agent_func: RunAgent = run_agent,
@@ -130,7 +174,8 @@ def repair_validation_failure_with_claude(
     changed_paths_since_base_func: ChangedPathsSinceBase = changed_paths_since_base,
     has_staged_changes_func: HasStagedChanges = has_staged_changes,
 ) -> ValidationOutcome:
-    changed_paths = tuple(changed_paths_since_base_func(repo_dir, f"origin/{target_branch}"))
+    comparison_ref = base_ref or f"origin/{target_branch}"
+    changed_paths = tuple(changed_paths_since_base_func(repo_dir, comparison_ref))
     if not changed_paths:
         return ValidationOutcome(False, validation_output)
 
@@ -195,11 +240,17 @@ def repair_validation_failure_with_claude(
             )
         run_git(repo_dir, "commit", "-m", "Repair backport validation failure")
 
+        validate_kwargs: dict[str, str] = {}
+        if validation_profile:
+            validate_kwargs["validation_profile"] = validation_profile
+        if base_ref:
+            validate_kwargs["base_ref"] = base_ref
         ok, output = validate_func(
             repo_dir,
             target_branch,
             test_commands,
             validation_rules,
+            **validate_kwargs,
         )
         if ok:
             logger.info("Claude Code validation repair passed for %s", target_branch)
@@ -232,6 +283,96 @@ def repair_validation_failure_with_claude(
     finally:
         if owns_log_path:
             remove_validation_log_path(log_path)
+
+
+def prepare_generated_files(
+    repo_dir: str,
+    changed_paths: tuple[str, ...],
+    generated_file_rules: list[Any],
+    *,
+    run_git: RunGit = run_git_default,
+) -> ValidationOutcome:
+    """Regenerate allowlisted tracked artifacts and fold them into the candidate.
+
+    A generator may edit only its declared outputs. Successful changes amend
+    the current candidate commit instead of creating a misleading standalone
+    "fix generated file" commit. Every matching generator is then run a second
+    time; a second diff is a deterministic convergence failure.
+    """
+    amended_paths: list[str] = []
+    amended_sha = ""
+    for rule in generated_file_rules:
+        if not any(fnmatch(path, pattern) for path in changed_paths for pattern in rule.paths):
+            continue
+        untracked_outputs = tuple(
+            output for output in rule.outputs if not _is_tracked(repo_dir, output)
+        )
+        if untracked_outputs:
+            return ValidationOutcome(
+                False,
+                "generated-file rule declares output(s) not tracked on the "
+                "target branch: " + ", ".join(untracked_outputs),
+            )
+        ok, output = run_test_commands(repo_dir, [rule.command])
+        if not ok:
+            _discard_generator_edits(repo_dir, run_git)
+            return ValidationOutcome(
+                False,
+                f"generated-file command failed: {output or rule.command}",
+            )
+
+        edited = tuple(worktree_changed_paths(repo_dir))
+        unexpected = tuple(path for path in edited if path not in set(rule.outputs))
+        if unexpected:
+            _discard_generator_edits(repo_dir, run_git)
+            return ValidationOutcome(
+                False,
+                "generated-file command edited unexpected path(s): "
+                + ", ".join(unexpected),
+            )
+        if edited:
+            run_git(repo_dir, "add", "--", *edited)
+            run_git(repo_dir, "commit", "--amend", "--no-edit")
+            amended_paths.extend(path for path in edited if path not in amended_paths)
+            amended_sha = head_sha(repo_dir)
+
+        ok, output = run_test_commands(repo_dir, [rule.command])
+        if not ok:
+            _discard_generator_edits(repo_dir, run_git)
+            return ValidationOutcome(
+                False,
+                f"generated-file convergence command failed: {output or rule.command}",
+            )
+        second_edit = tuple(worktree_changed_paths(repo_dir))
+        if second_edit:
+            _discard_generator_edits(repo_dir, run_git)
+            return ValidationOutcome(
+                False,
+                "generated-file command did not converge; second run edited: "
+                + ", ".join(second_edit),
+            )
+
+    return ValidationOutcome(
+        True,
+        "",
+        generated_paths=tuple(amended_paths),
+        amended_commit_sha=amended_sha,
+    )
+
+
+def _discard_generator_edits(repo_dir: str, run_git: RunGit) -> None:
+    new_paths = tuple(untracked_paths(repo_dir))
+    run_git(repo_dir, "reset", "--hard", "HEAD")
+    if new_paths:
+        run_git(repo_dir, "clean", "-f", "--", *new_paths)
+
+
+def _is_tracked(repo_dir: str, path: str) -> bool:
+    try:
+        git_output(repo_dir, "ls-files", "--error-unmatch", "--", path)
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 def _read_text_file(path: Path) -> str:

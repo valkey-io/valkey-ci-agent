@@ -11,6 +11,7 @@ import yaml  # type: ignore[import-untyped]
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _VALID_OWNER_TYPES = {"organization", "user"}
+_VALIDATION_PROFILES = {"", "valkey-core"}
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,15 @@ class ValidationRule:
 
 
 @dataclass(frozen=True)
+class GeneratedFileRule:
+    """A deterministic generator and the only tracked outputs it may edit."""
+
+    paths: tuple[str, ...]
+    command: str
+    outputs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RepoEntry:
     repo: str
     project_owner: str
@@ -36,8 +46,12 @@ class RepoEntry:
     build_commands: tuple[str, ...] = ()
     validation_setup_commands: tuple[str, ...] = ()
     validation_rules: tuple[ValidationRule, ...] = ()
+    validation_profile: str = ""
+    generated_file_rules: tuple[GeneratedFileRule, ...] = ()
     test_path_patterns: tuple[str, ...] = ()
     repair_validation_failures: bool = False
+    automatic_ci_followup: bool = False
+    ci_followup_ignored_jobs: tuple[str, ...] = ()
     backport_label: str = "backport"
     llm_conflict_label: str = "ai-resolved-conflicts"
     max_conflicting_files: int = 100
@@ -150,6 +164,15 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
             )
 
     validation_rules = _parse_validation_rules(raw.get("validation_rules", []), index)
+    validation_profile = raw.get("validation_profile", "")
+    if not isinstance(validation_profile, str) or validation_profile not in _VALIDATION_PROFILES:
+        raise ValueError(
+            f"repos[{index}].validation_profile must be one of "
+            f"{sorted(_VALIDATION_PROFILES)!r}, got {validation_profile!r}"
+        )
+    generated_file_rules = _parse_generated_file_rules(
+        raw.get("generated_file_rules", []), index
+    )
     test_path_patterns = raw.get("test_path_patterns", [])
     if not isinstance(test_path_patterns, list):
         raise ValueError(f"repos[{index}].test_path_patterns must be a list")
@@ -164,6 +187,20 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
         raise ValueError(
             f"repos[{index}].repair_validation_failures must be a boolean"
         )
+    automatic_ci_followup = raw.get("automatic_ci_followup", False)
+    if not isinstance(automatic_ci_followup, bool):
+        raise ValueError(
+            f"repos[{index}].automatic_ci_followup must be a boolean"
+        )
+    ci_followup_ignored_jobs = raw.get("ci_followup_ignored_jobs", [])
+    if not isinstance(ci_followup_ignored_jobs, list):
+        raise ValueError(f"repos[{index}].ci_followup_ignored_jobs must be a list")
+    for j, pattern in enumerate(ci_followup_ignored_jobs):
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ValueError(
+                f"repos[{index}].ci_followup_ignored_jobs[{j}] "
+                "must be a non-empty string"
+            )
 
     backport_label = raw.get("backport_label", "backport")
     if not isinstance(backport_label, str) or not backport_label.strip():
@@ -194,8 +231,12 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
         build_commands=tuple(build_commands),
         validation_setup_commands=tuple(validation_setup_commands),
         validation_rules=tuple(validation_rules),
+        validation_profile=str(validation_profile),
+        generated_file_rules=tuple(generated_file_rules),
         test_path_patterns=tuple(test_path_patterns),
         repair_validation_failures=repair_validation_failures,
+        automatic_ci_followup=automatic_ci_followup,
+        ci_followup_ignored_jobs=tuple(str(item) for item in ci_followup_ignored_jobs),
         backport_label=backport_label,
         llm_conflict_label=llm_conflict_label,
         max_conflicting_files=max_conflicting_files,
@@ -245,6 +286,46 @@ def _parse_validation_rules(raw: Any, repo_idx: int) -> list[ValidationRule]:
             ValidationRule(
                 paths=tuple(str(pattern) for pattern in paths),
                 commands=tuple(str(command) for command in commands),
+            )
+        )
+    return rules
+
+
+def _parse_generated_file_rules(raw: Any, repo_idx: int) -> list[GeneratedFileRule]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"repos[{repo_idx}].generated_file_rules must be a list")
+
+    rules: list[GeneratedFileRule] = []
+    for rule_idx, rule_raw in enumerate(raw):
+        prefix = f"repos[{repo_idx}].generated_file_rules[{rule_idx}]"
+        if not isinstance(rule_raw, dict):
+            raise ValueError(f"{prefix} must be a mapping")
+        paths = rule_raw.get("paths")
+        if not isinstance(paths, list) or not paths:
+            raise ValueError(f"{prefix}.paths must be a non-empty list")
+        outputs = rule_raw.get("outputs")
+        if not isinstance(outputs, list) or not outputs:
+            raise ValueError(f"{prefix}.outputs must be a non-empty list")
+        command = rule_raw.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError(f"{prefix}.command must be a non-empty string")
+        for field_name, values in (("paths", paths), ("outputs", outputs)):
+            for item_idx, value in enumerate(values):
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"{prefix}.{field_name}[{item_idx}] must be a non-empty string"
+                    )
+                if value.startswith("/") or ".." in value.split("/") or "\x00" in value:
+                    raise ValueError(
+                        f"{prefix}.{field_name}[{item_idx}] must stay within the repository"
+                    )
+        rules.append(
+            GeneratedFileRule(
+                paths=tuple(str(item) for item in paths),
+                command=command,
+                outputs=tuple(str(item) for item in outputs),
             )
         )
     return rules
