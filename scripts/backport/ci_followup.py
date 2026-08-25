@@ -47,7 +47,6 @@ _MARKER_RE = re.compile(
     r"<!-- valkey-ci-agent:auto-ci-followup "
     r"head=(?P<head>[0-9a-f]{40}) run=(?P<run>\d+) job=(?P<job>\d+) -->"
 )
-_MAX_RUNS = 30
 _FAILED_RUN_CONCLUSIONS = {"failure", "timed_out", "cancelled"}
 
 
@@ -94,12 +93,10 @@ def find_followup_target(
         return None, rejection
 
     head_sha = str(getattr(pr.head, "sha", "") or "")
-    handled = _handled_job_ids(pr, head_sha)
+    handled = _handled_job_ids(pr, head_sha, bot_login)
     repo = gh.get_repo(repo_entry.repo)
     current_runs = []
-    for index, run in enumerate(repo.get_workflow_runs(branch=head_branch)):
-        if index >= _MAX_RUNS:
-            break
+    for run in repo.get_workflow_runs(branch=head_branch):
         if str(getattr(run, "head_sha", "") or "") != head_sha:
             continue
         current_runs.append(run)
@@ -261,7 +258,7 @@ def _validate_sweep_pr(
     return ""
 
 
-def _handled_job_ids(pr: Any, head_sha: str) -> set[int]:
+def _handled_job_ids(pr: Any, head_sha: str, bot_login: str) -> set[int]:
     handled: set[int] = set()
     comments = retry_github_call(
         lambda: list(pr.get_issue_comments()),
@@ -269,6 +266,9 @@ def _handled_job_ids(pr: Any, head_sha: str) -> set[int]:
         description=f"list follow-up markers on #{pr.number}",
     )
     for comment in comments:
+        author = str(getattr(getattr(comment, "user", None), "login", "") or "")
+        if author != bot_login:
+            continue
         for match in _MARKER_RE.finditer(str(getattr(comment, "body", "") or "")):
             if match.group("head") == head_sha:
                 handled.add(int(match.group("job")))

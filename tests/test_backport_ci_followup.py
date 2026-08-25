@@ -126,6 +126,24 @@ def test_waits_while_any_current_head_run_is_in_progress(monkeypatch) -> None:
     assert reason == "current-head-ci-running"
 
 
+def test_checks_all_current_head_runs_before_acting(monkeypatch) -> None:
+    pr = _pr()
+    runs = [_run(run_id) for run_id in range(1, 31)]
+    runs.append(_run(31, status="in_progress", conclusion=""))
+    gh = _gh(runs, pr)
+    monkeypatch.setattr(ci_followup, "find_existing_pr", lambda *_args: pr)
+
+    target, reason = find_followup_target(
+        gh,
+        repo_entry=_entry(),
+        target_branch="9.0",
+        bot_login=_BOT,
+    )
+
+    assert target is None
+    assert reason == "current-head-ci-running"
+
+
 def test_refuses_non_bot_owned_sweep_pr(monkeypatch) -> None:
     pr = _pr(author="maintainer")
     gh = _gh([_run()], pr)
@@ -144,6 +162,7 @@ def test_refuses_non_bot_owned_sweep_pr(monkeypatch) -> None:
 
 def test_handled_job_marker_prevents_retry(monkeypatch) -> None:
     marker = SimpleNamespace(
+        user=SimpleNamespace(login=_BOT),
         body=(
             f"<!-- valkey-ci-agent:auto-ci-followup head={_HEAD} "
             "run=10 job=2 -->"
@@ -167,6 +186,35 @@ def test_handled_job_marker_prevents_retry(monkeypatch) -> None:
 
     assert target is None
     assert reason == "no-unhandled-actionable-failures"
+
+
+def test_ignores_handled_job_marker_from_another_user(monkeypatch) -> None:
+    marker = SimpleNamespace(
+        user=SimpleNamespace(login="untrusted-user"),
+        body=(
+            f"<!-- valkey-ci-agent:auto-ci-followup head={_HEAD} "
+            "run=10 job=2 -->"
+        ),
+    )
+    pr = _pr(comments=(marker,))
+    gh = _gh([_run()], pr)
+    monkeypatch.setattr(ci_followup, "find_existing_pr", lambda *_args: pr)
+    monkeypatch.setattr(
+        ci_followup,
+        "failed_jobs_for_run",
+        lambda *_args: [FailedJob("Reply schema validator", "failure", id=2)],
+    )
+
+    target, reason = find_followup_target(
+        gh,
+        repo_entry=_entry(),
+        target_branch="9.0",
+        bot_login=_BOT,
+    )
+
+    assert reason == "actionable"
+    assert target is not None
+    assert [job.id for job in target.jobs] == [2]
 
 
 def test_run_followup_uses_shared_engine_and_posts_job_markers(monkeypatch) -> None:

@@ -134,6 +134,7 @@ def validate_branch_with_optional_repair(
                 generated_paths=generated.generated_paths,
                 amended_commit_sha=generated.amended_commit_sha,
             )
+        pre_repair_head = head_sha(repo_dir)
         repaired = repair_validation_failure_with_claude(
             repo_dir,
             target_branch,
@@ -145,13 +146,45 @@ def validate_branch_with_optional_repair(
             validation_log_path=log_path,
             run_git=run_git,
         )
+        if not repaired.ok:
+            return ValidationOutcome(
+                False,
+                repaired.output,
+                generated_paths=generated.generated_paths,
+                amended_commit_sha=generated.amended_commit_sha,
+            )
+
+        regenerated = prepare_generated_files(
+            repo_dir,
+            tuple(changed_paths_since_base(repo_dir, comparison_ref)),
+            generated_file_rules or [],
+            run_git=run_git,
+        )
+        if not regenerated.ok:
+            run_git(repo_dir, "reset", "--hard", pre_repair_head)
+            return regenerated
+
+        final_output = repaired.output
+        if regenerated.amended_commit_sha:
+            ok, final_output = validate_backport_branch(
+                repo_dir,
+                target_branch,
+                test_commands,
+                validation_rules,
+                validation_profile=validation_profile,
+                base_ref=comparison_ref,
+            )
+            if not ok:
+                run_git(repo_dir, "reset", "--hard", pre_repair_head)
+                return ValidationOutcome(False, final_output)
+
         return ValidationOutcome(
-            repaired.ok,
-            repaired.output,
+            True,
+            final_output,
             resolutions=repaired.resolutions,
             ai_summary=repaired.ai_summary,
-            generated_paths=generated.generated_paths,
-            amended_commit_sha=generated.amended_commit_sha,
+            generated_paths=regenerated.generated_paths,
+            amended_commit_sha=regenerated.amended_commit_sha,
         )
     finally:
         remove_validation_log_path(log_path)
