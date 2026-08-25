@@ -14,6 +14,7 @@ repos:
     project_owner: org
     project_owner_type: organization
     language: c
+    automatic_ci_followup: true
     build_commands:
       - make test
     branches:
@@ -80,3 +81,15 @@ def test_build_matrix_filters_by_repo_and_project_number(tmp_path) -> None:
             }
         ]
     }
+
+
+def test_build_matrix_can_select_only_automatic_ci_followup_repos(tmp_path) -> None:
+    matrix = build_matrix(
+        _write_registry(tmp_path),
+        automatic_ci_followup_only=True,
+    )
+
+    assert [(entry["repo"], entry["branch"]) for entry in matrix["include"]] == [
+        ("org/core", "1.0"),
+        ("org/core", "2.0"),
+    ]

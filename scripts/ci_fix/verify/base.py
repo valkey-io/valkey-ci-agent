@@ -38,6 +38,7 @@ class FailedJob:
 
     name: str
     conclusion: str
+    id: int = 0
 
 
 @dataclass(frozen=True)

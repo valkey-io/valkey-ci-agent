@@ -24,6 +24,7 @@ def build_matrix(
     *,
     repo_filter: str | None = None,
     project_number_filter: int | None = None,
+    automatic_ci_followup_only: bool = False,
 ) -> dict:
     """Build a GitHub Actions matrix from the registry.
 
@@ -34,6 +35,8 @@ def build_matrix(
 
     for repo_entry in registry.repos:
         if repo_filter and repo_entry.repo != repo_filter:
+            continue
+        if automatic_ci_followup_only and not repo_entry.automatic_ci_followup:
             continue
         for branch_entry in repo_entry.branches:
             if project_number_filter is not None and branch_entry.project_number != project_number_filter:
@@ -65,12 +68,18 @@ def main() -> None:
     parser.add_argument("--repo", default="", help="Filter to this repo only")
     parser.add_argument("--project-number", type=int, default=None, help="Filter to this project number")
     parser.add_argument("--output-file", default="", help="Write to file instead of stdout (for GITHUB_OUTPUT)")
+    parser.add_argument(
+        "--automatic-ci-followup-only",
+        action="store_true",
+        help="Include only repositories with automatic_ci_followup enabled",
+    )
     args = parser.parse_args()
 
     matrix = build_matrix(
         args.registry,
         repo_filter=args.repo or None,
         project_number_filter=args.project_number,
+        automatic_ci_followup_only=args.automatic_ci_followup_only,
     )
 
     has_entries = len(matrix["include"]) > 0

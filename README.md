@@ -28,7 +28,7 @@ New workflows are added as sibling directories to `backport/`. Each workflow pic
 |----------|--------|-------------|
 | Backport | Active | Cherry-picks merged PRs onto release branches with AI conflict resolution |
 | Fuzzer Monitor | Active | Analyzes scheduled fuzzer runs and files issues for anomalous failures |
-| CI Fix | Active | On-demand `@valkeyrie-bot fix <ci-link>` - diagnoses and fixes a failing test on a backport PR |
+| CI Fix | Active | Maintainer-triggered or guarded automatic follow-up that diagnoses and verifies a failing check on a backport PR |
 | Test Failure Detector | Active | Detects test failures from Daily CI, files/updates GitHub issues |
 | Release Notes | Active | Cuts a release for valkey core or a module repo (search/json/bloom): AI-generates notes from `release-notes` PRs plus AI-triaged candidates without that label, promotes them onto a release line branch, bumps the repo's version file, opens a PR (held as a draft when the cut flags issues) |
 | Release Note Review | Active | Polls unresolved inline comments on automated release PRs, applies a guarded AI edit to the current dated section, replies, and resolves addressed threads |
@@ -46,9 +46,10 @@ The currently active workflow. Cherry-picks merged PRs onto release branches wit
 2. **Project discovery** - each leg queries the GitHub Project v2 board for PRs marked "To be backported"
 3. **Cherry-pick** - attempts `git cherry-pick` for each candidate onto the target release branch
 4. **AI conflict resolution** - when cherry-pick conflicts, Claude Code reads both sides and resolves the conflict in place
-5. **Validation** - registry-configured build commands run before push; any failure blocks the push
+5. **Validation** - registry build/rule commands plus an optional repository profile run against each candidate's own diff; any failure removes that candidate
 6. **PR creation** - pushes the branch and opens (or updates) a PR with a summary table
-7. **Status sync** - after a backport PR is merged into the release branch, the source PR's Project v2 status can be moved from "To be backported" to "Done"
+7. **CI follow-up** - enabled repositories inspect the current head of the open sweep PR and give one unhandled actionable failure to the verified CI-fix engine
+8. **Status sync** - after a backport PR is merged into the release branch, the source PR's Project v2 status can be moved from "To be backported" to "Done"
 
 Manual single-PR backports are also supported via `workflow_dispatch`.
 
@@ -66,7 +67,17 @@ repos:
       - "./ci/setup-backport-validation.sh" # optional; run once in clone
     build_commands:
       - "make -j$(nproc)"                # run before push; empty = skip
+    validation_profile: valkey-core       # optional dynamic, diff-aware checks
+    validation_rules:                     # optional subsystem checks by path
+      - paths: ["src/rdb.c"]
+        commands: ["./runtest --single unit/dump --clients 1"]
+    generated_file_rules:                 # optional deterministic regeneration
+      - paths: ["src/unit/*.c"]
+        command: "python3 utils/generate-unit-test-header.py"
+        outputs: ["src/unit/test_files.h"]
     repair_validation_failures: false    # optional; one AI repair attempt on failure
+    automatic_ci_followup: false         # inspect CI on the open sweep PR
+    ci_followup_ignored_jobs: ["*dco*"]  # informational failures, never fixed
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
@@ -80,6 +91,25 @@ repos:
 By default, agent branches are pushed directly to `repo` under the `agent/backport/...` namespace and PRs are opened in that same upstream repository. `push_repo` is optional and only exists as an escape hatch for a real different-owner fork; same-owner `push_repo` values are rejected so staging repositories do not become the normal model.
 
 The sweep branch is always kept green: a candidate is only kept if the whole branch still validates after the cherry-pick, so one bad commit can never block later candidates. Each scheduled run keeps up to two validated cherry-picks (`--max-candidates 2`) and reports candidates that were skipped or failed validation in the PR's "Needs attention" section without committing them. When `repair_validation_failures` is enabled, Claude Code gets one narrow edit-only attempt to fix a failing cherry-pick before it is dropped.
+
+The `valkey-core` profile adds checks that static globs cannot express safely:
+`git diff --check` over the candidate range, `clang-format-18` over changed
+C/C++ files, directly changed Tcl tests, C/C++ unit tests, subsystem tests for
+cluster/TLS/RDB/sentinel/module or test-harness changes, and targeted
+reply-schema validation for changed tests that do not opt out. Generated-file
+rules run twice to prove convergence. They may edit only their declared tracked
+outputs; an allowed update is amended into the candidate commit, while any
+unexpected path or non-convergent generator fails closed.
+
+When `automatic_ci_followup` is enabled, `backport-ci-followup.yml` runs only
+for registered branches with an App-owned open
+`agent/backport/sweep/<target>` PR. It requires the exact base, head repository,
+branch and 40-character current SHA, waits for all current-head runs to finish,
+ignores configured jobs such as DCO, and records one attempt per failed job id
+in hidden PR-comment markers. One current head gets at most one pushed fix;
+after a proven fast-forward push, later runs wait for CI on the new head.
+Refusals and unverifiable failures are reported without changing the branch.
+The bot never adds DCO sign-off and never force-pushes a published sweep branch.
 
 See [`examples/repos.yml`](examples/repos.yml) for a multi-module example.
 

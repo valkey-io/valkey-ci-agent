@@ -19,6 +19,7 @@ from github.GithubException import GithubException
 
 from scripts.backport.candidate_apply import apply_candidate
 from scripts.backport.diff_comments import reconcile_diff_comments
+from scripts.backport.git_commands import head_sha
 from scripts.backport.git_commands import run_git as _run_git
 from scripts.backport.models import (
     DETAIL_EMPTY_ON_TARGET,
@@ -33,11 +34,9 @@ from scripts.backport.models import (
 )
 from scripts.backport.pr_creator import BackportPRCreator
 from scripts.backport.registry import ValidationRule
+from scripts.backport.sweep_validation import validate_branch_with_optional_repair
 from scripts.backport.utils import build_branch_name
-from scripts.backport.validation import (
-    changed_paths_since_base,
-    select_validation_commands,
-)
+from scripts.backport.validation import changed_paths_since_base, select_validation_commands
 from scripts.common.build_validator import run_build_commands
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.github_client import retry_github_call
@@ -102,6 +101,9 @@ def run_backport(
     build_commands: list[str] | None = None,
     validation_setup_commands: list[str] | None = None,
     validation_rules: list[ValidationRule] | None = None,
+    validation_profile: str = "",
+    generated_file_rules: list[object] | None = None,
+    repair_validation_failures: bool = False,
     test_path_patterns: tuple[str, ...] | list[str] | None = None,
 ) -> BackportResult:
     """Execute the backport pipeline end-to-end.
@@ -343,25 +345,49 @@ def run_backport(
                         error_message=msg,
                     )
 
-                commands: list[str] = []
-                if build_commands or validation_rules:
+                validation_outcome = None
+                validation_ok = True
+                validation_output = ""
+                if validation_profile or generated_file_rules:
+                    validation_outcome = validate_branch_with_optional_repair(
+                        tmp_dir,
+                        target_branch,
+                        build_commands or [],
+                        validation_rules or [],
+                        repair=repair_validation_failures,
+                        validation_profile=validation_profile,
+                        generated_file_rules=generated_file_rules,
+                        run_git=_run_git,
+                    )
+                    validation_ok = validation_outcome.ok
+                    validation_output = validation_outcome.output
+                elif build_commands or validation_rules:
                     commands = select_validation_commands(
                         build_commands or [],
                         validation_rules or [],
                         changed_paths_since_base(tmp_dir, f"origin/{target_branch}"),
                     )
-                if commands:
-                    ok, output = run_build_commands(tmp_dir, commands)
-                    if not ok:
-                        msg = f"Build validation failed: {output[:500]}"
-                        logger.error(msg)
-                        _post_comment(repo, source_pr_number, f"Backport skipped: {msg}")
-                        return BackportResult(
-                            outcome="error",
-                            commits_cherry_picked=len(cherry_result.applied_commits),
-                            files_conflicted=len(cherry_result.conflicting_files),
-                            error_message=msg,
-                        )
+                    validation_ok, validation_output = run_build_commands(tmp_dir, commands)
+
+                if not validation_ok:
+                    msg = f"Build validation failed: {validation_output[:500]}"
+                    logger.error(msg)
+                    _post_comment(repo, source_pr_number, f"Backport skipped: {msg}")
+                    return BackportResult(
+                        outcome="error",
+                        commits_cherry_picked=len(cherry_result.applied_commits),
+                        files_conflicted=len(cherry_result.conflicting_files),
+                        error_message=msg,
+                    )
+                if validation_outcome is not None and validation_outcome.amended_commit_sha:
+                    application_result.resolved_commit_sha = validation_outcome.amended_commit_sha
+                    resolved_commit_sha = validation_outcome.amended_commit_sha
+                if validation_outcome is not None and validation_outcome.resolutions:
+                    application_result.resolutions.extend(validation_outcome.resolutions)
+                    resolution_results = application_result.resolutions
+                    application_result.resolved_by_ai = True
+                    application_result.ai_summary = validation_outcome.ai_summary
+                    resolved_commit_sha = head_sha(tmp_dir)
 
                 # Push the backport branch to the remote
                 push_remote = "origin"
@@ -668,6 +694,9 @@ def main() -> None:
         build_commands=list(repo_entry.build_commands) or None,
         validation_setup_commands=list(repo_entry.validation_setup_commands),
         validation_rules=list(repo_entry.validation_rules),
+        validation_profile=repo_entry.validation_profile,
+        generated_file_rules=list(repo_entry.generated_file_rules),
+        repair_validation_failures=repo_entry.repair_validation_failures,
         test_path_patterns=repo_entry.test_path_patterns,
     )
 

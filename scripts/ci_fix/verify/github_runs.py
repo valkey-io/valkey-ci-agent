@@ -38,7 +38,8 @@ def failed_jobs_for_run(gh: Any, repo_full_name: str, run_id: int, *, retries: i
         return []
     return [
         FailedJob(name=str(getattr(j, "name", "") or ""),
-                  conclusion=str(getattr(j, "conclusion", "") or ""))
+                  conclusion=str(getattr(j, "conclusion", "") or ""),
+                  id=int(getattr(j, "id", 0) or 0))
         for j in jobs
         if str(getattr(j, "conclusion", "") or "") in _FAILED_CONCLUSIONS
     ]
