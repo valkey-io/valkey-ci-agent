@@ -12,6 +12,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from scripts.ci_fix import comment_poll
 from scripts.ci_fix.comment_poll import poll_once
 
@@ -197,6 +199,72 @@ def test_lookback_default_and_clamp(monkeypatch):
 
     monkeypatch.setenv("CI_FIX_POLL_LOOKBACK_MINUTES", "garbage")
     assert _lookback_minutes() == _DEFAULT_LOOKBACK_MINUTES
+
+
+def test_target_repos_default_and_override(monkeypatch):
+    from scripts.ci_fix.comment_poll import _target_repos
+
+    monkeypatch.delenv("CI_FIX_POLL_TARGET_REPO", raising=False)
+    assert _target_repos() == ("valkey-io/valkey", "valkey-io/valkey-search")
+
+    # Comma-separated, whitespace-trimmed, order-preserving, de-duplicated.
+    monkeypatch.setenv(
+        "CI_FIX_POLL_TARGET_REPO",
+        " owner/a , owner/b ,owner/a",
+    )
+    assert _target_repos() == ("owner/a", "owner/b")
+
+    monkeypatch.setenv("CI_FIX_POLL_TARGET_REPO", "owner/only")
+    assert _target_repos() == ("owner/only",)
+
+    # An override that parses to nothing falls back to the default rather
+    # than silently polling zero repos.
+    monkeypatch.setenv("CI_FIX_POLL_TARGET_REPO", " , ,")
+    assert _target_repos() == ("valkey-io/valkey", "valkey-io/valkey-search")
+
+
+def test_poll_all_repos_isolates_single_repo_failure(monkeypatch):
+    """One repo failing is swallowed; the others are still polled and counted."""
+    from github.GithubException import GithubException
+
+    calls: list[str] = []
+
+    def fake_poll_once(gh, *, target_repo, **kwargs):
+        calls.append(target_repo)
+        if target_repo == "owner/bad":
+            raise GithubException(404, "not found", None)
+        return 1
+
+    monkeypatch.setattr(comment_poll, "poll_once", fake_poll_once)
+    # Failing repo first: proves polling CONTINUES to the good repo after the
+    # exception rather than aborting the whole tick.
+    dispatched = comment_poll._poll_all_repos(
+        MagicMock(),
+        target_repos=("owner/bad", "owner/good"),
+        org="valkey-io", team_slug="contributors",
+        bot_login="valkeyrie-ops[bot]", lookback_minutes=30,
+        dispatch=MagicMock(),
+    )
+    assert dispatched == 1
+    assert calls == ["owner/bad", "owner/good"]
+
+
+def test_poll_all_repos_raises_when_all_fail(monkeypatch):
+    """If every repo fails (e.g. bad token/app config), fail loudly."""
+    from github.GithubException import GithubException
+
+    def fake_poll_once(gh, *, target_repo, **kwargs):
+        raise GithubException(403, "forbidden", None)
+
+    monkeypatch.setattr(comment_poll, "poll_once", fake_poll_once)
+    with pytest.raises(RuntimeError, match="All 2 target repo"):
+        comment_poll._poll_all_repos(
+            MagicMock(),
+            target_repos=("owner/a", "owner/b"),
+            org="valkey-io", team_slug="contributors",
+            bot_login="valkeyrie-ops[bot]", lookback_minutes=30,
+            dispatch=MagicMock(),
+        )
 
 
 # --- helpers exercised directly (these would catch the PyGithub-shape bugs) ---
