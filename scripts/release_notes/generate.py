@@ -478,6 +478,10 @@ def generate(
             cwd=repo_dir,
             timeout=timeout,
             model=None,  # let CI_AGENT_CLAUDE_MODEL env override win
+            # One categorized bullet per PR against a fixed category list and
+            # canonical format. High is ample for the prose; maximum
+            # deliberation on a batch risks the request not finishing.
+            effort="high",
             allowed_tools="",
             disallowed_tools=_DISALLOWED_TOOLS,
         )
@@ -526,6 +530,7 @@ def generate(
                 cwd=repo_dir,
                 timeout=timeout,
                 model=None,
+                effort="high",
                 allowed_tools="",
                 disallowed_tools=_DISALLOWED_TOOLS,
             )

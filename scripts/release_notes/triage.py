@@ -393,6 +393,10 @@ def triage(
             cwd=repo_dir,
             timeout=timeout,
             model=None,  # let CI_AGENT_CLAUDE_MODEL env override win
+            # Triage is a bounded include/exclude classification per PR with a
+            # deterministic release-safety guardrail behind it, so maximum
+            # deliberation buys nothing and costs the request's completion.
+            effort="medium",
             allowed_tools="",
             disallowed_tools="Read,Grep,Glob,Bash,Write,Edit",
         )
