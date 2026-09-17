@@ -42,19 +42,14 @@ _RC_STAGE_RE = re.compile(r"^rc([1-9]\d*)$")
 # alongside the canonical "-rc3" this tool renders.
 _DATED_RC_RE_TMPL = r"^{display} {major}\.{minor}\.{patch}[- ][rR][cC]([1-9]\d*)\b"
 
-# A rendered note bullet ends with "(#N)" naming the PR it credits. The
-# bullet-line guard keeps a "(#N)" in prose or a heading from being read as a
-# credit. Used to dedup a cut's notes against the PRs the destination release
-# line already lists (see _drop_already_credited).
-_BULLET_LINE_RE = re.compile(r"^\s*[*-]\s+\S")
-# Trailing PR group: "(#N)" or a hand-written "(#N, #M)" at end of line,
-# tolerating trailing punctuation/closing parens. Generated notes always emit a
-# single canonical ref, while existing module changelogs sometimes credit
-# several PRs in one trailing group.
-_TRAILING_PR_GROUP_RE = re.compile(
-    r"\((?P<refs>#\d+(?:\s*,\s*#\d+)*)\)[\s.,:;)]*$"
-)
-_PR_NUMBER_RE = re.compile(r"#(\d+)")
+# The credit grammar (a bullet's trailing "(#N)") now lives in release_format,
+# the pure module both this cut and the cross-line wording index
+# (:mod:`scripts.release_notes.prior_notes`) import, so the two readers of a
+# published changelog cannot drift apart. Kept as module aliases because this
+# file's dedup (see _drop_already_credited) reads them on every cut.
+_BULLET_LINE_RE = rn.BULLET_LINE_RE
+_TRAILING_PR_GROUP_RE = rn.TRAILING_PR_GROUP_RE
+_PR_NUMBER_RE = rn.PR_NUMBER_RE
 _LEGACY_CONTRIBUTOR_RE = re.compile(
     r"^(?:Contributors|We appreciate the efforts of all who contributed code "
     r"to this release!)\s*$",
@@ -495,24 +490,12 @@ def _resolve_notes_range(
 
 def _trailing_pr_numbers(line: str) -> set[int]:
     """Return every PR number in a line's final ``(#N[, #M...])`` group."""
-    match = _TRAILING_PR_GROUP_RE.search(line)
-    if match is None:
-        return set()
-    return {int(number) for number in _PR_NUMBER_RE.findall(match.group("refs"))}
+    return rn.trailing_pr_numbers(line)
 
 
 def _credited_pr_numbers(notes_text: str) -> set[int]:
-    """Return the PR numbers a release-line changelog already credits.
-
-    Reads every bullet line's trailing local ``(#N[, #M...])`` reference from
-    *notes_text*. GitHub issue and PR numbers are unique within a repository, so
-    a trailing local reference is a valid credit regardless of section heading.
-    """
-    credited: set[int] = set()
-    for line in notes_text.splitlines():
-        if _BULLET_LINE_RE.match(line):
-            credited.update(_trailing_pr_numbers(line))
-    return credited
+    """Return the PR numbers a release-line changelog already credits."""
+    return rn.credited_pr_numbers(notes_text)
 
 
 def _grouped_pr_numbers(grouped: dict[str, list[str]]) -> set[int]:
@@ -752,6 +735,7 @@ def cut(
     baseline_unanchored: bool = False,
     security_from_advisories: bool = False,
     force_ready: bool = False,
+    align_prior_wording: bool = True,
     profile: projects_mod.ProjectProfile,
     release_owner: str = "",
 ) -> int:
@@ -776,6 +760,12 @@ def cut(
     regardless (the banner records that the flags were overridden), except for
     security signals, which are human-owned and hold the PR as a draft even under
     *force_ready* (see :func:`_should_hold`). A clean cut always opens ready.
+
+    By default a bullet whose source PR another release line already published a
+    note for takes that line's published wording verbatim, so one backported
+    commit does not get a different description per release branch (see
+    :mod:`scripts.release_notes.prior_notes`). Clear *align_prior_wording* to
+    generate this line's wording independently.
     """
     # Canonicalize once at the boundary so version.h, the dated heading, the commit
     # title, the prep-branch ref, and the release line all carry the same string.
@@ -824,6 +814,7 @@ def cut(
         tag_glob=notes_tag_glob, base_ref=notes_base_ref,
         release_branch=source_ref,
         patch_release=rn.parse_version(version)[2] > 0,
+        align_prior_wording=align_prior_wording,
         profile=profile,
     )
     if regen.included and not regen.bullet_count:
@@ -1046,6 +1037,24 @@ def _print_dry_run(
     if notes_meta.security_noted_prs:
         print(f"security fix supplied for noted PR(s); dropped from generated bullets "
               f"(kept only under Security Fixes): {list(notes_meta.security_noted_prs)}")
+    if regen.prior_lines_read or regen.prior_lines_failed:
+        print(f"release lines consulted for prior wording: {list(regen.prior_lines_read) or 'none'}")
+        for line, reason in regen.prior_lines_failed:
+            print(f"  could not read {line}: {reason}")
+        if regen.consistent_alignments:
+            print("notes already matching the published wording: "
+                  f"{list(regen.consistent_alignments)}")
+        if regen.aligned:
+            print("wording reused from another release line: "
+                  f"{[(n.pr_number, n.release_line) for n in regen.aligned]}")
+        else:
+            print("wording reused from another release line: none")
+    if regen.declined_alignments:
+        risky = [d.pr_number for d in regen.declined_alignments if d.needs_review]
+        print("published wording not reused: "
+              f"{[(d.pr_number, d.release_line, d.reason) for d in regen.declined_alignments]}")
+        if risky:
+            print(f"⚠️  release lines contradict each other about a note: {risky}")
     if notes_meta.urgency.strip().upper() == _SECURITY_URGENCY and not notes_meta.security_fixes:
         print("⚠️  urgency SECURITY but no security-fix entries")
     if regen.ai_included:
@@ -1193,7 +1202,10 @@ def _hold_reasons(plan: BranchPlan, notes_meta: "_NotesMeta") -> list[str]:
     advisory sub-cases that render a ``⚠️`` (fetch failed, or an advisory that could
     not be read) do. Deduping a PR that leaves real notes behind also does not
     hold: it renders no body section (only the version-bump-only case does, via
-    :func:`_no_new_prs_section`).
+    :func:`_no_new_prs_section`). Cross-line wording alignment is likewise
+    informational except for its risky declines (see below), so reusing another
+    line's wording — or being unable to read a line at all — reports without
+    holding.
     """
     regen = notes_meta.regen
     reasons: list[str] = []
@@ -1251,6 +1263,17 @@ def _hold_reasons(plan: BranchPlan, notes_meta: "_NotesMeta") -> list[str]:
     # case, not a hold reason. Only the urgency-with-no-fixes mismatch below holds.
     if notes_meta.urgency.strip().upper() == _SECURITY_URGENCY and not notes_meta.security_fixes:
         reasons.append("SECURITY urgency with no security-fix entries")
+    # Wording alignment is otherwise informational: reusing (or not reusing)
+    # another line's prose is a formatting outcome, and holding every cut that
+    # declined once would train reviewers to click through the banner. Only a
+    # contradiction holds — the lines credit different authors, or their wordings
+    # limit the change to different environments — because then one of the two
+    # published notes is wrong on its face and code cannot tell which.
+    if any(
+        getattr(d, "needs_review", False)
+        for d in getattr(regen, "declined_alignments", ())
+    ):
+        reasons.append("release lines contradict each other about a note")
     if regen.triage:
         reasons.append("AI triage could not decide some PRs")
     if regen.unresolved:
@@ -1376,6 +1399,8 @@ def _build_pr_body(
         + _impact_review_section(regen.impact_review, notes_meta.urgency)
         + _advisory_section(notes_meta)
         + _security_dedup_section(notes_meta)
+        + _wording_alignment_section(regen)
+        + _declined_alignment_section(getattr(regen, "declined_alignments", ()))
         + _security_warning_section(notes_meta)
         + _guardrail_included_section(regen.guardrail_included)
         + _triage_counts_section(regen)
@@ -1729,6 +1754,135 @@ def _security_dedup_section(notes_meta: "_NotesMeta") -> str:
         f"notes consistent, {pronoun} only under **Security Fixes**, where each is "
         "reviewed as a factual security entry.\n"
     )
+
+
+def _wording_alignment_section(regen: Any) -> str:
+    """Report which notes reuse the wording another release line already published.
+
+    Informational, and rendered whenever there was a sibling line to consult even
+    if nothing was carried: "we looked and every note is this line's own" is a
+    materially different statement from "we never looked", and only one of them
+    means the reviewer should expect cross-branch consistency. Substituting the
+    text of a note is a decision code made, so the reviewer sees each carry, the
+    line it came from, and which lines could not be read at all.
+    """
+    lines_read = getattr(regen, "prior_lines_read", ())
+    lines_failed = getattr(regen, "prior_lines_failed", ())
+    if not (lines_read or lines_failed):
+        return ""
+    aligned = getattr(regen, "aligned", ())
+    consistent = getattr(regen, "consistent_alignments", ())
+    lines = [
+        "",
+        "### Wording carried from other release lines",
+        "",
+        "A backported change is cut once per release line, and each cut words its "
+        "notes independently. To keep one commit from being described differently "
+        "per branch, a note whose source PR another line already published takes "
+        "that published wording verbatim (joined on the trailing `(#N)`, which "
+        "always names the original source PR). Only the text is reused; the "
+        "category, the `by @handle` credit, and the `(#N)` are this cut's own.",
+        "",
+    ]
+    if lines_read:
+        consulted = ", ".join(f"`{line}`" for line in lines_read)
+        lines.append(f"- Release lines consulted: {consulted}")
+    else:
+        lines.append("- No release line's published notes could be read.")
+    if lines_failed:
+        for line, reason in lines_failed:
+            detail = publish_mod.escape_cell(reason) if reason else "unknown reason"
+            # Deliberately not a ⚠️: a line older than the changelog file, or one
+            # that never had it, is the normal case and must not read as a defect.
+            lines.append(
+                f"- Could not read the published notes of `{line}`: {detail}. "
+                "Any note that line already published may still differ from this cut."
+            )
+    if consistent:
+        refs = ", ".join(f"#{n}" for n in sorted(consistent))
+        verb = "matches" if len(consistent) == 1 else "match"
+        lines.append(
+            f"- {len(consistent)} generated note(s) already {verb} the published "
+            f"wording: {refs}"
+        )
+    if not aligned:
+        lines.extend([
+            "- No note needed its wording replaced.",
+            "",
+        ])
+        return "\n".join(lines)
+    lines.append(f"- Reused published wording for {len(aligned)} note(s)")
+    lines.append("")
+    # Both wordings are shown. The model's own uncertainty flag is kept when a
+    # note's wording is carried (it judged the change, not the prose), so a
+    # reviewer reading "unclear whether user-facing" must be able to see the text
+    # that judgement was made about.
+    table = [
+        "| PR | Wording from | Carried wording | This cut generated |",
+        "|----|--------------|-----------------|--------------------|",
+    ]
+    for note in aligned:
+        generated = getattr(note, "generated_text", "") or ""
+        table.append(
+            f"| #{note.pr_number} | `{note.release_line}` "
+            f"({publish_mod.escape_cell(note.release_heading)}) | "
+            f"{publish_mod.escape_cell(note.text)} | "
+            f"{publish_mod.escape_cell(generated) if generated else '—'} |"
+        )
+    lines.extend(_details(f"{len(aligned)} note(s) reusing published wording", table))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _declined_alignment_section(declined: Sequence[Any]) -> str:
+    """List notes another line published that this cut deliberately did not reuse.
+
+    Every decline is shown, because "the lines still disagree here" is exactly
+    what a reviewer of a backported change needs to know. The ones marked ⚠️ are
+    the contradictions: the two lines credit different authors, or their wordings
+    limit the change to different environments, so they may not even be describing
+    the same change. Those hold the cut (see :func:`_hold_reasons`); the rest only
+    explain why the wording differs and need no action.
+    """
+    if not declined:
+        return ""
+    risky = [d for d in declined if getattr(d, "needs_review", False)]
+    heading = (
+        "### ⚠️ Release lines disagree about a note"
+        if risky
+        else "### Prior wording not reused"
+    )
+    lines = [
+        "",
+        heading,
+        "",
+        "Another release line already published a note for these PRs, but this cut "
+        "kept its own wording, so the entries will not read identically:",
+        "",
+    ]
+    if risky:
+        refs = ", ".join(f"#{d.pr_number}" for d in risky)
+        lines.extend([
+            f"⚠️ {refs}: the two lines contradict each other about the change "
+            "itself, not just its wording, which code must not resolve on its own. "
+            "Read the note on each line and settle which one is right before merging.",
+            "",
+        ])
+    table = [
+        "| PR | Other line | Why the wording was not reused |",
+        "|----|------------|--------------------------------|",
+    ]
+    for item in declined:
+        mark = "⚠️ " if getattr(item, "needs_review", False) else ""
+        heading_cell = publish_mod.escape_cell(item.release_heading)
+        lines_cell = f"`{item.release_line}` ({heading_cell})" if heading_cell else f"`{item.release_line}`"
+        table.append(
+            f"| #{item.pr_number} | {lines_cell} | "
+            f"{mark}{publish_mod.escape_cell(item.reason)} |"
+        )
+    lines.extend(_details(f"{len(declined)} note(s) not reusing published wording", table))
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _security_warning_section(notes_meta: "_NotesMeta") -> str:

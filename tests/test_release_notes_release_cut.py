@@ -2412,3 +2412,202 @@ class TestUncategorizedNotes:
 
     def test_section_is_silent_when_everything_was_categorized(self) -> None:
         assert rc._uncategorized_section(()) == ""
+class TestWordingAlignmentSections:
+    """The PR body must show every wording carry, decline, and unread line."""
+
+    _PLAN = BranchPlan("ga", "8.1", "8.1")
+
+    @staticmethod
+    def _regen(**overrides):
+        base = dict(
+            base_tag="8.1.8", grouped={}, included=1, bullet_count=1,
+            skipped=(), triage=(), had_prs=True,
+        )
+        base.update(overrides)
+        return pipeline_mod.RegenResult(**base)
+
+    def _meta(self, **overrides):
+        return rc._NotesMeta(
+            regen=self._regen(**overrides), already_credited=(),
+            noted_bullet_count=1, urgency="LOW", security_fixes=None,
+            security_noted_prs=(), baseline_unanchored=False,
+        )
+
+    @staticmethod
+    def _aligned(**overrides):
+        base = dict(
+            pr_number=42, release_line="9.0", release_heading="Valkey 9.0.1",
+            text="Fix a memory leak in ZDIFF", generated_text="Fix leak",
+        )
+        base.update(overrides)
+        return pipeline_mod.AlignedNote(**base)
+
+    @staticmethod
+    def _declined(**overrides):
+        base = dict(
+            pr_number=42, release_line="9.0", release_heading="Valkey 9.0.1",
+            reason="the published wording is not in the canonical bullet form",
+        )
+        base.update(overrides)
+        return pipeline_mod.DeclinedAlignment(**base)
+
+    def test_no_section_when_no_line_was_consulted(self) -> None:
+        # "We never looked" must not render as "we looked and found nothing":
+        # only one of the two promises cross-branch consistency.
+        assert rc._wording_alignment_section(self._regen()) == ""
+
+    def test_consulted_lines_reported_even_with_no_carry(self) -> None:
+        section = rc._wording_alignment_section(
+            self._regen(prior_lines_read=("9.0", "8.0"))
+        )
+        assert "Release lines consulted: `9.0`, `8.0`" in section
+        assert "No note needed its wording replaced." in section
+
+    def test_carried_wording_table_shows_both_wordings(self) -> None:
+        section = rc._wording_alignment_section(
+            self._regen(prior_lines_read=("9.0",), aligned=(self._aligned(),))
+        )
+        assert "| PR | Wording from | Carried wording | This cut generated |" in section
+        assert "#42" in section
+        assert "Fix a memory leak in ZDIFF" in section
+        # The generated text is what the model's own uncertainty flag referred to.
+        assert "Fix leak" in section
+
+    def test_unreadable_line_is_not_flagged_as_a_defect(self) -> None:
+        # A line older than the changelog file is the normal case; a ⚠️ here would
+        # make every 7.2 cut look broken.
+        section = rc._wording_alignment_section(
+            self._regen(prior_lines_failed=(("7.2", "path does not exist"),))
+        )
+        assert "Could not read the published notes of `7.2`" in section
+        assert "⚠️" not in section
+
+    def test_already_consistent_notes_counted(self) -> None:
+        section = rc._wording_alignment_section(
+            self._regen(prior_lines_read=("9.0",), consistent_alignments=(42, 43))
+        )
+        assert "2 generated note(s) already match" in section
+        assert "#42, #43" in section
+
+    def test_declined_section_is_quiet_when_nothing_declined(self) -> None:
+        assert rc._declined_alignment_section(()) == ""
+
+    def test_informational_decline_has_no_warning_heading(self) -> None:
+        section = rc._declined_alignment_section((self._declined(),))
+        assert "### Prior wording not reused" in section
+        assert "⚠️" not in section
+
+    def test_contradiction_gets_a_warning_heading(self) -> None:
+        section = rc._declined_alignment_section((
+            self._declined(needs_review=True, reason="`9.0` credits @carol but this cut resolved @alice"),
+        ))
+        assert "### ⚠️ Release lines disagree about a note" in section
+        assert "⚠️ #42" in section
+
+    def test_contradiction_holds_the_cut(self) -> None:
+        meta = self._meta(declined_alignments=(self._declined(needs_review=True),))
+        reasons = rc._hold_reasons(self._PLAN, meta)
+        assert "release lines contradict each other about a note" in reasons
+
+    def test_informational_decline_does_not_hold_the_cut(self) -> None:
+        # Hold fatigue is a real failure mode: the line publishes the wording it
+        # generated, which is exactly what it would have done anyway.
+        meta = self._meta(declined_alignments=(self._declined(),))
+        assert rc._hold_reasons(self._PLAN, meta) == []
+
+    def test_carrying_wording_never_holds_the_cut(self) -> None:
+        meta = self._meta(prior_lines_read=("9.0",), aligned=(self._aligned(),))
+        assert rc._hold_reasons(self._PLAN, meta) == []
+
+    def test_unread_line_never_holds_the_cut(self) -> None:
+        meta = self._meta(prior_lines_failed=(("7.2", "path does not exist"),))
+        assert rc._hold_reasons(self._PLAN, meta) == []
+
+    def test_sections_appear_in_the_pr_body(self) -> None:
+        meta = self._meta(
+            prior_lines_read=("9.0",),
+            aligned=(self._aligned(),),
+            declined_alignments=(self._declined(pr_number=43),),
+        )
+        body = rc._build_pr_body(
+            self._PLAN, "8.1.9", meta, profile=projects.VALKEY_PROFILE
+        )
+        assert "### Wording carried from other release lines" in body
+        assert "### Prior wording not reused" in body
+
+    def test_hold_survives_force_ready_only_as_a_banner_change(self) -> None:
+        # A wording contradiction is not a security signal, so --force-ready may
+        # open the PR ready; the body must still say what was flagged.
+        meta = self._meta(declined_alignments=(self._declined(needs_review=True),))
+        body = rc._build_pr_body(
+            self._PLAN, "8.1.9", meta, force_ready=True, profile=projects.VALKEY_PROFILE
+        )
+        assert "release lines contradict each other about a note" in body
+
+
+class TestAlignPriorWordingThreading:
+    """The opt-out must reach the pipeline, not be swallowed by the cut.
+
+    ``--no-align-prior-wording`` exists so a maintainer can word a line
+    independently when a sibling line's published text is wrong for this line.
+    If :func:`cut` accepted the flag and dropped it, the escape hatch would look
+    like it worked while the carry still happened, so the wiring is asserted
+    rather than assumed.
+    """
+
+    def _forwarded(self, monkeypatch, clone, **cut_kwargs):
+        from unittest.mock import MagicMock
+
+        from scripts.release_notes import render as render_mod
+        from scripts.release_notes.models import CategorizedBullet
+        from scripts.release_notes.pipeline import RegenResult
+
+        TestCutOrchestration()._setup(monkeypatch, clone, line_exists={"9.1": True})
+        grouped = render_mod.group_bullets(
+            [CategorizedBullet(pr_number=40, author="a", category="Bug Fixes", text="fix")],
+            categories=projects.VALKEY_PROFILE.categories,
+        )
+        captured = {}
+
+        def _spy(repo, clone_dir, **kwargs):
+            captured.update(kwargs)
+            return RegenResult(
+                base_tag="9.0.0", grouped=grouped, included=1, bullet_count=1,
+                skipped=(), triage=(), had_prs=True,
+            )
+
+        monkeypatch.setattr(pipeline_mod, "regenerate_unreleased", _spy)
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        repo.create_pull.return_value = MagicMock(number=1, html_url="https://x/1")
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+
+        rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            profile=projects.VALKEY_PROFILE, version="9.1.0", stage="rc1",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
+            contrib_base_ref=None, security_fixes=None, token="t", git_env={},
+            dry_run=False, **cut_kwargs,
+        )
+        return captured
+
+    def test_opt_out_forwarded_to_the_pipeline(self, monkeypatch, clone) -> None:
+        captured = self._forwarded(monkeypatch, clone, align_prior_wording=False)
+        assert captured["align_prior_wording"] is False
+
+    def test_opt_in_forwarded_to_the_pipeline(self, monkeypatch, clone) -> None:
+        captured = self._forwarded(monkeypatch, clone, align_prior_wording=True)
+        assert captured["align_prior_wording"] is True
+
+    def test_alignment_is_on_by_default(self, monkeypatch, clone) -> None:
+        # Consistency across release lines is the desired behaviour, so a caller
+        # that does not mention the flag must still get the carry.
+        captured = self._forwarded(monkeypatch, clone)
+        assert captured["align_prior_wording"] is True
+
+    def test_profile_reaches_the_pipeline_with_it(self, monkeypatch, clone) -> None:
+        # The prior-note index needs the profile's notes_file and display_name to
+        # find and parse sibling changelogs; a cut that forwarded the flag but not
+        # the profile would index nothing and silently carry no wording.
+        captured = self._forwarded(monkeypatch, clone)
+        assert captured["profile"] is projects.VALKEY_PROFILE

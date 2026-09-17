@@ -376,9 +376,22 @@ Because the prep branch is replaced with `--force-with-lease`, manual edits made
 directly on that generated branch are not retained.
 
 Use `release-notes-cut-advanced.yml` only for an explicit date/baseline,
-contributor override, security entries/advisory lookup, or `force_ready`. It
-delegates to the same release workflow as the normal dispatch, so the release
-logic cannot drift between the two interfaces.
+contributor override, security entries/advisory lookup, `no_align_prior_wording`,
+or `force_ready`. It delegates to the same release workflow as the normal
+dispatch, so the release logic cannot drift between the two interfaces.
+
+**When one change ships on several release lines, the first line to *merge* its
+release PR fixes the wording for the rest.** A backported change is worded once
+and then reused verbatim by the other lines (see step 6 of **How it works**
+below). The reuse reads merged release-line branches only, so a line cut while a
+sibling's release PR is still open finds nothing to reuse and words the note
+itself. Two consequences worth planning around:
+
+- Cutting a line whose siblings have already merged is always the cheapest path
+  to consistent notes; nothing else is required.
+- If you cut several lines in parallel, re-dispatch the still-open ones after the
+  first merges. A rerun regenerates from scratch, so it picks up the now-published
+  sibling wording and converges the lines.
 
 An omitted date resolves to the current **UTC** date. Use the advanced workflow's
 explicit `date` input when the intended release date follows another timezone's
@@ -473,7 +486,25 @@ human merges.
    review. The model never emits the `(#N)` reference or `by @handle`; code
    removes accidental duplicate markers and terminal punctuation, then appends
    the canonical attribution in `scripts/release_notes/render.py`.
-6. **Render + bump** (code) - render the categorized bullets into a new dated
+6. **Align wording across release lines** (code) - a change backported to several
+   release lines is discovered under its *original* source PR number on every
+   line, so that trailing `(#N)` is a branch-invariant join key that code, not the
+   model, produces. Before rendering, the cut reads the sibling release lines'
+   already-merged `00-RELEASENOTES` out of the existing clone
+   (`refs/remotes/origin/<M.m>`; no extra network calls, no writes) and, when a
+   note's PR already has a published bullet there, replaces this cut's freshly
+   generated prose with that published text verbatim. Only the prose is carried:
+   the category, the `by @handle` credit, and the `(#N)` reference stay the ones
+   this cut computed. Reuse is restricted to bullets under the canonical
+   `### <category>` headings this tool writes, and to text that round-trips
+   through the renderer unchanged, so hand-authored legacy sections are never
+   mined. Every carry and every declined carry is listed in the PR body, and two
+   deterministic disagreements refuse the carry and hold the PR: the two lines
+   crediting different authors, and the two wordings naming different environment
+   boundaries (e.g. one says 32-bit, the other does not), which is the signature
+   of a backport that was adapted rather than cherry-picked. `no_align_prior_wording`
+   (advanced workflow) or `--no-align-prior-wording` opts a line out entirely.
+7. **Render + bump** (code) - render the categorized bullets into a new dated
    section prepended before any existing sections on the release line via
    `render_release_notes` (`release_format.py`) / `set_version`
    (`version_bump.py`), append the cumulative contributor list
@@ -485,7 +516,7 @@ human merges.
    `valkey-io/valkey` ships no such tooling, so a cut runs against unmodified
    upstream (a plaintext `00-RELEASENOTES` placeholder and a `src/version.h`
    with the `VALKEY_VERSION*` macros).
-7. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
+8. **Open the PR** (code) - commit on the prep branch, push it (force-with-lease),
    and open/update a PR into the release line with a body that explains the cut and
    surfaces any advisories (below). When the cut flags anything a maintainer should
    address first, the PR opens as a draft to hold the merge (see [Edge-case
@@ -541,6 +572,13 @@ decision without opening a PR. The signals that hold:
   credited to a backport PR because the original author's PR could not be recovered.
 - **Triage** - PRs without `release-notes` that AI triage could not decide (no verdict returned), so
   a maintainer must decide whether to include them.
+- **Release lines disagree about a note** - a sibling release line already
+  published a bullet for this note's PR, but the two lines contradict each other
+  about the change itself rather than only its wording: they credit different
+  authors, or the two wordings name different environment boundaries. The carry is
+  refused (this cut keeps its own wording) and the PR holds so a maintainer can say
+  which line is right. Carries that succeeded, and carries declined for weaker
+  reasons, are reported but do not hold.
 
 The body always shows the resolved notes range so an over-broad baseline is
 visible: the resolved mode (e.g. `rc2`), the source and target branches, and both

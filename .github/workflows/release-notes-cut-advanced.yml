@@ -56,6 +56,11 @@ on:
         required: false
         type: boolean
         default: false
+      no_align_prior_wording:
+        description: "Word notes independently instead of reusing another release line's published wording"
+        required: false
+        type: boolean
+        default: false
       force_ready:
         description: "Open ready despite reviewer-facing signals"
         required: false
@@ -85,6 +90,7 @@ jobs:
       base_ref: ${{ inputs.base_ref }}
       security_fixes: ${{ inputs.security_fixes }}
       security_from_advisories: ${{ inputs.security_from_advisories }}
+      no_align_prior_wording: ${{ inputs.no_align_prior_wording }}
       force_ready: ${{ inputs.force_ready }}
       dry_run: ${{ inputs.dry_run }}
     # release-notes-cut selects the branch-restricted release-control

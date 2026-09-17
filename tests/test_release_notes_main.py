@@ -410,6 +410,47 @@ def test_security_from_advisories_env_false_is_false(patched, monkeypatch):
     assert captured["security_from_advisories"] is False
 
 
+def test_align_prior_wording_defaults_on(patched):
+    # Consistent wording across release lines is the default; a maintainer who
+    # dispatches a normal cut must get the carry without asking for it.
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["align_prior_wording"] is True
+
+
+def test_no_align_prior_wording_flag_inverts_to_cut(patched):
+    # The CLI spells the escape hatch as a negative (--no-align-prior-wording)
+    # but cut() takes the positive, so the polarity flip is the thing to guard:
+    # a missing "not" would silently keep aligning after an explicit opt-out.
+    captured = _capture_cut(patched)
+    main(["--token", "t", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW", "--no-align-prior-wording"])
+    assert captured["align_prior_wording"] is False
+
+
+def test_no_align_prior_wording_env_default_reaches_cut(patched, monkeypatch):
+    # The workflow passes this input only as
+    # RELEASE_NOTES_NO_ALIGN_PRIOR_WORDING ('true'/'false'), never as a CLI
+    # flag, so the env default must reach cut() inverted.
+    captured = _capture_cut(patched)
+    monkeypatch.setenv("RELEASE_NOTES_NO_ALIGN_PRIOR_WORDING", "true")
+    main(["--token", "t", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["align_prior_wording"] is False
+
+
+def test_no_align_prior_wording_env_false_still_aligns(patched, monkeypatch):
+    # 'false' is the literal string GitHub Actions exports for an unchecked box;
+    # a bare bool(os.environ.get(...)) would misread it as truthy and disable
+    # alignment on every workflow-driven cut.
+    captured = _capture_cut(patched)
+    monkeypatch.setenv("RELEASE_NOTES_NO_ALIGN_PRIOR_WORDING", "false")
+    main(["--token", "t", "--version", "9.1.0",
+          "--stage", "rc2", "--urgency", "LOW"])
+    assert captured["align_prior_wording"] is True
+
+
 def test_cut_failure_returns_one(patched):
     def _cut(repo, **kwargs):
         raise RuntimeError("boom")

@@ -533,3 +533,181 @@ def test_dedup_all_reserved_keeps_first(monkeypatch):
     kept, dups = pipeline_mod._dedup_bullets_by_pr(bl)
     assert [b.text for b in kept] == ["one"]
     assert dups == (1,)
+
+
+class TestPriorWordingAlignment:
+    """The wording-alignment seam between generation and rendering.
+
+    A real local "remote" with two release branches stands in for the cut's own
+    clone, because the seam's whole premise is that the sibling lines' published
+    notes are already on disk (``git clone`` fetches every branch) and no extra
+    network call is needed.
+    """
+
+    _PUBLISHED = "Fix a memory leak in ZDIFF when the result set becomes empty"
+
+    @pytest.fixture
+    def clone(self, tmp_path):
+        from scripts.common.proc import run_git
+
+        remote = str(tmp_path / "remote")
+        os.makedirs(remote)
+        run_git(remote, "init", "-q", "--initial-branch", "8.1")
+        run_git(remote, "config", "user.email", "t@e")
+        run_git(remote, "config", "user.name", "t")
+        heading = "Valkey 8.1.9  -  Released Tue 21 July 2026"
+        (tmp_path / "remote" / "00-RELEASENOTES").write_text(
+            "\n".join([
+                heading, "-" * len(heading), "",
+                "Upgrade urgency LOW.", "",
+                "### Bug Fixes",
+                f"* {self._PUBLISHED} by @a (#40)",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        run_git(remote, "add", "00-RELEASENOTES")
+        run_git(remote, "commit", "-q", "-m", "8.1 notes")
+        run_git(remote, "checkout", "-q", "-b", "9.0", "8.1")
+        run_git(remote, "commit", "-q", "--allow-empty", "-m", "9.0")
+
+        clone = str(tmp_path / "clone")
+        run_git(None, "clone", "-q", "--branch", "9.0", remote, clone)
+        # The fixture data files the cut reads live alongside the git metadata.
+        shutil.copytree(_FIXTURE_CLONE, clone, dirs_exist_ok=True)
+        return clone
+
+    def _regen(self, monkeypatch, clone, *, bullets=None, discovery_kwargs=None, **kwargs):
+        prs = (MergedPR(number=40, title="Fix ZDIFF leak", author="a", url="u",
+                        labels=("release-notes",)),)
+        monkeypatch.setattr(
+            pipeline_mod.discover_mod, "discover",
+            lambda *a, **k: DiscoveryResult(
+                base_tag="9.0.0", head_ref="9.0", prs=prs, **(discovery_kwargs or {})
+            ),
+        )
+        monkeypatch.setattr(
+            pipeline_mod.generate_mod, "generate",
+            lambda *a, **k: GenerationResult(
+                bullets=bullets or (
+                    CategorizedBullet(
+                        pr_number=40, author="a", category="Bug Fixes",
+                        text="Fix leak in ZDIFF",
+                    ),
+                ),
+                skipped=(),
+            ),
+        )
+        monkeypatch.setattr(
+            pipeline_mod.triage_mod, "triage",
+            lambda candidates, **k: TriageResult(),
+        )
+        return pipeline_mod.regenerate_unreleased(
+            object(), clone, head_ref="9.0", tag_glob=None,
+            release_branch="9.0", profile=projects.VALKEY_PROFILE, **kwargs,
+        )
+
+    def test_published_wording_replaces_generated_wording(self, monkeypatch, clone):
+        r = self._regen(monkeypatch, clone)
+
+        assert r.grouped["Bug Fixes"] == [f"* {self._PUBLISHED} by @a (#40)"]
+        assert r.prior_lines_read == ("8.1",)
+        assert [n.pr_number for n in r.aligned] == [40]
+        assert r.aligned[0].release_line == "8.1"
+        assert r.aligned[0].text == self._PUBLISHED
+        # The generated wording is kept for the PR body so a reviewer can compare.
+        assert r.aligned[0].generated_text == "Fix leak in ZDIFF"
+
+    def test_the_line_being_cut_is_not_consulted(self, monkeypatch, clone):
+        # 9.0 carries the same file (it branched from 8.1), so a seam that failed
+        # to exclude the line under cut would report "carried from 9.0".
+        r = self._regen(monkeypatch, clone)
+        assert "9.0" not in r.prior_lines_read
+
+    def test_flag_off_keeps_this_line_independent(self, monkeypatch, clone):
+        r = self._regen(monkeypatch, clone, align_prior_wording=False)
+
+        assert r.grouped["Bug Fixes"] == ["* Fix leak in ZDIFF by @a (#40)"]
+        assert r.aligned == ()
+        assert r.prior_lines_read == ()
+        assert r.prior_lines_failed == ()
+
+    def test_matching_wording_reported_as_already_consistent(self, monkeypatch, clone):
+        r = self._regen(monkeypatch, clone, bullets=(
+            CategorizedBullet(
+                pr_number=40, author="a", category="Bug Fixes", text=self._PUBLISHED,
+            ),
+        ))
+        assert r.consistent_alignments == (40,)
+        assert r.aligned == ()
+
+    def test_scope_disagreement_declines_and_is_marked_for_review(self, monkeypatch, clone):
+        # The seam has to hand align_wording the note-side scope detector, because
+        # the guardrail that normally polices scope claims reads the *original*
+        # PR's title/body -- byte-identical on every line -- so only comparing the
+        # two wordings can catch a backport that was adapted rather than
+        # cherry-picked. Here 8.1 published no environment limit while this cut's
+        # note limits the fix to 32-bit builds: carrying either text over the
+        # other would publish a claim one line's diff does not support, so the
+        # carry is refused and a human is asked which line is right.
+        r = self._regen(monkeypatch, clone, bullets=(
+            CategorizedBullet(
+                pr_number=40, author="a", category="Bug Fixes",
+                text="Fix a memory leak in ZDIFF on 32-bit builds",
+            ),
+        ))
+        assert r.grouped["Bug Fixes"] == [
+            "* Fix a memory leak in ZDIFF on 32-bit builds by @a (#40)"
+        ]
+        assert r.aligned == ()
+        assert [d.pr_number for d in r.declined_alignments] == [40]
+        assert r.declined_alignments[0].needs_review is True
+        assert "32-bit" in r.declined_alignments[0].reason
+
+    def test_carried_note_keeps_its_uncertainty(self, monkeypatch, clone):
+        # The model's flag judged the change, not the prose. Carrying wording from
+        # another line does not answer "is this user-facing?", so the note must
+        # still reach the reviewer.
+        r = self._regen(monkeypatch, clone, bullets=(
+            CategorizedBullet(
+                pr_number=40, author="a", category="Bug Fixes", text="Fix leak",
+                uncertain=True, uncertain_reason="unclear whether user-facing",
+            ),
+        ))
+        assert [n.pr_number for n in r.aligned] == [40]
+        assert [(n.pr_number, n.reason) for n in r.uncertain] == [
+            (40, "unclear whether user-facing"),
+        ]
+
+    def test_unconfirmed_credit_declines_without_holding(self, monkeypatch, clone):
+        r = self._regen(
+            monkeypatch, clone,
+            discovery_kwargs={"unresolved_backports": (
+                UnresolvedBackport(number=40, title="Fix ZDIFF leak", url="u"),
+            )},
+        )
+        assert r.grouped["Bug Fixes"] == ["* Fix leak in ZDIFF by @a (#40)"]
+        assert [d.pr_number for d in r.declined_alignments] == [40]
+        assert not r.declined_alignments[0].needs_review
+
+    def test_alignment_failure_degrades_to_generated_wording(self, monkeypatch, clone):
+        def boom(*_a, **_k):
+            raise RuntimeError("index build failed")
+
+        monkeypatch.setattr(pipeline_mod.prior_notes_mod, "build_index", boom)
+        r = self._regen(monkeypatch, clone)
+
+        assert r.grouped["Bug Fixes"] == ["* Fix leak in ZDIFF by @a (#40)"]
+        assert r.aligned == ()
+        assert r.prior_lines_read == ()
+
+    def test_reserved_category_bullet_is_not_reported_as_aligned(self, monkeypatch, clone):
+        # group_bullets drops a reserved-category bullet, so the note never
+        # renders; reporting a carry for it would describe text nobody can see.
+        r = self._regen(monkeypatch, clone, bullets=(
+            CategorizedBullet(
+                pr_number=40, author="a", category="Security Fixes", text="Fix leak",
+            ),
+        ))
+        assert r.aligned == ()
+        assert 40 in r.skipped
