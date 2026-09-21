@@ -22,13 +22,11 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from scripts.backport.sweep_graphql import GitHubGraphQLClient
-from scripts.backport.utils import (
-    pr_numbers_from_commit_messages,
-    pr_numbers_from_commit_subjects,
-)
+from scripts.backport.utils import pr_numbers_from_commit_messages
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.polling import (
     PollLoopError,
@@ -72,12 +70,12 @@ class BackportStatusUpdateResult:
 def verify_prs_on_branch(
     repo_full_name: str,
     target_branch: str,
-    pr_numbers: set[int],
+    pr_merged_at: dict[int, str],
     *,
     token: str = "",
     git_env: dict[str, str] | None = None,
 ) -> set[int]:
-    """Return which of ``pr_numbers`` actually landed on ``target_branch``.
+    """Return which PRs in ``pr_merged_at`` actually landed on ``target_branch``.
 
     A PR is considered present if either:
 
@@ -93,11 +91,20 @@ def verify_prs_on_branch(
     trailers and the structured ``## Applied`` section, so a stray ``(#N)``
     reference in a ``## Needs attention`` row or in prose never counts.
 
+    A matching commit must be at least as new as that source PR's merge time.
+    Imported histories can contain commit subjects from another repository with
+    the same PR number (for example, Valkey inherited Redis ``#4607``); those
+    older collisions must not make a current PR appear backported.
+
     ``token`` authenticates the clone for private/auth-required repos.
     """
-    if not pr_numbers:
+    if not pr_merged_at:
         return set()
 
+    merge_times = {
+        number: _parse_timestamp(merged_at)
+        for number, merged_at in pr_merged_at.items()
+    }
     env = dict(os.environ if git_env is None else git_env)
     with GitAuth(token, prefix="mark-done-git-askpass-") as git_auth:
         env = git_auth.env(env)
@@ -105,48 +112,40 @@ def verify_prs_on_branch(
             repo_dir = os.path.join(tmp, "repo")
             _shallow_clone(repo_full_name, target_branch, repo_dir, env)
 
-            applied = pr_numbers_from_commit_subjects(_branch_commit_subjects(repo_dir))
-            applied |= _applied_prs_from_commit_bodies(repo_dir)
+            applied: set[int] = set()
+            for committed_at, message in _branch_commit_records(repo_dir):
+                matched = pr_numbers_from_commit_messages([message])
+                applied_section = _markdown_section(message, "Applied")
+                if applied_section:
+                    matched.update(_pr_numbers_from_table_cells(applied_section))
+                for number in matched & merge_times.keys():
+                    if committed_at >= merge_times[number]:
+                        applied.add(number)
 
-    return pr_numbers & applied
+    return applied
 
 
-def _branch_commit_subjects(repo_dir: str) -> list[str]:
+def _parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _branch_commit_records(repo_dir: str) -> list[tuple[datetime, str]]:
     result = subprocess.run(
-        ["git", "log", "--format=%s", "HEAD"],
+        ["git", "log", "-z", "--format=%cI%x00%B", "HEAD"],
         cwd=repo_dir,
         capture_output=True,
         text=True,
         check=True,
     )
-    return result.stdout.splitlines()
-
-
-# git log -z NUL-separates commit records, letting us split multi-line bodies.
-_COMMIT_RECORD_DELIM = "\x00"
-
-
-def _applied_prs_from_commit_bodies(repo_dir: str) -> set[int]:
-    """Source PR numbers recorded in full backport commit messages.
-
-    Terminal ``Backport-Source-PR`` trailers are parsed from every message.
-    Squash-merged sweep batches are also read from the structured ``## Applied``
-    table; references in ``## Needs attention`` or prose are ignored.
-    """
-    result = subprocess.run(
-        ["git", "log", "-z", "--format=%B", "HEAD"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    numbers: set[int] = set()
-    for message in result.stdout.split(_COMMIT_RECORD_DELIM):
-        numbers.update(pr_numbers_from_commit_messages([message]))
-        applied_section = _markdown_section(message, "Applied")
-        if applied_section:
-            numbers.update(_pr_numbers_from_table_cells(applied_section))
-    return numbers
+    fields = result.stdout.split("\x00")
+    if fields and not fields[-1]:
+        fields.pop()
+    if len(fields) % 2:
+        raise RuntimeError("git log returned an incomplete commit record")
+    return [
+        (_parse_timestamp(fields[index]), fields[index + 1])
+        for index in range(0, len(fields), 2)
+    ]
 
 
 def _shallow_clone(
@@ -274,9 +273,9 @@ def reconcile_project_board(
 
     Unlike :func:`mark_backport_items_done`, this does not need a merged-PR body
     or a merge hook. It scans the board, clones the branch once, verifies each
-    candidate by ``(#N)`` presence, and flips only the verified items. Items not
-    yet on the branch are recorded as ``unverified`` and left untouched so a
-    later run can pick them up.
+    candidate by post-merge ``(#N)`` or backport metadata, and flips only the
+    verified items. Items not yet on the branch are recorded as ``unverified``
+    and left untouched so a later run can pick them up.
     """
     project = _load_project(
         gql,
@@ -285,7 +284,7 @@ def reconcile_project_board(
         project_owner_type=project_owner_type,
     )
 
-    candidate_pr_numbers: set[int] = set()
+    candidate_pr_merged_at: dict[int, str] = {}
     for item in project["items"]:
         content = item.get("content") or {}
         if content.get("__typename") != "PullRequest":
@@ -295,19 +294,24 @@ def reconcile_project_board(
         if _normalize(_item_single_select_value(item, status_field)) != _normalize(from_status):
             continue
         number = content.get("number")
-        if not isinstance(number, int):
+        merged_at = content.get("mergedAt")
+        if not isinstance(number, int) or not isinstance(merged_at, str) or not merged_at:
             continue
-        candidate_pr_numbers.add(number)
+        candidate_pr_merged_at[number] = merged_at
 
-    if not candidate_pr_numbers:
+    if not candidate_pr_merged_at:
         return BackportStatusUpdateResult(requested=[])
 
     verified = verify_prs_on_branch(
-        source_repo, target_branch, candidate_pr_numbers, token=token, git_env=git_env
+        source_repo,
+        target_branch,
+        candidate_pr_merged_at,
+        token=token,
+        git_env=git_env,
     )
     logger.info(
         "Branch %s: %d candidate(s) in %r, %d verified present",
-        target_branch, len(candidate_pr_numbers), from_status, len(verified),
+        target_branch, len(candidate_pr_merged_at), from_status, len(verified),
     )
 
     return mark_backport_items_done(
@@ -315,7 +319,7 @@ def reconcile_project_board(
         project_owner=project_owner,
         project_number=project_number,
         source_repo=source_repo,
-        source_pr_numbers=sorted(candidate_pr_numbers),
+        source_pr_numbers=sorted(candidate_pr_merged_at),
         project_owner_type=project_owner_type,
         status_field=status_field,
         from_status=from_status,
@@ -505,6 +509,7 @@ query($owner: String!, $number: Int!, $cursor: String) {{
             __typename
             ... on PullRequest {{
               number
+              mergedAt
               repository {{ nameWithOwner }}
             }}
           }}

@@ -82,10 +82,10 @@ def test_reconcile_marks_only_branch_present_items(monkeypatch) -> None:
 
     captured: dict = {}
 
-    def fake_verify(repo, branch, pr_numbers, *, token="", git_env=None):
+    def fake_verify(repo, branch, pr_merged_at, *, token="", git_env=None):
         captured["repo"] = repo
         captured["branch"] = branch
-        captured["pr_numbers"] = set(pr_numbers)
+        captured["pr_merged_at"] = dict(pr_merged_at)
         return {201}  # only 201 actually landed on the branch
 
     monkeypatch.setattr(mark_done, "verify_prs_on_branch", fake_verify)
@@ -99,7 +99,7 @@ def test_reconcile_marks_only_branch_present_items(monkeypatch) -> None:
     )
 
     # Only valkey-io/valkey items still "To be backported" are candidates.
-    assert captured["pr_numbers"] == {201, 202}
+    assert set(captured["pr_merged_at"]) == {201, 202}
     assert captured["repo"] == "valkey-io/valkey"
     assert captured["branch"] == "9.1"
     assert result.updated == [201]
@@ -122,6 +122,35 @@ def test_reconcile_no_candidates_is_noop(monkeypatch) -> None:
         project_number=14,
         source_repo="valkey-io/valkey",
         target_branch="9.1",
+    )
+
+    assert result == BackportStatusUpdateResult(requested=[])
+    assert gql.mutations == []
+
+
+def test_reconcile_ignores_unmerged_project_items(monkeypatch) -> None:
+    gql = FakeGraphQLClient(
+        project_items=[
+            _project_item(
+                302,
+                "valkey-io/valkey",
+                "item-302",
+                "To be backported",
+                merged_at=None,
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        mark_done, "verify_prs_on_branch",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not verify")),
+    )
+
+    result = reconcile_project_board(
+        gql,
+        project_owner="valkey-io",
+        project_number=51,
+        source_repo="valkey-io/valkey",
+        target_branch="9.2",
     )
 
     assert result == BackportStatusUpdateResult(requested=[])
@@ -219,9 +248,9 @@ def test_verify_counts_subject_but_not_body_mention(tmp_path, monkeypatch) -> No
         "valkey-io/valkey",
         "9.1",
         {
-            3801,  # present via subject (#3801)
-            3920,  # only mentioned in a body -> NOT present
-            4242,  # never referenced -> absent
+            3801: "2000-01-01T00:00:00Z",  # present via subject (#3801)
+            3920: "2000-01-01T00:00:00Z",  # only mentioned in a body -> NOT present
+            4242: "2000-01-01T00:00:00Z",  # never referenced -> absent
         },
     )
 
@@ -269,13 +298,66 @@ def test_verify_detects_squash_merged_applied_table(tmp_path, monkeypatch) -> No
     present = mark_done.verify_prs_on_branch(
         "valkey-io/valkey",
         "9.1",
-        {3801, 3847, 7777, 8888, 9999},  # the ## Applied table is the only signal
+        {
+            number: "2000-01-01T00:00:00Z"
+            for number in (3801, 3847, 7777, 8888, 9999)
+        },  # the ## Applied table is the only signal
     )
 
     # Only Source-PR-column entries of the Applied table count: the #7777 in a
     # Title cell, the #8888 in a Detail cell, and the Needs-attention #9999 are
     # all excluded.
     assert present == {3801, 3847}
+
+
+def test_verify_ignores_imported_history_pr_number_collision(tmp_path, monkeypatch) -> None:
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+    def commit(message: str, committed_at: str, content: str) -> None:
+        (repo / "f").write_text(content)
+        subprocess.run(["git", "add", "f"], cwd=repo, check=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-qm", message],
+            cwd=repo,
+            check=True,
+            env={
+                **env,
+                "GIT_AUTHOR_DATE": committed_at,
+                "GIT_COMMITTER_DATE": committed_at,
+            },
+        )
+
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
+    commit(
+        "Merge pull request #4607 from oranagra/psync2_backlog",
+        "2018-01-16T15:32:58+01:00",
+        "old\n",
+    )
+    commit("Current backport (#5000)", "2026-09-21T10:00:00Z", "new\n")
+
+    def fake_clone(repo_full_name, target_branch, dest_dir, git_env):
+        subprocess.run(["git", "clone", "-q", str(repo), dest_dir], check=True, env=env)
+
+    monkeypatch.setattr(mark_done, "_shallow_clone", fake_clone)
+
+    present = mark_done.verify_prs_on_branch(
+        "valkey-io/valkey",
+        "9.2",
+        {
+            4607: "2026-09-21T09:24:51Z",
+            5000: "2026-09-21T09:30:00Z",
+        },
+    )
+
+    assert present == {5000}
 
 
 def test_dry_run_reports_without_mutating() -> None:
@@ -380,13 +462,18 @@ class FakeGraphQLClient:
 
 
 def _project_item(
-    number: int, repo: str, item_id: str, status: str
+    number: int,
+    repo: str,
+    item_id: str,
+    status: str,
+    merged_at: str | None = "2000-01-01T00:00:00Z",
 ) -> dict:
     return {
         "id": item_id,
         "content": {
             "__typename": "PullRequest",
             "number": number,
+            "mergedAt": merged_at,
             "repository": {"nameWithOwner": repo},
         },
         "fieldValues": {
