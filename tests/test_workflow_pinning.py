@@ -155,7 +155,10 @@ def test_push_capable_app_tokens_can_update_workflows():
 
 
 def test_backport_workflows_refresh_credentials_after_validation():
-    for filename in ("backport-sweep.yml", "backport-poll.yml"):
+    for filename, job_name in (
+        ("backport-sweep.yml", "sweep"),
+        ("backport-poll.yml", "poll"),
+    ):
         text = (Path(".github/workflows") / filename).read_text(encoding="utf-8")
         assert (
             text.index("- name: Generate preparation token")
@@ -164,10 +167,20 @@ def test_backport_workflows_refresh_credentials_after_validation():
             < text.index("- name: Publish backport sweep")
             < text.index("- name: Clean up prepared sweep")
         )
-        assert "role-duration-seconds: 10800" in text
         assert "TARGET_TOKEN: ${{ steps.prepare-token.outputs.token }}" in text
         assert "TARGET_TOKEN: ${{ steps.publish-token.outputs.token }}" in text
         assert "--target-token" not in text
+
+        workflow = yaml.load(text, Loader=yaml.BaseLoader)
+        job = workflow["jobs"][job_name]
+        aws_step = next(
+            step
+            for step in job["steps"]
+            if step.get("name") == "Configure AWS credentials"
+        )
+        assert int(aws_step["with"]["role-duration-seconds"]) >= (
+            int(job["timeout-minutes"]) * 60
+        )
 
     poll = (Path(".github/workflows") / "backport-poll.yml").read_text()
     assert 'cron: "0 * * * *"' in poll

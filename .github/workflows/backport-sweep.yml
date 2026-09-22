@@ -74,7 +74,7 @@ jobs:
     needs: preflight
     if: needs.preflight.outputs.has_entries == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.preflight.outputs.matrix) }}
@@ -126,7 +126,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: backport-sweep-${{ github.run_id }}-${{ matrix.branch }}
           aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 10800
+          role-duration-seconds: 18000
 
       - name: Prepare backport sweep
         id: prepare
