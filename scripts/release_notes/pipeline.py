@@ -17,13 +17,16 @@ from typing import Any
 from scripts.release_notes import code_age as code_age_mod
 from scripts.release_notes import discover as discover_mod
 from scripts.release_notes import generate as generate_mod
+from scripts.release_notes import prior_notes as prior_notes_mod
 from scripts.release_notes import projects as projects_mod
 from scripts.release_notes import render as render_mod
 from scripts.release_notes import triage as triage_mod
 from scripts.release_notes.ai_inputs import PRDiffCollector
 from scripts.release_notes.classify import classify
 from scripts.release_notes.models import (
+    AlignedNote,
     CollidedCommit,
+    DeclinedAlignment,
     MergedPR,
     ReleaseImpact,
     RevertedSourcePR,
@@ -66,12 +69,18 @@ class RegenResult:
     collided: tuple[CollidedCommit, ...] = ()  # distinct commits dropped by a reused subject (#N) (shipped un-noted)
     reverted: tuple[RevertedSourcePR, ...] = ()  # Revert-titled sweep manifest rows (the range ships the revert, not the change)
     pr_authors: tuple[str, ...] = ()  # GitHub logins of resolved source-PR authors; unresolved backports excluded
+    aligned: tuple[AlignedNote, ...] = ()  # notes whose wording was carried from a sibling release line
+    declined_alignments: tuple[DeclinedAlignment, ...] = ()  # sibling wording found but deliberately not carried
+    consistent_alignments: tuple[int, ...] = ()  # PRs whose generated wording already matched the sibling line
+    prior_lines_read: tuple[str, ...] = ()  # sibling release lines whose published notes were indexed
+    prior_lines_failed: tuple[tuple[str, str], ...] = ()  # (release line, why its notes could not be read)
 
 
 def regenerate_unreleased(
     repo: Any, clone_dir: str, *, head_ref: str, tag_glob: str | None,
     base_ref: str | None = None, release_branch: str | None = None,
     patch_release: bool = False,
+    align_prior_wording: bool = True,
     profile: projects_mod.ProjectProfile,
 ) -> RegenResult:
     """Discover the range, triage PRs without ``release-notes``, and generate bullets.
@@ -84,6 +93,11 @@ def regenerate_unreleased(
     line. ``profile`` carries the target repository's categories and prompt
     wording. Returns a RegenResult whose ``grouped`` map the cut caller renders
     into a dated section, plus the AI include/exclude decisions for the PR body.
+
+    Unless *align_prior_wording* is cleared, a bullet whose source PR another
+    release line already published a note for takes that published wording
+    verbatim, so a backported change reads identically on every line (see
+    :mod:`scripts.release_notes.prior_notes`).
     """
     discovery = discover_mod.discover(
         repo, clone_dir, head_ref, tag_glob=tag_glob, base_ref=base_ref,
@@ -181,6 +195,16 @@ def regenerate_unreleased(
     )
     # Keep one bullet per PR; prefer a renderable bullet over a reserved-category one.
     bullets, duplicate_prs = _dedup_bullets_by_pr(gen.bullets)
+    # Replace freshly-invented prose with the wording a sibling release line
+    # already published for the same source PR, so a backported change reads the
+    # same on every line. Runs before grouping so the carried text goes through
+    # the same render/format path as generated text.
+    align, prior_lines_read, prior_lines_failed = _align_prior_wording(
+        bullets, clone_dir,
+        profile=profile, release_branch=release_branch, discovery=discovery,
+        impact_review=impact_review, enabled=align_prior_wording,
+    )
+    bullets = align.bullets
     grouped = render_mod.group_bullets(bullets, categories=profile.categories)
 
     # Only report uncertainty for bullets that survive into grouped.
@@ -191,7 +215,9 @@ def regenerate_unreleased(
         if (m := _TRAILING_PR_RE.search(line))
     }
     # A note whose PR diff could not be read was judged on title/body alone;
-    # flag it for review even when the model itself was confident.
+    # flag it for review even when the model itself was confident. Wording
+    # alignment does not change this: a carried note still describes a change this
+    # cut could not read the diff of.
     def _reason(b: Any) -> str:
         parts = [b.uncertain_reason] if b.uncertain else []
         if b.pr_number in diff_collector.failed_reads:
@@ -240,7 +266,71 @@ def regenerate_unreleased(
         collided=discovery.collided,
         reverted=discovery.reverted,
         pr_authors=all_pr_authors,
+        # Only report carries/declines for notes that actually rendered.
+        aligned=tuple(n for n in align.aligned if n.pr_number in rendered_prs),
+        declined_alignments=tuple(
+            d for d in align.declined if d.pr_number in rendered_prs
+        ),
+        consistent_alignments=tuple(
+            pr for pr in align.already_consistent if pr in rendered_prs
+        ),
+        prior_lines_read=prior_lines_read,
+        prior_lines_failed=prior_lines_failed,
     )
+
+
+def _align_prior_wording(
+    bullets, clone_dir: str, *, profile: projects_mod.ProjectProfile,
+    release_branch: str | None, discovery: Any, impact_review: Any, enabled: bool,
+):
+    """Carry sibling release lines' published wording onto *bullets*.
+
+    Returns ``(AlignResult, lines_read, lines_failed)``. The index is built from
+    the clone the cut already made, so this adds no network call. Any failure
+    degrades to "no wording carried": inconsistent notes are a defect worth
+    fixing, but never worth failing a release cut over.
+
+    Two deterministic risk sets are passed through. A PR whose credit this cut
+    could not confirm (an unresolved backport or cherry-pick, or a subject
+    collision that reused a PR number) may not name the same change the sibling
+    line noted, so its wording is not carried. A PR naming a CVE is worded per
+    line by a human. ``material_scope_tokens`` supplies the one check that
+    distinguishes an adapted backport from a reworded one.
+    """
+    if not enabled or not bullets:
+        return prior_notes_mod.AlignResult(bullets=tuple(bullets)), (), ()
+    # Exclude the line being cut: its own credited PRs are dropped later by the
+    # cut's already-credited dedup, and a "carried from 8.0" report naming the
+    # line under cut would be misleading.
+    current_line = (
+        release_branch
+        if release_branch and prior_notes_mod.is_release_line(release_branch)
+        else None
+    )
+    try:
+        index = prior_notes_mod.build_index(
+            clone_dir,
+            notes_file=profile.notes_file,
+            display_name=profile.display_name,
+            current_line=current_line,
+            wanted={b.pr_number for b in bullets},
+        )
+        unconfirmed_credit = (
+            {item.number for item in discovery.unresolved_backports}
+            | {item.number for item in discovery.unresolved_cherry_picks}
+            | {item.number for item in discovery.collided}
+        )
+        result = prior_notes_mod.align_wording(
+            bullets, index,
+            prs_by_number={pr.number: pr for pr in discovery.prs},
+            scope_tokens=generate_mod.material_scope_tokens,
+            unconfirmed_credit_prs=unconfirmed_credit,
+            cve_prs={item.number for item in impact_review if item.cve},
+        )
+    except Exception as exc:  # noqa: BLE001 - never fail a cut over wording alignment
+        logger.warning("Could not align prior release-note wording: %s", exc)
+        return prior_notes_mod.AlignResult(bullets=tuple(bullets)), (), ()
+    return result, index.lines_read, index.lines_failed
 
 
 def _triaged_prs(decisions, by_number):

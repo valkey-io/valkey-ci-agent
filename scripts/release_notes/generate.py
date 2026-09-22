@@ -443,6 +443,30 @@ def _review_bullet(
     return _apply_factual_scope_guardrail(reviewed, pr)
 
 
+def material_scope_tokens(text: str) -> frozenset[str]:
+    """Which material environment boundaries *text* states (32-bit, ARM, Windows...).
+
+    The note side of :data:`_MATERIAL_SCOPE_RULES`, exposed so two candidate
+    wordings for one note can be compared for equal blast radius.
+
+    :mod:`scripts.release_notes.prior_notes` needs exactly this. When it reuses a
+    sibling release line's published wording, ``_apply_factual_scope_guardrail``
+    cannot police the substitution: that guardrail's evidence is the PR's title
+    and body, and a backport is remapped to its original PR, so the evidence is
+    byte-identical on every line no matter how differently the backport behaves
+    there. The freshly generated text is the only input that saw *this* line's
+    diff. Requiring the two wordings to name the same boundaries makes the
+    guardrail's verdict on the reused text provably identical to its verdict on
+    the generated text, and refuses the reuse exactly when the lines disagree
+    about how far the change reaches.
+    """
+    return frozenset(
+        label
+        for label, _evidence_re, note_re in _MATERIAL_SCOPE_RULES
+        if note_re.search(text)
+    )
+
+
 def generate(
     prs: Sequence[MergedPR],
     *,

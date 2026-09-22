@@ -79,6 +79,43 @@ class UncertainNote:
 
 
 @dataclass(frozen=True)
+class AlignedNote:
+    """A note whose wording was carried verbatim from a sibling release line.
+
+    A backported change is cut once per release line, and each cut's AI run
+    invents its own prose. When another line already published a note for the
+    same source PR, that published ``text`` is substituted so the lines agree
+    word for word (see :mod:`scripts.release_notes.prior_notes`). Reported in the
+    release PR body: substituting text is a decision a reviewer must be able to
+    see and reject.
+    """
+
+    pr_number: int
+    release_line: str        # the "M.m" line the wording came from
+    release_heading: str     # the dated heading it was published under
+    text: str                # the carried wording
+    generated_text: str = ""  # what this cut's own AI run had written for the note
+
+
+@dataclass(frozen=True)
+class DeclinedAlignment:
+    """A sibling line's published note that was found but deliberately not carried.
+
+    ``reason`` says why in reviewer-facing terms. ``needs_review`` marks the cases
+    where the two lines contradict each other about the change — a different
+    credit, or a different environment scope — which a human must settle and which
+    hold the release PR. The rest are structural and informational: the line
+    simply keeps the wording it generated.
+    """
+
+    pr_number: int
+    release_line: str
+    release_heading: str
+    reason: str
+    needs_review: bool = False
+
+
+@dataclass(frozen=True)
 class GenerationResult:
     """AI output for the whole range: categorized bullets and skipped PRs."""
 

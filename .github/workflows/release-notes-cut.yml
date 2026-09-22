@@ -97,6 +97,11 @@ on:
         required: false
         type: boolean
         default: false
+      no_align_prior_wording:
+        description: "Word this line's notes independently instead of reusing what another release line published for the same PR"
+        required: false
+        type: boolean
+        default: false
       force_ready:
         description: "Open ready despite reviewer-facing signals"
         required: false
@@ -237,6 +242,7 @@ jobs:
           RELEASE_NOTES_BASE_REF: ${{ inputs.base_ref || '' }}
           RELEASE_NOTES_SECURITY_FIXES: ${{ inputs.security_fixes || '' }}
           RELEASE_NOTES_SECURITY_FROM_ADVISORIES: ${{ inputs.security_from_advisories && 'true' || 'false' }}
+          RELEASE_NOTES_NO_ALIGN_PRIOR_WORDING: ${{ inputs.no_align_prior_wording && 'true' || 'false' }}
           RELEASE_NOTES_FORCE_READY: ${{ inputs.force_ready && 'true' || 'false' }}
           RELEASE_NOTES_RELEASE_OWNER: ${{ inputs.release_owner || github.actor }}
           RELEASE_NOTES_DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}

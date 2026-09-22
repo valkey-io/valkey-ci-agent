@@ -47,6 +47,7 @@ def test_shared_workflow_keeps_advanced_inputs_available() -> None:
         "base_ref",
         "security_fixes",
         "security_from_advisories",
+        "no_align_prior_wording",
         "force_ready",
         "release_owner",
         "dry_run",
@@ -71,6 +72,7 @@ def test_advanced_dispatch_delegates_to_the_shared_release_job() -> None:
         "base_ref",
         "security_fixes",
         "security_from_advisories",
+        "no_align_prior_wording",
         "force_ready",
         "dry_run",
     }

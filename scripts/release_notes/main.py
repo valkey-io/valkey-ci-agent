@@ -122,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
                         default=_env_flag("RELEASE_NOTES_SECURITY_FROM_ADVISORIES"),
                         help="Auto-render PUBLISHED GitHub security advisories fixed by this "
                              "version into Security Fixes (merged with any --security-fix bullets)")
+    parser.add_argument("--no-align-prior-wording", action="store_true",
+                        default=_env_flag("RELEASE_NOTES_NO_ALIGN_PRIOR_WORDING"),
+                        help="Generate this line's note wording independently instead of "
+                             "reusing what another release line already published for the "
+                             "same source PR. Only for a line whose changelog conventions "
+                             "differ from its siblings; the default keeps a backported "
+                             "change worded identically on every branch.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute and print the cut without pushing or opening a PR")
     parser.add_argument(
@@ -194,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             force_ready=args.force_ready,
             release_owner=release_owner,
+            align_prior_wording=not args.no_align_prior_wording,
             resolve_rc1_baseline=resolve_rc1_baseline,
             profile=profile,
         )
@@ -305,6 +313,7 @@ def _run_cut(
     dry_run: bool,
     force_ready: bool = False,
     release_owner: str = "",
+    align_prior_wording: bool = True,
     resolve_rc1_baseline: bool = False,
     profile: projects_mod.ProjectProfile,
 ) -> int:
@@ -359,6 +368,7 @@ def _run_cut(
                 token=token, git_env=git_env, dry_run=dry_run,
                 force_ready=force_ready,
                 release_owner=release_owner,
+                align_prior_wording=align_prior_wording,
                 baseline_unanchored=baseline_unanchored,
                 profile=profile,
             )

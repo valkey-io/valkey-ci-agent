@@ -383,6 +383,8 @@ main.py (manual dispatch: repo, version, optional stage, urgency, dry_run)
             -> generate()  AI: one categorized bullet per included PR
             -> normalize operator-output categories and canonical bullet format
             -> dedup bullets by PR number (surfaces duplicate_prs)
+            -> prior_notes.align_wording()  reuse a sibling release line's
+                            published text for the same source PR (local, read-only)
             -> group_bullets()  {category: [canonical bullet line, ...]}
        -> _drop_already_credited()   dedup against PRs the line already ships
        -> promote_and_bump()         dated section + profile version bump + contributors
@@ -398,6 +400,24 @@ advances when a human merges. The normal dispatch has five inputs and defaults t
 a dry run; patch versions may omit stage and infer `ga`, while `M.m.0` always
 requires an explicit stage. The advanced dispatch is a thin wrapper around the
 same reusable workflow.
+
+Each release line is cut by its own independent run, so nothing about the AI pass
+makes two lines word the same backported change the same way. One carve-out
+closes that gap: because `backport_refs` resolves a release-branch commit back to
+its *original* source PR before the bullet's `(#N)` is written, that reference is
+identical on every line and is produced by code, never by the model. Before
+rendering, `prior_notes` builds an index of the sibling release lines' merged
+`00-RELEASENOTES` files keyed by that number and, on a hit, substitutes the
+published text for this cut's generated prose. The index is read out of refs the
+clone already has (`refs/remotes/origin/<M.m>` — `main.py` clones without
+`--single-branch`/`--depth` and fetches tags), so consistency costs no extra
+network calls and no writes; a line whose changelog is unreadable is reported and
+skipped rather than failing the cut. Only prose is carried — category, credit,
+and reference remain this cut's — and only from bullets under the canonical
+`### <category>` headings `release_format.render_version_section` writes, which
+excludes every hand-authored legacy section. Because the shared grammar
+(`trailing_pr_numbers`, the bullet form) lives in `release_format`, `prior_notes`
+stays importable from `pipeline` without the `release_cut` -> `pipeline` cycle.
 
 The prep branch name is deterministic for a version and stage. Re-dispatching
 while its PR is open regenerates the full tagged range through the latest M.m
@@ -446,7 +466,8 @@ Signals fall into two tiers. Malformed inputs, a missing target branch, an
 already-released/backward target, or a target branch that advances during
 generation are hard errors that abort before any PR. Warnings (out-of-sequence
 stages, unresolved PRs, empty notes, security mismatches, AI-triage decisions,
-deterministic triage overrides, and `LOW`/`MODERATE` urgency paired with
+deterministic triage overrides, an irreconcilable cross-line wording conflict, and
+`LOW`/`MODERATE` urgency paired with
 release-impact signals) hold the PR as a draft with a banner naming them. Impact
 detection is a review trigger, not an automatic security or severity
 classification. Re-dispatch reconciles draft state automatically. `force_ready`,
@@ -467,6 +488,7 @@ calendar date.
 - `scripts/release_notes/ai_inputs.py` - shared, bounded PR prompt payloads and SHA-cached diffs; combined sweep diffs are omitted when they cannot be attributed to one source PR
 - `scripts/release_notes/triage.py` - completeness-first Claude include/exclude plus deterministic release-impact guardrail for PRs without `release-notes` (no tools; PR data inlined in prompt)
 - `scripts/release_notes/generate.py` - Claude bullet generation (no tools; PR data inlined in prompt)
+- `scripts/release_notes/prior_notes.py` - index sibling release lines' published `00-RELEASENOTES` bullets by source PR number and reuse their wording (local git reads only; declines and holds on a cross-line contradiction)
 - `scripts/release_notes/models.py` - typed dataclasses for the pipeline
 - `scripts/release_notes/projects.py` - per-repo release conventions (ProjectProfile) and version bumpers (valkey version.h macros, valkey-search kModuleVersion, valkey-json CMake project VERSION, valkey-bloom Cargo.toml)
 - `scripts/release_notes/security.py` - Security Fixes from published GitHub advisories (never AI-authored)

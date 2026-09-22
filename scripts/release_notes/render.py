@@ -25,6 +25,11 @@ def _one_line(text: str) -> str:
     return " ".join(text.splitlines()).strip()
 
 
+def safe_handle(author: str) -> str:
+    """The handle :func:`format_bullet` would credit for *author* ("" for none)."""
+    return _HANDLE_SAFE_RE.sub("", author)
+
+
 def format_bullet(bullet: CategorizedBullet) -> str:
     """Render one canonical bullet line: ``* <text> by @<handle> (#<N>)``.
 
@@ -49,7 +54,7 @@ def format_bullet(bullet: CategorizedBullet) -> str:
     if without_terminal_punctuation:
         text = without_terminal_punctuation
     parts = [f"* {text}"]
-    handle = _HANDLE_SAFE_RE.sub("", bullet.author)
+    handle = safe_handle(bullet.author)
     if handle:
         parts.append(f"by @{handle}")
     parts.append(f"(#{bullet.pr_number})")

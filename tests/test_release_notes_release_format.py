@@ -361,3 +361,75 @@ class TestModuleRepoRendering:
             prior_text="Some unrelated placeholder text\n", contributors=[],
         )
         assert "placeholder" not in out
+
+
+class TestTrailingPrNumbers:
+    """The trailing ``(#N)`` group is the branch-invariant join key.
+
+    ``prior_notes`` and the release-cut dedup both read it, so the grammar lives
+    here once rather than being re-derived per caller.
+    """
+
+    @pytest.mark.parametrize("line,expected", [
+        ("* Fix a crash by @alice (#42)", {42}),
+        ("* Fix a crash (#42)", {42}),
+        ("* Assorted fixes (#47, #232)", {47, 232}),
+        ("* Assorted fixes (#47,#232, #9)", {47, 232, 9}),
+        ("* Fix a crash (#42).", {42}),
+        ("* Fix a crash (#42) ", {42}),
+        # Only the *final* group counts; a mid-sentence reference is prose.
+        ("* Revert the change from (#1200) that broke replicas (#42)", {42}),
+        ("* Fix a crash", set()),
+        # A reference that is not at the end credits nothing: the group must be
+        # trailing, or prose quoting a PR would be read as this note's credit.
+        ("* Revert the change from (#1200) that broke replicas", set()),
+    ])
+    def test_trailing_group_parsed(self, line, expected) -> None:
+        assert rf.trailing_pr_numbers(line) == expected
+
+    def test_only_bullets_are_credited(self) -> None:
+        text = (
+            "Valkey 9.0.1  -  Released Tue 21 July 2026\n"
+            "### Bug Fixes\n"
+            "* Fix a crash by @alice (#42)\n"
+            "Some prose mentioning (#99)\n"
+            "- Fix a leak by @bob (#43)\n"
+        )
+        assert rf.credited_pr_numbers(text) == {42, 43}
+
+
+class TestDatedReleaseKey:
+    """Dated headings sort deterministically, RC before the GA of one version."""
+
+    def test_ga_and_rc_keys(self) -> None:
+        assert rf.dated_release_key("Valkey 9.0.1  -  Released Tue 21 July 2026", "Valkey") == (
+            9, 0, 1, 1, 0,
+        )
+        assert rf.dated_release_key("Valkey 9.0.0 GA  -  Released Mon 31 March 2025", "Valkey") == (
+            9, 0, 0, 1, 0,
+        )
+        assert rf.dated_release_key("Valkey 9.0.0 RC2  -  Released Thu 20 March 2025", "Valkey") == (
+            9, 0, 0, 0, 2,
+        )
+
+    def test_rc_sorts_before_ga_of_the_same_version(self) -> None:
+        rc1 = rf.dated_release_key("Valkey 9.0.0 RC1", "Valkey")
+        rc2 = rf.dated_release_key("Valkey 9.0.0 RC2", "Valkey")
+        ga = rf.dated_release_key("Valkey 9.0.0 GA", "Valkey")
+        patch = rf.dated_release_key("Valkey 9.0.1", "Valkey")
+        assert rc1 < rc2 < ga < patch
+
+    @pytest.mark.parametrize("line", [
+        "Valkey 9.0 release notes",
+        "Valkey Search 1.2.1 GA",
+        "### Bug Fixes",
+        "Valkeyish 9.0.1",
+        "",
+    ])
+    def test_non_headings_rejected(self, line) -> None:
+        assert rf.dated_release_key(line, "Valkey") is None
+
+    def test_display_name_is_matched_exactly(self) -> None:
+        assert rf.dated_release_key("Valkey Search 1.2.1 GA", "Valkey Search") == (
+            1, 2, 1, 1, 0,
+        )
