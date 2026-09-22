@@ -44,6 +44,7 @@ from scripts.backport.sweep_git import (
     untracked_paths,
 )
 from scripts.backport.validation import select_validation_commands
+from scripts.common.logging_utils import compact_log_value, log_highlight
 
 logger = logging.getLogger(__name__)
 
@@ -180,9 +181,11 @@ def apply_candidate(
     except (SourceChangeError, subprocess.CalledProcessError) as exc:
         return CandidateResult(candidate.source_pr_number, candidate.source_pr_title, "error", str(exc))
 
-    logger.info(
-        "Applying PR #%d from %s with %s plan (%d commit(s))",
+    log_highlight(
+        logger,
+        "BACKPORT ATTEMPT: PR #%d | %s | source=%s | plan=%s | commits=%d",
         candidate.source_pr_number,
+        compact_log_value(candidate.source_pr_title),
         repo_full_name,
         plan.strategy,
         len(plan.commits),

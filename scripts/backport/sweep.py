@@ -54,6 +54,7 @@ from scripts.backport.sweep_validation import (
 )
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.job_summary import emit_job_summary
+from scripts.common.logging_utils import compact_log_value, log_highlight
 
 if TYPE_CHECKING:
     from scripts.backport.registry import BranchEntry, RepoEntry  # noqa: F401
@@ -67,6 +68,21 @@ _DEFAULT_BRANCH_FIELDS = (
 _DEFAULT_STATUS_FIELD = "Status"
 _DEFAULT_STATUS_VALUE = "To be backported"
 _BRANCH_PREFIX = "agent/backport/sweep"
+
+
+def _log_existing_sweep_pr(
+    existing_pr: Any,
+    target_branch: str,
+    backport_branch: str,
+) -> None:
+    log_highlight(
+        logger,
+        "BACKPORT SWEEP PR: resuming PR #%d | %s | target=%s | branch=%s",
+        existing_pr.number,
+        compact_log_value(getattr(existing_pr, "title", "")),
+        target_branch,
+        backport_branch,
+    )
 
 
 class ProjectBackportDiscovery:
@@ -425,11 +441,12 @@ def _prepare_branch(
                         f"Open backport PR #{existing_pr.number} has no remote branch "
                         f"{backport_branch}"
                     )
-                logger.info(
-                    "Found existing PR #%d for %s, fetching branch...",
-                    existing_pr.number,
+                _log_existing_sweep_pr(
+                    existing_pr,
                     target_branch,
+                    backport_branch,
                 )
+                logger.info("Fetching existing backport sweep branch...")
                 _run_git(tmpdir, "fetch", "push_target", backport_branch, env=git_env)
                 _run_git(tmpdir, "checkout", f"push_target/{backport_branch}")
                 _run_git(tmpdir, "checkout", "-B", backport_branch)
@@ -495,6 +512,12 @@ def _prepare_branch(
                 break
 
             if str(candidate.source_pr_number) in already_applied:
+                logger.info(
+                    "BACKPORT SKIPPED: PR #%d | %s | already present on %s",
+                    candidate.source_pr_number,
+                    compact_log_value(candidate.source_pr_title),
+                    backport_branch,
+                )
                 result.results.append(
                     CandidateResult(
                         source_pr_number=candidate.source_pr_number,
@@ -531,6 +554,12 @@ def _prepare_branch(
                     "restore the worktree; aborting this branch"
                 )
             if candidate_result.outcome != "applied":
+                logger.warning(
+                    "BACKPORT NOT APPLIED: PR #%d | %s | outcome=%s",
+                    candidate.source_pr_number,
+                    compact_log_value(candidate.source_pr_title),
+                    candidate_result.outcome,
+                )
                 continue
 
             validation_outcome = validate_branch_with_optional_repair(
@@ -553,8 +582,10 @@ def _prepare_branch(
                 candidate_result.detail = validation_failure_detail(output)
                 _run_git(tmpdir, "reset", "--hard", pre_candidate_head)
                 logger.warning(
-                    "Validation failed for candidate #%d on %s; removed candidate and continuing.",
+                    "BACKPORT REJECTED: PR #%d | %s | target=%s | "
+                    "validation failed; removed candidate and continuing",
                     candidate.source_pr_number,
+                    compact_log_value(candidate.source_pr_title),
                     target_branch,
                 )
                 continue
@@ -578,6 +609,12 @@ def _prepare_branch(
                         )
                         if part
                     )
+            logger.info(
+                "BACKPORT ACCEPTED: PR #%d | %s | target=%s",
+                candidate.source_pr_number,
+                compact_log_value(candidate.source_pr_title),
+                target_branch,
+            )
             applied_count += 1
 
         committed = [

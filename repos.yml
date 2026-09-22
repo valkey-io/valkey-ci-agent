@@ -6,7 +6,9 @@ repos:
     validation_setup_commands:
       # tcl-tls is what `./runtest --tls` needs; tests/unit/tls.tcl silently
       # skips its whole body without it.
-      - "sudo apt-get update && sudo apt-get install -y clang-format-18 libssl-dev tcl8.6 tclx tcl-tls"
+      # src/unit/Makefile resolves both gtest and gmock through pkg-config before
+      # any C++ unit test can compile.
+      - "sudo apt-get update && sudo apt-get install -y clang-format-18 libssl-dev libgtest-dev libgmock-dev tcl8.6 tclx tcl-tls"
       - "python3 -m pip install -r utils/req-res-validator/requirements.txt"
       # Certificates for the TLS validation rule below. Runs once per branch,
       # writes only to the gitignored tests/tls/.
