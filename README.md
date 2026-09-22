@@ -96,7 +96,7 @@ The `valkey-core` profile adds checks that static globs cannot express safely:
 `git diff --check` over the candidate range, branch-native `clang-format-18`
 over only candidate line ranges and suffixes enforced by that release's
 workflow, directly changed Tcl tests (including required modes such as TLS),
-C/C++ unit tests, subsystem tests for cluster/TLS/RDB/sentinel/module or
+C/C++ unit tests, branch-compatible checks for cluster, sentinel, module, or
 test-harness changes, and targeted reply-schema validation for changed tests
 that do not opt out. It checks the target branch's actual C/C++ unit-test
 discovery convention, so a clean cross-harness cherry-pick cannot pass while
