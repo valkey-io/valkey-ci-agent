@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -13,6 +15,7 @@ from scripts.backport.registry import (
     ValidationRule,
     load_registry,
 )
+from scripts.backport.validation import select_validation_commands
 
 
 def _write_registry(tmp_path, data):
@@ -39,6 +42,24 @@ def _minimal_registry(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def test_valkey_registry_installs_dependencies_for_cpp_unit_validation():
+    project_root = Path(__file__).resolve().parents[1]
+    registry = load_registry(str(project_root / "repos.yml"))
+    valkey = next(entry for entry in registry.repos if entry.repo == "valkey-io/valkey")
+
+    commands = select_validation_commands(
+        valkey.build_commands,
+        valkey.validation_rules,
+        ("src/unit/test_bgiteration.cpp",),
+        validation_profile=valkey.validation_profile,
+    )
+    setup = " ".join(valkey.validation_setup_commands)
+
+    assert "make -C src test-unit" in commands
+    assert "libgtest-dev" in setup
+    assert "libgmock-dev" in setup
 
 
 class TestLoadRegistry:
