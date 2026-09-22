@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -48,6 +49,7 @@ from scripts.backport.sweep_validation import (
     validate_backport_branch,
 )
 from scripts.common.git_auth import GitAuth
+from scripts.common.logging_utils import LOG_HIGHLIGHT_RULE
 
 
 def _candidate_apply_process(fake_run):
@@ -1727,6 +1729,30 @@ def _mock_phase_boundary(monkeypatch, target_branch="8.1"):
             "pre-candidate-head" if branch == target_branch else None
         ),
     )
+
+
+def test_existing_sweep_pr_log_highlights_number_title_and_branch(caplog):
+    existing_pr = SimpleNamespace(
+        number=4731,
+        title="\x1b[32m[backport]\nBackport sweep for 9.2\x1b[0m",
+    )
+    caplog.set_level(logging.INFO, logger=backport_sweep.__name__)
+
+    backport_sweep._log_existing_sweep_pr(
+        existing_pr,
+        "9.2",
+        "agent/backport/sweep/9.2",
+    )
+
+    assert caplog.messages == [
+        LOG_HIGHLIGHT_RULE,
+        (
+            "BACKPORT SWEEP PR: resuming PR #4731 | "
+            "[backport] Backport sweep for 9.2 | target=9.2 | "
+            "branch=agent/backport/sweep/9.2"
+        ),
+        LOG_HIGHLIGHT_RULE,
+    ]
 
 
 

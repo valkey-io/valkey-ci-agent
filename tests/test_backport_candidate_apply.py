@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ from scripts.backport.models import (
 )
 from scripts.backport.source_plan import SourceChangePlan
 from scripts.backport.sweep_git import list_applied_prs_on_branch
+from scripts.common.logging_utils import LOG_HIGHLIGHT_RULE
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -60,6 +62,53 @@ def _candidate(
         merge_commit_sha=merge_commit_sha,
         commit_shas=commit_shas,
     )
+
+
+def test_apply_candidate_highlights_number_title_and_plan(
+    caplog,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    candidate = BackportCandidate(
+        source_pr_number=4714,
+        source_pr_title="\x1b[31mDeflake\nBgIterationTest.createAndCleanup\x1b[0m",
+        source_pr_url="https://github.com/example/repo/pull/4714",
+        target_branch="9.2",
+    )
+    plan = SourceChangePlan(
+        strategy="single",
+        commits=("source-sha",),
+        merge_commit_sha="source-sha",
+        source_commits=("source-sha",),
+        aggregate_patch_id="patch-id",
+    )
+    monkeypatch.setattr(
+        candidate_apply,
+        "head_sha",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("stop after logging")
+        ),
+    )
+    caplog.set_level(logging.INFO, logger=candidate_apply.__name__)
+
+    result = apply_candidate(
+        str(tmp_path),
+        candidate,
+        "valkey-io/valkey",
+        {},
+        source_plan=plan,
+    )
+
+    assert result.outcome == "error"
+    assert caplog.messages == [
+        LOG_HIGHLIGHT_RULE,
+        (
+            "BACKPORT ATTEMPT: PR #4714 | "
+            "Deflake BgIterationTest.createAndCleanup | "
+            "source=valkey-io/valkey | plan=single | commits=1"
+        ),
+        LOG_HIGHLIGHT_RULE,
+    ]
 
 
 def test_rebase_merged_pull_request_fails_closed_end_to_end(
