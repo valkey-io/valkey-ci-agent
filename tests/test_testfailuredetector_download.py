@@ -10,6 +10,7 @@ import pytest
 try:
     from scripts.test_failure_detector.download import (
         download_all_test_failures,
+        get_job_info,
         get_job_urls,
         get_latest_daily_run,
     )
@@ -21,12 +22,19 @@ except ImportError as _exc:
 pytestmark = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
 
-def _make_mock_run(run_number: int, run_id: int, conclusion: str, status: str = "completed"):
+def _make_mock_run(
+    run_number: int,
+    run_id: int,
+    conclusion: str,
+    status: str = "completed",
+    event: str = "schedule",
+):
     run = MagicMock()
     run.run_number = run_number
     run.id = run_id
     run.conclusion = conclusion
     run.status = status
+    run.event = event
     run.created_at = "2026-06-01 00:00:00+00:00"
     return run
 
@@ -73,6 +81,55 @@ class TestGetLatestDailyRun:
 
         result = get_latest_daily_run(mock_gh, "owner/repo")
         assert result == failure_run
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_skips_startup_failure_runs(self, mock_retry) -> None:
+        """A run that died before any job started uploads no artifact. Returning
+        it would report the older run's real failures as a clean pass."""
+        startup_failed = _make_mock_run(14, 200, "startup_failure")
+        failure_run = _make_mock_run(13, 199, "failure")
+
+        mock_workflow = MagicMock()
+        mock_workflow.name = "Daily"
+        mock_workflow.get_runs.return_value = [startup_failed, failure_run]
+
+        mock_repo = MagicMock()
+        mock_repo.get_workflows.return_value = [mock_workflow]
+        mock_retry.side_effect = lambda op, **kwargs: op()
+
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        assert get_latest_daily_run(mock_gh, "owner/repo") == failure_run
+
+    def test_run_listing_is_retried_around_iteration(self) -> None:
+        """get_runs() returns a lazy PaginatedList that issues no request until
+        iterated, so the retry must wrap the iteration, not the construction."""
+        from github import GithubException
+
+        state = {"calls": 0}
+
+        class _LazyRuns:
+            def __iter__(self):
+                state["calls"] += 1
+                if state["calls"] == 1:
+                    raise GithubException(502, {"message": "Server Error"}, None)
+                return iter([_make_mock_run(13, 199, "failure")])
+
+        mock_workflow = MagicMock()
+        mock_workflow.name = "Daily"
+        mock_workflow.get_runs.return_value = _LazyRuns()
+
+        mock_repo = MagicMock()
+        mock_repo.get_workflows.return_value = [mock_workflow]
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        with patch("scripts.common.github_client.time.sleep"):
+            result = get_latest_daily_run(mock_gh, "owner/repo")
+
+        assert result.id == 199
+        assert state["calls"] == 2
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
     def test_returns_first_success_or_failure(self, mock_retry) -> None:
@@ -138,18 +195,50 @@ class TestGetLatestDailyRun:
         assert result is None
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
-    def test_filters_to_scheduled_runs_only(self, mock_retry) -> None:
-        """Run selection must restrict to event='schedule'.
+    def test_discovers_only_scheduled_runs(self, mock_retry) -> None:
+        """Auto-discovery takes the nightly run and nothing else.
 
-        The Daily workflow also runs on pull_request, and those PR runs are
-        more recent than the nightly. Without the event filter the detector
-        picks a PR run (which has no test artifacts) instead of the nightly.
+        A dispatched Daily accepts inputs that skip jobs and can point the
+        checkout at another repository or ref, so its failures need not belong
+        to this branch and its absent jobs would read as passing. The API
+        filters one event at a time, so the listing stays unfiltered and the
+        event check is local.
         """
-        scheduled_run = _make_mock_run(12, 199, "failure")
+        for event, expected in (("schedule", True), ("workflow_dispatch", False)):
+            run = _make_mock_run(12, 199, "failure", event=event)
+
+            mock_workflow = MagicMock()
+            mock_workflow.name = "Daily"
+            mock_workflow.get_runs.return_value = [run]
+
+            mock_repo = MagicMock()
+            mock_repo.get_workflows.return_value = [mock_workflow]
+
+            mock_retry.side_effect = lambda op, **kwargs: op()
+
+            mock_gh = MagicMock()
+            mock_gh.get_repo.return_value = mock_repo
+
+            found = get_latest_daily_run(mock_gh, "owner/repo")
+            assert (found == run) is expected, event
+            mock_workflow.get_runs.assert_called_once_with(
+                branch="unstable", status="completed",
+            )
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_skips_pull_request_runs(self, mock_retry) -> None:
+        """A pull_request run tests the PR's merge commit, not the branch, so
+        its failures belong to the PR. A PR opened from a branch in the same
+        repo needs no approval and reaches a real conclusion, so the
+        conclusion check alone would let it through and the detector would
+        file PR failures against the branch.
+        """
+        pr_run = _make_mock_run(14, 299, "failure", event="pull_request")
+        nightly_run = _make_mock_run(13, 298, "failure", event="schedule")
 
         mock_workflow = MagicMock()
         mock_workflow.name = "Daily"
-        mock_workflow.get_runs.return_value = [scheduled_run]
+        mock_workflow.get_runs.return_value = [pr_run, nightly_run]
 
         mock_repo = MagicMock()
         mock_repo.get_workflows.return_value = [mock_workflow]
@@ -159,11 +248,7 @@ class TestGetLatestDailyRun:
         mock_gh = MagicMock()
         mock_gh.get_repo.return_value = mock_repo
 
-        result = get_latest_daily_run(mock_gh, "owner/repo")
-        assert result == scheduled_run
-        mock_workflow.get_runs.assert_called_once_with(
-            branch="unstable", status="completed", event="schedule",
-        )
+        assert get_latest_daily_run(mock_gh, "owner/repo") == nightly_run
 
     @patch("scripts.test_failure_detector.download.retry_github_call")
     def test_skips_action_required_runs(self, mock_retry) -> None:
@@ -263,6 +348,49 @@ class TestDownloadAllTestFailures:
         )
         assert result is None
 
+    def test_filters_by_name_so_siblings_cannot_hide_the_artifact(self) -> None:
+        """The listing must be name-filtered: a Daily run uploads one artifact
+        per job, and an unfiltered first page can omit the one we want."""
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [self._make_artifact("all-test-failures")]
+        client.download_artifact.return_value = {"all-test-failures.json": b"{}"}
+
+        download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
+        assert client.list_run_artifacts.call_args.kwargs["name"] == "all-test-failures"
+
+    def test_prefers_newest_live_artifact_over_expired_attempt(self) -> None:
+        """Re-running a workflow leaves one artifact per attempt under the same
+        name. An expired earlier attempt must not shadow the usable one."""
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [
+            self._make_artifact("all-test-failures", artifact_id=1, expired=True),
+            self._make_artifact("all-test-failures", artifact_id=2, expired=False),
+        ]
+        client.download_artifact.return_value = {"all-test-failures.json": b'{"ok":1}'}
+
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
+        assert result == b'{"ok":1}'
+        client.download_artifact.assert_called_once_with(
+            "owner/repo", 2, damaged=None,
+        )
+
+    def test_returns_none_when_every_attempt_expired(self) -> None:
+        client = MagicMock()
+        client.list_run_artifacts.return_value = [
+            self._make_artifact("all-test-failures", artifact_id=1, expired=True),
+            self._make_artifact("all-test-failures", artifact_id=2, expired=True),
+        ]
+
+        result = download_all_test_failures(
+            MagicMock(), "owner/repo", 123, "fake-token", artifact_client=client,
+        )
+        assert result is None
+        client.download_artifact.assert_not_called()
+
 
 class TestGetJobUrls:
     @patch("scripts.test_failure_detector.download.retry_github_call")
@@ -357,3 +485,111 @@ class TestGetJobUrls:
 
         result = get_job_urls(mock_gh, "owner/repo", 123)
         assert result == {}
+
+
+def _step(number, name, conclusion="success"):
+    step = MagicMock()
+    step.number = number
+    step.name = name
+    step.conclusion = conclusion
+    return step
+
+
+class TestGetJobInfoStepUrls:
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_anchors_each_suite_to_its_step(self, mock_retry) -> None:
+        """A suite links to the step that ran it, not the job's first failure."""
+        job = MagicMock()
+        job.name = "test-ubuntu-jemalloc"
+        job.html_url = "https://example.com/job/1"
+        job.conclusion = "failure"
+        job.steps = [
+            _step(9, "test"),
+            _step(10, "module api test"),
+            _step(11, "sentinel tests"),
+            _step(12, "unittest", "failure"),
+        ]
+
+        mock_run = MagicMock()
+        mock_run.jobs.return_value = [job]
+        mock_repo = MagicMock()
+        mock_repo.get_workflow_run.return_value = mock_run
+        mock_retry.side_effect = lambda op, **kwargs: op()
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        info = get_job_info(mock_gh, "owner/repo", 123)
+        assert info.url_for("test-ubuntu-jemalloc", "valkey") == "https://example.com/job/1#step:9:1"
+        assert info.url_for("test-ubuntu-jemalloc", "unittest") == "https://example.com/job/1#step:12:1"
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_unmapped_suite_falls_back_to_plain_job_url(self, mock_retry) -> None:
+        """A suite with no step mapping keeps the plain job URL."""
+        job = MagicMock()
+        job.name = "test-ubuntu-jemalloc"
+        job.html_url = "https://example.com/job/1"
+        job.conclusion = "failure"
+        job.steps = [_step(9, "test")]
+
+        mock_run = MagicMock()
+        mock_run.jobs.return_value = [job]
+        mock_repo = MagicMock()
+        mock_repo.get_workflow_run.return_value = mock_run
+        mock_retry.side_effect = lambda op, **kwargs: op()
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        info = get_job_info(mock_gh, "owner/repo", 123)
+        assert info.url_for("test-ubuntu-jemalloc", "sentinel") == "https://example.com/job/1"
+
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_matrix_alias_shares_step_urls(self, mock_retry) -> None:
+        """A normalized job alias resolves the same step URLs as its exact name."""
+        job = MagicMock()
+        job.name = "test-valgrind-test (unit)"
+        job.html_url = "https://example.com/job/2"
+        job.conclusion = "failure"
+        job.steps = [_step(7, "test", "failure")]
+
+        mock_run = MagicMock()
+        mock_run.jobs.return_value = [job]
+        mock_repo = MagicMock()
+        mock_repo.get_workflow_run.return_value = mock_run
+        mock_retry.side_effect = lambda op, **kwargs: op()
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        info = get_job_info(mock_gh, "owner/repo", 123)
+        assert info.url_for("test-valgrind-test-unit", "valkey") == "https://example.com/job/2#step:7:1"
+
+
+class TestGetJobInfoFailedJobs:
+    @patch("scripts.test_failure_detector.download.retry_github_call")
+    def test_classifies_failure_and_timed_out_as_failed(self, mock_retry) -> None:
+        """A job the runner killed on the timeout concludes "timed_out", not
+        "failure". Both must land in ``failed`` so timeout recovery scans the
+        console logs where the [TIMEOUT] lines live."""
+        def _job(name, conclusion):
+            job = MagicMock()
+            job.name = name
+            job.html_url = f"https://example.com/{name}"
+            job.conclusion = conclusion
+            job.steps = []
+            return job
+
+        jobs = [
+            _job("job-failure", "failure"),
+            _job("job-timed-out", "timed_out"),
+            _job("job-success", "success"),
+            _job("job-cancelled", "cancelled"),
+        ]
+        mock_run = MagicMock()
+        mock_run.jobs.return_value = jobs
+        mock_repo = MagicMock()
+        mock_repo.get_workflow_run.return_value = mock_run
+        mock_retry.side_effect = lambda op, **kwargs: op()
+        mock_gh = MagicMock()
+        mock_gh.get_repo.return_value = mock_repo
+
+        info = get_job_info(mock_gh, "owner/repo", 123)
+        assert info.failed == {"job-failure", "job-timed-out"}
