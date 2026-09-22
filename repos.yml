@@ -10,30 +10,12 @@ repos:
       # any C++ unit test can compile.
       - "sudo apt-get update && sudo apt-get install -y clang-format-18 libssl-dev libgtest-dev libgmock-dev tcl8.6 tclx tcl-tls"
       - "python3 -m pip install -r utils/req-res-validator/requirements.txt"
-      # Certificates for the TLS validation rule below. Runs once per branch,
-      # writes only to the gitignored tests/tls/.
+      # Certificates for the valkey-core profile's TLS checks. Runs once per
+      # branch and writes only to the gitignored tests/tls/.
       - "./utils/gen-test-certs.sh"
     build_commands:
       - "make -j$(nproc) BUILD_TLS=yes"
     validation_profile: valkey-core
-    validation_rules:
-      - paths:
-          - "src/rdb.c"
-          - "src/rio.c"
-          - "src/t_stream.c"
-          - "src/stream.h"
-          - "src/listpack.c"
-        commands:
-          - "./runtest --single unit/dump --clients 1"
-      - paths:
-          - "src/tls.c"
-          - "src/tls.h"
-        commands:
-          # `--tls` is mandatory: tests/unit/tls.tcl wraps its entire body in
-          # `if {$::tls}`, so without the flag the unit passes without asserting
-          # anything. The build above is BUILD_TLS=yes, so built-in `--tls` is
-          # the matching mode (`--tls-module` would need BUILD_TLS=module).
-          - "./runtest --single unit/tls --clients 1 --tls"
     generated_file_rules:
       - paths:
           - "src/unit/*.c"

@@ -57,6 +57,7 @@ def test_valkey_registry_installs_dependencies_for_cpp_unit_validation():
     )
     setup = " ".join(valkey.validation_setup_commands)
 
+    assert valkey.validation_rules == ()
     assert "make -C src test-unit" in commands
     assert "libgtest-dev" in setup
     assert "libgmock-dev" in setup
