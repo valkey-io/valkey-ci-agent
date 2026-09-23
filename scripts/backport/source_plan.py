@@ -275,12 +275,15 @@ def _commit_exists(repo_dir: str, sha: str) -> bool:
 
 
 def _exact_patch_id(repo_dir: str, base: str, tip: str) -> str:
+    # Ignore surrounding context so an adjacent base-branch change made before
+    # a squash merge does not change the identity of the source changes.
     diff = _git_bytes(
         repo_dir,
         "diff",
         "--binary",
         "--full-index",
         "--no-ext-diff",
+        "--unified=0",
         base,
         tip,
     )
