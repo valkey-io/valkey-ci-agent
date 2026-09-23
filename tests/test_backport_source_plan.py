@@ -112,6 +112,46 @@ def test_squash_ignores_target_updates_merged_into_source(tmp_path: Path) -> Non
     assert plan.commits == (squash_sha,)
 
 
+def test_squash_ignores_adjacent_target_update_context(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _commit(repo, "settings.mk", "BUILD_TLS\nBUILD_RDMA\n", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "-q", "-b", "source")
+    first = _commit(
+        repo,
+        "settings.mk",
+        "BUILD_TLS\nBUILD_RDMA\nBUILD_ZSTD\n",
+        "add zstd setting",
+    )
+    second = _commit(
+        repo,
+        "settings.mk",
+        "BUILD_TLS\nBUILD_RDMA\nBUILD_ZSTD\nZSTD_PREFIX\n",
+        "add zstd prefix",
+    )
+
+    _git(repo, "checkout", "-q", "main")
+    _commit(
+        repo,
+        "settings.mk",
+        "BUILD_TLS\nOPENSSL_PREFIX\nBUILD_RDMA\n",
+        "advance target beside source change",
+    )
+    _git(repo, "merge", "-q", "--squash", "source")
+    _git(repo, "commit", "-q", "-m", "squash source")
+    squash_sha = _git(repo, "rev-parse", "HEAD")
+
+    plan = plan_source_change(str(repo), squash_sha, [first, second])
+
+    assert plan.strategy == "squash"
+    assert plan.commits == (squash_sha,)
+    assert plan.source_commits == (first, second)
+    assert _git(repo, "merge-base", squash_sha, second) == base
+
+
 def test_multi_commit_rebase_merge_is_refused(
     history: tuple[Path, str, str, str],
 ) -> None:
