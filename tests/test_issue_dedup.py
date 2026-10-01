@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scripts.common.issue_dedup import IssueContent, IssueDedupPublisher
+from scripts.common.issue_dedup import (
+    IssueContent,
+    IssueDedupPublisher,
+    _fingerprint_marker_re,
+)
 
 NAMESPACE = "valkey-ci-agent:test"
 
@@ -313,6 +317,29 @@ def test_title_fallback_requires_exact_title_match():
     mock_repo.create_issue.assert_called_once()
 
 
+def test_title_fallback_does_not_adopt_another_fingerprints_issue():
+    """Titles are summarized and truncated, so two different bugs can share one.
+    Adopting an issue already claimed by another fingerprint would retarget this
+    fingerprint onto it and leave the current failure with no issue at all."""
+    claimed = _mock_issue(
+        9,
+        body=f"<!-- {NAMESPACE}:a1b2c3d4e5f60718293a -->\n"
+             f"<!-- {NAMESPACE}:occurrences:1 -->",
+        title="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    mock_gh, mock_repo = _mock_gh(open_issues=[claimed])
+    mock_repo.create_issue.return_value = _mock_issue(1, title="new")
+
+    publisher = IssueDedupPublisher(mock_gh, marker_namespace=NAMESPACE)
+    action, url = publisher.upsert(
+        "o/r", fingerprint="b9c8d7e6f5a41328495b", render=_render_static(),
+        title_fallback="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    assert action == "created"
+    assert url == "https://x/issues/1"
+    claimed.edit.assert_not_called()
+
+
 def test_title_fallback_matches_titles_unsafe_for_search_syntax():
     """Local matching handles titles that used to require query sanitizing
     (quotes, colons, HTML-comment arrows) with a plain exact comparison."""
@@ -453,6 +480,34 @@ def test_recently_closed_legacy_issue_matched_via_title_fallback():
     mock_repo.create_issue.assert_not_called()
 
 
+def test_recently_closed_claimed_issue_does_not_suppress_a_different_bug():
+    """Titles are summarized and truncated, so two different bugs can share
+    one. A closed issue already stamped with a marker from this namespace
+    belongs to a different fingerprint, so matching it by title would discard
+    the current failure instead of filing it, and silently: suppression writes
+    nothing anywhere.
+    """
+    claimed_closed = _mock_issue(
+        13,
+        body=f"<!-- {NAMESPACE}:aaaaaaaaaaaaaaaaaaaa -->\nsome other bug",
+        title="[SANITIZER] heap-use-after-free in zslDeleteNode",
+        closed_at=_recent(),
+    )
+    mock_gh, mock_repo = _mock_gh(closed_issues=[claimed_closed])
+    mock_repo.create_issue.return_value = _mock_issue(1)
+
+    publisher = IssueDedupPublisher(
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
+    )
+    action, _ = publisher.upsert(
+        "o/r", fingerprint="bbbbbbbbbbbbbbbbbbbb", render=_render_static(),
+        title_fallback="[SANITIZER] heap-use-after-free in zslDeleteNode",
+    )
+
+    assert action == "created"
+    mock_repo.create_issue.assert_called_once()
+
+
 def test_recently_closed_title_fallback_requires_exact_match():
     """A near-miss title in the closed listing must not suppress creation."""
     near_miss = _mock_issue(
@@ -472,6 +527,33 @@ def test_recently_closed_title_fallback_requires_exact_match():
 
     assert action == "created"
     mock_repo.create_issue.assert_called_once()
+
+
+def test_title_suppression_is_tracked_per_repository():
+    """Issue numbers restart in every repository, so the one-suppression-per-
+    closed-issue rule is scoped to a repository. One publisher can serve
+    several, and a number consumed in the first must still suppress the
+    matching closed issue in the second.
+    """
+    legacy_closed = _mock_issue(
+        11, body="no marker here", title="[TEST-FAILURE] PSYNC2 in t.tcl",
+        closed_at=_recent(),
+    )
+    mock_gh, mock_repo = _mock_gh(closed_issues=[legacy_closed])
+
+    publisher = IssueDedupPublisher(
+        mock_gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
+    )
+    common = dict(
+        fingerprint="newfp", render=_render_static(),
+        title_fallback="[TEST-FAILURE] PSYNC2 in t.tcl",
+    )
+    first, _ = publisher.upsert("o/r", **common)
+    second, _ = publisher.upsert("o/other", **common)
+
+    assert first == "skipped-recently-closed"
+    assert second == "skipped-recently-closed"
+    mock_repo.create_issue.assert_not_called()
 
 
 def test_closed_listing_fetched_once_per_batch():
@@ -570,3 +652,199 @@ def test_closed_lookback_custom_duration():
     assert closed_call.kwargs["since"] == datetime(
         2026, 7, 21, 6, 0, 0, tzinfo=timezone.utc,
     )
+
+
+class TestClaimGuardSpansSiblingNamespaces:
+    """An issue claimed under one namespace must look claimed to its siblings.
+
+    Namespaces are per-failure-type while titles are summarized and shared
+    across types, so a publisher that only recognized its own namespace's
+    marker would adopt a sibling's issue by title, retargeting its fingerprint
+    onto an unrelated bug and leaving its own failure unfiled.
+    """
+
+    def test_a_sibling_namespaces_claim_is_recognized(self) -> None:
+        body = "<!-- valkey-ci-agent:valgrind-error:abc123def456 -->\n**Summary**\n"
+        assert _fingerprint_marker_re("valkey-ci-agent:memory-error").search(body)
+
+    def test_own_namespaces_claim_is_recognized(self) -> None:
+        body = "<!-- valkey-ci-agent:memory-error:abc123def456 -->\n"
+        assert _fingerprint_marker_re("valkey-ci-agent:memory-error").search(body)
+
+    def test_bookkeeping_markers_are_not_claims(self) -> None:
+        """Only a fingerprint digest claims an issue. The occurrence counter and
+        idempotency key live in the same namespace and must not be mistaken for
+        one, or every issue would read as claimed."""
+        for marker in (
+            "<!-- valkey-ci-agent:memory-error:occurrences:3 -->",
+            # A workflow run id is all digits, so it satisfies the digest
+            # pattern; without excluding the key segment every updated issue
+            # would read as claimed.
+            "<!-- valkey-ci-agent:memory-error:last-key:30499308370 -->",
+            "<!-- valkey-ci-agent:memory-error:last-key:abc123def456 -->",
+            "<!-- valkey-ci-agent:reported-traces:Sanitizer,Valgrind -->",
+        ):
+            assert not _fingerprint_marker_re("valkey-ci-agent:memory-error").search(marker)
+
+    def test_an_unmarked_body_is_unclaimed(self) -> None:
+        assert not _fingerprint_marker_re("valkey-ci-agent:memory-error").search(
+            "**Summary**\nno markers here\n"
+        )
+
+
+def _real_issue(number: int, *, body: str, title: str) -> object:
+    """A genuine PyGithub Issue, not a mock.
+
+    ``Issue.body`` is a read-only property. A MagicMock accepts assignment to it
+    and hides code that writes there, so anything touching a cached issue's body
+    has to be exercised against the real class.
+    """
+    from github.Issue import Issue
+    from github.Requester import Requester
+
+    requester = MagicMock(spec=Requester)
+    requester.is_not_lazy = False
+    return Issue(
+        requester=requester, headers={},
+        attributes={
+            "number": number, "body": body, "title": title,
+            "html_url": f"https://x/issues/{number}",
+        },
+        completed=True,
+    )
+
+
+class TestUpdateAgainstRealIssueObjects:
+    """The listing entries the publisher caches are real Issue objects.
+
+    Only the listing needs to be real: that is what the publisher holds across
+    upserts and what its body bookkeeping touches. The reloaded handle it edits
+    stays a mock so no HTTP is attempted.
+    """
+
+    @staticmethod
+    def _gh_with_real_listing(listing, created):
+        repo = MagicMock()
+        editable = {}
+
+        def _get_issues(state=None, since=None, labels=None):
+            return list(listing) if state == "open" else []
+
+        def _get_issue(number):
+            for issue in [*listing, *created]:
+                if issue.number == number:
+                    return editable.setdefault(
+                        number,
+                        _mock_issue(number, body=issue.body, title=issue.title),
+                    )
+            raise KeyError(number)
+
+        def _create_issue(**kwargs):
+            new = _mock_issue(2 + len(created), body=kwargs["body"],
+                              title=kwargs["title"])
+            created.append(new)
+            return new
+
+        repo.get_issues.side_effect = _get_issues
+        repo.get_issue.side_effect = _get_issue
+        repo.create_issue.side_effect = _create_issue
+        gh = MagicMock()
+        gh.get_repo.return_value = repo
+        return gh
+
+    def test_recurrence_reports_updated_not_an_error(self) -> None:
+        marker = f"<!-- {NAMESPACE}:abc123def456 -->"
+        listing = [_real_issue(1, body=f"{marker}\nB", title="T")]
+        gh = self._gh_with_real_listing(listing, [])
+        publisher = IssueDedupPublisher(gh, marker_namespace=NAMESPACE)
+
+        with patch("scripts.common.issue_dedup.retry_github_call",
+                   side_effect=lambda op, **_: op()):
+            action, _ = publisher.upsert(
+                "o/r", fingerprint="abc123def456", render=_render_static(),
+            )
+
+        assert action == "updated"
+
+    def test_a_second_fingerprint_sharing_the_title_gets_its_own_issue(self) -> None:
+        """The body recorded after an update must be visible to the next upsert,
+        or a title match reads the issue as unclaimed and adopts it."""
+        listing = [_real_issue(1, body="filed by hand, no marker", title="T")]
+        created: list = []
+        gh = self._gh_with_real_listing(listing, created)
+        publisher = IssueDedupPublisher(gh, marker_namespace=NAMESPACE)
+
+        actions = []
+        with patch("scripts.common.issue_dedup.retry_github_call",
+                   side_effect=lambda op, **_: op()):
+            for fingerprint in ("aaaa11112222", "bbbb33334444"):
+                action, _ = publisher.upsert(
+                    "o/r", fingerprint=fingerprint, render=_render_static(),
+                    title_fallback="T",
+                )
+                actions.append(action)
+
+        assert actions == ["updated", "created"]
+
+    def test_a_failed_comment_still_leaves_the_issue_claimed(self) -> None:
+        """The edit lands before the comment, so a comment that fails must not
+        leave the issue readable as unclaimed: the next fingerprint would adopt
+        it by title and file nothing of its own."""
+        listing = [_real_issue(1, body="filed by hand, no marker", title="T")]
+        created: list = []
+        gh = self._gh_with_real_listing(listing, created)
+        publisher = IssueDedupPublisher(gh, marker_namespace=NAMESPACE)
+
+        def _run(op, **kwargs):
+            if "comment" in kwargs.get("description", ""):
+                raise RuntimeError("comment failed")
+            return op()
+
+        with patch("scripts.common.issue_dedup.retry_github_call", side_effect=_run):
+            with pytest.raises(RuntimeError):
+                publisher.upsert(
+                    "o/r", fingerprint="aaaa11112222", render=_render_static(),
+                    title_fallback="T",
+                )
+            action, _ = publisher.upsert(
+                "o/r", fingerprint="bbbb33334444", render=_render_static(),
+                title_fallback="T",
+            )
+
+        assert action == "created"
+
+
+class TestClosedIssueSuppressesOnlyOneFingerprint:
+    def test_a_second_fingerprint_is_still_filed(self) -> None:
+        """Suppression files nothing, and a title is shared by more than one bug,
+        so one closed issue must not stand in for every fingerprint."""
+        closed = _mock_issue(
+            42, body="filed by hand, no marker", title="T",
+            closed_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        )
+        gh, repo = _mock_gh(closed_issues=[closed])
+        created: list = []
+
+        def _create_issue(**kwargs):
+            new = _mock_issue(100 + len(created), body=kwargs["body"],
+                              title=kwargs["title"])
+            created.append(new)
+            return new
+
+        repo.create_issue.side_effect = _create_issue
+        publisher = IssueDedupPublisher(
+            gh, marker_namespace=NAMESPACE, closed_lookback=timedelta(days=1),
+        )
+
+        actions = []
+        with patch("scripts.common.issue_dedup.retry_github_call",
+                   side_effect=lambda op, **_: op()):
+            for fingerprint in ("aaaa11112222", "bbbb33334444"):
+                action, _ = publisher.upsert(
+                    "o/r", fingerprint=fingerprint, render=_render_static(),
+                    title_fallback="T",
+                )
+                actions.append(action)
+
+        assert actions == ["skipped-recently-closed", "created"]
+        assert len(created) == 1
