@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from scripts.common.github_client import (
@@ -27,6 +28,14 @@ if TYPE_CHECKING:
     from github import Github
 
 logger = logging.getLogger(__name__)
+
+# Artifacts requested per listing page, GitHub's maximum. Named so the query
+# and the short-page check that ends pagination cannot drift apart.
+_ARTIFACT_PAGE_SIZE = 100
+
+# Bounds the artifact listing so a pathological run can't spin forever. At 100
+# per page this covers far more artifacts than any real run uploads.
+_MAX_ARTIFACT_PAGES = 20
 
 
 @dataclass(frozen=True)
@@ -60,30 +69,64 @@ class ArtifactClient:
             _fetch, retries=self._retries, description=f"list runs {workflow_file}",
         )
 
-    def list_run_artifacts(self, repo_full_name: str, run_id: int) -> list[WorkflowArtifact]:
+    def list_run_artifacts(
+        self, repo_full_name: str, run_id: int, *, name: str | None = None,
+    ) -> list[WorkflowArtifact]:
+        """List a run's artifacts, following pagination.
+
+        A single Valkey Daily run uploads one artifact per job, hundreds after
+        matrix expansion, so the response is paginated and reading only the
+        first page can miss the artifact entirely. Pass ``name`` to have GitHub
+        filter server-side, which is both cheaper and immune to that ordering.
+        """
         repo = self._gh.get_repo(repo_full_name)
+        base = f"/repos/{repo_full_name}/actions/runs/{run_id}/artifacts"
+        query = f"per_page={_ARTIFACT_PAGE_SIZE}"
+        if name is not None:
+            query += f"&name={quote(name)}"
 
-        def _fetch() -> Any:
-            _, data = repo._requester.requestJsonAndCheck(
-                "GET", f"/repos/{repo_full_name}/actions/runs/{run_id}/artifacts",
-            )
-            return data
+        artifacts: list[WorkflowArtifact] = []
+        seen_ids: set[int] = set()
+        for page in range(1, _MAX_ARTIFACT_PAGES + 1):
+            def _fetch(page: int = page) -> Any:
+                _, data = repo._requester.requestJsonAndCheck(
+                    "GET", f"{base}?{query}&page={page}",
+                )
+                return data
 
-        payload = retry_github_call(_fetch, retries=self._retries,
-                                    description=f"list artifacts {run_id}")
-        if not isinstance(payload, dict):
-            return []
-        return [
-            WorkflowArtifact(
-                artifact_id=a["id"], name=a["name"],
-                size_in_bytes=a.get("size_in_bytes", 0),
-                expired=a.get("expired", False),
+            payload = retry_github_call(
+                _fetch, retries=self._retries,
+                description=f"list artifacts {run_id} page {page}",
             )
-            for a in payload.get("artifacts", [])
-            if isinstance(a, dict)
-            and isinstance(a.get("id"), int)
-            and isinstance(a.get("name"), str)
-        ]
+            if not isinstance(payload, dict):
+                break
+            entries = payload.get("artifacts")
+            if not isinstance(entries, list) or not entries:
+                break
+            for a in entries:
+                if (
+                    isinstance(a, dict)
+                    and isinstance(a.get("id"), int)
+                    and isinstance(a.get("name"), str)
+                    and a["id"] not in seen_ids
+                ):
+                    seen_ids.add(a["id"])
+                    artifacts.append(WorkflowArtifact(
+                        artifact_id=a["id"], name=a["name"],
+                        size_in_bytes=a.get("size_in_bytes", 0),
+                        expired=a.get("expired", False),
+                    ))
+            total = payload.get("total_count")
+            if isinstance(total, int) and len(seen_ids) >= total:
+                break
+            if len(entries) < _ARTIFACT_PAGE_SIZE:
+                break
+        else:
+            logger.warning(
+                "Stopped listing artifacts for run %d at the %d-page cap; "
+                "%d seen so far", run_id, _MAX_ARTIFACT_PAGES, len(artifacts),
+            )
+        return artifacts
 
     def download_artifact(
         self,
