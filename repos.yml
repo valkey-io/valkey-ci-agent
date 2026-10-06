@@ -85,3 +85,5 @@ repos:
         project_number: 34
       - branch: "1.2"
         project_number: 58
+      - branch: "1.3"
+        project_number: 69
