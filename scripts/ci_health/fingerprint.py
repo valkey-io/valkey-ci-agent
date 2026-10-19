@@ -1,56 +1,83 @@
 """Stable per-failure identity shared with the Test Failure Detector.
 
-The dashboard names a failure by a display string, ``"<test> in <file>"`` for
-an attributed Tcl failure or a job-level label such as
-``"test-valgrind-test (unit): unattributed failure"`` for anything the log
-parser could not pin to a test. The detector names the same failure by the
-``(test_name, test_file)`` pair from the ``all-test-failures`` artifact and
-hashes it with :func:`scripts.common.incidents.compute_fingerprint` under
-:data:`scripts.test_failure_detector.issue_renderer.MARKER_NAMESPACE`.
+The detector files two kinds of issue, each keyed by a fingerprint from
+:func:`scripts.common.incidents.compute_fingerprint` under
+:data:`scripts.test_failure_detector.issue_renderer.MARKER_NAMESPACE`:
 
-This module maps a display name onto that pair and applies the same hash, so
-a scorecard row and a ``[TEST-FAILURE]`` issue for the same failure carry the
-same fingerprint and either side can look the other up.
+* ``[TEST-FAILURE]``, keyed by the ``(test_name, test_file)`` pair runtest
+  prints as ``<name> in tests/<file>.tcl``
+  (:func:`scripts.test_failure_detector.issue_renderer.fingerprint_for`);
+* ``[JOB-FAILURE]``, keyed by its cause: the runtest summary line
+  ``[<status>]: <data>`` that names no test, such as an exception, a
+  valgrind or sanitizer report's first error and frames, or the shutdown
+  leak check. The job and step are not part of the key, so one cause failing
+  in several jobs is one issue
+  (:func:`scripts.test_failure_detector.issue_renderer.job_fingerprint_for`).
 
-Failures the artifact never carries (spawn timeouts, valgrind/sanitizer job
-failures with no attributed test; ``tests/test_helper.tcl`` skips them in
-``write_test_failures``) get ``test_file="unknown"``, the same fallback that
-file uses for a line it cannot parse, so a future detector fed from log-parser
-output lands on the identical key.
+The dashboard names a failure by a display string. An attributed one has the
+``<name> in tests/<file>.tcl`` shape; this module splits it with the
+detector's own :func:`scripts.common.valkey_ci.test_in_file` and hashes the
+pair through the detector's own function, so a scorecard row and its issue
+share an id by construction rather than by a copied formula.
+
+Every other display name, a job-level bucket (``"<job>: unattributed
+failure"``, ``"<job>: server crash"``) or an exception the parser could name
+only by message or file, gets a ci_health-local id under its own namespace.
+It is stable for deep links and can never collide with a detector id, but it
+is not one: the ``[JOB-FAILURE]`` key is the cause line, which a display name
+does not carry. Looking up that issue takes the cause itself
+(:func:`fingerprint_for_cause`), which the sync layer takes from the
+detector's log reader, ``scripts.test_failure_detector.job_failures``, not
+from a display name.
 """
 
 from __future__ import annotations
 
-import re
-from typing import Tuple
+from typing import Optional, Tuple
 
 from scripts.common.incidents import compute_fingerprint
-from scripts.test_failure_detector.issue_renderer import MARKER_NAMESPACE
+from scripts.common.valkey_ci import test_in_file
+from scripts.test_failure_detector.issue_renderer import MARKER_NAMESPACE, fingerprint_for, job_fingerprint_for
+from scripts.test_failure_detector.job_failures import JobFailure
+from scripts.test_failure_detector.parse_failures import UniqueFailure
 
-UNKNOWN_FILE = "unknown"
-
-# "<test name> in tests/<path>.tcl" -- the shape both the Tcl runner's summary
-# lines and the dashboard's display names use for an attributed failure.
-_ATTRIBUTED_RE = re.compile(r"^(?P<name>.+?) in (?P<file>tests/\S+\.tcl)$")
+# Namespace element for ids only the dashboard knows. The detector's ids use
+# either the bare pair or "job", so this cannot collide with them.
+LOCAL_KIND = "ci_health"
 
 
-def split_display_name(display_name: str) -> Tuple[str, str]:
-    """Return ``(test_name, test_file)`` for a dashboard display name.
+def split_display_name(display_name: str) -> Optional[Tuple[str, str]]:
+    """Return ``(test_name, test_file)`` for an attributed display name, else None.
 
-    Attributed failures split on the trailing ``in tests/...tcl``; anything
-    else is the whole string with ``test_file=UNKNOWN_FILE``.
+    The split is the detector's: it takes the trailing ``in tests/...tcl``
+    and folds a test client's state (``pid:NNN``, ``port NNN``) into its
+    stable name, so both sides land on the same pair.
     """
-    m = _ATTRIBUTED_RE.match(display_name.strip())
-    if m:
-        return m.group("name"), m.group("file")
-    return display_name.strip(), UNKNOWN_FILE
+    return test_in_file(display_name.strip())
 
 
-def fingerprint_for_pair(test_name: str, test_file: str) -> str:
-    """The detector's fingerprint for a ``(test_name, test_file)`` pair."""
-    return compute_fingerprint(namespace=(MARKER_NAMESPACE, test_name, test_file), shapes=())
+def fingerprint_for_test(test_name: str, test_file: str) -> str:
+    """The detector's ``[TEST-FAILURE]`` fingerprint for a ``(test_name, test_file)`` pair."""
+    return fingerprint_for(UniqueFailure(test_name=test_name, test_file=test_file))
+
+
+def fingerprint_for_cause(cause: str) -> str:
+    """The detector's ``[JOB-FAILURE]`` fingerprint for a runtest summary line.
+
+    ``cause`` is the ``[<status>]: <data>`` line as the detector's
+    ``job_failures`` reader builds it. The job and step are not part of the
+    detector's key (see ``JobFailure.identity``), so none are needed here.
+    """
+    return job_fingerprint_for(JobFailure(job="", url="", summary=(cause,)))
 
 
 def fingerprint_for_name(display_name: str) -> str:
-    """The detector's fingerprint for a dashboard display name."""
-    return fingerprint_for_pair(*split_display_name(display_name))
+    """A stable id for a dashboard display name.
+
+    An attributed name gets the detector's ``[TEST-FAILURE]`` fingerprint;
+    any other name gets a ci_health-local id (see the module docstring).
+    """
+    pair = split_display_name(display_name)
+    if pair is not None:
+        return fingerprint_for_test(*pair)
+    return compute_fingerprint(namespace=(MARKER_NAMESPACE, LOCAL_KIND, display_name.strip()), shapes=())

@@ -28,10 +28,10 @@ series per branch, the same as for `unstable`.
 
 Some failures never reach the `all-test-failures` artifact: a test that timed
 out while spawning a server, or a valgrind or sanitizer job that failed with
-no test attributed. The log parser reads the failed job's log for those, and
-is the only source for them. It also reads attributed Tcl failures, test
-framework exceptions, and server crashes, and keeps a per-job bucket for a
-failed job it cannot name at all.
+no test attributed. The log parser reads the failed job's log for those, as
+the detector's `job_failures.py` does for its `[JOB-FAILURE]` causes. It also
+reads attributed Tcl failures, test framework exceptions, and server crashes,
+and keeps a per-job bucket for a failed job it cannot name at all.
 
 A scorecard per test gives its current streak, failure rate, trend, and a
 classification: `persistent` when it fails at least half of its recorded runs
@@ -51,15 +51,31 @@ dependency; the sync change supplies the real comparer.
 
 ## Shared failure identity
 
-A scorecard row and the detector's issue for the same test should share one
+A scorecard row and the detector's issue for the same failure should share one
 id, so the dashboard can link to the issue and the issue can link back to the
-history. `fingerprint.py` is that contract. The detector keys a
-`[TEST-FAILURE]` issue by `(test_name, test_file)` through
-`compute_fingerprint` under its marker namespace; `fingerprint.py` maps a
-display name onto the same pair and applies the same call. Failures with no
-attributed test use `test_file="unknown"`, the fallback
-`tests/test_helper.tcl` writes for a line it cannot parse. A parity test pins
-the two against each other.
+history. `fingerprint.py` is that contract, and it reaches the detector's keys
+through the detector's own functions rather than a copied formula.
+
+The detector files two kinds of issue. A `[TEST-FAILURE]` is keyed by the
+`(test_name, test_file)` pair runtest prints as `<name> in tests/<file>.tcl`;
+an attributed display name is split with the detector's `test_in_file`, which
+folds a test client's `pid:NNN` and `port NNN` state the same way, and hashed
+with `issue_renderer.fingerprint_for`. A `[JOB-FAILURE]` is keyed by its
+cause, the runtest summary line `[<status>]: <data>` that names no test, with
+the job and step left out so one cause failing in several jobs is one issue;
+a cause line is hashed with `issue_renderer.job_fingerprint_for`.
+
+Any other display name, a per-job `unattributed failure` or `server crash`
+bucket or an exception the parser could name only by message, gets a
+ci_health-local id under its own namespace element. It is stable for deep
+links and can never collide with a detector id, but it is not one: the
+`[JOB-FAILURE]` key is the cause line, which a display name does not carry.
+Looking that issue up takes the cause itself, which the sync layer reads from
+the detector's `job_failures` reader.
+
+The parity tests run the detector's `find_unrecorded_failures` on a valgrind
+log so the cause under test is the one the detector builds, and pin that the
+local id equals neither detector key.
 
 ## Where the code lives
 
@@ -68,8 +84,9 @@ scripts/ci_health/
   store.py        SQLite history: runs, jobs, parsed failures
   log_parser.py   job-log parser: attributed Tcl failures, timeouts,
                   exceptions, crashes, and the per-job bucket
-  fingerprint.py  the detector's issue key, so a scorecard row and its
-                  [TEST-FAILURE] issue share one id
+  fingerprint.py  the detector's two issue keys, reached through the
+                  detector's own functions, so a scorecard row and its
+                  [TEST-FAILURE] or [JOB-FAILURE] issue share one id
   scorecard.py    per-test streak, failure rate, classification, trend
   blame.py        green-to-red onset per test, commit range, confidence
   stats.py        Beta-Bernoulli regression confidence
