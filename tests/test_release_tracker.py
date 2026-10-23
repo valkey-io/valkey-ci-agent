@@ -461,7 +461,10 @@ def test_moved_branch_blocks_automatic_publication(monkeypatch: pytest.MonkeyPat
 
     workflow.create_dispatch.assert_not_called()
     assert result == "#42: candidate invalidated by branch movement"
-    assert "Rerun Prepare Release" in issue.create_comment.call_args.args[0]
+    # The cut refuses a version the branch already records, so the only
+    # recovery that works is reverting the notes commit first.
+    posted = issue.create_comment.call_args.args[0]
+    assert "Revert the release-notes commit with a new PR, then rerun Prepare Release" in posted
 
 
 def test_existing_exact_publication_run_prevents_duplicate_dispatch(

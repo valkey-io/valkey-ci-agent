@@ -71,7 +71,8 @@ a PR to add the new release line to the backport registry.
 The watcher never tries to fix anything, and it never decides something
 succeeded because of what the issue says. If the release branch moves after
 the notes PR merged, automatic publication stops and the issue asks for a new
-notes PR. If a build or the qualification fails, the issue links the failed
+notes PR: revert the release-notes commit with a PR, then rerun Prepare
+Release. If a build or the qualification fails, the issue links the failed
 run and says what to do next. You fix the problem in the repository and run
 the right workflow again.
 

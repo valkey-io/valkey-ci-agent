@@ -494,7 +494,9 @@ def _render_status(
         candidate_evidence = f"[Candidate `{candidate_sha[:12]}`]({candidate_url})"
         if branch_head != candidate_sha:
             candidate_status = _status_badge("Blocked", "cf222e")
-            candidate_action = "Rerun Prepare Release for the new branch head."
+            # A plain rerun is refused: version.h on the branch already records
+            # this release, and the cut only moves forward.
+            candidate_action = "Revert the release-notes commit with a new PR, then rerun Prepare Release."
             current = "The release branch moved after the candidate was reviewed."
             next_action = candidate_action
             summary = "candidate invalidated by branch movement"
