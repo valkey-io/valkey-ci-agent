@@ -1,9 +1,9 @@
 """Comment-triggered entry point for the CI fix bot.
 
-A maintainer comments ``@valkeyrie-ops fix <ci-link>`` on a valkey-io/valkey PR.
-This scheduled poller finds that comment and dispatches the existing ``ci-fix``
-workflow, which does the actual diagnose/verify/push. The poller is only the
-trigger; it owns no fix logic.
+A maintainer comments ``@valkeyrie-ops fix [<ci-link>] [hint]`` on a
+valkey-io/valkey PR. This scheduled poller finds that comment and
+dispatches the ``ci-fix`` workflow, which does the actual diagnose/edit/publish. The
+poller is only the trigger; it owns no fix logic.
 
 Idempotency is a reaction marker on GitHub, not external state. The claim is
 atomic: GitHub's create-reaction returns ``201`` when this call added the
@@ -283,6 +283,9 @@ def dispatch_ci_fix(
         run_url = (
             f"https://github.com/{command.run_owner}/{command.run_repo}"
             f"/actions/runs/{command.run_id}"
+            + (f"/attempts/{command.run_attempt}" if command.run_attempt else "")
+            + (f"/job/{command.job_id}" if command.job_id else "")
+            if command.run_id else ""
         )
         inputs = {
             "repo": repo_full_name,
@@ -365,7 +368,11 @@ def main() -> int:
     )
 
     gh = Github(auth=Auth.Token(token))
-    dispatch = dispatch_ci_fix(gh, agent_repo=agent_repo, workflow=workflow, ref=ref)
+    # Dispatch on the agent repository with its own token, so the target
+    # repository's token never carries actions:write.
+    dispatch_token = os.environ.get("CI_FIX_POLL_DISPATCH_TOKEN", "") or token
+    dispatch = dispatch_ci_fix(Github(auth=Auth.Token(dispatch_token)), agent_repo=agent_repo,
+                               workflow=workflow, ref=ref)
 
     def _poll() -> int:
         return poll_once(

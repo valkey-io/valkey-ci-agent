@@ -111,20 +111,6 @@ class ArtifactClient:
             damaged,
         )
 
-    def download_run_logs(self, repo_full_name: str, run_id: int) -> dict[str, bytes]:
-        """Download a workflow run's console logs as a ``{path: bytes}`` map.
-
-        GitHub returns the whole run's logs as a zip whose members are the
-        per-step text logs (one file per job step, plus per-job rollups).
-        Unlike ``download_artifact`` this is the raw CI console output, not a
-        user-uploaded artifact bundle. Shares the same token-redirect, retry,
-        and uncompressed-size-cap discipline as artifact downloads. Returns an
-        empty map if the logs have expired (404) or the zip is unreadable.
-        """
-        return _extract_zip(self._download(
-            f"/repos/{repo_full_name}/actions/runs/{run_id}/logs"
-        ))
-
     def download_job_log(self, repo_full_name: str, job_id: int) -> str:
         """Return one job's plain-text console log ("" when it has expired)."""
         data = self._download(f"/repos/{repo_full_name}/actions/jobs/{int(job_id)}/logs")

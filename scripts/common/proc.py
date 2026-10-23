@@ -152,6 +152,9 @@ LOCKED_GIT_CONFIG = (
     "-c", "credential.helper=",
     "-c", "diff.external=",
 )
+# A strict read also keeps a planted ``core.fsmonitor`` command from running.
+_FSMONITOR_OFF = ("-c", "core.fsmonitor=false")
+_STRICT_GIT_CONFIG = (*LOCKED_GIT_CONFIG, *_FSMONITOR_OFF)
 
 # Process-runtime environment variables that carry no credential: the minimal
 # set any scrubbed subprocess needs. Other allowlists extend this.
@@ -165,6 +168,20 @@ NETWORK_ENV = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
 _GIT_SAFE_ENV = PROCESS_BASICS
 
 
+def git_safe_env() -> dict[str, str]:
+    """The scrubbed git environment, also ignoring user and system config.
+
+    For the CI fix's ``strict`` reads of a checkout an agent edited: a global
+    ``~/.gitconfig`` is writable by the same user that runs untrusted tests and
+    edit agents, so it must not be able to add hooks or commands.
+    """
+    env = filter_env(_GIT_SAFE_ENV)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def filter_env(allowlist: tuple[str, ...]) -> dict[str, str]:
     """Return os.environ filtered to non-empty allowlisted names.
 
@@ -175,15 +192,49 @@ def filter_env(allowlist: tuple[str, ...]) -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in allowed and value}
 
 
-def worktree_changed_paths(repo_dir: str) -> tuple[str, ...]:
+def default_branch_ref(repo_dir: str) -> str:
+    """``origin/<default branch>`` of a clone, or "" when it cannot be resolved."""
+    try:
+        ref = git_output(repo_dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").strip()
+    except subprocess.CalledProcessError:
+        return ""
+    return ref if ref.startswith("origin/") else ""
+
+
+def git_paths(repo_dir: str, *args: str) -> tuple[str, ...]:
+    """The NUL-separated paths a ``-z`` git listing prints.
+
+    A path may be any bytes, not only UTF-8: surrogateescape keeps them as
+    they are, and passing such a path back to git reproduces the same bytes.
+    """
+    result = subprocess.run(
+        ["git", *_STRICT_GIT_CONFIG, *args], cwd=repo_dir, capture_output=True,
+        encoding="utf-8", errors="surrogateescape", timeout=_GIT_TIMEOUT_S, env=git_safe_env(),
+    )
+    if result.returncode != 0:
+        _raise_git_failure(result)
+    return tuple(path for path in result.stdout.split("\0") if path)
+
+
+def worktree_changed_paths(repo_dir: str, *, strict: bool = False) -> tuple[str, ...]:
     """Return tracked-but-modified and untracked paths in the working tree.
 
     Combines ``git diff --name-only HEAD`` (tracked changes) with
     ``git ls-files --others --exclude-standard`` (new files), NUL-delimited so
     paths with spaces survive. Used to see exactly which files an edit step
     touched.
+
+    ``strict`` lists a rename as both of its paths and reads the checkout as
+    ``git_paths`` does, for a checkout an agent with Bash edited.
     """
     paths: set[str] = set()
+    if strict:
+        for args in (
+            ("diff", "--no-renames", "--name-only", "-z", "HEAD"),
+            ("ls-files", "--others", "--exclude-standard", "-z"),
+        ):
+            paths.update(git_paths(repo_dir, *args))
+        return tuple(sorted(paths))
     for args in (
         ("diff", "--name-only", "-z", "HEAD"),
         ("ls-files", "--others", "--exclude-standard", "-z"),
@@ -197,7 +248,7 @@ class EmptyPatch(Exception):
     """Raised when the approved paths produce no patch content."""
 
 
-def build_approved_patch(repo_dir: str, changed_paths: tuple[str, ...]) -> str:
+def build_approved_patch(repo_dir: str, changed_paths: tuple[str, ...], *, strict: bool = False) -> str:
     """Return the exact patch for ``changed_paths`` that a push would apply.
 
     Includes untracked approved files (staged with ``--intent-to-add`` so they
@@ -209,9 +260,14 @@ def build_approved_patch(repo_dir: str, changed_paths: tuple[str, ...]) -> str:
     Raises ``EmptyPatch`` when there are no approved paths, or when the approved
     paths yield no content, so an empty or vanished edit is refused rather than
     silently approved (and never broadened to the whole tree).
+
+    ``strict``, for a checkout an agent with Bash edited, reads it as
+    ``git_paths`` does and builds the patch from the bytes, without renames.
     """
     if not changed_paths:
         raise EmptyPatch("no approved paths to build a patch from")
+    if strict:
+        return _strict_patch(repo_dir, changed_paths)
     untracked = tuple(
         p
         for p in run_git(
@@ -222,6 +278,22 @@ def build_approved_patch(repo_dir: str, changed_paths: tuple[str, ...]) -> str:
     if untracked:
         run_git(repo_dir, "add", "--intent-to-add", "--", *untracked)
     patch = git_output(repo_dir, "diff", "--no-ext-diff", "--binary", "HEAD", "--", *changed_paths)
+    if not patch.strip():
+        raise EmptyPatch("approved paths produced an empty patch")
+    return patch
+
+
+def _strict_patch(repo_dir: str, changed_paths: tuple[str, ...]) -> str:
+    untracked = git_paths(repo_dir, "ls-files", "--others", "--exclude-standard", "-z", "--", *changed_paths)
+    if untracked:
+        run_git(repo_dir, *_FSMONITOR_OFF, "add", "--intent-to-add", "--", *untracked, env=git_safe_env())
+    # No renames: the push re-checks the staged paths against ``changed_paths``,
+    # which lists both sides. No textconv: the patch must be the bytes, and a
+    # textconv driver is a command.
+    patch = run_git(
+        repo_dir, *_FSMONITOR_OFF, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--binary",
+        "HEAD", "--", *changed_paths, env=git_safe_env(),
+    ).stdout
     if not patch.strip():
         raise EmptyPatch("approved paths produced an empty patch")
     return patch

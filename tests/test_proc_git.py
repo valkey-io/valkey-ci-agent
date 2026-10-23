@@ -97,35 +97,6 @@ def test_build_approved_patch_treats_paths_literally(tmp_path):
     assert "leaked" not in patch
 
 
-def test_reset_worktree_removes_ignored_build_artifacts(tmp_path):
-    from scripts.ci_fix.review import reset_worktree
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    run_git(str(repo), "init", "-q")
-    (repo / ".gitignore").write_text("*.o\nbuild/\n")
-    (repo / "f.c").write_text("int main(){return 0;}\n")
-    run_git(str(repo), "add", ".gitignore", "f.c")
-    run_git(
-        str(repo),
-        "-c", "user.email=t@t",
-        "-c", "user.name=t",
-        "commit", "-qm", "init",
-    )
-
-    (repo / "f.o").write_text("object")
-    (repo / "build").mkdir()
-    (repo / "build" / "server").write_text("binary")
-    (repo / "scratch.txt").write_text("untracked")
-
-    reset_worktree(str(repo))
-
-    assert not (repo / "f.o").exists()
-    assert not (repo / "build").exists()
-    assert not (repo / "scratch.txt").exists()
-    assert (repo / "f.c").exists()
-
-
 def test_git_failure_message_carries_stderr_and_subcommand(tmp_path):
     import pytest
 
@@ -164,3 +135,111 @@ def test_is_ancestor_separates_no_from_unknown(tmp_path):
     assert proc.is_ancestor(str(tmp_path), second, first) is False
     # A missing object is a broken question, not a negative answer.
     assert proc.is_ancestor(str(tmp_path), "0" * 40, second) is None
+
+
+# --- repo- and user-controlled git config must never execute -------------------------
+
+import os  # noqa: E402
+
+from scripts.common.proc import build_approved_patch, worktree_changed_paths  # noqa: E402
+
+
+def _repo_with_change(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    for key, value in (("user.email", "t@t"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(repo), "config", key, value], check=True)
+    (repo / "f.txt").write_text("base\n")
+    subprocess.run(["git", "-C", str(repo), "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    (repo / "f.txt").write_text("changed\n")
+    return repo
+
+
+def _marker_script(tmp_path, name):
+    marker = tmp_path / f"{name}.ran"
+    script = tmp_path / f"{name}.sh"
+    script.write_text(f"#!/bin/sh\necho ran > {marker}\ncat \"$1\" 2>/dev/null\n")
+    script.chmod(0o755)
+    return script, marker
+
+
+def test_a_planted_fsmonitor_never_runs(tmp_path):
+    repo = _repo_with_change(tmp_path)
+    script, marker = _marker_script(tmp_path, "fsmonitor")
+    subprocess.run(["git", "-C", str(repo), "config", "core.fsmonitor", str(script)], check=True)
+
+    changed = worktree_changed_paths(str(repo), strict=True)
+    build_approved_patch(str(repo), changed, strict=True)
+
+    assert changed == ("f.txt",)
+    assert not marker.exists()
+
+
+def test_a_planted_textconv_driver_never_shapes_the_patch(tmp_path):
+    repo = _repo_with_change(tmp_path)
+    script, marker = _marker_script(tmp_path, "textconv")
+    (repo / ".gitattributes").write_text("*.txt diff=evil\n")
+    subprocess.run(["git", "-C", str(repo), "config", "diff.evil.textconv", str(script)], check=True)
+
+    patch = build_approved_patch(str(repo), ("f.txt",), strict=True)
+
+    assert "+changed" in patch
+    assert not marker.exists()
+
+
+def test_user_global_config_is_ignored(tmp_path, monkeypatch):
+    """~/.gitconfig is writable by the same user that runs untrusted tests.
+
+    A global clean filter runs on every diff of a modified file, and nothing on
+    the git command line turns it off: only ignoring the global config does.
+    """
+    repo = _repo_with_change(tmp_path)
+    script, marker = _marker_script(tmp_path, "filter")
+    attributes = tmp_path / "attributes"
+    attributes.write_text("* filter=evil\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(
+        f"[core]\n\tattributesFile = {attributes}\n[filter \"evil\"]\n\tclean = {script}\n"
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    assert worktree_changed_paths(str(repo), strict=True) == ("f.txt",)
+    build_approved_patch(str(repo), ("f.txt",), strict=True)
+    assert not marker.exists()
+
+
+def test_a_non_utf8_path_survives_discovery_patching_and_the_staged_check(tmp_path):
+    """A path may be any bytes; it must come back from git exactly as written."""
+    import os
+    import subprocess
+
+    import pytest
+
+    from scripts.ci_fix.push import _apply_patch, _staged_paths
+    from scripts.common.proc import build_approved_patch, worktree_changed_paths
+
+    def git(cwd, *args):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args], cwd=cwd, check=True,
+                       capture_output=True)
+
+    work, clean = tmp_path / "work", tmp_path / "clean"
+    for repo in (work, clean):
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "seed").write_text("x\n")
+        git(repo, "add", "seed")
+        git(repo, "commit", "-qm", "seed")
+    raw = os.fsencode(str(work)) + b"/caf\xe9.tcl"
+    try:
+        with open(raw, "wb") as handle:
+            handle.write(b"set x 1\n")
+    except OSError:
+        pytest.skip("the local filesystem rejects non-UTF-8 path bytes")
+    changed = worktree_changed_paths(str(work), strict=True)
+    assert [os.fsencode(path) for path in changed] == [b"caf\xe9.tcl"]
+    patch = build_approved_patch(str(work), changed, strict=True)
+    _apply_patch(str(clean), patch)
+    assert _staged_paths(str(clean)) == changed

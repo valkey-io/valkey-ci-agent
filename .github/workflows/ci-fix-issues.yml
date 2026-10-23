@@ -1,0 +1,40 @@
+name: CI Fix Issues
+
+# One run handles one Test Failure Detector issue and, when a fix is
+# accepted, opens or updates a draft PR. The target repository's normal PR CI
+# and human review decide whether it is mergeable; this workflow never merges.
+# The fix runs like every other (ci-fix-run.yml), inside the Valkey job that
+# failed when it can host it.
+# ci-fix-issue-dispatch.yml finds active runs for an issue by this name.
+run-name: "CI fix issue #${{ inputs.issue }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Test Failure Detector issue number"
+        required: true
+        type: number
+
+permissions: {}
+
+concurrency:
+  group: ci-fix-issue-${{ inputs.issue }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  fix:
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/ci-fix-run.yml
+    with:
+      front_door: issue
+      request: ${{ format('{{"repo":"valkey-io/valkey","issue":{0}}}', inputs.issue) }}
+      key: issue-${{ inputs.issue }}
+    secrets:
+      VALKEYRIE_BOT_APP_ID: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      VALKEYRIE_BOT_PRIVATE_KEY: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}

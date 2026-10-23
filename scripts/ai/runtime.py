@@ -16,6 +16,7 @@ from scripts.ai.claude_code import (
     _resolve_claude_model,
     run_claude_code,
 )
+from scripts.common.isolation import isolated_user
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,9 @@ AgentProfileName = Literal[
     "test_adaptation_edit_only",
     "validation_repair_edit_only",
     "fuzzer_analysis_readonly",
-    "ci_fix_diagnose_readonly",
+    "ci_fix_edit",
+    "ci_fix_suggest",
+    "ci_fix_review",
     "release_notes_review_edit_only",
 ]
 
@@ -43,6 +46,14 @@ class AgentProfile:
     failure_policy: str = "fail-closed"
     disallowed_tools: str = ""
     env_allowlist: tuple[str, ...] = DEFAULT_CLAUDE_ENV_ALLOWLIST
+    # Keep the CLI's working-directory boundary (see claude_code.run_claude_code).
+    # Suggestion-only CI fixes are confined; bot-owned branches intentionally
+    # use the same unconfined edit model as the backport agents.
+    confined: bool = False
+    # Run as CI_FIX_AGENT_USER (see scripts/common/isolation.py): for a
+    # profile with Bash in an untrusted checkout, which must not reach the
+    # job's environment.
+    isolated: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,14 +112,41 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         writes_allowed=False,
         output_schema="text",
     ),
-    "ci_fix_diagnose_readonly": AgentProfile(
-        name="ci_fix_diagnose_readonly",
-        allowed_tools="Read,Grep,Glob",
-        timeout=3600,
-        effort="high",
-        max_turns=200,
-        writes_allowed=False,
-        output_schema="text",
+    "ci_fix_edit": AgentProfile(
+        name="ci_fix_edit",
+        allowed_tools="Read,Edit,MultiEdit,Write,Grep,Glob,Bash",
+        timeout=2700,
+        effort="max",
+        max_turns=160,
+        writes_allowed=True,
+        output_schema="candidate-json",
+        isolated=True,
+    ),
+    "ci_fix_review": AgentProfile(
+        name="ci_fix_review",
+        allowed_tools="Read,Grep",
+        timeout=1200,
+        effort="max",
+        max_turns=80,
+        output_schema="review-json",
+        disallowed_tools="Bash,Glob,Edit,MultiEdit,Write",
+        confined=True,
+        # It reads a tree the isolated account just ran commands in; a link
+        # left there must not reach this process's environment.
+        isolated=True,
+    ),
+    "ci_fix_suggest": AgentProfile(
+        name="ci_fix_suggest",
+        allowed_tools="Read,Edit,MultiEdit,Write,Grep",
+        timeout=2700,
+        effort="max",
+        max_turns=160,
+        writes_allowed=True,
+        output_schema="candidate-json",
+        disallowed_tools="Bash,Glob",
+        confined=True,
+        # A contributor or fork PR's checkout may hold links out of it.
+        isolated=True,
     ),
     "release_notes_review_edit_only": AgentProfile(
         name="release_notes_review_edit_only",
@@ -135,10 +173,12 @@ def run_agent(
     timeout: int | None = None,
     model: str | None = None,
     evidence_dir: str | Path | None = None,
+    extra_dirs: tuple[str, ...] = (),
 ) -> AgentRunResult:
     """Run Claude Code under a named capability profile.
 
     The profile controls tool permissions, timeout, effort, and audit labels.
+    ``extra_dirs`` are directories besides ``cwd`` a confined profile may read.
     Optional evidence is written after the process exits so generated files in
     the working tree cannot influence the prompt that just ran.
     """
@@ -158,6 +198,9 @@ def run_agent(
         allowed_tools=profile.allowed_tools,
         disallowed_tools=profile.disallowed_tools,
         env_allowlist=profile.env_allowlist,
+        confined=profile.confined,
+        extra_dirs=extra_dirs,
+        run_as=isolated_user() if profile.isolated else "",
     )
     finished_at = datetime.now(timezone.utc).isoformat()
     result = AgentRunResult(

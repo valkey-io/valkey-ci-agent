@@ -1,11 +1,14 @@
 name: CI Fix Bot
 
-# A maintainer triggers a fix manually via workflow_dispatch (the Actions UI or
-# `gh workflow run`), supplying the PR and the failing run URL. A comment-based
-# trigger (`@valkeyrie-bot fix ...` on a valkey-io/valkey PR) needs a thin
-# wrapper in the target repo to forward the event here, since issue_comment
-# events only fire in the repo where the comment is made; that wrapper is a
-# follow-up. See README for the dispatch invocation.
+# A maintainer comments "@valkeyrie-ops fix [<run-or-job-url>] [hint]" on a
+# Valkey PR; the comment poller dispatches this workflow. It may also be run
+# manually while the feature is being trialled.
+#
+# The fix runs like every other (ci-fix-run.yml): planned against the PR's
+# exact failed job, prepared inside the Valkey job that failed when it
+# can host it, and published to a bot-owned branch, or as a suggestion for a
+# contributor's branch, which is never pushed. Normal target CI and a human
+# merge decide the rest.
 on:
   workflow_dispatch:
     inputs:
@@ -14,150 +17,50 @@ on:
         required: true
         type: string
       pr:
-        description: "Backport PR number"
+        description: "PR number"
         required: true
         type: number
       run_url:
-        description: "Failed GitHub Actions run URL"
-        required: true
+        description: "Failed run/job URL (empty = choose the most actionable current-head failure)"
+        required: false
         type: string
+        default: ""
       hint:
         description: "Optional diagnosis hint"
         required: false
         type: string
+        default: ""
       commenter:
-        description: "Requesting user (honored only when dispatched by the trusted poller App)"
+        description: "Requesting user (trusted only when forwarded by the poller App)"
         required: false
         type: string
+        default: ""
       comment_id:
-        description: "Triggering comment id, reacted to with the run outcome"
+        description: "Triggering comment id"
         required: false
         type: string
+        default: ""
 
 permissions: {}
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   ci-fix:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    if: github.repository == 'valkey-io/valkey-ci-agent'
     permissions:
       contents: read
       id-token: write
     concurrency:
-      # Serialize ci-fix runs for the same PR so two dispatches don't push at
-      # once. This does not coordinate with other workflows that write the same
-      # branch; the exact-head lease (see push.py) is what keeps a concurrent
-      # branch update or deletion from being clobbered.
-      group: ci-fix-${{ inputs.pr }}
+      group: ci-fix-${{ inputs.repo }}-${{ inputs.pr }}
       cancel-in-progress: false
-    env:
-      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-      CLAUDE_CODE_USE_BEDROCK: "1"
-      CI_AGENT_EVIDENCE_DIR: agent-evidence
-    steps:
-      - name: Check out agent repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Set up agent dependencies
-        uses: ./.github/actions/setup-agent
-        with:
-          install-claude: "true"
-
-      - name: Generate GitHub App token
-        id: generate-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
-          owner: valkey-io
-          repositories: valkey
-          # members:read for the contributors-team auth check; contents:write
-          # to push the fix; pull-requests:write + issues:write to comment (the
-          # PR comment uses the Issues comments API); actions:read for logs.
-          permission-members: read
-          permission-actions: read
-          permission-contents: write
-          permission-workflows: write
-          permission-pull-requests: write
-          permission-issues: write
-          permission-metadata: read
-
-      - name: Generate agent-repo token (macOS verify dispatch)
-        id: agent-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
-          owner: valkey-io
-          repositories: valkey-ci-agent
-          # actions:write to dispatch the verify-macos workflow and read its
-          # run status; nothing else on the agent repo.
-          permission-actions: write
-          permission-metadata: read
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          role-session-name: valkey-ci-fix-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Run the CI fix
-        shell: bash
-        env:
-          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
-          CI_FIX_MACOS_AGENT_REPO: valkey-io/valkey-ci-agent
-          CI_FIX_MACOS_AGENT_REF: main
-          CI_FIX_MACOS_TOKEN: ${{ steps.agent-token.outputs.token }}
-          CI_FIX_REPO: ${{ inputs.repo }}
-          CI_FIX_PR: ${{ inputs.pr }}
-          CI_FIX_RUN_URL: ${{ inputs.run_url }}
-          CI_FIX_VERIFY_RUNS: ${{ vars.CI_FIX_VERIFY_RUNS || '2' }}
-          # The commenter input is honored only when the trusted poller App
-          # dispatched this run; any other dispatcher (a human via the Actions
-          # UI) falls back to github.actor, so a manual run cannot rewrite the
-          # audit attribution. The engine's authorization check runs against
-          # whichever principal is chosen regardless.
-          CI_FIX_COMMENTER: ${{ (github.actor == 'valkeyrie-ops[bot]' && inputs.commenter) || github.actor }}
-          CI_FIX_HINT: ${{ inputs.hint || '' }}
-          CI_FIX_COMMENT_ID: ${{ inputs.comment_id || '' }}
-        run: |
-          set -euo pipefail
-          if [[ ! "${CI_FIX_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "Invalid repo: ${CI_FIX_REPO}" >&2
-            exit 1
-          fi
-          if [[ "${CI_FIX_REPO}" != "valkey-io/valkey" ]]; then
-            echo "ci-fix.yml is currently scoped to valkey-io/valkey (got: ${CI_FIX_REPO})" >&2
-            exit 1
-          fi
-          if [[ ! "${CI_FIX_PR}" =~ ^[0-9]+$ ]]; then
-            echo "Invalid PR number: ${CI_FIX_PR}" >&2
-            exit 1
-          fi
-          args=(
-            -m scripts.ci_fix.main
-            --repo "${CI_FIX_REPO}"
-            --pr "${CI_FIX_PR}"
-            --run-url "${CI_FIX_RUN_URL}"
-            --commenter "${CI_FIX_COMMENTER}"
-          )
-          if [[ -n "${CI_FIX_HINT}" ]]; then
-            args+=(--hint "${CI_FIX_HINT}")
-          fi
-          python "${args[@]}"
-
-      - name: Upload agent evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ci-fix-agent-evidence-${{ github.run_id }}
-          path: agent-evidence
-          if-no-files-found: ignore
-          retention-days: 30
+      queue: max
+    uses: ./.github/workflows/ci-fix-run.yml
+    with:
+      front_door: pr
+      # The commenter is trusted only when the poller App started the run
+      # (scripts/ci_fix/main.py).
+      request: ${{ toJSON(inputs) }}
+      key: pr-${{ inputs.pr }}
+    secrets:
+      VALKEYRIE_BOT_APP_ID: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      VALKEYRIE_BOT_PRIVATE_KEY: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}

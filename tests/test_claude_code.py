@@ -253,6 +253,38 @@ def test_run_claude_code_reports_timeout(monkeypatch):
     assert fake_processes[0].killed is True
 
 
+def test_an_isolated_cli_that_times_out_is_stopped_through_its_account(monkeypatch):
+    """The CLI sits under root's sudo, which the runner may not signal."""
+    process = _FakeProcess(["sudo"], timeout=True)
+
+    def no_signal(*_args):
+        raise PermissionError("Operation not permitted")
+
+    killed = []
+    monkeypatch.setattr(claude_code.subprocess, "Popen", lambda cmd, **_kwargs: process)
+    monkeypatch.setattr(claude_code.os, "killpg", no_signal)
+    monkeypatch.setattr(process, "kill", no_signal)
+    monkeypatch.setattr(claude_code, "kill_all", killed.append)
+
+    stdout, stderr, rc = claude_code._run_streaming(
+        ["sudo"], "prompt", cwd=None, env={}, timeout=3, run_as="ci-fix-agent",
+    )
+
+    assert (stderr, rc) == ("timeout after 3s", 1)
+    assert killed == ["ci-fix-agent"]
+
+
+def test_a_process_that_may_not_be_signalled_does_not_turn_a_timeout_into_a_crash(monkeypatch):
+    def no_signal(*_args):
+        raise PermissionError("Operation not permitted")
+
+    process = _FakeProcess(["cli"])
+    monkeypatch.setattr(claude_code.os, "killpg", no_signal)
+    monkeypatch.setattr(process, "kill", no_signal)
+
+    claude_code._kill_process_group(process)
+
+
 def test_run_claude_code_reports_missing_cli(monkeypatch):
     def fake_popen(_cmd, **_kwargs):
         raise FileNotFoundError
@@ -275,3 +307,65 @@ def test_timeout_fires_even_when_the_cli_never_reads_its_prompt(monkeypatch):
     stdout, stderr, rc = claude_code.run_claude_code("x" * 1_000_000, timeout=2)
     assert stderr == "timeout after 2s" and rc == 1
     assert time.monotonic() - started < 20
+
+
+# --- confined runs: the CLI's working-directory boundary is kept ---------------------
+
+def _captured_cmd(monkeypatch, **kwargs):
+    from scripts.ai import claude_code
+
+    captured = {}
+
+    class _Proc:
+        stdout = iter(())
+        stdin = io.StringIO()
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **_kw):
+        captured["cmd"] = cmd
+        return _Proc()
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", fake_popen)
+    claude_code.run_claude_code("p", cwd="/repo", **kwargs)
+    return captured["cmd"]
+
+
+def test_a_confined_read_only_run_keeps_permission_checks(monkeypatch):
+    cmd = _captured_cmd(monkeypatch, allowed_tools="Read,Grep", confined=True, extra_dirs=("/work/logs",))
+    assert "--dangerously-skip-permissions" not in cmd
+    assert cmd[cmd.index("--permission-mode") + 1] == "default"
+    assert cmd[cmd.index("--add-dir") + 1] == "/work/logs"
+    assert "--allowedTools" not in cmd  # a blanket allow would lift the path boundary
+    # A checkout's or user's settings file could add directories or allow rules.
+    assert cmd[cmd.index("--setting-sources") + 1] == ""
+
+
+def test_a_confined_edit_run_accepts_edits_only_inside(monkeypatch):
+    cmd = _captured_cmd(monkeypatch, allowed_tools="Read,Edit,MultiEdit,Grep", confined=True)
+    assert "--dangerously-skip-permissions" not in cmd
+    assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+    assert cmd[cmd.index("--setting-sources") + 1] == ""
+    assert "--add-dir" not in cmd
+
+
+def test_a_confined_profile_cannot_allow_bash(monkeypatch):
+    import pytest
+
+    with pytest.raises(ValueError, match="cannot allow Bash"):
+        _captured_cmd(monkeypatch, allowed_tools="Read,Bash", confined=True)
+
+
+def test_a_confined_profile_cannot_allow_glob(monkeypatch):
+    """Glob's absolute patterns are not boundary-checked, so it would list names anywhere."""
+    import pytest
+
+    with pytest.raises(ValueError, match="cannot allow Glob"):
+        _captured_cmd(monkeypatch, allowed_tools="Read,Grep,Glob", confined=True)
+
+
+def test_unconfined_runs_keep_their_existing_flags(monkeypatch):
+    cmd = _captured_cmd(monkeypatch, allowed_tools="Read,Edit,Bash")
+    assert "--dangerously-skip-permissions" in cmd
+    assert "--permission-mode" not in cmd

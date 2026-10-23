@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from scripts.common.git_clone import shallow_clone_at_sha
+from scripts.common.git_clone import is_full_sha, shallow_clone_at_sha
 
 
 def test_rejects_invalid_repo_format(tmp_path):
@@ -127,3 +127,34 @@ def test_oserror_returns_false(tmp_path):
 
     with patch("scripts.common.git_clone.subprocess.run", side_effect=fake_run):
         assert shallow_clone_at_sha("owner/name", tmp_path / "dest") is False
+
+
+def test_pull_number_fetches_the_pr_head_before_checkout(tmp_path):
+    """A fork PR's head commit is only reachable through refs/pull/<n>/head."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _R()
+
+    with patch("scripts.common.git_clone.subprocess.run", side_effect=fake_run):
+        ok = shallow_clone_at_sha("owner/name", tmp_path / "dest", sha="deadbeef1234567", pull_number=42)
+    assert ok is True
+    assert calls[1][-3:] == ["fetch", "origin", "refs/pull/42/head"]
+    assert "checkout" in calls[2]
+
+
+def test_negative_pull_number_is_refused(tmp_path):
+    assert shallow_clone_at_sha("owner/name", tmp_path / "d", sha="deadbeef1234567", pull_number=-1) is False
+
+
+def test_full_sha_requires_exactly_forty_hex_characters():
+    assert is_full_sha("a" * 40)
+    assert is_full_sha("ABCDEF0123456789ABCDEF0123456789ABCDEF01")
+    assert not is_full_sha("a" * 39)
+    assert not is_full_sha("g" * 40)

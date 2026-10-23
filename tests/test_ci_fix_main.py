@@ -1,213 +1,138 @@
-"""Tests for the ci_fix workflow entry point."""
+"""The PR command front door: its plan and its report on the pull request."""
 
 from __future__ import annotations
 
-import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from scripts.ci_fix import main as main_mod
-from scripts.ci_fix.main import _parse_event, main
-from scripts.ci_fix.models import FixOutcome, OutcomeKind
+from scripts.ci_fix.gate import GateError, GateRejection
+from scripts.ci_fix.models import (
+    Failure,
+    FixPlan,
+    FixPolicy,
+    FixResult,
+    FixTarget,
+    FixTask,
+    FrontDoor,
+    ResultKind,
+    TargetKind,
+)
 
-_RUN_URL = "https://github.com/valkey-io/valkey/actions/runs/27559908167"
-
-
-def _event(*, action="created", is_pr=True, body=f"@valkeyrie-bot fix {_RUN_URL}",
-           login="alice", number=3988, repo="valkey-io/valkey", comment_id=7):
-    issue: dict = {"number": number}
-    if is_pr:
-        issue["pull_request"] = {"url": "..."}
-    return {
-        "action": action,
-        "issue": issue,
-        "comment": {"id": comment_id, "body": body, "user": {"login": login}},
-        "repository": {"full_name": repo},
-    }
-
-
-def test_parse_event_happy():
-    parsed = _parse_event(_event())
-    assert parsed == ("valkey-io/valkey", 3988, "alice", f"@valkeyrie-bot fix {_RUN_URL}", 7)
+_SHA = "a" * 40
+_BOT = "valkeyrie-ops[bot]"
+_REQUEST = {"repo": "valkey-io/valkey", "pr": 42, "commenter": "alice", "comment_id": "7"}
 
 
-def test_parse_event_ignores_non_pr():
-    assert _parse_event(_event(is_pr=False)) is None
+def _task() -> FixTask:
+    return FixTask(
+        failure=Failure("valkey-io/valkey", 9, _SHA, 10, "build", base_branch="unstable", pr_number=42),
+        target=FixTarget(
+            kind=TargetKind.UPDATE_PR,
+            repo_full_name="valkey-io/valkey",
+            base_repo_full_name="valkey-io/valkey",
+            branch="agent/ci-fix/x",
+            expected_sha=_SHA,
+        ),
+        policy=FixPolicy.GENERAL,
+    )
 
 
-def test_parse_event_ignores_non_created():
-    assert _parse_event(_event(action="edited")) is None
+@pytest.fixture
+def wired(monkeypatch):
+    monkeypatch.setenv("GITHUB_ACTOR", _BOT)
+    posted: list[tuple[str, int, str]] = []
+    reacted: list[tuple[int, ResultKind]] = []
+    monkeypatch.setattr(main_mod, "_post_comment", lambda _gh, repo, pr, body: posted.append((repo, pr, body)))
+    monkeypatch.setattr(
+        main_mod, "_react_outcome", lambda _gh, _repo, comment_id, kind: reacted.append((comment_id, kind)),
+    )
+
+    def gate(result):
+        build = MagicMock(return_value=result)
+        monkeypatch.setattr(main_mod, "build_fix_task", build)
+        return build
+
+    return SimpleNamespace(posted=posted, reacted=reacted, gate=gate)
 
 
-def test_parse_event_ignores_missing_fields():
-    assert _parse_event(_event(login="")) is None
+def test_an_authorized_command_is_planned_against_its_exact_job(wired) -> None:
+    build = wired.gate(_task())
+
+    plan = main_mod.plan_request(MagicMock(), None, _REQUEST, bot_login=_BOT)
+
+    assert plan == FixPlan(front_door=FrontDoor.PR, task=_task(), comment_id=7)
+    assert build.call_args.kwargs["commenter"] == "alice"
+    assert wired.posted == [] and wired.reacted == []
 
 
-def _write_event(tmp_path, event) -> str:
-    path = tmp_path / "event.json"
-    path.write_text(json.dumps(event))
-    return str(path)
+@pytest.mark.parametrize(("gate", "kind", "text"), [
+    (GateRejection("not authorized"), ResultKind.REFUSED, "No fix prepared: not authorized"),
+    (GateError("temporary GitHub failure"), ResultKind.FAILED, "could not evaluate"),
+])
+def test_the_gates_answer_is_posted_at_once(wired, gate, kind, text) -> None:
+    wired.gate(gate)
+
+    result = main_mod.plan_request(MagicMock(), None, _REQUEST, bot_login=_BOT)
+
+    assert result["action"] == kind.value
+    assert text in wired.posted[0][2]
+    assert wired.reacted == [(7, kind)]
 
 
-def test_main_ignores_non_command_comment(tmp_path, monkeypatch):
-    event_path = _write_event(tmp_path, _event(body="thanks, lgtm"))
-    rc = main(["--event-path", event_path, "--target-token", "t"])
-    assert rc == 0
+def test_the_commenter_is_trusted_only_from_the_poller(wired, monkeypatch) -> None:
+    build = wired.gate(_task())
+    monkeypatch.setenv("GITHUB_ACTOR", "mallory")
+
+    main_mod.plan_request(MagicMock(), None, _REQUEST, bot_login=_BOT)
+
+    assert build.call_args.kwargs["commenter"] == "mallory"
 
 
-def test_main_ignores_non_pr_comment(tmp_path):
-    event_path = _write_event(tmp_path, _event(is_pr=False))
-    rc = main(["--event-path", event_path, "--target-token", "t"])
-    assert rc == 0
+@pytest.mark.parametrize("request_", [
+    {**_REQUEST, "pr": 0},
+    {**_REQUEST, "repo": "someone/valkey"},
+    {**_REQUEST, "run_url": "https://example.com/no"},
+])
+def test_a_malformed_request_is_an_error(wired, request_) -> None:
+    wired.gate(AssertionError("the gate is not reached"))
+
+    with pytest.raises(ValueError):
+        main_mod.plan_request(MagicMock(), None, request_, bot_login=_BOT)
 
 
-def test_main_runs_pipeline_and_comments(tmp_path, monkeypatch):
-    event_path = _write_event(tmp_path, _event())
+def test_the_result_is_commented_and_reacted_to(wired) -> None:
+    plan = FixPlan(front_door=FrontDoor.PR, task=_task(), comment_id=7)
+    result = FixResult(kind=ResultKind.PUSHED, summary="pushed", task=_task(), commit_sha="b" * 40)
 
-    pushed = FixOutcome(kind=OutcomeKind.PUSHED, summary="done", commit_sha="abc")
-    fake_run = MagicMock(return_value=pushed)
-    posted = {}
+    report = main_mod.report_result(MagicMock(), plan, result)
 
-    monkeypatch.setattr(main_mod, "Github", MagicMock())
-    monkeypatch.setattr(main_mod, "ArtifactClient", MagicMock())
-    monkeypatch.setattr(main_mod, "run_ci_fix", fake_run)
-    monkeypatch.setattr(main_mod, "_post_comment",
-                        lambda gh, repo, num, body: posted.update(repo=repo, num=num, body=body))
-
-    rc = main(["--event-path", event_path, "--target-token", "tok"])
-    assert rc == 0
-    assert fake_run.called
-    assert posted["repo"] == "valkey-io/valkey"
-    assert posted["num"] == 3988
+    assert report["action"] == "pushed"
+    assert "Pushed `bbbbbbbbbbbb`" in wired.posted[0][2]
+    assert wired.reacted == [(7, ResultKind.PUSHED)]
 
 
-def test_main_runs_dispatch_request_and_comments(monkeypatch):
-    pushed = FixOutcome(kind=OutcomeKind.PUSHED, summary="done", commit_sha="abc")
-    fake_run = MagicMock(return_value=pushed)
-    posted = {}
+def test_a_comment_that_cannot_be_posted_fails_the_run_but_still_reacts(wired, monkeypatch) -> None:
+    monkeypatch.setattr(main_mod, "_post_comment", MagicMock(side_effect=RuntimeError("403")))
+    plan = FixPlan(front_door=FrontDoor.PR, task=_task(), comment_id=7)
+    result = FixResult(kind=ResultKind.PUSHED, summary="pushed", task=_task(), commit_sha="b" * 40)
 
-    monkeypatch.setattr(main_mod, "Github", MagicMock())
-    monkeypatch.setattr(main_mod, "ArtifactClient", MagicMock())
-    monkeypatch.setattr(main_mod, "run_ci_fix", fake_run)
-    monkeypatch.setattr(main_mod, "_post_comment",
-                        lambda gh, repo, num, body: posted.update(repo=repo, num=num, body=body))
-
-    rc = main([
-        "--target-token", "tok",
-        "--repo", "valkey-io/valkey",
-        "--pr", "3988",
-        "--run-url", _RUN_URL,
-        "--commenter", "alice",
-        "--hint", "look at payload",
-    ])
-    assert rc == 0
-    assert fake_run.call_args.kwargs["commenter"] == "alice"
-    assert fake_run.call_args.kwargs["command"].hint == "look at payload"
-    assert posted["repo"] == "valkey-io/valkey"
-    assert posted["num"] == 3988
+    with pytest.raises(RuntimeError):
+        main_mod.report_result(MagicMock(), plan, result)
+    assert wired.reacted == [(7, ResultKind.PUSHED)]
 
 
-def test_main_returns_nonzero_on_failed_outcome(tmp_path, monkeypatch):
-    event_path = _write_event(tmp_path, _event())
-    failed = FixOutcome(kind=OutcomeKind.FAILED, summary="clone failed")
-
-    monkeypatch.setattr(main_mod, "Github", MagicMock())
-    monkeypatch.setattr(main_mod, "ArtifactClient", MagicMock())
-    monkeypatch.setattr(main_mod, "run_ci_fix", MagicMock(return_value=failed))
-    monkeypatch.setattr(main_mod, "_post_comment", lambda *a, **k: None)
-
-    rc = main(["--event-path", event_path, "--target-token", "tok"])
-    assert rc == 1
-
-
-def test_main_unexpected_error_still_posts_comment(tmp_path, monkeypatch):
-    """An unexpected pipeline exception must become a FAILED comment, not a crash."""
-    event_path = _write_event(tmp_path, _event())
-    posted = {}
-
-    monkeypatch.setattr(main_mod, "Github", MagicMock())
-    monkeypatch.setattr(main_mod, "ArtifactClient", MagicMock())
-    monkeypatch.setattr(main_mod, "run_ci_fix",
-                        MagicMock(side_effect=RuntimeError("boom")))
-    monkeypatch.setattr(main_mod, "_post_comment",
-                        lambda gh, repo, num, body: posted.update(body=body))
-
-    rc = main(["--event-path", event_path, "--target-token", "tok"])
-    assert rc == 1
-    assert "internal error" in posted["body"].lower()
-    # The raw exception text must not leak into the public comment.
-    assert "boom" not in posted["body"]
-
-
-def test_verify_runs_env_parsing(monkeypatch):
-    from scripts.ci_fix.main import _MAX_VERIFY_RUNS, _verify_runs
-    from scripts.ci_fix.review import DEFAULT_VERIFY_RUNS
-
-    monkeypatch.delenv("CI_FIX_VERIFY_RUNS", raising=False)
-    assert _verify_runs() == DEFAULT_VERIFY_RUNS
-
-    monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "5")
-    assert _verify_runs() == 5
-
-    monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "0")
-    assert _verify_runs() == 1
-
-    monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "999")
-    assert _verify_runs() == _MAX_VERIFY_RUNS
-
-    monkeypatch.setenv("CI_FIX_VERIFY_RUNS", "not-a-number")
-    assert _verify_runs() == DEFAULT_VERIFY_RUNS
-
-
-def _reaction_gh():
+def test_reaction_uses_plus_one_for_published_result() -> None:
     requester = MagicMock()
     gh = MagicMock()
-    gh.get_repo.return_value._requester = requester
-    return gh, requester
+    gh.get_repo.return_value = SimpleNamespace(_requester=requester)
 
+    main_mod._react_outcome(gh, "o/r", 7, ResultKind.SUGGESTED)
 
-def test_react_outcome_pushed_adds_plus_one():
-    from scripts.ci_fix.main import _react_outcome
-
-    gh, requester = _reaction_gh()
-    _react_outcome(gh, "valkey-io/valkey", 55, OutcomeKind.PUSHED)
     requester.requestJsonAndCheck.assert_called_once_with(
-        "POST", "/repos/valkey-io/valkey/issues/comments/55/reactions",
+        "POST",
+        "/repos/o/r/issues/comments/7/reactions",
         input={"content": "+1"},
     )
-
-
-def test_react_outcome_refused_adds_minus_one():
-    from scripts.ci_fix.main import _react_outcome
-
-    gh, requester = _reaction_gh()
-    _react_outcome(gh, "valkey-io/valkey", 55, OutcomeKind.REFUSED)
-    requester.requestJsonAndCheck.assert_called_once_with(
-        "POST", "/repos/valkey-io/valkey/issues/comments/55/reactions",
-        input={"content": "-1"},
-    )
-
-
-def test_react_outcome_no_comment_id_is_noop():
-    from scripts.ci_fix.main import _react_outcome
-
-    gh, requester = _reaction_gh()
-    _react_outcome(gh, "valkey-io/valkey", 0, OutcomeKind.PUSHED)
-    requester.requestJsonAndCheck.assert_not_called()
-
-
-def test_react_outcome_swallows_failure():
-    """A failed reaction must never raise: the comment is the real report."""
-    from scripts.ci_fix.main import _react_outcome
-
-    gh, requester = _reaction_gh()
-    requester.requestJsonAndCheck.side_effect = RuntimeError("boom")
-    _react_outcome(gh, "valkey-io/valkey", 55, OutcomeKind.PUSHED)
-
-
-def test_react_outcome_swallows_repo_lookup_failure():
-    """A transient failure in the repo lookup must not escape either."""
-    from scripts.ci_fix.main import _react_outcome
-
-    gh = MagicMock()
-    gh.get_repo.side_effect = RuntimeError("transient API error")
-    _react_outcome(gh, "valkey-io/valkey", 55, OutcomeKind.PUSHED)

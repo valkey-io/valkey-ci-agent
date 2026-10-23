@@ -36,6 +36,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           install-mode: dev
+          # The confinement test drives the pinned CLI the agents run.
+          install-claude: ${{ matrix.python-version == '3.11' && 'true' || 'false' }}
 
       - name: Run ruff lint
         if: matrix.python-version == '3.11'
@@ -45,10 +47,45 @@ jobs:
         if: matrix.python-version != '3.11'
         run: pytest -v
 
+      - name: Create an account for the isolation tests
+        if: matrix.python-version == '3.11'
+        run: |
+          sudo useradd --create-home --shell /bin/bash ci-fix-agent
+          echo "CI_FIX_TEST_AGENT_USER=ci-fix-agent" >> "${GITHUB_ENV}"
+
       - name: Run pytest with coverage
         if: matrix.python-version == '3.11'
+        env:
+          REQUIRE_CLAUDE_CLI: "1"
         run: pytest --cov=scripts --cov-report=term-missing --cov-report=xml --cov-fail-under=60 -v
 
       - name: Run mypy type checking
         if: matrix.python-version == '3.11'
         run: mypy scripts/
+
+  isolation-as-root:
+    # The CI-fix agent's account as a copied Valkey container job makes it:
+    # as root, without sudo, with the distribution's tools.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: alpine:3.22
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+        with:
+          install-mode: dev
+          system-packages: "true"
+
+      - name: Create an account for the isolation tests
+        run: |
+          useradd --create-home --shell /bin/bash -K UID_MIN=2000 -K GID_MIN=2000 ci-fix-agent
+          echo "CI_FIX_TEST_AGENT_USER=ci-fix-agent" >> "${GITHUB_ENV}"
+
+      - name: Run the isolation tests
+        run: pytest -v tests/test_isolation.py

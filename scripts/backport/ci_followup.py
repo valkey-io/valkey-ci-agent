@@ -1,72 +1,74 @@
-"""Automatically diagnose current-head CI failures on open sweep PRs.
+"""Fix one current-head CI failure on an open backport sweep PR.
 
-The follow-up is deliberately narrower than the maintainer-triggered CI-fix
-entry point. It acts only on the one bot-owned ``agent/backport/sweep/<base>``
-PR for a registered branch, only after every current-head workflow run has
-completed, and never retries the same logical workflow job on one head. The
-shared CI-fix engine still owns diagnosis, verification, skeptical review, and
-lease-protected push.
+This module is intentionally only a selector and front door. It finds the
+bot-owned sweep PR for one registered release branch, waits for its current
+head's CI to finish, chooses one unhandled actionable job, and plans its fix,
+which runs like every other (:mod:`scripts.ci_fix.run`).
+
+The engine owns diagnosis, editing, and publication. The target PR's normal CI
+remains the final verifier, matching the existing backport workflow model. A
+result comment carries a hidden marker with its outcome, so the same logical
+job is not retried on the same head once it has a result. A failed attempt (an
+agent crash, the time running out) is retried, up to ``MAX_FAILED_ATTEMPTS``
+in all.
 """
 
 from __future__ import annotations
 
-import argparse
 import hashlib
-import json
 import logging
-import os
 import re
-import sys
+from collections import Counter
 from dataclasses import dataclass
-from fnmatch import fnmatch
-from pathlib import Path
-from typing import Any, Iterable
-
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from github import Auth, Github
+from typing import Any
 
 from scripts.backport.registry import RepoEntry, load_registry
 from scripts.backport.sweep import _BRANCH_PREFIX
 from scripts.backport.sweep_prs import find_existing_pr
-from scripts.ci_fix.comment import render_comment
-from scripts.ci_fix.models import FixOutcome, FixRequest, OutcomeKind
-from scripts.ci_fix.pipeline import run_ci_fix_request
-from scripts.ci_fix.review import DEFAULT_VERIFY_RUNS
-from scripts.ci_fix.verify.base import FailedJob, VerifyBackend
-from scripts.ci_fix.verify.github_runs import failed_jobs_for_run
-from scripts.ci_fix.verify.macos import MacosVerifier
-from scripts.common.git_auth import GitAuth
+from scripts.ci_fix.comment import render_result
+from scripts.ci_fix.github_runs import (
+    FailedJob,
+    most_actionable_failure,
+    newest_runs_for_head,
+    workflow_file,
+    workflow_identity,
+)
+from scripts.ci_fix.models import (
+    MAX_FAILED_ATTEMPTS,
+    Failure,
+    FixPlan,
+    FixPolicy,
+    FixResult,
+    FixTarget,
+    FixTask,
+    FrontDoor,
+    ResultKind,
+    TargetKind,
+)
+from scripts.ci_fix.policy import is_backport_branch, is_writable_branch
 from scripts.common.github_client import retry_github_call
-from scripts.common.identity import APP_LOGIN
-from scripts.common.logging_utils import configure_logging
-from scripts.common.polling import env_int
-from scripts.common.workflow_artifacts import ArtifactClient
+from scripts.common.workflow_jobs import job_is_ignored
 
 logger = logging.getLogger(__name__)
 
 _MARKER_RE = re.compile(
     r"<!-- valkey-ci-agent:auto-ci-followup "
-    r"head=(?P<head>[0-9a-f]{40}) run=(?P<run>\d+) job=(?P<job>\d+)"
-    r"(?: key=(?P<key>[0-9a-f]{64}))? -->"
+    r"head=(?P<head>[0-9a-f]{40}) run=(?P<run>\d+)"
+    r"(?: attempt=(?P<attempt>\d+))? job=(?P<job>\d+)"
+    r"(?: key=(?P<key>[0-9a-f]{64}))?(?: outcome=(?P<outcome>[a-z]+))? -->"
 )
-# A run can conclude "cancelled" (a manual stop, or a concurrency cancel) and
-# still contain a job that genuinely failed before the cancel landed. Matching
-# the interactive gate, run-level conclusion is only a cheap filter for "no job
-# can have failed here"; `failed_jobs_for_run` is what decides truth per job,
-# and it deliberately ignores cancelled *jobs*.
-_FAILED_RUN_CONCLUSIONS = {"failure", "timed_out", "cancelled"}
-_MAX_ATTEMPTS_PER_PR = 3
+_MAX_ATTEMPTS_PER_HEAD = 3
 
 
 @dataclass(frozen=True)
 class FollowupTarget:
+    """One failed job selected from the current sweep PR head."""
+
     pr: Any
     run: Any
     head_sha: str
     head_branch: str
-    jobs: tuple[FailedJob, ...]
+    job: FailedJob
 
 
 @dataclass(frozen=True)
@@ -83,27 +85,80 @@ def find_followup_target(
     target_branch: str,
     bot_login: str,
 ) -> tuple[FollowupTarget | None, str]:
-    """Return one safe, unhandled current-head failure or a skip reason."""
+    """Return one safe, unhandled current-head failure or a skip reason.
+
+    Every open bot-owned PR into ``target_branch`` is considered, not only the
+    sweep PR: a pushed CI fix and a draft PR opened for a detector issue start
+    the repository's own CI, and nothing else watches whether it goes red.
+    """
     if not repo_entry.automatic_ci_followup:
         return None, "disabled"
     if repo_entry.effective_push_repo != repo_entry.repo:
         return None, "fork-head-unsupported"
 
-    head_branch = f"{_BRANCH_PREFIX}/{target_branch}"
-    pr = find_existing_pr(
-        gh,
-        repo_entry.repo,
-        repo_entry.effective_push_repo,
-        head_branch,
-    )
-    if pr is None:
-        return None, "no-open-sweep-pr"
+    prs = _bot_prs_into(gh, repo_entry, target_branch=target_branch, bot_login=bot_login)
+    if not prs:
+        return None, "no-open-bot-pr"
+    reasons: list[str] = []
+    for pr in prs:
+        target, reason = _followup_for_pr(
+            gh, pr, repo_entry=repo_entry, target_branch=target_branch, bot_login=bot_login,
+        )
+        if target is not None:
+            return target, reason
+        reasons.append(reason)
+    # The sweep PR's reason first: it is the one a maintainer expects.
+    return None, reasons[0]
 
+
+def _bot_prs_into(
+    gh: Any, repo_entry: RepoEntry, *, target_branch: str, bot_login: str,
+) -> list[Any]:
+    """Open bot-owned PRs into ``target_branch`` from a namespace this engine writes.
+
+    The deterministic sweep PR comes first, then any other, newest first, so a
+    sweep failure is still handled before a fix PR's.
+    """
+    sweep_branch = f"{_BRANCH_PREFIX}/{target_branch}"
+    sweep = find_existing_pr(gh, repo_entry.repo, repo_entry.effective_push_repo, sweep_branch)
+    found = [sweep] if sweep is not None else []
+    try:
+        others = retry_github_call(
+            lambda: list(gh.get_repo(repo_entry.repo).get_pulls(
+                state="open", base=target_branch, sort="created", direction="desc",
+            )[:_MAX_SCANNED_PRS]),
+            retries=2,
+            description=f"list open PRs into {target_branch}",
+        )
+    except Exception as exc:  # noqa: BLE001 - the sweep PR is still followed up
+        logger.warning("Could not list open PRs into %s: %s", target_branch, exc)
+        return found
+    for pr in others:
+        head = str(getattr(getattr(pr, "head", None), "ref", "") or "")
+        if head == sweep_branch or not is_writable_branch(head):
+            continue
+        if str(getattr(getattr(pr, "user", None), "login", "") or "") != bot_login:
+            continue
+        found.append(pr)
+    return found
+
+
+def _followup_for_pr(
+    gh: Any,
+    pr: Any,
+    *,
+    repo_entry: RepoEntry,
+    target_branch: str,
+    bot_login: str,
+) -> tuple[FollowupTarget | None, str]:
+    """One unhandled failure on ``pr``'s exact current head, or why there is none."""
+    head_branch = str(getattr(getattr(pr, "head", None), "ref", "") or "")
+    if not is_writable_branch(head_branch):
+        return None, "head-branch-not-writable"
     rejection = _validate_sweep_pr(
         pr,
         repo_full_name=repo_entry.repo,
         target_branch=target_branch,
-        head_branch=head_branch,
         bot_login=bot_login,
     )
     if rejection:
@@ -111,73 +166,48 @@ def find_followup_target(
 
     head_sha = str(getattr(pr.head, "sha", "") or "")
     handled = _handled_failures(pr, head_sha, bot_login)
-    if handled.attempt_count >= _MAX_ATTEMPTS_PER_PR:
+    if handled.attempt_count >= _MAX_ATTEMPTS_PER_HEAD:
         return None, "attempt-budget-exhausted"
-    repo = gh.get_repo(repo_entry.repo)
-    # Filter by head SHA server-side: a long-lived sweep branch accumulates a
-    # run per push, and paging its whole history every hour just to discard
-    # older heads wastes the target repository's API budget. The client-side
-    # re-check below still holds, so a server that ignores the filter cannot
-    # widen the target beyond the current head.
-    current_runs = []
-    for run in repo.get_workflow_runs(branch=head_branch, head_sha=head_sha):
-        if str(getattr(run, "head_sha", "") or "") != head_sha:
-            continue
-        current_runs.append(run)
+
+    current_runs = newest_runs_for_head(
+        gh,
+        repo_entry.repo,
+        branch=head_branch,
+        head_sha=head_sha,
+    )
 
     if not current_runs:
         return None, "no-current-head-runs"
-    if any(str(getattr(run, "status", "") or "") != "completed" for run in current_runs):
+    if any(
+        str(getattr(run, "status", "") or "") != "completed"
+        for run in current_runs
+    ):
         return None, "current-head-ci-running"
 
-    candidates: list[tuple[int, FollowupTarget]] = []
-    for run in current_runs:
-        conclusion = str(getattr(run, "conclusion", "") or "")
-        if conclusion not in _FAILED_RUN_CONCLUSIONS:
-            continue
-        failed = tuple(
-            job
-            for job in failed_jobs_for_run(gh, repo_entry.repo, int(run.id))
-            if job.id
-            and job.id not in handled.job_ids
-            and _job_key(run, job.name) not in handled.job_keys
-            and not _ignored_job(job.name, repo_entry.ci_followup_ignored_jobs)
-        )
-        if not failed:
-            continue
-        selected = _select_job(failed)
-        priority = _job_priority(selected.name)
-        candidates.append(
-            (
-                priority,
-                FollowupTarget(
-                    pr=pr,
-                    run=run,
-                    head_sha=head_sha,
-                    head_branch=head_branch,
-                    jobs=(selected,),
-                ),
-            )
-        )
-
-    if not candidates:
+    picked = most_actionable_failure(
+        gh, repo_entry.repo, current_runs,
+        keep=lambda run, job: bool(job.id)
+        and job.id not in handled.job_ids
+        and _job_key(run, job.name) not in handled.job_keys
+        and not job_is_ignored(job.name, repo_entry.ci_followup_ignored_jobs),
+    )
+    if picked is None:
         return None, "no-unhandled-actionable-failures"
-    candidates.sort(key=lambda item: (item[0], -int(item[1].run.id)))
-    return candidates[0][1], "actionable"
+    run, job, _failed = picked
+    return FollowupTarget(pr=pr, run=run, head_sha=head_sha, head_branch=head_branch, job=job), "actionable"
 
 
-def run_followup(
+def plan_request(
     gh: Any,
+    _artifact_client: Any,
+    request: dict[str, Any],
     *,
-    repo_entry: RepoEntry,
-    target_branch: str,
     bot_login: str,
-    git_env: dict[str, str],
-    artifact_client: ArtifactClient,
-    macos_verifier: VerifyBackend | None = None,
-    verify_runs: int = DEFAULT_VERIFY_RUNS,
-) -> dict[str, Any]:
-    """Attempt at most one fix for the current head and record the outcome."""
+    registry: str = "repos.yml",
+) -> FixPlan | dict[str, Any]:
+    """The fix plan for one failure on ``request``'s branch (``{"repo", "branch"}``), or why there is none."""
+    repo_entry, _branch_entry = load_registry(registry).get_branch(str(request["repo"]), str(request["branch"]))
+    target_branch = str(request["branch"])
     target, reason = find_followup_target(
         gh,
         repo_entry=repo_entry,
@@ -192,127 +222,78 @@ def run_followup(
             "reason": reason,
         }
 
-    selected_job = _select_job(target.jobs)
-    jobs = (selected_job,)
-    job_names = (selected_job.name,)
-    request = FixRequest(
+    selected_job = target.job
+    run_attempt = int(getattr(target.run, "run_attempt", 1) or 1)
+    failure = Failure(
         repo_full_name=repo_entry.repo,
-        pr_number=int(target.pr.number),
-        head_repo_full_name=repo_entry.repo,
-        head_branch=target.head_branch,
-        head_sha=target.head_sha,
         run_id=int(target.run.id),
-        requested_by=bot_login,
-        hint=(
-            "Automatic backport CI follow-up. Prioritize deterministic failures "
-            "in this order: " + ", ".join(job_names)
-        )[:500],
+        run_attempt=run_attempt,
+        head_sha=target.head_sha,
+        job_id=selected_job.id,
+        job_name=selected_job.name,
+        base_branch=target_branch,
+        description=f"the failure in job `{selected_job.name}`",
+        pr_number=int(target.pr.number),
+        workflow=workflow_file(target.run),
     )
-    # Claim the logical job *before* the engine runs. The claim comment carries
-    # the same hidden markers as the result, so a crash, an OOM kill, or the job
-    # timeout can no longer leave the attempt unrecorded - without this, every
-    # scheduled run would re-diagnose the same failure on the same head forever.
-    # The claim is edited in place afterwards, so one attempt is still one
-    # comment on the PR.
-    claim = retry_github_call(
-        lambda: target.pr.create_issue_comment(
-            _render_claim_comment(request, target.run, jobs)
+    task = FixTask(
+        failure=failure,
+        target=FixTarget(
+            kind=TargetKind.UPDATE_PR,
+            repo_full_name=repo_entry.repo,
+            base_repo_full_name=repo_entry.repo,
+            branch=target.head_branch,
+            expected_sha=target.head_sha,
         ),
-        retries=3,
-        description=f"claim automatic CI follow-up on #{request.pr_number}",
+        # A backport branch's failure is usually a missing upstream change; a
+        # pushed CI fix or a draft PR has no upstream counterpart to port.
+        policy=FixPolicy.BACKPORT if is_backport_branch(target.head_branch) else FixPolicy.GENERAL,
+    )
+    return FixPlan(
+        front_door=FrontDoor.FOLLOW_UP, task=task,
+        markers=tuple(_markers(failure, target.run, (selected_job,))),
     )
 
-    try:
-        def pre_push_check() -> str:
-            """Revalidate the automation's authority at the last possible moment."""
-            try:
-                current = retry_github_call(
-                    lambda: gh.get_repo(repo_entry.repo).get_pull(request.pr_number),
-                    retries=2,
-                    description=f"revalidate PR #{request.pr_number} before push",
-                )
-            except Exception:  # noqa: BLE001 - a failed authorization check must deny the push
-                logger.exception("could not revalidate automatic follow-up before push")
-                return "the automatic follow-up PR could not be revalidated"
 
-            rejection = _validate_sweep_pr(
-                current,
-                repo_full_name=repo_entry.repo,
-                target_branch=target_branch,
-                head_branch=request.head_branch,
-                bot_login=bot_login,
-            )
-            if rejection:
-                return f"automatic follow-up authorization expired ({rejection})"
-            current_sha = str(getattr(current.head, "sha", "") or "")
-            if current_sha != request.head_sha:
-                return (
-                    "the PR head moved from "
-                    f"{request.head_sha[:12]} to {current_sha[:12] or '(missing)'}"
-                )
-            return ""
+def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:
+    """Comment the result on the PR, with the markers that record its outcome.
 
-        outcome = run_ci_fix_request(
-            gh,
-            request=request,
-            failed_jobs=job_names,
-            git_env=git_env,
-            artifact_client=artifact_client,
-            macos_verifier=macos_verifier,
-            verify_runs=verify_runs,
-            pre_push_check=pre_push_check,
-        )
-    except Exception:  # noqa: BLE001 - every automatic attempt needs an audit result
-        logger.exception("automatic CI follow-up failed unexpectedly")
-        outcome = FixOutcome(
-            kind=OutcomeKind.FAILED,
-            summary=(
-                "An internal error stopped automatic CI follow-up; see the "
-                "valkey-ci-agent workflow logs for details."
-            ),
-        )
-
-    current_pr = retry_github_call(
-        lambda: gh.get_repo(repo_entry.repo).get_pull(request.pr_number),
-        retries=2,
-        description=f"recheck PR #{request.pr_number} head",
+    The outcome tells a refusal, which retires the job but changed nothing,
+    and a failure, which is retried a bounded number of times, from an
+    attempt that counts against the head's budget.
+    """
+    failure = plan.task.failure
+    what = "backport" if is_backport_branch(plan.task.target.branch) else "pull request"
+    body = f"Automatic follow-up on this {what}'s CI.\n\n" + render_result(result)
+    body += "\n\n" + "\n".join(
+        marker.removesuffix(" -->") + f" outcome={result.kind.value} -->" for marker in plan.markers
     )
-    current_sha = str(getattr(current_pr.head, "sha", "") or "")
-    pushed = outcome.kind is OutcomeKind.PUSHED and bool(outcome.commit_sha)
-    head_mismatch_after_push = pushed and current_sha != outcome.commit_sha
-    stale = (
-        not outcome.commit_sha
-        if outcome.kind is OutcomeKind.PUSHED
-        else current_sha != request.head_sha
-    )
-    if stale:
-        body = _render_stale_comment(request, target.run, jobs)
-    else:
-        body = _render_followup_comment(outcome, request, target.run, jobs)
-        if head_mismatch_after_push:
-            body += _render_post_push_head_mismatch(outcome.commit_sha, current_sha)
     retry_github_call(
-        lambda: claim.edit(body),
+        lambda: gh.get_repo(failure.repo_full_name).get_pull(failure.pr_number).create_issue_comment(body),
         retries=3,
-        description=f"post automatic CI follow-up on #{request.pr_number}",
+        description=f"post automatic CI follow-up on #{failure.pr_number}",
     )
-    result = {
-        "repo": repo_entry.repo,
-        "branch": target_branch,
-        "action": "stale" if stale else outcome.kind.value,
-        "pr": request.pr_number,
-        "head": request.head_sha,
-        "run": request.run_id,
-        "jobs": [job.name for job in jobs],
+    response: dict[str, Any] = {
+        "repo": failure.repo_full_name,
+        "branch": failure.base_branch,
+        "action": result.kind.value,
+        "pr": failure.pr_number,
+        "head": failure.head_sha,
+        "run": failure.run_id,
+        "run_attempt": failure.run_attempt,
+        "job": {
+            "id": failure.job_id,
+            "name": failure.job_name,
+        },
+        "summary": result.summary,
     }
-    if stale:
-        result["reason"] = "PR head moved during follow-up; the result was discarded"
-    else:
-        result["summary"] = outcome.summary
-        if head_mismatch_after_push:
-            result["head_moved_after_push"] = True
-            result["current_head"] = current_sha
-    return result
+    if result.commit_sha:
+        response["commit"] = result.commit_sha
+    return response
+
+
+# How many open PRs into one branch are inspected for a bot-owned fix PR.
+_MAX_SCANNED_PRS = 50
 
 
 def _validate_sweep_pr(
@@ -320,27 +301,22 @@ def _validate_sweep_pr(
     *,
     repo_full_name: str,
     target_branch: str,
-    head_branch: str,
     bot_login: str,
 ) -> str:
-    """Return ``""`` when this PR may be auto-fixed, or a skip-reason slug.
-
-    This is the gate that replaces the human-team membership check the
-    maintainer-triggered entry point relies on, so every field is checked
-    explicitly rather than trusted: open, exact base and head refs, head in the
-    target repository itself, a 40-hex head SHA, and bot authorship. Anything
-    else is a PR the automation has no mandate over.
-    """
+    """Return ``""`` only for the expected open, bot-owned sweep PR."""
     if str(getattr(pr, "state", "open") or "") != "open":
         return "pr-not-open"
     if str(getattr(pr.base, "ref", "") or "") != target_branch:
         return "base-branch-mismatch"
-    if str(getattr(pr.head, "ref", "") or "") != head_branch:
-        return "head-branch-mismatch"
-    head_repo = str(getattr(getattr(pr.head, "repo", None), "full_name", "") or "")
+    head_repo = str(
+        getattr(getattr(pr.head, "repo", None), "full_name", "") or ""
+    )
     if head_repo != repo_full_name:
         return "head-repository-mismatch"
-    if not re.fullmatch(r"[0-9a-f]{40}", str(getattr(pr.head, "sha", "") or "")):
+    if not re.fullmatch(
+        r"[0-9a-f]{40}",
+        str(getattr(pr.head, "sha", "") or ""),
+    ):
         return "invalid-head-sha"
     author = str(getattr(getattr(pr, "user", None), "login", "") or "")
     if author != bot_login:
@@ -353,17 +329,16 @@ def _handled_failures(
     head_sha: str,
     bot_login: str,
 ) -> _HandledFailures:
-    """Return the PR attempt count and jobs already attempted on this head.
+    """Return the attempts and handled jobs for ``head_sha`` only.
 
-    A bot-authored comment with at least one valid marker counts as one attempt,
-    regardless of how many jobs it names. Exact job ids and logical keys count
-    only when the marker's head matches, so an older attempt cannot suppress a
-    different failure on the current head. Logical keys suppress the twin
-    push/pull_request run of the same workflow job, whose GitHub job ids are
-    necessarily different.
+    A refusal changed nothing on the branch: it retires its job, but is not
+    one of the head's attempts. A failure is one, and retires its job only
+    after ``MAX_FAILED_ATTEMPTS`` of them, since it says nothing about the job.
     """
     job_ids: set[int] = set()
     job_keys: set[str] = set()
+    failed_ids: Counter[int] = Counter()
+    failed_keys: Counter[str] = Counter()
     attempt_count = 0
     comments = retry_github_call(
         lambda: list(pr.get_issue_comments()),
@@ -371,19 +346,32 @@ def _handled_failures(
         description=f"list follow-up markers on #{pr.number}",
     )
     for comment in comments:
-        author = str(getattr(getattr(comment, "user", None), "login", "") or "")
+        author = str(
+            getattr(getattr(comment, "user", None), "login", "") or ""
+        )
         if author != bot_login:
             continue
         matches = tuple(
-            _MARKER_RE.finditer(str(getattr(comment, "body", "") or ""))
+            match
+            for match in _MARKER_RE.finditer(
+                str(getattr(comment, "body", "") or "")
+            )
+            if match.group("head") == head_sha
         )
-        if matches:
+        if any(match.group("outcome") != ResultKind.REFUSED.value for match in matches):
             attempt_count += 1
         for match in matches:
-            if match.group("head") == head_sha:
-                job_ids.add(int(match.group("job")))
-                if match.group("key"):
-                    job_keys.add(match.group("key"))
+            job, key = int(match.group("job")), match.group("key")
+            if match.group("outcome") == ResultKind.FAILED.value:
+                failed_ids[job] += 1
+                if key:
+                    failed_keys[key] += 1
+                continue
+            job_ids.add(job)
+            if key:
+                job_keys.add(key)
+    job_ids.update(job for job, count in failed_ids.items() if count >= MAX_FAILED_ATTEMPTS)
+    job_keys.update(key for key, count in failed_keys.items() if count >= MAX_FAILED_ATTEMPTS)
     return _HandledFailures(
         job_ids=frozenset(job_ids),
         job_keys=frozenset(job_keys),
@@ -391,188 +379,23 @@ def _handled_failures(
     )
 
 
-def _ignored_job(name: str, patterns: Iterable[str]) -> bool:
-    lowered = name.lower()
-    return any(fnmatch(lowered, pattern.lower()) for pattern in patterns)
-
-
-def _job_priority(name: str) -> int:
-    """Rank a failed job by how deterministic its failure usually is.
-
-    Only the best tier present gets an attempt, so the ordering matters: a
-    formatting or build break has one obvious fix, a test failure needs
-    diagnosis, and a sanitizer or valgrind failure is the most likely to be
-    flaky or to need a judgement call. Unrecognised names sort last.
-    """
-    lowered = name.lower()
-    if any(
-        token in lowered
-        for token in ("format", "lint", "schema", "generated", "build", "compile")
-    ):
-        return 0
-    if any(
-        token in lowered
-        for token in ("asan", "ubsan", "tsan", "sanitizer", "valgrind")
-    ):
-        return 2
-    if any(token in lowered for token in ("unit", "integration", "test")):
-        return 1
-    return 3
-
-
-def _select_job(jobs: Iterable[FailedJob]) -> FailedJob:
-    """Choose one deterministic failure for this automatic attempt."""
-    return min(
-        jobs,
-        key=lambda job: (
-            _job_priority(job.name),
-            int(job.id),
-            job.name.lower(),
-        ),
-    )
-
-
 def _job_key(run: Any, job_name: str) -> str:
     """Identify one logical job across twin events for the same workflow/head."""
-    workflow_identity = ""
-    for attribute in ("workflow_id", "path", "name"):
-        value = str(getattr(run, attribute, "") or "").strip()
-        if value:
-            workflow_identity = f"{attribute}:{value}"
-            break
-    if not workflow_identity:
-        # Fail open when a partial API object exposes no workflow identity:
-        # distinct runs must not suppress one another merely because they both
-        # contain a generic job name such as "build".
-        workflow_identity = f"run:{int(getattr(run, 'id', 0) or 0)}"
     normalized_name = " ".join(job_name.casefold().split())
     return hashlib.sha256(
-        f"{workflow_identity}\0{normalized_name}".encode()
+        f"{workflow_identity(run)}\0{normalized_name}".encode()
     ).hexdigest()
 
 
 def _markers(
-    request: FixRequest,
+    failure: Failure,
     run: Any,
     jobs: tuple[FailedJob, ...],
-) -> str:
-    """Render hidden exact/logical claim markers read by ``_handled_failures``."""
-    return "\n".join(
-        f"<!-- valkey-ci-agent:auto-ci-followup head={request.head_sha} "
-        f"run={request.run_id} job={job.id} key={_job_key(run, job.name)} -->"
+) -> list[str]:
+    """Render terminal exact/logical markers consumed by ``_handled_failures``."""
+    return [
+        f"<!-- valkey-ci-agent:auto-ci-followup head={failure.head_sha} "
+        f"run={failure.run_id} attempt={failure.run_attempt} job={job.id} "
+        f"key={_job_key(run, job.name)} -->"
         for job in jobs
-    )
-
-
-def _render_claim_comment(
-    request: FixRequest,
-    run: Any,
-    jobs: tuple[FailedJob, ...],
-) -> str:
-    """Render the pre-attempt claim, replaced in place once the engine returns."""
-    names = ", ".join(f"`{job.name}`" for job in jobs) or "the current failure"
-    return (
-        "Automatic follow-up for the current backport head is diagnosing "
-        f"{names} at `{request.head_sha[:12]}`. This comment is replaced with "
-        "the result; if it is not, the agent run itself failed and the "
-        "valkey-ci-agent workflow logs have the details.\n\n"
-        + _markers(request, run, jobs)
-    )
-
-
-def _render_stale_comment(
-    request: FixRequest,
-    run: Any,
-    jobs: tuple[FailedJob, ...],
-) -> str:
-    """Render the outcome for an attempt whose head moved while it ran."""
-    return (
-        "Automatic follow-up for `"
-        + request.head_sha[:12]
-        + "` was discarded: this PR's head moved while the fix was being "
-        "verified, so nothing was pushed. CI on the new head is followed up "
-        "separately.\n\n"
-        + _markers(request, run, jobs)
-    )
-
-
-def _render_followup_comment(
-    outcome: FixOutcome,
-    request: FixRequest,
-    run: Any,
-    jobs: tuple[FailedJob, ...],
-) -> str:
-    """Render the engine's outcome plus markers that retire this logical job."""
-    return (
-        "Automatic follow-up for the current backport head.\n\n"
-        + render_comment(outcome)
-        + "\n\n"
-        + _markers(request, run, jobs)
-    )
-
-
-def _render_post_push_head_mismatch(pushed_sha: str, current_sha: str) -> str:
-    """Explain a post-push recheck mismatch without denying the real push."""
-    return (
-        "\n\nThe fix was pushed as `"
-        + pushed_sha[:12]
-        + "`. At the post-push recheck, the PR API reported `"
-        + (current_sha[:12] or "(missing)")
-        + "` as the current head, so CI follow-up will evaluate that head "
-        "separately."
-    )
-
-
-def _macos_verifier() -> VerifyBackend | None:
-    """Build the macOS verification backend, or ``None`` when it is not configured.
-
-    Both ``CI_FIX_MACOS_AGENT_REPO`` and ``CI_FIX_MACOS_TOKEN`` have to be set, so
-    macOS verification stays opt-in and a deployment without it degrades to the
-    other backends instead of failing.
-    """
-    agent_repo = os.environ.get("CI_FIX_MACOS_AGENT_REPO", "")
-    token = os.environ.get("CI_FIX_MACOS_TOKEN", "")
-    if not agent_repo or not token:
-        return None
-    agent_gh = Github(auth=Auth.Token(token))
-    return MacosVerifier(
-        agent_gh,
-        agent_repo_full_name=agent_repo,
-        ref=os.environ.get("CI_FIX_MACOS_AGENT_REF", "main"),
-        artifact_client=ArtifactClient(agent_gh, token=token),
-    )
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--registry", default="repos.yml")
-    parser.add_argument("--repo", required=True)
-    parser.add_argument("--branch", required=True)
-    parser.add_argument("--target-token", default=os.environ.get("TARGET_TOKEN", ""))
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args(argv)
-    if not args.target_token:
-        parser.error("--target-token or TARGET_TOKEN is required")
-
-    configure_logging(verbose=args.verbose)
-    registry = load_registry(args.registry)
-    repo_entry, _branch_entry = registry.get_branch(args.repo, args.branch)
-    gh = Github(auth=Auth.Token(args.target_token))
-    bot_login = os.environ.get("AUTO_CI_FOLLOWUP_BOT_LOGIN", f"{APP_LOGIN}[bot]")
-    with GitAuth(args.target_token, prefix="backport-ci-followup-git-askpass-") as auth:
-        result = run_followup(
-            gh,
-            repo_entry=repo_entry,
-            target_branch=args.branch,
-            bot_login=bot_login,
-            git_env=auth.env(),
-            artifact_client=ArtifactClient(gh, token=args.target_token),
-            macos_verifier=_macos_verifier(),
-            verify_runs=env_int("CI_FIX_VERIFY_RUNS", DEFAULT_VERIFY_RUNS, minimum=1, maximum=10),
-        )
-    print(json.dumps(result, indent=2))
-    return 1 if result.get("action") == OutcomeKind.FAILED.value else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    ]

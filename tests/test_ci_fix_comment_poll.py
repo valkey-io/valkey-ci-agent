@@ -316,3 +316,36 @@ def test_skips_of_fix_commands_are_logged(caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert any("not on a pull request" in m for m in messages)
     assert any("Scanned 1 comment(s)" in m and "0 fix(es) dispatched" in m for m in messages)
+
+
+def test_dispatch_forwards_a_job_link_intact():
+    from scripts.ci_fix.comment_poll import dispatch_ci_fix
+    from scripts.ci_fix.gate import parse_command
+
+    gh = MagicMock()
+    dispatch = dispatch_ci_fix(gh, agent_repo="o/agent", workflow="ci-fix.yml", ref="main")
+    command = parse_command(f"@valkeyrie-ops fix {_RUN_URL}/job/77 the tcl one")
+    dispatch("valkey-io/valkey", 5, command, "alice", 9)
+    inputs = gh.get_repo.return_value.get_workflow.return_value.create_dispatch.call_args.args[1]
+    assert inputs["run_url"] == f"{_RUN_URL}/job/77"
+    assert parse_command(f"@valkeyrie-ops fix {inputs['run_url']}").job_id == 77
+
+
+def test_dispatch_forwards_a_run_attempt_link_intact():
+    from scripts.ci_fix.comment_poll import dispatch_ci_fix
+    from scripts.ci_fix.gate import parse_command
+
+    gh = MagicMock()
+    dispatch = dispatch_ci_fix(
+        gh,
+        agent_repo="o/agent",
+        workflow="ci-fix.yml",
+        ref="main",
+    )
+    command = parse_command(f"@valkeyrie-ops fix {_RUN_URL}/attempts/3")
+    dispatch("valkey-io/valkey", 5, command, "alice", 9)
+    inputs = (
+        gh.get_repo.return_value.get_workflow.return_value.create_dispatch
+        .call_args.args[1]
+    )
+    assert inputs["run_url"] == f"{_RUN_URL}/attempts/3"

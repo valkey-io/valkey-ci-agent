@@ -1,9 +1,3 @@
-"""Push-path tests, focused on the PORT path preserving upstream authorship.
-
-A port carries an already-merged upstream commit, so the pushed commit must keep
-the original author and sign-off rather than being re-authored as the bot.
-"""
-
 from __future__ import annotations
 
 import subprocess
@@ -12,251 +6,479 @@ from pathlib import Path
 import pytest
 
 from scripts.ci_fix import push as push_mod
-from scripts.ci_fix.models import FixPath, FixProposal
-from scripts.ci_fix.push import PushRefused, commit_and_push_port
+from scripts.ci_fix.models import (
+    CandidateAction,
+    FixCandidate,
+    FixTarget,
+    TargetKind,
+)
+from scripts.ci_fix.push import PushFailed, PushRefused, commit_message, push_candidate
 
 
-def _git(repo, *args, **kw):
-    return subprocess.run(["git", "-C", str(repo), *args], check=True,
-                          capture_output=True, text=True, **kw).stdout
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
 
 
-def _make_origin(tmp_path):
-    """A repo whose default branch (unstable) carries a fix authored by a
-    distinct human, and a release branch that diverged before the fix and is
-    missing it. Returns (work, bare, fix_sha, head_sha).
-
-    ``unstable`` is set as the default branch (origin/HEAD) so the port path's
-    ancestry check resolves it the way a real clone would.
-    """
-    work = tmp_path / "origin"
+def _remote(tmp_path: Path, branch: str = "agent/backport/sweep/9.0") -> tuple[Path, str, str]:
+    work = tmp_path / "work"
     work.mkdir()
     _git(work, "init", "-q", "-b", "unstable")
-    _git(work, "config", "user.email", "base@t")
     _git(work, "config", "user.name", "Base")
-    (work / "f.txt").write_text("base\n")
-    _git(work, "add", "f.txt")
-    _git(work, "commit", "-qm", "base")
-    base_sha = _git(work, "rev-parse", "HEAD").strip()
+    _git(work, "config", "user.email", "base@example.com")
+    (work / "seed.txt").write_text("seed\n")
+    _git(work, "add", "seed.txt")
+    _git(work, "commit", "-qm", "seed")
+    head_sha = _git(work, "rev-parse", "HEAD").strip()
+    _git(work, "branch", branch, head_sha)
 
-    # The release branch diverges at base, before the fix lands.
-    _git(work, "branch", "agent/backport/sweep/9.0", base_sha)
-
-    # The upstream fix on unstable (the default branch), authored by a human.
-    (work / "g.txt").write_text("the fix\n")
-    _git(work, "add", "g.txt")
-    _git(work, "-c", "user.email=author@example.com", "-c", "user.name=Real Author",
-         "commit", "-qm", "the upstream fix\n\nSigned-off-by: Real Author <author@example.com>")
-    fix_sha = _git(work, "rev-parse", "HEAD").strip()
-
-    head_sha = _git(work, "rev-parse", "agent/backport/sweep/9.0").strip()
-    _git(work, "checkout", "-q", "agent/backport/sweep/9.0")
+    (work / "upstream.txt").write_text("fixed upstream\n")
+    _git(work, "add", "upstream.txt")
+    _git(
+        work,
+        "-c",
+        "user.name=Real Author",
+        "-c",
+        "user.email=author@example.com",
+        "commit",
+        "-qm",
+        "upstream fix\n\nSigned-off-by: Real Author <author@example.com>",
+    )
+    port_sha = _git(work, "rev-parse", "HEAD").strip()
 
     bare = tmp_path / "remote.git"
-    _git(work, "clone", "-q", "--bare", str(work), str(bare))
-    # Point the bare remote's HEAD at unstable so a clone resolves it as default.
+    _git(tmp_path, "clone", "-q", "--bare", str(work), str(bare))
     _git(bare, "symbolic-ref", "HEAD", "refs/heads/unstable")
-    return work, bare, fix_sha, head_sha
+    return bare, head_sha, port_sha
 
 
-def test_port_push_preserves_original_authorship(tmp_path, monkeypatch):
-    work, bare, fix_sha, head_sha = _make_origin(tmp_path)
+def _diverged_port_remote(
+    tmp_path: Path,
+    *,
+    base_text: str | None,
+    upstream_text: str,
+    target_text: str,
+) -> tuple[Path, str, str]:
+    work = tmp_path / "diverged-work"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "unstable")
+    _git(work, "config", "user.name", "Base")
+    _git(work, "config", "user.email", "base@example.com")
+    seed = work / "seed.txt"
+    seed.write_text("seed\n")
+    _git(work, "add", "seed.txt")
+    if base_text is not None:
+        (work / "collision.txt").write_text(base_text)
+        _git(work, "add", "collision.txt")
+    _git(work, "commit", "-qm", "seed")
+    base_sha = _git(work, "rev-parse", "HEAD").strip()
+    branch = "agent/backport/sweep/9.0"
+    _git(work, "branch", branch, base_sha)
 
-    # Clone from the bare remote (it has both branches, the fix commit, and
-    # HEAD->unstable), and push back to it, so no network or real GitHub is used.
-    def fake_clone(_full_name, dest: Path):
-        _git(dest.parent, "clone", "-q", str(bare), str(dest))
+    (work / "collision.txt").write_text(upstream_text)
+    _git(work, "add", "collision.txt")
+    _git(work, "commit", "-qm", "upstream fix")
+    port_sha = _git(work, "rev-parse", "HEAD").strip()
 
-    monkeypatch.setattr(push_mod, "_clone_clean", fake_clone)
-    monkeypatch.setattr(push_mod, "github_https_url", lambda _n: str(bare))
+    _git(work, "checkout", "-q", branch)
+    (work / "collision.txt").write_text(target_text)
+    _git(work, "add", "collision.txt")
+    _git(work, "commit", "-qm", "target change")
+    head_sha = _git(work, "rev-parse", "HEAD").strip()
 
-    pushed_sha = commit_and_push_port(
-        str(work),
-        head_repo_full_name="valkey-io/valkey",
-        head_branch="agent/backport/sweep/9.0",
-        head_sha=head_sha,
-        unstable_fix_commit=fix_sha,
-        git_env={},
+    bare = tmp_path / "diverged-remote.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(work), str(bare))
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/unstable")
+    return bare, head_sha, port_sha
+
+
+def _merge_port_remote(tmp_path: Path) -> tuple[Path, str, str]:
+    work = tmp_path / "merge-work"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "unstable")
+    _git(work, "config", "user.name", "Base")
+    _git(work, "config", "user.email", "base@example.com")
+    (work / "seed.txt").write_text("seed\n")
+    _git(work, "add", "seed.txt")
+    _git(work, "commit", "-qm", "seed")
+    head_sha = _git(work, "rev-parse", "HEAD").strip()
+    _git(work, "branch", "agent/backport/sweep/9.0", head_sha)
+    _git(work, "checkout", "-qb", "fix")
+    (work / "fix.txt").write_text("fix\n")
+    _git(work, "add", "fix.txt")
+    _git(work, "commit", "-qm", "fix")
+    _git(work, "checkout", "-q", "unstable")
+    (work / "main.txt").write_text("main\n")
+    _git(work, "add", "main.txt")
+    _git(work, "commit", "-qm", "main")
+    _git(work, "merge", "-q", "--no-ff", "-m", "merge fix", "fix")
+    port_sha = _git(work, "rev-parse", "HEAD").strip()
+
+    bare = tmp_path / "merge-remote.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(work), str(bare))
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/unstable")
+    return bare, head_sha, port_sha
+
+
+def _patch_for(tmp_path: Path, head_sha: str, remote: Path, path: str = "fix.txt") -> str:
+    checkout = tmp_path / f"patch-{path.replace('/', '-')}"
+    _git(tmp_path, "clone", "-q", str(remote), str(checkout))
+    _git(checkout, "checkout", "-q", head_sha)
+    destination = checkout / path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("the fix\n")
+    _git(checkout, "add", "--intent-to-add", path)
+    return _git(checkout, "diff", "--binary", "HEAD")
+
+
+def _target(
+    head_sha: str,
+    *,
+    kind: TargetKind = TargetKind.UPDATE_PR,
+    branch: str = "agent/backport/sweep/9.0",
+) -> FixTarget:
+    return FixTarget(
+        kind=kind,
+        repo_full_name="valkey-io/valkey",
+        branch=branch,
+        expected_sha=head_sha,
     )
 
-    # The pushed commit on the bare remote keeps the original author, not the bot.
-    author = _git(bare, "log", "-1", "--format=%an <%ae>", pushed_sha).strip()
-    assert author == "Real Author <author@example.com>"
-    body = _git(bare, "log", "-1", "--format=%B", pushed_sha)
-    assert "Signed-off-by: Real Author <author@example.com>" in body
-    assert "cherry picked from commit" in body  # the -x trailer
+
+def _candidate(patch: str, path: str = "fix.txt") -> FixCandidate:
+    return FixCandidate(
+        action=CandidateAction.PATCH,
+        failing_check="unit test",
+        root_cause="The fixture is stale.",
+        reasoning="Refresh the fixture.",
+        patch=patch,
+        changed_paths=(path,),
+    )
 
 
-def test_port_push_refuses_commit_not_on_default_branch(tmp_path, monkeypatch):
-    """A SHA the model points at that is not reachable from the default branch
-    is refused, not ported: code owns 'this is a merged upstream fix'."""
-    work, bare, _fix_sha, head_sha = _make_origin(tmp_path)
+def test_patch_is_committed_to_the_existing_branch_with_an_exact_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    patch = _patch_for(tmp_path, head_sha, remote)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
 
-    # A commit that exists but lives only on a side branch, never merged to
-    # the default branch.
-    _git(work, "checkout", "-qb", "rogue", head_sha)
-    (work / "rogue.txt").write_text("not upstream\n")
-    _git(work, "add", "rogue.txt")
-    _git(work, "commit", "-qm", "rogue commit")
-    rogue_sha = _git(work, "rev-parse", "HEAD").strip()
-    _git(work, "checkout", "-q", "agent/backport/sweep/9.0")
-    # Refresh the bare so the clone can fetch the rogue object by SHA.
-    rebare = tmp_path / "remote2.git"
-    _git(work, "clone", "-q", "--bare", str(work), str(rebare))
-    _git(rebare, "symbolic-ref", "HEAD", "refs/heads/unstable")
+    pushed = push_candidate(_candidate(patch), _target(head_sha), git_env={})
 
-    def fake_clone(_full_name, dest: Path):
-        _git(dest.parent, "clone", "-q", str(rebare), str(dest))
+    assert _git(remote, "rev-parse", "agent/backport/sweep/9.0").strip() == pushed
+    assert _git(remote, "rev-parse", f"{pushed}^").strip() == head_sha
+    assert _git(remote, "show", f"{pushed}:fix.txt") == "the fix\n"
+    assert "Signed-off-by:" not in _git(remote, "log", "-1", "--format=%B", pushed)
 
-    monkeypatch.setattr(push_mod, "_clone_clean", fake_clone)
-    monkeypatch.setattr(push_mod, "github_https_url", lambda _n: str(rebare))
 
-    with pytest.raises(PushRefused, match="not reachable from"):
-        commit_and_push_port(
-            str(work),
-            head_repo_full_name="valkey-io/valkey",
-            head_branch="agent/backport/sweep/9.0",
-            head_sha=head_sha,
-            unstable_fix_commit=rogue_sha,
+def test_a_suggestion_target_is_never_pushed() -> None:
+    """A suggestion's branch is the contributor's, even when its name looks like the bot's."""
+    target = _target("b" * 40, kind=TargetKind.SUGGEST)
+
+    with pytest.raises(PushRefused, match="suggestion target"):
+        push_candidate(_candidate("diff"), target, git_env={})
+
+
+@pytest.mark.parametrize("path", [".github/workflows/fix.yml", ".github/actions/setup/action.yml"])
+def test_a_ci_definition_change_is_never_pushed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    """A pushed workflow runs with the repository's privileges; a person applies it."""
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    patch = _patch_for(tmp_path, head_sha, remote, path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+
+    with pytest.raises(PushRefused, match=f"changes {path}"):
+        push_candidate(_candidate(patch, path), _target(head_sha), git_env={})
+    assert _git(remote, "rev-parse", "agent/backport/sweep/9.0").strip() == head_sha
+
+
+def test_new_draft_target_requires_the_branch_not_to_exist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    patch = _patch_for(tmp_path, head_sha, remote)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    target = _target(
+        head_sha,
+        kind=TargetKind.DRAFT_PR,
+        branch="agent/ci-fix/issue-9-100-500",
+    )
+
+    pushed = push_candidate(_candidate(patch), target, git_env={})
+    assert _git(remote, "rev-parse", target.branch).strip() == pushed
+    with pytest.raises(PushRefused, match="target branch changed"):
+        push_candidate(_candidate(patch), target, git_env={})
+
+
+def test_moved_or_deleted_existing_branch_is_not_recreated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    patch = _patch_for(tmp_path, head_sha, remote)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+
+    def delete_at_last_check() -> str:
+        _git(remote, "update-ref", "-d", "refs/heads/agent/backport/sweep/9.0")
+        return ""
+
+    with pytest.raises(PushRefused):
+        push_candidate(
+            _candidate(patch),
+            _target(head_sha),
+            git_env={},
+            pre_push_check=delete_at_last_check,
+        )
+    assert "agent/backport/sweep/9.0" not in _git(remote, "branch", "--list")
+
+
+def test_patch_apply_failure_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+
+    with pytest.raises(PushFailed, match="Git operation failed"):
+        push_candidate(
+            _candidate("this is not a patch"),
+            _target(head_sha),
             git_env={},
         )
 
 
-def test_port_push_refuses_commit_already_on_head(tmp_path, monkeypatch):
-    """Porting a commit already present on the PR head is a no-op and refused."""
-    work, bare, fix_sha, _head_sha = _make_origin(tmp_path)
+def test_non_lease_push_failure_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    patch = _patch_for(tmp_path, head_sha, remote)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    real_run_git = push_mod.run_git
 
-    # Make the head branch already contain the fix (fast-forward it to unstable).
-    head_with_fix = fix_sha
+    def run_git(repo_dir, *args, **kwargs):
+        if args[:1] == ("push",):
+            raise subprocess.CalledProcessError(
+                128,
+                ["git", "push"],
+                stderr="fatal: unable to access remote",
+            )
+        return real_run_git(repo_dir, *args, **kwargs)
 
-    def fake_clone(_full_name, dest: Path):
-        _git(dest.parent, "clone", "-q", str(bare), str(dest))
+    monkeypatch.setattr(push_mod, "run_git", run_git)
 
-    monkeypatch.setattr(push_mod, "_clone_clean", fake_clone)
-    monkeypatch.setattr(push_mod, "github_https_url", lambda _n: str(bare))
-
-    with pytest.raises(PushRefused, match="already present on the PR head"):
-        commit_and_push_port(
-            str(work),
-            head_repo_full_name="valkey-io/valkey",
-            head_branch="agent/backport/sweep/9.0",
-            head_sha=head_with_fix,
-            unstable_fix_commit=fix_sha,
-            git_env={},
-        )
-
-
-def test_port_push_refuses_non_namespaced_branch(tmp_path):
-    with pytest.raises(PushRefused):
-        commit_and_push_port(
-            str(tmp_path), head_repo_full_name="valkey-io/valkey",
-            head_branch="main", head_sha="a" * 40, unstable_fix_commit="b" * 40, git_env={},
-        )
+    with pytest.raises(PushFailed, match="push failed"):
+        push_candidate(_candidate(patch), _target(head_sha), git_env={})
 
 
-def test_port_push_refuses_malformed_commit(tmp_path):
-    with pytest.raises(PushRefused):
-        commit_and_push_port(
-            str(tmp_path), head_repo_full_name="valkey-io/valkey",
-            head_branch="agent/backport/sweep/9.0", head_sha="a" * 40,
-            unstable_fix_commit="not-a-sha", git_env={},
-        )
+def test_revalidation_api_failure_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    patch = _patch_for(tmp_path, head_sha, remote)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
 
-
-def test_pre_push_check_refuses_expired_authorization():
-    with pytest.raises(PushRefused, match="authorization expired"):
-        push_mod._verify_push_authorized(lambda: "automatic follow-up authorization expired")
-
-
-def test_pre_push_check_fails_closed_on_revalidation_error():
-    def explode() -> str:
+    def unavailable() -> str:
         raise RuntimeError("GitHub unavailable")
 
-    with pytest.raises(PushRefused, match="could not be revalidated"):
-        push_mod._verify_push_authorized(explode)
+    with pytest.raises(PushFailed, match="could not be revalidated"):
+        push_candidate(
+            _candidate(patch),
+            _target(head_sha),
+            git_env={},
+            pre_push_check=unavailable,
+        )
 
 
-def test_author_fix_commit_message_uses_source_file_for_build_failure():
-    proposal = FixProposal(
-        path=FixPath.AUTHOR,
-        failing_check="make SERVER_CFLAGS='-Werror' (compile of timeout.o)",
-        root_cause=(
-            "timeout.c:169 `if (ftval > LLONG_MAX)` compares a long double "
-            "against the LLONG_MAX const int; newer Xcode clang errors under "
-            "-Werror."
-        ),
-        reasoning="minimal cast",
-        confidence=0.9,
-        build_command="make SERVER_CFLAGS='-Werror'",
-        verify_command="make SERVER_CFLAGS='-Werror'",
+def test_port_preserves_the_merged_commit_author(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, port_sha = _remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    candidate = FixCandidate(
+        action=CandidateAction.PORT,
+        failing_check="build",
+        port_commit=port_sha,
     )
 
-    message = push_mod._commit_message(proposal)
-    subject = message.splitlines()[0]
-    assert subject == "Fix timeout.c build failure"
-    assert "make SERVER_CFLAGS" not in subject
+    pushed = push_candidate(candidate, _target(head_sha), git_env={})
+
+    assert _git(remote, "log", "-1", "--format=%an <%ae>", pushed).strip() == (
+        "Real Author <author@example.com>"
+    )
+    body = _git(remote, "log", "-1", "--format=%B", pushed)
+    assert "Signed-off-by: Real Author" in body
+    assert "cherry picked from commit" in body
+
+
+def test_port_must_be_merged_on_the_default_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    work = tmp_path / "rogue"
+    _git(tmp_path, "clone", "-q", str(remote), str(work))
+    _git(work, "checkout", "-qb", "rogue", head_sha)
+    _git(work, "config", "user.name", "Rogue")
+    _git(work, "config", "user.email", "rogue@example.com")
+    (work / "rogue.txt").write_text("rogue\n")
+    _git(work, "add", "rogue.txt")
+    _git(work, "commit", "-qm", "rogue")
+    rogue_sha = _git(work, "rev-parse", "HEAD").strip()
+    _git(work, "push", "-q", str(remote), "rogue")
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+
+    with pytest.raises(PushRefused, match="not merged"):
+        push_candidate(
+            FixCandidate(action=CandidateAction.PORT, port_commit=rogue_sha),
+            _target(head_sha),
+            git_env={},
+        )
+
+
+def test_conflicting_port_is_permanently_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, port_sha = _diverged_port_remote(
+        tmp_path,
+        base_text="base\n",
+        upstream_text="upstream\n",
+        target_text="target\n",
+    )
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+
+    with pytest.raises(PushRefused, match="cherry-pick conflicts"):
+        push_candidate(
+            FixCandidate(action=CandidateAction.PORT, port_commit=port_sha),
+            _target(head_sha),
+            git_env={},
+        )
+
+
+def test_equivalent_port_is_permanently_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, port_sha = _diverged_port_remote(
+        tmp_path,
+        base_text=None,
+        upstream_text="same fix\n",
+        target_text="same fix\n",
+    )
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+
+    with pytest.raises(PushRefused, match="empty or already equivalent"):
+        push_candidate(
+            FixCandidate(action=CandidateAction.PORT, port_commit=port_sha),
+            _target(head_sha),
+            git_env={},
+        )
+
+
+def test_merge_commit_port_is_permanently_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, port_sha = _merge_port_remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+
+    with pytest.raises(PushRefused, match="merge commits require"):
+        push_candidate(
+            FixCandidate(action=CandidateAction.PORT, port_commit=port_sha),
+            _target(head_sha),
+            git_env={},
+        )
+
+
+def test_operational_cherry_pick_failure_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, port_sha = _remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    real_run_git = push_mod.run_git
+
+    def run_git(repo_dir, *args, **kwargs):
+        if args[:1] == ("cherry-pick",):
+            raise subprocess.CalledProcessError(
+                128,
+                ["git", "cherry-pick"],
+                stderr="fatal: could not write new index file",
+            )
+        return real_run_git(repo_dir, *args, **kwargs)
+
+    monkeypatch.setattr(push_mod, "run_git", run_git)
+
+    with pytest.raises(PushFailed, match="Git operation failed"):
+        push_candidate(
+            FixCandidate(action=CandidateAction.PORT, port_commit=port_sha),
+            _target(head_sha),
+            git_env={},
+        )
+
+
+@pytest.mark.parametrize(
+    "branch",
+    ["unstable", "9.0", "feature/x", "agent/release-cut/9.0.1"],
+)
+def test_only_ci_fix_and_backport_namespaces_are_writable(branch: str) -> None:
+    with pytest.raises(PushRefused, match="only writes under"):
+        push_candidate(
+            FixCandidate(action=CandidateAction.PORT, port_commit="b" * 40),
+            _target("a" * 40, branch=branch),
+            git_env={},
+        )
+
+
+def test_commit_message_is_concise_and_wraps_the_explanation() -> None:
+    candidate = FixCandidate(
+        action=CandidateAction.PATCH,
+        failing_check="a very long failing check name " * 5,
+        root_cause="A sufficiently long root cause explanation " * 8,
+        reasoning="Use the existing helper instead.",
+    )
+    message = commit_message(candidate)
+
+    assert len(message.splitlines()[0]) <= 72
     assert all(len(line) <= 72 for line in message.splitlines())
 
 
-def test_author_fix_commit_message_keeps_natural_test_name():
-    proposal = FixProposal(
-        path=FixPath.AUTHOR,
-        failing_check="corrupt payload: zset listpack with NAN score",
-        root_cause="payload embeds RDB v80; branch is v11",
-        reasoning="scaffolding fix",
-        confidence=0.9,
-        build_command="make",
-        verify_command="./runtest --single x",
-    )
+def test_a_ported_upstream_commit_that_changes_ci_definitions_is_not_pushed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "w"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "unstable")
+    _git(work, "config", "user.name", "Base")
+    _git(work, "config", "user.email", "base@example.com")
+    (work / "seed.txt").write_text("seed\n")
+    _git(work, "add", "seed.txt")
+    _git(work, "commit", "-qm", "seed")
+    head_sha = _git(work, "rev-parse", "HEAD").strip()
+    _git(work, "branch", "agent/backport/sweep/9.0", head_sha)
+    (work / ".github" / "workflows").mkdir(parents=True)
+    (work / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+    _git(work, "add", ".github")
+    _git(work, "commit", "-qm", "upstream workflow fix")
+    port_sha = _git(work, "rev-parse", "HEAD").strip()
+    bare = tmp_path / "r.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(work), str(bare))
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/unstable")
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(bare))
 
-    assert push_mod._commit_message(proposal).splitlines()[0] == (
-        "Fix corrupt payload: zset listpack with NAN score"
-    )
-
-
-def test_author_fix_commit_message_does_not_treat_make_progress_as_build():
-    proposal = FixProposal(
-        path=FixPath.AUTHOR,
-        failing_check="replication timeout",
-        root_cause="timeout.c:169 the test does not make progress before timing out",
-        reasoning="timeout fix",
-        confidence=0.9,
-        build_command="make",
-        verify_command="./runtest --single replication",
-    )
-
-    assert push_mod._commit_message(proposal).splitlines()[0] == "Fix replication timeout"
-
-
-def test_author_fix_commit_message_does_not_treat_test_error_as_build():
-    proposal = FixProposal(
-        path=FixPath.AUTHOR,
-        failing_check="protocol test",
-        root_cause="tests/unit/protocol.tcl:42 assertion error: invalid CRLF response",
-        reasoning="protocol fix",
-        confidence=0.9,
-        build_command="make",
-        verify_command="./runtest --single unit/protocol",
-    )
-
-    assert push_mod._commit_message(proposal).splitlines()[0] == "Fix protocol test"
-
-
-def test_author_fix_commit_message_preserves_body_paragraphs():
-    proposal = FixProposal(
-        path=FixPath.AUTHOR,
-        failing_check="protocol test",
-        root_cause=(
-            "First sentence describes the failure and has enough words to wrap "
-            "onto another line cleanly.\n\n"
-            "Second sentence explains why the fix is safe."
-        ),
-        reasoning="protocol fix",
-        confidence=0.9,
-        build_command="make",
-        verify_command="./runtest --single unit/protocol",
-    )
-
-    message = push_mod._commit_message(proposal)
-    assert "\n\nSecond sentence explains why the fix is safe.\n" in message
-    assert all(len(line) <= 72 for line in message.splitlines())
+    with pytest.raises(PushRefused, match="changes .github/workflows/ci.yml"):
+        push_candidate(FixCandidate(action=CandidateAction.PORT, port_commit=port_sha),
+                       _target(head_sha), git_env={})

@@ -1,0 +1,87 @@
+name: CI Fix Issue Dispatch
+
+# Starts ci-fix-issues.yml once per open Daily Test Failure Detector issue
+# worth an attempt, keeping at most max_runs of those runs active at once
+# (scripts/ci_fix/issue_dispatch.py). It only reads valkey-io/valkey; each
+# dispatched run handles one issue as before.
+#
+# The schedule does nothing until the CI_FIX_ISSUES_AUTO_DISPATCH repository
+# variable is "true", so the rollout stays manual until it is switched on.
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      max_runs:
+        description: "Most ci-fix-issues runs active at once (empty = CI_FIX_ISSUES_MAX_RUNS, else 2)"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "List what would be dispatched without dispatching"
+        required: false
+        type: boolean
+        default: true
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  dispatch:
+    name: "Dispatch detector issue fixes"
+    if: >-
+      github.repository == 'valkey-io/valkey-ci-agent'
+      && (github.event_name == 'workflow_dispatch' || vars.CI_FIX_ISSUES_AUTO_DISPATCH == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ci-fix-issue-dispatch
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      # Lists and dispatches ci-fix-issues.yml runs in this repository.
+      actions: write
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+        with:
+          install-claude: "false"
+
+      - name: Generate target repository token
+        id: target-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          # Read issues, their timelines and comments; nothing is written.
+          permission-issues: read
+          permission-pull-requests: read
+          permission-metadata: read
+
+      - name: Dispatch
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.target-token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          MAX_RUNS: ${{ inputs.max_runs || vars.CI_FIX_ISSUES_MAX_RUNS || '2' }}
+          # A scheduled run has no inputs and dispatches for real.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(--repo valkey-io/valkey --max-runs "${MAX_RUNS}")
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python -m scripts.ci_fix.issue_dispatch "${args[@]}" > dispatch.json
+          cat dispatch.json
+          { echo '```json'; cat dispatch.json; echo '```'; } >> "${GITHUB_STEP_SUMMARY}"

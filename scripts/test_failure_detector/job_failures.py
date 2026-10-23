@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from scripts.common.incidents import compute_fingerprint
-from scripts.common.valkey_ci import strip_log_prefix, test_in_file
+from scripts.common.valkey_ci import gtest_failure, gtest_file_of, strip_log_prefix, test_in_file
 from scripts.common.workflow_artifacts import ArtifactClient
 from scripts.common.workflow_jobs import FAILED_JOB_CONCLUSIONS, job_is_ignored
 from scripts.test_failure_detector.parse_failures import JobReference, UniqueFailure
@@ -228,7 +228,20 @@ def _failure_summary(artifact_client: ArtifactClient, repo_full_name: str, job: 
         elif match := _EXCEPTION_RE.match(line):
             where = _exception_location(plain[index + 1:index + 1 + _EXCEPTION_LINES])
             lines.append(("exception", match.group("data").strip() + (f" at {where}" if where else "")))
+        elif (unit_test := gtest_failure(line)) is not None:
+            lines.append(("err", _gtest_cause(unit_test, plain[:index])))
     return lines
+
+
+def _gtest_cause(test: str, before: list[str]) -> str:
+    """The cause of C unit test ``test``'s failure: its name and the file it failed in.
+
+    The file of its first failed assertion, by base name and without its
+    line (scripts/common/valkey_ci.py): the issue stays the same when the
+    assertion moves, or another job's build prints the path differently.
+    """
+    file = gtest_file_of(test, before)
+    return f"Unit test {test} failed in {file}" if file else f"Unit test {test} failed"
 
 
 def _exception_location(following: list[str]) -> str:

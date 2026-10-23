@@ -1,8 +1,10 @@
 name: Backport CI Follow-up
 
-# Open sweep PRs are otherwise invisible to the backport poller until they
-# merge. This workflow watches their current heads and gives one unhandled,
-# actionable CI failure to the existing verified CI-fix engine.
+# Find one current-head failure on an open bot-owned PR into each enabled
+# branch, and fix it like every other failure (ci-fix-run.yml): prepared
+# inside the Valkey job that failed when it can host it, pushed to the
+# bot's branch, and verified by the target PR's normal CI. Only repositories
+# whose registry entry enables automatic_ci_followup are followed up.
 on:
   schedule:
     - cron: "20 * * * *"
@@ -66,8 +68,6 @@ jobs:
     name: "follow-up/${{ matrix.repo }}/${{ matrix.branch }}"
     needs: preflight
     if: needs.preflight.outputs.has_entries == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.preflight.outputs.matrix) }}
@@ -75,99 +75,17 @@ jobs:
       group: backport-branch-mutation-${{ matrix.repo }}-${{ matrix.branch }}
       cancel-in-progress: false
       queue: max
-    env:
-      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-      CLAUDE_CODE_USE_BEDROCK: "1"
-      CI_AGENT_EVIDENCE_DIR: agent-evidence
     permissions:
       contents: read
       id-token: write
-    steps:
-      - name: Check out agent repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-          fetch-depth: 1
-
-      - name: Set up agent dependencies
-        uses: ./.github/actions/setup-agent
-        with:
-          install-claude: "true"
-
-      - name: Generate target repository token
-        id: target-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
-          owner: ${{ matrix.repo_owner }}
-          repositories: ${{ matrix.repo_name }}
-          # Same scopes as ci-fix.yml minus members:read, because this caller
-          # replaces the human-team gate with a machine gate on the bot-owned
-          # sweep PR. contents:write + workflows:write to push the fix: a
-          # release-branch CI fix is often a workflow-file change, and the port
-          # path cherry-picks an upstream commit that may touch one, so a push
-          # without workflows:write is rejected outright. pull-requests:write +
-          # issues:write to comment (the PR comment uses the Issues comments
-          # API); actions:read for run logs.
-          permission-actions: read
-          permission-contents: write
-          permission-workflows: write
-          permission-pull-requests: write
-          permission-issues: write
-          permission-metadata: read
-
-      - name: Generate agent repository token
-        id: agent-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
-          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
-          owner: valkey-io
-          repositories: valkey-ci-agent
-          permission-actions: write
-          permission-metadata: read
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          role-session-name: backport-ci-followup-${{ github.run_id }}-${{ matrix.branch }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Follow up on current-head CI
-        shell: bash
-        env:
-          TARGET_TOKEN: ${{ steps.target-token.outputs.token }}
-          AUTO_CI_FOLLOWUP_BOT_LOGIN: ${{ steps.target-token.outputs.app-slug }}[bot]
-          CI_FIX_MACOS_AGENT_REPO: valkey-io/valkey-ci-agent
-          CI_FIX_MACOS_AGENT_REF: main
-          CI_FIX_MACOS_TOKEN: ${{ steps.agent-token.outputs.token }}
-          CI_FIX_VERIFY_RUNS: ${{ vars.CI_FIX_VERIFY_RUNS || '2' }}
-          TARGET_REPO: ${{ matrix.repo }}
-          TARGET_BRANCH: ${{ matrix.branch }}
-        run: |
-          set -euo pipefail
-          python -m scripts.backport.ci_followup \
-            --registry repos.yml \
-            --repo "${TARGET_REPO}" \
-            --branch "${TARGET_BRANCH}" \
-            --verbose | tee backport-ci-followup-result.json
-
-      - name: Upload result
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: backport-ci-followup-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
-          path: backport-ci-followup-result.json
-          if-no-files-found: ignore
-          retention-days: 30
-
-      - name: Upload agent evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: backport-ci-followup-evidence-${{ github.run_id }}-${{ matrix.repo_slug }}-${{ matrix.branch }}
-          path: agent-evidence
-          if-no-files-found: ignore
-          retention-days: 30
+    uses: ./.github/workflows/ci-fix-run.yml
+    with:
+      front_door: follow-up
+      request: ${{ format('{{"repo":"{0}","branch":"{1}"}}', matrix.repo, matrix.branch) }}
+      key: ${{ matrix.repo_slug }}-${{ matrix.branch }}
+      target_owner: ${{ matrix.repo_owner }}
+      target_repo: ${{ matrix.repo_name }}
+    secrets:
+      VALKEYRIE_BOT_APP_ID: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      VALKEYRIE_BOT_PRIVATE_KEY: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}

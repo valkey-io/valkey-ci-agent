@@ -89,7 +89,7 @@ def _build_job_summary(
             "### Failed jobs with no recorded cause (not filed)",
             "",
             f"{len(unexplained)} failed job(s) printed no test failure, exception, or "
-            "valgrind or sanitizer report (a unit test, a build break, a crash, an outage):",
+            "valgrind or sanitizer report, or failed C unit test (a build break, a crash, an outage):",
             "",
         ])
         lines.extend(f"- `{_one_line(name)}`" for name in unexplained)

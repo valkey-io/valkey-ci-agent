@@ -172,6 +172,8 @@ def test_a_job_failure_issue_is_titled_by_its_cause_and_marks_its_job():
     assert content.title == "[JOB-FAILURE] Valgrind error: Invalid read of size 8 at quicklistNext in Daily"
     assert content.labels == (issue_renderer.LABEL_NAME,)
     assert issue_renderer.job_marker("test-valgrind-test (unit)") in content.body
+    assert issue_renderer.parse_job_marker(content.body) == "test-valgrind-test (unit)"
+    assert issue_renderer.parse_job_marker("no marker here") == ""
     assert "Valgrind error: Invalid read" in content.body
     # Distinct causes never share an issue.
     other = JobFailure(job="test-valgrind-test (unit)", url="", step="test", summary=("[exception]: boom",))
@@ -352,11 +354,12 @@ def test_a_sanitizer_report_is_identified_by_its_error_not_the_server_log():
     )
 
 
-def test_a_failing_unit_test_is_reported_not_filed():
-    """gtest prints no runtest summary: nothing identifies the cause well enough to file it."""
+def test_a_unit_test_job_that_names_no_failed_test_is_reported_not_filed():
+    """With no ``[  FAILED  ] Suite.Test (N ms)`` line (the binary crashed, or would
+    not build), nothing names the cause well enough to file it."""
     unexplained = []
     client = MagicMock()
-    client.download_job_log.return_value = "[  FAILED  ] SdsTest.Trim (3 ms)\n"
+    client.download_job_log.return_value = "make[1]: *** [Makefile:12: test-unit] Segmentation fault\n"
     _tests, jobs = find_unrecorded_failures(
         client, "valkey-io/valkey", {}, jobs=[_job(1, "test-ubuntu-jemalloc", step="unittest")],
         unexplained=unexplained,
@@ -397,3 +400,75 @@ def test_daily_fingerprints_are_unchanged():
     assert issue_renderer.fingerprint_for(failure) == compute_fingerprint(
         namespace=(issue_renderer.MARKER_NAMESPACE, "t", "tests/unit/a.tcl"), shapes=(),
     )
+
+
+# The tail of a real ``make test-unit`` log: gtest's own lines, colours and
+# timestamps included, and the list gtest repeats the failure in at the end.
+_GTEST = (
+    "2026-10-19T20:57:53.8168531Z [4/299] Crc64Test.TestCrc64 (3 ms)\n"
+    "2026-10-19T20:57:53.8174333Z \x1b[0;32m[ RUN      ] \x1b[mCrc64Test.TestCrc64\n"
+    "2026-10-19T20:57:53.8174970Z test_crc64.cpp:29: Failure\n"
+    "2026-10-19T20:57:53.8175536Z Expected equality of these values:\n"
+    "2026-10-19T20:57:53.8177982Z     Which is: 16845390139448941002\n"
+    "2026-10-19T20:57:53.8181827Z [calcula]: CRC64 '123456789'\n"
+    "2026-10-19T20:57:53.8183082Z \x1b[0;31m[  FAILED  ] \x1b[mCrc64Test.TestCrc64 (0 ms)\n"
+    "2026-10-19T20:57:53.8187230Z \x1b[0;31m[  FAILED  ] \x1b[m1 test, listed below:\n"
+    "2026-10-19T20:57:53.8188482Z \x1b[0;31m[  FAILED  ] \x1b[mCrc64Test.TestCrc64\n"
+    "2026-10-19T20:57:53.8189274Z  1 FAILED TEST\n"
+    "2026-10-19T20:57:53.8189877Z [4/299] Crc64Test.TestCrc64 returned with exit code 1 (3 ms)\n"
+)
+
+
+def test_a_failed_c_unit_test_is_a_job_failure_named_for_the_test():
+    """runtest prints nothing for it, so before this it was only ever "unexplained"."""
+    tests, jobs = _find([_job(1, "test-ubuntu-jemalloc", step="unittest"),
+                         _job(2, "test-ubuntu-arm", step="unittest")], {1: _GTEST, 2: _GTEST})
+
+    assert tests == []
+    assert [(job.step, job.summary, [ref.job for ref in job.jobs]) for job in jobs] == [
+        ("unittest", ("[err]: Unit test Crc64Test.TestCrc64 failed in test_crc64.cpp",),
+         ["test-ubuntu-jemalloc", "test-ubuntu-arm"]),
+    ]
+    content = issue_renderer.render_job_issue(jobs[0], "<!-- marker -->", 1)
+    assert content.title == "[JOB-FAILURE] Unit test Crc64Test.TestCrc64 failed in test_crc64.cpp in Daily"
+
+
+def test_a_c_unit_tests_issue_does_not_change_when_its_assertion_moves():
+    moved = _GTEST.replace("test_crc64.cpp:29:", "test_crc64.cpp:31:").replace("16845390139448941002", "7")
+    _, before = _find([_job(1, "test-ubuntu-jemalloc", step="unittest")], {1: _GTEST})
+    _, after = _find([_job(1, "test-ubuntu-jemalloc", step="unittest")], {1: moved})
+
+    assert issue_renderer.job_fingerprint_for(before[0]) == issue_renderer.job_fingerprint_for(after[0])
+
+
+def test_a_c_unit_tests_issue_does_not_change_with_the_build_dirs_path_or_a_later_assertion():
+    """gtest prints the file as the compiler saw it: a CMake or container build gives a path."""
+    pathed = _GTEST.replace("test_crc64.cpp:29:", "/__w/valkey/valkey/src/unit/test_crc64.cpp:29:")
+    later = _GTEST.replace(
+        "[calcula]: CRC64 '123456789'\n",
+        "[calcula]: CRC64 '123456789'\n2026-10-19T20:57:53.8182000Z test_helpers.h:12: Failure\n",
+    )
+    _, plain = _find([_job(1, "test-ubuntu-jemalloc", step="unittest")], {1: _GTEST})
+    _, with_path = _find([_job(1, "test-ubuntu-jemalloc", step="unittest")], {1: pathed})
+    _, with_later = _find([_job(1, "test-ubuntu-jemalloc", step="unittest")], {1: later})
+
+    assert with_path[0].summary == with_later[0].summary == plain[0].summary == (
+        "[err]: Unit test Crc64Test.TestCrc64 failed in test_crc64.cpp",
+    )
+
+
+def test_each_failed_c_unit_test_is_its_own_failure_and_a_parameterized_one_keeps_its_name():
+    log = (
+        "[ RUN      ] Crc64Test.TestCrc64\n"
+        "test_crc64.cpp:29: Failure\n"
+        "[  FAILED  ] Crc64Test.TestCrc64 (0 ms)\n"
+        "[ RUN      ] Sizes/HashtableTest.Grow/2\n"
+        "[  FAILED  ] Sizes/HashtableTest.Grow/2, where GetParam() = 64 (12 ms)\n"
+    )
+    _, jobs = _find([_job(1, "test-ubuntu-jemalloc", step="unittest")], {1: log})
+
+    assert [job.summary for job in jobs] == [
+        ("[err]: Unit test Crc64Test.TestCrc64 failed in test_crc64.cpp",),
+        # No ``file:line: Failure`` before it (a crash, or a FAIL() with no location).
+        ("[err]: Unit test Sizes/HashtableTest.Grow/2 failed",),
+    ]

@@ -77,6 +77,18 @@ def test_fuzzer_profile_is_readonly() -> None:
     assert "Read" in profile.allowed_tools
 
 
+def test_ci_fix_profiles_match_their_publication_targets() -> None:
+    edit = agent_runtime.AGENT_PROFILES["ci_fix_edit"]
+    suggest = agent_runtime.AGENT_PROFILES["ci_fix_suggest"]
+
+    assert edit.writes_allowed is True
+    assert edit.confined is False
+    assert "Bash" in edit.allowed_tools
+    assert suggest.writes_allowed is True
+    assert suggest.confined is True
+    assert suggest.disallowed_tools == "Bash,Glob"
+
+
 def test_release_notes_review_profile_is_edit_only() -> None:
     edit = agent_runtime.AGENT_PROFILES["release_notes_review_edit_only"]
 

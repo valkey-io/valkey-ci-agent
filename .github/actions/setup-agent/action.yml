@@ -14,11 +14,28 @@ inputs:
     description: Install the Claude Code CLI used by AI-backed agent jobs.
     required: false
     default: "false"
+  path:
+    description: Where the agent repository is checked out.
+    required: false
+    default: "."
+  system-packages:
+    description: >-
+      Install Python, Node and the agent account's tools with the system's
+      package manager, as root: for a job's container, where setup-python's
+      builds may not run and there is no sudo.
+    required: false
+    default: "false"
 
 runs:
   using: composite
   steps:
+    - name: Install Python and Node from the system's packages
+      if: ${{ inputs['system-packages'] == 'true' }}
+      shell: sh
+      run: sh "${GITHUB_ACTION_PATH}/system-packages.sh"
+
     - name: Set up Python ${{ inputs['python-version'] }}
+      if: ${{ inputs['system-packages'] != 'true' }}
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: ${{ inputs['python-version'] }}
@@ -49,11 +66,13 @@ runs:
     - name: Install runtime dependencies
       if: ${{ inputs['install-mode'] == 'runtime' }}
       shell: bash
+      working-directory: ${{ inputs.path }}
       run: python -m pip install .
 
     - name: Install development dependencies
       if: ${{ inputs['install-mode'] == 'dev' }}
       shell: bash
+      working-directory: ${{ inputs.path }}
       run: python -m pip install -e ".[dev]"
 
     - name: Install Claude Code

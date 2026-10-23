@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from scripts.common.incidents import compute_fingerprint
 from scripts.common.issue_dedup import IssueContent
@@ -306,9 +306,19 @@ def job_title_for(failure: JobFailure) -> str:
 _TITLE_CAUSE_CHARS = 100
 
 
+# The job a job-level failure issue names, read back by the CI-fix issue flow.
+_JOB_MARKER_RE = re.compile(rf"<!-- {re.escape(MARKER_NAMESPACE)}:job:(?P<job>[^\s>]+) -->")
+
+
 def job_marker(job: str) -> str:
     """A hidden marker naming the issue's first job, percent-encoded so it cannot end the comment."""
     return f"<!-- {MARKER_NAMESPACE}:job:{quote(job, safe='')} -->"
+
+
+def parse_job_marker(body: str) -> str:
+    """The job a job-level failure issue tracks, or "" for a test failure issue."""
+    match = _JOB_MARKER_RE.search(body or "")
+    return unquote(match.group("job")) if match else ""
 
 
 def render_job_issue(failure: JobFailure, marker: str, occurrences: int) -> IssueContent:

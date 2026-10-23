@@ -1,393 +1,441 @@
-"""Commit a validated fix and push it to the backport PR's own branch.
+"""Commit and push a CI-fix candidate to a bot-owned branch.
 
-This is the only place ``ci_fix`` mutates a remote, so it carries the push
-discipline:
+The CI-fix agent follows the same publishing model as the backport agent:
 
-- The fix is committed authored as the bot, without a DCO sign-off - a human
-  must certify the change before it can be merged upstream. Local git
-  commands run with a scrubbed environment so a repository git hook can never
-  read a credential from the ambient environment.
-- The push target must live in the allowed agent namespace
-  (``agent/backport/...``) on the PR's own head repo. Anything else is refused.
-- The generated commit must descend from the validated PR head, and the push
-  uses an exact-SHA lease. Git therefore rejects a moved or deleted branch
-  instead of overwriting it or recreating a branch whose PR was closed.
+* the agent may edit a disposable checkout, but it never commits or pushes;
+* code reapplies the resulting patch (or cherry-picks a merged upstream fix)
+  in a clean clone;
+* only the bot namespaces are writable; and
+* an exact ``--force-with-lease`` prevents overwriting a branch that moved.
 
-The branch is never merged. The push re-triggers the PR's normal CI.
+The push starts normal repository CI. It never merges the branch.
 """
 
 from __future__ import annotations
 
-import logging
-import re
 import subprocess
 import tempfile
 import textwrap
 from pathlib import Path
 from typing import Callable
 
-from scripts.ci_fix.models import FixProposal
-from scripts.ci_fix.port_discovery import resolve_default_branch
+from scripts.ci_fix.models import CandidateAction, FixCandidate, FixTarget, TargetKind
+from scripts.ci_fix.policy import (
+    WRITABLE_BRANCH_PREFIXES,
+    is_writable_branch,
+)
 from scripts.common.git_auth import github_https_url
-from scripts.common.git_clone import REPO_RE, SHA_RE
-from scripts.common.proc import BOT_EMAIL, BOT_NAME, EmptyPatch, build_approved_patch, git_output, run_git
+from scripts.common.git_clone import REPO_RE, is_full_sha
+from scripts.common.proc import (
+    BOT_EMAIL,
+    BOT_NAME,
+    default_branch_ref,
+    git_output,
+    git_paths,
+    is_ancestor,
+    run_git,
+)
 
-logger = logging.getLogger(__name__)
-
-ALLOWED_BRANCH_PREFIX = "agent/backport/"
 PrePushCheck = Callable[[], str]
 
-
 class PushRefused(Exception):
-    """Raised when a push target falls outside the allowed namespace."""
+    """Publication was permanently refused by a safety or stale-target check."""
 
 
-def commit_and_push_fix(
-    repo_dir: str,
+class PushStale(PushRefused):
+    """The exact remote lease no longer matches the publication target."""
+
+
+class PushFailed(Exception):
+    """Publication failed operationally and may succeed when retried."""
+
+
+def push_candidate(
+    candidate: FixCandidate,
+    target: FixTarget,
     *,
-    head_repo_full_name: str,
-    head_branch: str,
-    head_sha: str,
-    proposal: FixProposal,
-    changed_paths: tuple[str, ...],
     git_env: dict[str, str],
     pre_push_check: PrePushCheck | None = None,
 ) -> str:
-    """Commit the working-tree fix and push it to the PR head branch.
+    """Commit ``candidate`` on ``target.expected_sha`` and push it.
 
-    The verified checkout is treated as untrusted: test commands may have
-    modified ``.git/config`` or hooks. We only extract a binary patch for the
-    approved paths, then apply it in a fresh clone at ``head_sha``. The clean
-    clone is the only checkout that receives credentials. Returns the new
-    commit SHA. Raises ``PushRefused`` if any trust-boundary check fails.
+    ``UPDATE_PR`` requires the remote branch to still point at
+    ``expected_sha``. ``DRAFT_PR`` creates a new branch and requires that the
+    remote ref not exist. Returns the new commit SHA.
     """
-    if not head_branch.startswith(ALLOWED_BRANCH_PREFIX):
-        # The prefix is a convention, not proof the branch is bot-owned: the
-        # push is contained by the descendant check plus exact-head lease, the
-        # gate's same-repo head requirement, and the App token being scoped to
-        # the one target repo.
-        raise PushRefused(
-            f"Refusing to push to {head_branch!r}: ci_fix only pushes to branches "
-            f"under {ALLOWED_BRANCH_PREFIX}."
+    _validate_target(target)
+    create = target.kind is TargetKind.DRAFT_PR
+    if candidate.action is CandidateAction.PATCH:
+        return _push_patch(
+            candidate,
+            target,
+            git_env=git_env,
+            pre_push_check=pre_push_check,
+            create=create,
         )
-    if not REPO_RE.fullmatch(head_repo_full_name):
-        raise PushRefused(f"Refusing to push to malformed repo {head_repo_full_name!r}.")
-    if not SHA_RE.fullmatch(head_sha):
-        raise PushRefused(f"Refusing to push from malformed head SHA {head_sha!r}.")
-    if not changed_paths:
-        raise PushRefused("Refusing to push: no approved changed paths to stage.")
-    if not _is_valid_branch_name(head_branch):
-        raise PushRefused(f"Refusing to push to malformed branch {head_branch!r}.")
-
-    try:
-        patch = build_approved_patch(repo_dir, changed_paths)
-    except EmptyPatch as exc:
-        raise PushRefused(f"Refusing to push: {exc}.") from exc
-
-    with tempfile.TemporaryDirectory(prefix="ci-fix-push-") as tmpdir:
-        clean_repo = Path(tmpdir) / "repo"
-        _clone_clean(head_repo_full_name, clean_repo)
-        try:
-            run_git(str(clean_repo), "checkout", head_sha)
-            run_git(str(clean_repo), "checkout", "-B", head_branch)
-            _apply_patch(str(clean_repo), patch)
-
-            staged = _staged_paths(str(clean_repo))
-            if staged != tuple(sorted(changed_paths)):
-                raise PushRefused(
-                    "Refusing to push: approved patch staged unexpected paths "
-                    f"{staged!r} (expected {tuple(sorted(changed_paths))!r})."
-                )
-
-            run_git(str(clean_repo), "config", "user.name", BOT_NAME)
-            run_git(str(clean_repo), "config", "user.email", BOT_EMAIL)
-            run_git(str(clean_repo), "commit", "-m", _commit_message(proposal))
-
-            _push_with_expected_head(
-                str(clean_repo),
-                head_repo_full_name=head_repo_full_name,
-                head_branch=head_branch,
-                head_sha=head_sha,
-                git_env=git_env,
-                pre_push_check=pre_push_check,
-            )
-        except subprocess.CalledProcessError as exc:
-            # Keep the pipeline's "every outcome is a comment" guarantee: a git
-            # failure in the clean clone (unreachable SHA, non-fast-forward
-            # push, etc.) becomes a refusal, never an uncaught crash.
-            detail = (exc.stderr or str(exc)).strip()[:300]
-            raise PushRefused(f"Refusing to push: git failed: {detail}") from exc
-
-        return git_output(str(clean_repo), "rev-parse", "HEAD").strip()
-
-
-def commit_and_push_port(
-    repo_dir: str,
-    *,
-    head_repo_full_name: str,
-    head_branch: str,
-    head_sha: str,
-    unstable_fix_commit: str,
-    git_env: dict[str, str],
-    pre_push_check: PrePushCheck | None = None,
-) -> str:
-    """Cherry-pick an existing upstream fix onto the PR branch and push it.
-
-    Unlike an authored fix, a PORT carries an already-merged upstream commit, so
-    we preserve its original authorship and add the standard ``cherry picked
-    from`` trailer rather than re-authoring it as the bot. The same push
-    discipline applies: namespaced branch, validated repo/SHA, descendant-only
-    commit, and exact-head lease from a fresh clone. A conflicting or empty cherry-pick, or any git
-    failure, becomes ``PushRefused`` so the outcome is always a comment.
-    """
-    if not head_branch.startswith(ALLOWED_BRANCH_PREFIX):
-        raise PushRefused(
-            f"Refusing to push to {head_branch!r}: ci_fix only pushes to branches "
-            f"under {ALLOWED_BRANCH_PREFIX}."
+    if candidate.action is CandidateAction.PORT:
+        return _push_port(
+            candidate,
+            target,
+            git_env=git_env,
+            pre_push_check=pre_push_check,
+            create=create,
         )
-    if not REPO_RE.fullmatch(head_repo_full_name):
-        raise PushRefused(f"Refusing to push to malformed repo {head_repo_full_name!r}.")
-    if not SHA_RE.fullmatch(head_sha):
-        raise PushRefused(f"Refusing to push from malformed head SHA {head_sha!r}.")
-    if not SHA_RE.fullmatch(unstable_fix_commit):
-        raise PushRefused(f"Refusing to port malformed commit {unstable_fix_commit!r}.")
-    if not _is_valid_branch_name(head_branch):
-        raise PushRefused(f"Refusing to push to malformed branch {head_branch!r}.")
-
-    with tempfile.TemporaryDirectory(prefix="ci-fix-port-") as tmpdir:
-        clean_repo = Path(tmpdir) / "repo"
-        _clone_clean(head_repo_full_name, clean_repo)
-        try:
-            # The fix commit lives on the default branch and may not be in the
-            # blobless clone yet; fetch the exact object before picking.
-            run_git(str(clean_repo), "fetch", "origin", unstable_fix_commit)
-            run_git(str(clean_repo), "checkout", head_sha)
-            run_git(str(clean_repo), "checkout", "-B", head_branch)
-            # Code, not the AI, owns "this is a real already-merged upstream
-            # fix". Verify the commit is reachable from the default branch and
-            # is not already on the PR head, so a model-chosen SHA cannot skip
-            # local verification by pointing at an arbitrary or already-present
-            # commit. A SHA that fails this is refused, not ported.
-            _verify_portable_commit(str(clean_repo), unstable_fix_commit, head_sha)
-            # The cherry-pick keeps the upstream commit's author and sign-off,
-            # but it still needs a committer identity to create the commit (a
-            # fresh clone has none). The bot is the committer, the human stays
-            # the author, which is the normal backport shape.
-            run_git(str(clean_repo), "config", "user.name", BOT_NAME)
-            run_git(str(clean_repo), "config", "user.email", BOT_EMAIL)
-            # -x records "cherry picked from commit <sha>".
-            run_git(str(clean_repo), "cherry-pick", "-x", unstable_fix_commit)
-
-            _push_with_expected_head(
-                str(clean_repo),
-                head_repo_full_name=head_repo_full_name,
-                head_branch=head_branch,
-                head_sha=head_sha,
-                git_env=git_env,
-                pre_push_check=pre_push_check,
-            )
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or str(exc)).strip()[:300]
-            raise PushRefused(f"Refusing to push: git failed: {detail}") from exc
-
-        return git_output(str(clean_repo), "rev-parse", "HEAD").strip()
+    raise PushRefused("Refusing to push: the agent did not prepare a fix.")
 
 
-def _verify_push_authorized(pre_push_check: PrePushCheck | None) -> None:
-    """Fail closed when a trusted caller can no longer authorize this push."""
-    if pre_push_check is None:
-        return
-    try:
-        reason = pre_push_check()
-    except Exception as exc:  # noqa: BLE001 - authorization errors must fail closed
-        raise PushRefused(
-            "Refusing to push: the PR could not be revalidated immediately before push."
-        ) from exc
-    if reason:
-        raise PushRefused(f"Refusing to push: {reason}")
-
-
-def _push_with_expected_head(
-    clean_repo: str,
+def _push_patch(
+    candidate: FixCandidate,
+    target: FixTarget,
     *,
-    head_repo_full_name: str,
-    head_branch: str,
-    head_sha: str,
     git_env: dict[str, str],
     pre_push_check: PrePushCheck | None,
-) -> None:
-    """Push only when HEAD descends from, and the remote still equals, ``head_sha``."""
-    if not _is_ancestor(clean_repo, head_sha, "HEAD"):
+    create: bool,
+) -> str:
+    if not candidate.changed_paths:
+        raise PushRefused("Refusing to push: the candidate has no changed paths.")
+    if not candidate.patch.strip():
+        raise PushRefused("Refusing to push: the candidate patch is empty.")
+
+    with tempfile.TemporaryDirectory(prefix="ci-fix-push-") as tempdir:
+        repo_dir = Path(tempdir) / "repo"
+        _clone(target.base_repo_full_name or target.repo_full_name, repo_dir)
+        try:
+            run_git(str(repo_dir), "checkout", "--detach", target.expected_sha)
+            _apply_patch(str(repo_dir), candidate.patch)
+            staged = _staged_paths(str(repo_dir))
+            expected = tuple(sorted(candidate.changed_paths))
+            if staged != expected:
+                raise PushRefused(
+                    "Refusing to push: the patch staged unexpected paths "
+                    f"{staged!r} (expected {expected!r})."
+                )
+            _set_identity(repo_dir)
+            run_git(str(repo_dir), "commit", "-m", commit_message(candidate))
+            _push(
+                repo_dir,
+                target,
+                git_env=git_env,
+                pre_push_check=pre_push_check,
+                create=create,
+            )
+            return git_output(str(repo_dir), "rev-parse", "HEAD").strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            raise PushFailed(f"CI-fix Git operation failed: {exc}") from exc
+
+
+def _push_port(
+    candidate: FixCandidate,
+    target: FixTarget,
+    *,
+    git_env: dict[str, str],
+    pre_push_check: PrePushCheck | None,
+    create: bool,
+) -> str:
+    commit = candidate.port_commit.strip()
+    if not is_full_sha(commit):
+        raise PushRefused(f"Refusing to port malformed commit {commit!r}.")
+
+    with tempfile.TemporaryDirectory(prefix="ci-fix-port-") as tempdir:
+        repo_dir = Path(tempdir) / "repo"
+        _clone(target.base_repo_full_name or target.repo_full_name, repo_dir)
+        try:
+            run_git(str(repo_dir), "checkout", "--detach", target.expected_sha)
+            check_port(repo_dir, commit, target.expected_sha)
+            _set_identity(repo_dir)
+            try:
+                run_git(str(repo_dir), "cherry-pick", "-x", commit)
+            except subprocess.CalledProcessError as exc:
+                reason = cherry_pick_refusal(repo_dir, commit)
+                if reason:
+                    raise PushRefused(reason) from exc
+                raise
+            _push(
+                repo_dir,
+                target,
+                git_env=git_env,
+                pre_push_check=pre_push_check,
+                create=create,
+            )
+            return git_output(str(repo_dir), "rev-parse", "HEAD").strip()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            raise PushFailed(f"CI-fix Git operation failed: {exc}") from exc
+
+
+def _validate_target(target: FixTarget) -> None:
+    if target.kind is TargetKind.SUGGEST:
+        # A suggestion's branch is the contributor's own; it is never pushed to.
+        raise PushRefused("Refusing to push to a suggestion target.")
+    if not REPO_RE.fullmatch(target.repo_full_name):
+        raise PushRefused(f"Refusing to push to malformed repo {target.repo_full_name!r}.")
+    if target.base_repo_full_name and not REPO_RE.fullmatch(target.base_repo_full_name):
         raise PushRefused(
-            "Refusing to push: the generated commit does not descend from the validated PR head."
+            f"Refusing to clone malformed base repo {target.base_repo_full_name!r}."
         )
-    destination = f"refs/heads/{head_branch}"
-    run_git(clean_repo, "remote", "set-url", "origin", github_https_url(head_repo_full_name))
-    # Keep the mutable PR-state check adjacent to the actual push. A concurrent
-    # head update or deletion after this call is still rejected by the lease.
-    _verify_push_authorized(pre_push_check)
-    run_git(
-        clean_repo,
-        "push",
-        f"--force-with-lease={destination}:{head_sha}",
-        "origin",
-        f"HEAD:{destination}",
-        env=git_env,
-    )
-
-
-def _verify_portable_commit(clean_repo: str, fix_commit: str, head_sha: str) -> None:
-    """Refuse unless ``fix_commit`` is a genuine upstream fix missing from head.
-
-    A PORT skips local verification because the commit is already merged and
-    tested on the default branch. That exception is only safe if *code*, not the
-    AI, proves the SHA is exactly that. Two deterministic checks:
-
-    - the commit is reachable from the default branch (it really is merged
-      upstream, not an arbitrary or fabricated SHA); and
-    - the commit is not already an ancestor of the PR head (porting it actually
-      adds the missing fix rather than being a no-op).
-
-    A SHA that fails either check raises ``PushRefused`` instead of being
-    cherry-picked.
-    """
-    default_branch = resolve_default_branch(clean_repo)
-    ref = f"origin/{default_branch}"
-    try:
-        git_output(clean_repo, "rev-parse", "--verify", ref)
-    except subprocess.CalledProcessError:
-        run_git(
-            clean_repo, "fetch", "origin",
-            f"refs/heads/{default_branch}:refs/remotes/origin/{default_branch}",
-        )
-    if not _is_ancestor(clean_repo, fix_commit, ref):
+    if not is_full_sha(target.expected_sha):
+        raise PushRefused(f"Refusing to push from malformed SHA {target.expected_sha!r}.")
+    if not is_writable_branch(target.branch):
         raise PushRefused(
-            f"Refusing to port {fix_commit[:12]}: it is not reachable from {ref}, "
-            "so it is not a merged upstream fix."
+            f"Refusing to push to {target.branch!r}: CI fix only writes under "
+            f"{', '.join(WRITABLE_BRANCH_PREFIXES)}."
         )
-    if _is_ancestor(clean_repo, fix_commit, head_sha):
-        raise PushRefused(
-            f"Refusing to port {fix_commit[:12]}: it is already present on the PR head."
-        )
-
-
-def _is_ancestor(repo_dir: str, maybe_ancestor: str, descendant: str) -> bool:
-    """True if ``maybe_ancestor`` is an ancestor of ``descendant`` (or equal)."""
     try:
-        git_output(repo_dir, "merge-base", "--is-ancestor", maybe_ancestor, descendant)
-        return True
-    except subprocess.CalledProcessError:
-        return False
-
-
-def _clone_clean(head_repo_full_name: str, dest: Path) -> None:
-    url = github_https_url(head_repo_full_name)
-    try:
-        run_git(None, "clone", "--filter=blob:none", url, str(dest))
+        run_git(None, "check-ref-format", "--branch", target.branch)
     except subprocess.CalledProcessError as exc:
-        raise PushRefused(f"Refusing to push: clone failed: {(exc.stderr or '')[:300]}") from exc
+        raise PushRefused(f"Refusing to push to malformed branch {target.branch!r}.") from exc
+
+
+def _clone(repo_full_name: str, destination: Path) -> None:
+    try:
+        run_git(
+            None,
+            "clone",
+            "--filter=blob:none",
+            github_https_url(repo_full_name),
+            str(destination),
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        raise PushFailed(f"CI-fix clone failed: {exc}") from exc
+
+
+def _set_identity(repo_dir: Path) -> None:
+    run_git(str(repo_dir), "config", "user.name", BOT_NAME)
+    run_git(str(repo_dir), "config", "user.email", BOT_EMAIL)
 
 
 def _apply_patch(repo_dir: str, patch: str) -> None:
-    try:
-        run_git(repo_dir, "apply", "--index", "--whitespace=nowarn", "-", input=patch)
-    except subprocess.CalledProcessError as exc:
-        raise PushRefused(
-            f"Refusing to push: approved patch did not apply cleanly: {(exc.stderr or '')[:300]}"
-        ) from exc
+    run_git(
+        repo_dir,
+        "apply",
+        "--index",
+        "--whitespace=nowarn",
+        "-",
+        input=patch,
+    )
 
 
 def _staged_paths(repo_dir: str) -> tuple[str, ...]:
-    out = git_output(repo_dir, "diff", "--cached", "--name-only", "-z", "HEAD")
-    return tuple(sorted(path for path in out.split("\0") if path))
+    return tuple(sorted(git_paths(
+        repo_dir,
+        "diff",
+        "--cached",
+        "--no-renames",
+        "--name-only",
+        "-z",
+        "HEAD",
+    )))
 
 
-def _is_valid_branch_name(branch: str) -> bool:
+def _push(
+    repo_dir: Path,
+    target: FixTarget,
+    *,
+    git_env: dict[str, str],
+    pre_push_check: PrePushCheck | None,
+    create: bool,
+) -> None:
+    if not _is_ancestor(str(repo_dir), target.expected_sha, "HEAD"):
+        raise PushRefused(
+            "Refusing to push: the generated commit does not descend from the expected head."
+        )
+    # A workflow or action change runs with the repository's own privileges
+    # once pushed, so a person applies it, never the bot. This also covers a
+    # ported upstream commit, and is why the push token has no workflows scope.
+    ci_paths = [
+        path for path in git_paths(
+            str(repo_dir), "diff", "--no-renames", "--name-only", "-z", target.expected_sha, "HEAD",
+        )
+        if path.startswith(".github/")
+    ]
+    if ci_paths:
+        raise PushRefused(
+            f"Refusing to push: the fix changes {', '.join(ci_paths)}; a maintainer must "
+            "apply CI definition changes."
+        )
+    if pre_push_check is not None:
+        try:
+            reason = pre_push_check()
+        except Exception as exc:  # noqa: BLE001 - a failed recheck denies the push
+            raise PushFailed(
+                f"The publication target could not be revalidated: {exc}"
+            ) from exc
+        if reason:
+            raise PushRefused(f"Refusing to push: {reason}")
+
+    destination = f"refs/heads/{target.branch}"
+    expected_remote = "" if create else target.expected_sha
+    run_git(
+        str(repo_dir),
+        "remote",
+        "set-url",
+        "origin",
+        github_https_url(target.repo_full_name),
+    )
+    if create:
+        # An empty lease rejects an existing ref only when the push changes
+        # it: pushing a commit identical to the one already there succeeds as
+        # a no-op. Creating means the branch must not exist at all.
+        try:
+            existing = run_git(
+                str(repo_dir), "ls-remote", "--heads", "origin", destination, env=git_env,
+            ).stdout.strip()
+        except subprocess.CalledProcessError as exc:
+            raise PushFailed(f"CI-fix push failed: {exc}") from exc
+        if existing:
+            raise PushStale("Refusing to push: the target branch changed after revalidation.")
     try:
-        run_git(None, "check-ref-format", "--branch", branch)
-    except subprocess.CalledProcessError:
-        return False
-    return True
+        run_git(
+            str(repo_dir),
+            "push",
+            f"--force-with-lease={destination}:{expected_remote}",
+            "origin",
+            f"HEAD:{destination}",
+            env=git_env,
+        )
+    except subprocess.CalledProcessError as exc:
+        if _is_stale_lease(exc):
+            raise PushStale(
+                "Refusing to push: the target branch changed after revalidation."
+            ) from exc
+        raise PushFailed(f"CI-fix push failed: {exc}") from exc
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise PushFailed(f"CI-fix push failed: {exc}") from exc
 
 
-def _commit_message(proposal: FixProposal) -> str:
-    """A focused commit message with a maintainer-readable subject.
+def check_port(repo_dir: Path, commit: str, head_sha: str) -> None:
+    """Raise ``PushRefused`` unless ``commit`` can be cherry-picked onto ``head_sha``.
 
-    ``failing_check`` often comes from logs and can be a raw build command
-    ("make SERVER_CFLAGS=...") rather than a useful commit subject. Prefer a
-    source file named in the compiler diagnostic for build failures, and keep
-    the detailed root cause in a wrapped body.
+    The engine runs this before it tests a port, and the publisher again in
+    its clean clone.
     """
-    subject = _commit_subject(proposal)
-    body = _format_commit_body(proposal.root_cause)
-    return f"{subject}\n\n{body}\n"
+    _verify_merged_upstream(repo_dir, commit, head_sha)
+    if _commit_parent_count(repo_dir, commit) > 1:
+        raise PushRefused(
+            f"Refusing to port {commit[:12]}: merge commits require an "
+            "explicit mainline parent."
+        )
 
 
-def _format_commit_body(body: str) -> str:
-    return "\n\n".join(
+def _verify_merged_upstream(repo_dir: Path, commit: str, head_sha: str) -> None:
+    default_ref = _default_branch_ref(repo_dir)
+    if not _is_ancestor(str(repo_dir), commit, default_ref, missing_is_false=True):
+        raise PushRefused(
+            f"Refusing to port {commit[:12]}: it is not merged into {default_ref}."
+        )
+    if _is_ancestor(str(repo_dir), commit, head_sha):
+        raise PushRefused(
+            f"Refusing to port {commit[:12]}: it is already present on the target head."
+        )
+
+
+def _commit_parent_count(repo_dir: Path, commit: str) -> int:
+    line = git_output(
+        str(repo_dir),
+        "rev-list",
+        "--parents",
+        "--max-count=1",
+        commit,
+    ).strip()
+    fields = line.split()
+    if not fields or fields[0].lower() != commit.lower():
+        raise PushFailed(f"CI-fix could not inspect commit {commit[:12]}.")
+    return len(fields) - 1
+
+
+def cherry_pick_refusal(repo_dir: Path, commit: str) -> str:
+    """Return a permanent refusal reason for a deterministic pick failure."""
+    unmerged = git_paths(
+        str(repo_dir),
+        "diff",
+        "--name-only",
+        "--diff-filter=U",
+        "-z",
+    )
+    if unmerged:
+        return (
+            f"Refusing to port {commit[:12]}: the cherry-pick conflicts with "
+            f"the target head in {', '.join(unmerged)}."
+        )
+    if _cherry_pick_in_progress(repo_dir) and not _staged_paths(str(repo_dir)):
+        return (
+            f"Refusing to port {commit[:12]}: the cherry-pick is empty or "
+            "already equivalent on the target head."
+        )
+    return ""
+
+
+def _cherry_pick_in_progress(repo_dir: Path) -> bool:
+    try:
+        git_output(
+            str(repo_dir),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "CHERRY_PICK_HEAD",
+        )
+        return True
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 1:
+            return False
+        raise
+
+
+def _default_branch_ref(repo_dir: Path) -> str:
+    ref = default_branch_ref(str(repo_dir))
+    if not ref:
+        raise PushRefused("Refusing to port: the default branch could not be resolved.")
+    return ref
+
+
+def _is_ancestor(
+    repo_dir: str,
+    ancestor: str,
+    descendant: str,
+    *,
+    missing_is_false: bool = False,
+) -> bool:
+    """Whether ``ancestor`` is in ``descendant``'s history; git that cannot tell is a failure.
+
+    With ``missing_is_false``, a commit git cannot place (one this clone does
+    not have) counts as not an ancestor.
+    """
+    try:
+        answer = is_ancestor(repo_dir, ancestor, descendant)
+    except OSError as exc:
+        raise PushFailed(f"CI-fix Git ancestry check failed: {exc}") from exc
+    if answer is None:
+        if missing_is_false:
+            return False
+        raise PushFailed(f"CI-fix Git ancestry check failed: is {ancestor[:12]} in {descendant}?")
+    return answer
+
+
+def _is_stale_lease(exc: subprocess.CalledProcessError) -> bool:
+    """Return whether Git definitively rejected an out-of-date lease."""
+    detail = f"{getattr(exc, 'stderr', '') or ''}\n{getattr(exc, 'stdout', '') or ''}"
+    return "stale info" in detail.lower()
+
+
+def commit_message(candidate: FixCandidate) -> str:
+    """Return a concise bot-authored commit message for an authored patch."""
+    subject = fit_subject(f"Fix {candidate.failing_check or 'CI failure'}")
+    paragraphs = [candidate.root_cause.strip(), candidate.reasoning.strip()]
+    body = "\n\n".join(
         textwrap.fill(
-            paragraph.strip(),
+            paragraph,
             width=72,
             break_long_words=False,
             break_on_hyphens=False,
         )
-        for paragraph in body.strip().split("\n\n")
-        if paragraph.strip()
+        for paragraph in paragraphs
+        if paragraph
     )
+    return f"{subject}\n\n{body}\n" if body else subject
 
 
-_SOURCE_LOCATION_RE = re.compile(
-    r"`?([A-Za-z0-9_./-]+\.(?:c|h|cc|cpp|cxx|m|mm|py|tcl|sh|rs|go|java|js|ts)):\d+"
-)
-
-
-def _commit_subject(proposal: FixProposal) -> str:
-    source = _source_file_from_root_cause(proposal.root_cause)
-    if source and _looks_like_build_failure(proposal):
-        return _fit_subject(f"Fix {source} build failure")
-
-    check = _clean_failing_check(proposal.failing_check)
-    if not check:
-        return "Fix CI failure"
-    return _fit_subject(f"Fix {check}")
-
-
-def _source_file_from_root_cause(root_cause: str) -> str:
-    match = _SOURCE_LOCATION_RE.search(root_cause)
-    if not match:
-        return ""
-    return Path(match.group(1)).name
-
-
-def _looks_like_build_failure(proposal: FixProposal) -> bool:
-    check = proposal.failing_check.strip().lower()
-    if check.startswith(("make ", "cmake ", "ninja ", "clang ", "gcc ", "cc ")):
-        return True
-    text = f"{check} {proposal.root_cause}".lower()
-    return any(
-        marker in text
-        for marker in (
-            "compile",
-            "compiler",
-            "clang",
-            "gcc",
-            "-werror",
-        )
-    )
-
-
-def _clean_failing_check(failing_check: str) -> str:
-    check = " ".join(failing_check.strip().split())
-    check = check.strip(" .")
-    lowered = check.lower()
-    if lowered.startswith(("make ", "cmake ", "ninja ", "clang ", "gcc ", "cc ")):
-        return "build failure"
-    return check
-
-
-def _fit_subject(subject: str) -> str:
-    """Trim to Git's conventional 72-char subject length at a word boundary."""
-    subject = " ".join(subject.split())
+def fit_subject(subject: str) -> str:
+    """Fit a Git commit or PR subject to the conventional 72 characters."""
+    subject = " ".join(subject.split()).strip(" .")
     if len(subject) <= 72:
         return subject
     clipped = subject[:72].rstrip()

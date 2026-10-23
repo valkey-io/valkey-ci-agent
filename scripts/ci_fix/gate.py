@@ -1,19 +1,13 @@
-"""Authorization and integrity gate for ``@valkeyrie-bot fix <ci-link>``.
+"""Authorize a CI-fix request and bind it to one failed job.
 
-This is the security boundary. Nothing downstream runs until every check here
-passes, and every check fails closed.
+The gate keeps only the trust checks that matter operationally:
 
-The command shape check requires the comment to be the fix command with a CI
-run link on the same repository as the PR. The authorization check requires the
-commenter to be an active member of a configured GitHub team
-(``valkey-io/contributors``); a failed or negative membership read is a refusal,
-never a fallback to a looser check. The SHA-bound run gating check requires the
-failed run's ``head_repo``/``head_branch`` to match the PR head, and the PR head
-SHA to still equal the SHA the run was built from. If the branch moved, the log
-no longer describes the code, so we refuse rather than fix a stale failure.
+* the requester is an authorized maintainer;
+* the Actions run belongs to the PR and tested its current head;
+* the selected job actually failed; and
+* only a bot-authored branch in the CI agent's namespace may be pushed.
 
-The gate returns a ``FixRequest`` only when all three hold; otherwise a
-``GateRejection`` explaining why, which the caller turns into a PR comment.
+Every other PR receives a patch suggestion instead.
 """
 
 from __future__ import annotations
@@ -21,32 +15,47 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
+from urllib.parse import urlsplit
 
-from scripts.ci_fix.models import FixRequest
+from github.GithubException import GithubException
+
+from scripts.ci_fix.github_runs import (
+    FailedJob,
+    failed_jobs_for_run,
+    most_actionable_failure,
+    newest_runs_for_head,
+    select_job,
+    workflow_file,
+)
+from scripts.ci_fix.models import (
+    Failure,
+    FixPolicy,
+    FixTarget,
+    FixTask,
+    TargetKind,
+)
+from scripts.ci_fix.policy import can_update_branch, is_backport_branch
 from scripts.common.github_client import retry_github_call
 from scripts.common.identity import APP_LOGIN, BOT_LOGIN
 
 logger = logging.getLogger(__name__)
 
-# The comment must *begin* with the invocation (after optional leading
-# whitespace) so quoting or mentioning the command mid-discussion does not
-# trigger a fix. Either bot identity may drive it: the manual-dispatch bot or
-# the App that opens the PRs (used by the comment poller); both come from
-# scripts.common.identity so the accepted mentions track the real accounts. The
-# hint is only the remainder of the invocation line, not the whole comment, so
-# a multi-line conversational reply is not folded into the hint.
 _COMMAND_RE = re.compile(
     r"^\s*@(?:" + "|".join(re.escape(login) for login in (BOT_LOGIN, APP_LOGIN))
-    + r")\s+fix\s+(?P<url>\S+)(?:[^\S\n]+(?P<hint>[^\n]*))?",
+    + r")\s+fix\b[^\S\n]*(?P<rest>[^\n]*)",
     re.IGNORECASE,
 )
-# Actions run URL: .../<owner>/<repo>/actions/runs/<run_id>
-_RUN_URL_RE = re.compile(
-    r"github\.com/(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)/actions/runs/(?P<run_id>\d+)",
+_RUN_PATH_RE = re.compile(
+    r"/(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)/actions/runs/(?P<run_id>\d+)"
+    r"(?:/attempts/(?P<run_attempt>\d+))?"
+    r"(?:/jobs?/(?P<job_id>\d+))?/?",
 )
-
+_GITHUB_HOSTS = frozenset({"github.com", "www.github.com"})
+_MARKDOWN_LINK_RE = re.compile(r"\[[^\]\n]*\]\((?P<url>[^)\s]+)\)")
+_ANGLE_LINK_RE = re.compile(r"<(?P<url>[^>\s]+)>")
+_BARE_LINK_RE = re.compile(r"\S*(?:://|github\.com/)\S*", re.IGNORECASE)
 _DEFAULT_AUTH_TEAM = "contributors"
 
 
@@ -56,31 +65,72 @@ class ParsedCommand:
     run_repo: str
     run_id: int
     hint: str
+    job_id: int = 0
+    run_attempt: int = 0
 
 
 @dataclass(frozen=True)
 class GateRejection:
-    """A refusal with a human-readable reason for the PR comment."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class GateError:
+    """A retryable failure while reading the state needed by the gate."""
 
     reason: str
 
 
 def parse_command(body: str) -> ParsedCommand | None:
-    """Parse a comment body into a command, or None if it isn't one."""
+    """Parse ``@bot fix [run-or-job-url] [hint]`` from one comment line."""
     if not body:
         return None
     match = _COMMAND_RE.search(body)
-    if not match:
+    if match is None:
         return None
-    url_match = _RUN_URL_RE.search(match.group("url"))
-    if not url_match:
+    links: list[str] = []
+
+    def take(found: re.Match[str]) -> str:
+        link = found.group("url") if "url" in found.groupdict() else found.group(0)
+        # A bare link ends a sentence like any word: ``... /runs/1.``
+        links.append(link.rstrip(".,;:!?)"))
+        return " "
+
+    rest = match.group("rest")
+    for pattern in (_MARKDOWN_LINK_RE, _ANGLE_LINK_RE, _BARE_LINK_RE):
+        rest = pattern.sub(take, rest)
+    hint = " ".join(rest.split())
+    if not links:
+        return ParsedCommand("", "", 0, hint)
+    if len(links) != 1:
         return None
-    hint = (match.group("hint") or "").strip()
+    parsed = parse_run_url(links[0])
+    return replace(parsed, hint=hint) if parsed is not None else None
+
+
+def parse_run_url(run_url: str) -> ParsedCommand | None:
+    """Parse one github.com Actions run or job URL."""
+    url = (run_url or "").strip()
+    if "://" not in url:
+        url = f"https://{url}"
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or (parts.hostname or "").lower() not in _GITHUB_HOSTS:
+        return None
+    if parts.username or parts.password or parts.port:
+        return None
+    match = _RUN_PATH_RE.fullmatch(parts.path)
+    if match is None:
+        return None
     return ParsedCommand(
-        run_owner=url_match.group("owner"),
-        run_repo=url_match.group("repo"),
-        run_id=int(url_match.group("run_id")),
-        hint=hint,
+        run_owner=match.group("owner"),
+        run_repo=match.group("repo"),
+        run_id=int(match.group("run_id")),
+        hint="",
+        job_id=int(match.group("job_id") or 0),
+        run_attempt=int(match.group("run_attempt") or 0),
     )
 
 
@@ -91,6 +141,7 @@ def is_authorized(
     username: str,
     *,
     retries: int = 2,
+    raise_on_error: bool = False,
 ) -> bool:
     """Return True only if ``username`` is allowed to drive the bot.
 
@@ -102,6 +153,9 @@ def is_authorized(
     The primary source is active membership of ``org/team_slug``. Fails closed:
     any error reading membership (permission, network, missing team) returns
     False, and a ``pending`` invitation does not authorize.
+
+    ``raise_on_error`` raises a read error other than "not a member" instead,
+    for a caller that reports it as retryable.
 
     An explicit allowlist may be supplied via ``CI_FIX_AUTH_ALLOWLIST`` (a
     comma-separated list of logins). It is empty by default - in production the
@@ -124,6 +178,9 @@ def is_authorized(
             retries=retries, description=f"team membership {username}",
         )
     except Exception as exc:  # noqa: BLE001 - fail closed on any read error
+        if raise_on_error and not (isinstance(exc, GithubException) and exc.status == 404):
+            # The caller tells "could not check" (retryable) apart from "not a member".
+            raise
         logger.warning("Authorization check failed closed for %s: %s", username, exc)
         return False
     state = getattr(membership, "state", None)
@@ -135,7 +192,7 @@ def _auth_allowlist() -> frozenset[str]:
     return frozenset(login.strip() for login in raw.split(",") if login.strip())
 
 
-def build_fix_request(
+def build_fix_task(
     gh: Any,
     *,
     command: ParsedCommand,
@@ -145,99 +202,146 @@ def build_fix_request(
     org: str = "valkey-io",
     auth_team: str = _DEFAULT_AUTH_TEAM,
     retries: int = 2,
-) -> FixRequest | GateRejection:
-    """Run all gate checks and return a FixRequest or a GateRejection.
-
-    Assumes the comment was already confirmed to be on a pull request by the
-    caller (the GitHub Actions event guarantees this for ``issue_comment`` on
-    a PR); this function enforces authorization, run ownership, and SHA
-    binding.
-    """
-    if not is_authorized(gh, org, auth_team, commenter, retries=retries):
+) -> FixTask | GateRejection | GateError:
+    """Return a fully bound task or a reason the request is not actionable."""
+    try:
+        authorized = is_authorized(gh, org, auth_team, commenter, retries=retries, raise_on_error=True)
+    except Exception as exc:  # noqa: BLE001 - transient reads must remain retryable
+        return GateError(f"Could not authorize @{commenter}: {exc}")
+    if not authorized:
         return GateRejection(
-            reason=f"@{commenter} is not an active member of {org}/{auth_team}; refusing."
+            f"@{commenter} is not an active member of {org}/{auth_team}; refusing."
         )
-
-    run_repo_full_name = f"{command.run_owner}/{command.run_repo}"
-    if run_repo_full_name != pr_repo_full_name:
+    if command.run_id and f"{command.run_owner}/{command.run_repo}" != pr_repo_full_name:
         return GateRejection(
-            reason=(
-                f"The linked run belongs to {run_repo_full_name}, not this PR's "
-                f"repository {pr_repo_full_name}; refusing."
-            )
+            f"The linked run belongs to {command.run_owner}/{command.run_repo}, "
+            f"not {pr_repo_full_name}; refusing."
         )
 
     try:
+        repo = retry_github_call(
+            lambda: gh.get_repo(pr_repo_full_name),
+            retries=retries,
+            description=f"get {pr_repo_full_name}",
+        )
         pr = retry_github_call(
-            lambda: gh.get_repo(pr_repo_full_name).get_pull(pr_number),
-            retries=retries, description=f"get PR #{pr_number}",
+            lambda: repo.get_pull(pr_number),
+            retries=retries,
+            description=f"get PR #{pr_number}",
         )
-        run = retry_github_call(
-            lambda: gh.get_repo(pr_repo_full_name).get_workflow_run(command.run_id),
-            retries=retries, description=f"get run {command.run_id}",
-        )
-    except Exception as exc:  # noqa: BLE001 - fail closed
-        return GateRejection(reason=f"Could not load PR or run: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return GateError(f"Could not load PR #{pr_number}: {exc}")
 
-    run_status = str(getattr(run, "status", "") or "")
-    if run_status != "completed":
-        return GateRejection(
-            reason=(
-                f"The linked run is not finished yet (status: {run_status or 'unknown'}). "
-                "Its logs are only available once it completes - re-run me when it has."
-            )
-        )
-    # We deliberately do NOT gate on the run's overall conclusion. A run can be
-    # "cancelled" overall (a manual stop, or fail-fast after one job failed) yet
-    # still contain genuine job failures worth fixing. Whether there is a real
-    # failure to act on is decided per-job downstream: the pipeline lists the
-    # jobs that actually failed and requires the AI's hinted job to be one of
-    # them, refusing otherwise. Run-level conclusion is noise; the job is truth.
+    head = getattr(pr, "head", None)
+    head_sha = str(getattr(head, "sha", "") or "")
+    head_branch = str(getattr(head, "ref", "") or "")
+    head_repo = str(getattr(getattr(head, "repo", None), "full_name", "") or "")
+    base_branch = str(getattr(getattr(pr, "base", None), "ref", "") or "")
+    author = str(getattr(getattr(pr, "user", None), "login", "") or "")
+    if str(getattr(pr, "state", "") or "") != "open":
+        return GateRejection(f"PR #{pr_number} is not open; refusing.")
+    if not all((head_sha, head_branch, head_repo, base_branch)):
+        return GateRejection("Could not determine the PR head and base; refusing.")
 
-    pr_head_sha = str(getattr(pr.head, "sha", "") or "")
-    pr_head_ref = str(getattr(pr.head, "ref", "") or "")
-    pr_head_repo = str(getattr(getattr(pr.head, "repo", None), "full_name", "") or "")
-    run_head_sha = str(getattr(run, "head_sha", "") or "")
-    run_head_branch = str(getattr(run, "head_branch", "") or "")
+    selected: FailedJob
+    if command.run_id:
+        try:
+            run = retry_github_call(
+                lambda: repo.get_workflow_run(command.run_id),
+                retries=retries,
+                description=f"get run {command.run_id}",
+            )
+            current_attempt = int(getattr(run, "run_attempt", 1) or 1)
+            failed = failed_jobs_for_run(
+                gh,
+                pr_repo_full_name,
+                command.run_id,
+                run_attempt=current_attempt,
+                retries=retries,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return GateError(f"Could not load run {command.run_id}: {exc}")
+        if not failed:
+            return GateRejection(f"Run {command.run_id} has no failed job to fix.")
+        if command.run_attempt and command.run_attempt != current_attempt:
+            return GateRejection(
+                f"The linked URL names run attempt {command.run_attempt}, but "
+                f"run {command.run_id} is currently attempt {current_attempt}."
+            )
+        if command.job_id:
+            matched = next((job for job in failed if job.id == command.job_id), None)
+            if matched is None:
+                return GateRejection(
+                    f"Job {command.job_id} is not a failed job of run {command.run_id}; refusing."
+                )
+            selected = matched
+        else:
+            selected = select_job(failed)
+    else:
+        try:
+            runs = newest_runs_for_head(
+                gh, pr_repo_full_name, branch=head_branch, head_sha=head_sha, retries=retries,
+            )
+            picked = most_actionable_failure(gh, pr_repo_full_name, runs)
+        except Exception as exc:  # noqa: BLE001
+            return GateError(f"Could not inspect CI runs for this PR: {exc}")
+        if picked is None:
+            return GateRejection(
+                f"No completed failed run was found for the current head {head_sha[:12]}."
+            )
+        run, selected, failed = picked
 
-    if not pr_head_sha or not run_head_sha:
+    status = str(getattr(run, "status", "") or "")
+    if status != "completed":
         return GateRejection(
-            reason="Could not determine the PR or run head commit; refusing."
+            f"The linked run is not complete yet (status: {status or 'unknown'})."
         )
-    if run_head_sha != pr_head_sha:
+    run_sha = str(getattr(run, "head_sha", "") or "")
+    if run_sha != head_sha:
         return GateRejection(
-            reason=(
-                "The PR branch has moved since this run "
-                f"(run built {run_head_sha[:12] or 'unknown'}, PR head is "
-                f"{pr_head_sha[:12] or 'unknown'}); re-run CI and try again."
-            )
+            f"The PR moved after this run (run: {run_sha[:12]}, PR: {head_sha[:12]})."
         )
-    if run_head_branch and pr_head_ref and run_head_branch != pr_head_ref:
+    run_branch = str(getattr(run, "head_branch", "") or "")
+    if run_branch and run_branch != head_branch:
         return GateRejection(
-            reason=(
-                f"The run's branch ({run_head_branch}) does not match the PR head "
-                f"branch ({pr_head_ref}); refusing."
-            )
-        )
-    if not pr_head_repo:
-        return GateRejection(
-            reason="Could not determine the PR head repository; refusing.",
-        )
-    if pr_head_repo != pr_repo_full_name:
-        return GateRejection(
-            reason=(
-                f"The PR head is on {pr_head_repo}, not {pr_repo_full_name}; "
-                "ci_fix only pushes to branches on the PR's own repository."
-            )
+            f"The run tested branch {run_branch}, not the current PR branch {head_branch}."
         )
 
-    return FixRequest(
+    same_repo = head_repo == pr_repo_full_name
+    bot_owned = can_update_branch(
+        same_repo=same_repo,
+        branch=head_branch,
+        author=author,
+    )
+    target_kind = TargetKind.UPDATE_PR if bot_owned else TargetKind.SUGGEST
+    target = FixTarget(
+        kind=target_kind,
+        repo_full_name=head_repo,
+        base_repo_full_name=pr_repo_full_name,
+        branch=head_branch,
+        expected_sha=head_sha,
+    )
+    failure = Failure(
         repo_full_name=pr_repo_full_name,
-        pr_number=pr_number,
-        head_repo_full_name=pr_repo_full_name,
-        head_branch=pr_head_ref,
-        head_sha=pr_head_sha,
-        run_id=command.run_id,
-        requested_by=commenter,
+        run_id=int(getattr(run, "id", 0) or command.run_id),
+        run_attempt=int(getattr(run, "run_attempt", 1) or 1),
+        head_sha=head_sha,
+        job_id=selected.id,
+        job_name=selected.name,
+        base_branch=base_branch,
+        description=f"Targeting the failure in `{selected.name}`.",
         hint=command.hint,
+        pr_number=pr_number,
+        other_failed_jobs=tuple(job.name for job in failed if job.id != selected.id),
+        workflow=workflow_file(run),
+    )
+    policy = (
+        FixPolicy.BACKPORT
+        if bot_owned and is_backport_branch(head_branch)
+        else FixPolicy.GENERAL
+    )
+    return FixTask(
+        failure=failure,
+        target=target,
+        policy=policy,
     )

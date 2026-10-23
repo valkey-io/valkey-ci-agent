@@ -10,8 +10,10 @@ import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
+from scripts.common.isolation import as_user, handed_to, kill_all
 from scripts.common.logging_utils import log_group
 from scripts.common.proc import filter_env
 
@@ -61,11 +63,22 @@ def run_claude_code(
     allowed_tools: str = "Read,Edit,MultiEdit,Write,Bash,Glob,Grep",
     disallowed_tools: str | None = None,
     env_allowlist: tuple[str, ...] | None = None,
+    confined: bool = False,
+    extra_dirs: tuple[str, ...] = (),
+    run_as: str = "",
 ) -> tuple[str, str, int]:
     """Run claude CLI and return (stdout, stderr, exit_code).
 
     Requires ``claude`` on PATH and Bedrock credentials in the
     environment (CLAUDE_CODE_USE_BEDROCK=1 + AWS creds).
+
+    ``confined`` keeps the CLI's own working-directory boundary instead of
+    bypassing all permission checks: tools may read (and, under
+    ``acceptEdits``, edit) only ``cwd`` and ``extra_dirs``, and a request for
+    anything else - another directory, ``/proc``, a symlink out of the tree - is
+    refused. Use it whenever the prompt or the files carry untrusted content.
+    A confined profile cannot use Bash, which would stall on an approval, or
+    Glob, whose absolute patterns are not boundary-checked.
     """
     env = _build_claude_env(env_allowlist)
     env["CLAUDE_CODE_USE_BEDROCK"] = "1"
@@ -90,11 +103,8 @@ def run_claude_code(
         "--tools", allowed_tools,
         # Three layers, each doing distinct work: --tools is the set of tools
         # that exist, --disallowedTools (below) hard-denies specific ones, and
-        # --dangerously-skip-permissions drops the interactive approval prompt
-        # that otherwise blocks every write in headless --print mode. The env
-        # is already hardened (GitHub tokens stripped, AWS-only) and runs in
-        # throwaway checkouts.
-        "--dangerously-skip-permissions",
+        # the permission mode decides what an existing tool may touch.
+        *_permission_args(allowed_tools, confined, extra_dirs),
         # cwd is an untrusted checkout. --safe-mode disables all project
         # customizations (CLAUDE.md, hooks, plugins, skills) so a malicious
         # repo cannot execute code in our credentialed subprocess.
@@ -121,7 +131,19 @@ def run_claude_code(
     # The event stream is long; fold it so the lines around it stay readable.
     with log_group("Claude Code output"):
         logger.debug("Prompt starts: %s", " ".join(prompt[:200].split()))
-        stdout, stderr, returncode = _run_streaming(cmd, prompt, cwd=cwd, env=env, timeout=timeout)
+        if run_as:
+            # The checkout is untrusted and Bash can run anything in it: run
+            # the CLI as an account that cannot read this process's
+            # environment, where the job's credentials live.
+            if not cwd:
+                raise ValueError("an isolated run needs a working directory")
+            with handed_to(run_as, Path(cwd), readable=tuple(Path(d) for d in extra_dirs)) as home:
+                stdout, stderr, returncode = _run_streaming(
+                    as_user(run_as, env, cmd, home=home), prompt, cwd=cwd, env={}, timeout=timeout,
+                    run_as=run_as,
+                )
+        else:
+            stdout, stderr, returncode = _run_streaming(cmd, prompt, cwd=cwd, env=env, timeout=timeout)
     elapsed = time.monotonic() - started
     if stderr.startswith("timeout"):
         logger.error("Claude Code timed out after %ds.", timeout)
@@ -136,6 +158,7 @@ def run_claude_code(
 
 def _run_streaming(
     cmd: list[str], prompt: str, *, cwd: str | None, env: dict[str, str], timeout: int,
+    run_as: str = "",
 ) -> tuple[str, str, int]:
     stdout_parts: list[str] = []
     process = None
@@ -184,7 +207,7 @@ def _run_streaming(
         return stdout, "", returncode
     except subprocess.TimeoutExpired:
         if process is not None:
-            _kill_process_group(process)
+            _kill_process_group(process, run_as)
         # Let the reader thread flush buffered output before we read it.
         reader.join(timeout=5)
         stdout = "".join(stdout_parts)
@@ -193,8 +216,15 @@ def _run_streaming(
         return "", "claude not found", 127
 
 
-def _kill_process_group(process: Any) -> None:
-    """Kill *process* and everything it spawned; fall back to the process alone."""
+def _kill_process_group(process: Any, run_as: str = "") -> None:
+    """Kill *process* and everything it spawned; fall back to the process alone.
+
+    A CLI run as ``run_as`` sits under root's sudo, which this process may
+    not signal: everything that account runs is killed instead.
+    """
+    if run_as:
+        kill_all(run_as)
+        return
     try:
         os.killpg(process.pid, signal.SIGKILL)
         return
@@ -202,8 +232,35 @@ def _kill_process_group(process: Any) -> None:
         pass
     try:
         process.kill()
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
+
+
+def _permission_args(allowed_tools: str, confined: bool, extra_dirs: tuple[str, ...]) -> list[str]:
+    """CLI permission flags for one run.
+
+    Unconfined runs skip all permission checks (the approval prompt would
+    otherwise block every write in headless --print mode); their checkouts are
+    trusted code. Confined runs keep the working-directory boundary: reads, and
+    edits under acceptEdits, are allowed only inside cwd and ``extra_dirs``.
+    """
+    if not confined:
+        return ["--dangerously-skip-permissions"]
+    tools = {token.split("(", 1)[0] for token in re.split(r"[\s,]+", allowed_tools) if token}
+    if "Bash" in tools:
+        raise ValueError("a confined agent profile cannot allow Bash")
+    # Glob checks its path argument but not an absolute pattern, so it lists
+    # file names anywhere; Grep (files_with_matches) lists inside the boundary.
+    if "Glob" in tools:
+        raise ValueError("a confined agent profile cannot allow Glob")
+    edits = any(tool in allowed_tools for tool in ("Edit", "MultiEdit"))
+    # No settings files at all: a checkout's .claude/settings.json (or one a
+    # test planted in ~/.claude) could add directories or allow rules that
+    # lift the boundary. Model, region and credentials come from flags and env.
+    args = ["--permission-mode", "acceptEdits" if edits else "default", "--setting-sources", ""]
+    for directory in extra_dirs:
+        args += ["--add-dir", directory]
+    return args
 
 
 def _build_claude_env(env_allowlist: tuple[str, ...] | None = None) -> dict[str, str]:
