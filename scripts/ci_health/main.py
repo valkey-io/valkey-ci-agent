@@ -1,9 +1,12 @@
 """Command line for CI health: sync the store, then report from it.
 
 Every command reads from GitHub at most; nothing here writes to a
-repository, an issue or a comment. ``sync`` brings the store up to date,
-``scorecard`` and ``blame`` compute from it and write JSON. The workflow
-runs the three in that order; by hand, run whichever you need.
+repository, an issue or a comment. ``sync`` brings the store up to date;
+``scorecard`` and ``blame`` compute from it and write JSON; ``report``
+writes the whole site: the dashboard pages, the Markdown report and every
+JSON export, and fails when the Daily data is stale so a dead token or a
+stalled sync is never published as a quiet night. The workflow runs
+``sync`` then ``report``; by hand, run whichever you need.
 """
 
 from __future__ import annotations
@@ -18,6 +21,8 @@ from typing import Callable, List, Optional
 from github import Auth, Github
 
 from scripts.ci_health.blame import compute_blame
+from scripts.ci_health.releases import generate_releases_data, render_release_strip, render_releases_html
+from scripts.ci_health.report import generate_report_data, render_html, render_markdown, stale_reason
 from scripts.ci_health.scorecard import compute_scorecards
 from scripts.ci_health.store import Cache
 from scripts.ci_health.sync import WORKFLOW_FILES, GitHubRunsClient, HistorySync, RunsClient
@@ -117,6 +122,69 @@ def run_blame(args: argparse.Namespace, make_client: ClientFactory) -> int:
     return 0
 
 
+def run_report(args: argparse.Namespace, make_client: ClientFactory) -> int:
+    """Write the site: dashboard pages, Markdown report and JSON exports.
+
+    Daily freshness is the gate: a newest Daily run older than
+    ``--max-age-days`` fails the command, since a regular nightly cadence
+    makes that the sign of a dead token or a stalled sync. The per-commit CI
+    and weekly release views only warn, because merges are bursty and the
+    weekly backfill may still be in progress.
+    """
+    site = Path(args.site)
+    site.mkdir(parents=True, exist_ok=True)
+    cache = Cache(args.db)
+    try:
+        client = make_client(args.token, args.repo) if args.token else None
+        daily = generate_report_data(
+            cache, days=args.days, branch=args.branch, workflow="daily.yml", repo=args.repo, client=client,
+        )
+        ci = None
+        if not args.no_ci:
+            ci = generate_report_data(
+                cache, branch=args.branch, workflow="ci.yml", repo=args.repo, client=client,
+                per_run=True, max_runs=40,
+            )
+        releases = generate_releases_data(cache, repo=args.repo)
+        strip = render_release_strip(releases["summary_rows"]) if releases["summary_rows"] else ""
+        _write_text(render_html(daily, ci_data=ci, releases_strip=strip), site / "index.html")
+        _write_text(render_releases_html(releases), site / "releases.html")
+        _write_text(render_markdown(daily), site / "report.md")
+        _write_json(daily, str(site / "report.json"))
+        if ci is not None:
+            _write_json(ci, str(site / "report-ci.json"))
+        _write_json(releases, str(site / "report-releases.json"))
+        # The report already carries the scorecards and the regressions over
+        # a 90-day window; the standalone files are those same records, so
+        # the commit ranges are compared once, not twice.
+        _write_json(daily["scorecard"], str(site / "scorecards.json"))
+        _write_json(daily["regressions"], str(site / "blame.json"))
+    finally:
+        cache.close()
+
+    if ci is not None:
+        reason = stale_reason(ci["summary"].get("latest_run_date"), max_age_days=args.max_age_days)
+        if reason:
+            logger.warning("CI view is stale: %s", reason)
+    reason = stale_reason(releases["summary"].get("latest_week"), max_age_days=9)
+    if reason:
+        logger.warning("Release-branch view is stale: %s", reason)
+    reason = stale_reason(daily["summary"].get("latest_run_date"), max_age_days=args.max_age_days)
+    if reason:
+        log_outcome(logger, logging.ERROR, "Daily data is stale, not publishing: %s", reason)
+        return 1
+    log_outcome(
+        logger, logging.INFO, "Wrote the site to %s; newest Daily run %s",
+        site, daily["summary"].get("latest_run_date"),
+    )
+    return 0
+
+
+def _write_text(content: str, path: Path) -> None:
+    path.write_text(content)
+    logger.info("Wrote %s", path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m scripts.ci_health.main",
@@ -149,6 +217,15 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Workflow to report on: daily, weekly, ci, or a workflow file name (default: daily).")
         report.add_argument("--output", "-o", default=None, help="Write here instead of stdout.")
         report.set_defaults(func=func)
+
+    site = sub.add_parser("report", help="Write the dashboard pages, Markdown report and JSON exports to a directory.")
+    site.add_argument("--site", default="ci-health/site", help="Directory to write (default: ci-health/site).")
+    site.add_argument("--days", type=int, default=30, help="Days of history in the recent window (default: 30).")
+    site.add_argument("--branch", default="unstable", help="Branch to report on (default: unstable).")
+    site.add_argument("--no-ci", action="store_true", help="Leave out the per-commit CI view.")
+    site.add_argument("--max-age-days", type=int, default=2,
+                      help="Fail if the newest Daily run is older than this (default: 2).")
+    site.set_defaults(func=run_report)
     return parser
 
 

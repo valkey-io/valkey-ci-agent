@@ -9,9 +9,11 @@ every Daily run in a local store and computes per-test statistics over it.
 
 ## Status
 
-The store, the statistics and the workflow that fills the store are in. The
-workflow uploads its results as JSON; the published dashboard and the Slack
-report follow as separate changes. The design is in
+The store, the statistics, the workflow that fills the store and the
+dashboard it renders are in. The dashboard is published to GitHub Pages once
+the repository enables it; until then every run uploads it as an artifact.
+The Slack report, and the link from each row to the Test Failure Detector's
+issue, follow as separate changes. The design is in
 [issue 115](https://github.com/valkey-io/valkey-ci-agent/issues/115). The
 code is ported from the
 [valkey-daily-dashboard](https://github.com/rainsupreme/valkey-daily-dashboard)
@@ -48,10 +50,40 @@ The weekly workflow's runs are split into one synthetic run per release
 branch. That backlog is worked through within a budget of API calls per run,
 newest first, so steady state costs only the newest week.
 
-Then the scorecards and blame ranges are computed over the whole store and
-written as JSON. Nothing is written to any repository, issue or comment, and
-the only GitHub token the job holds can read Actions and contents, not write
-them.
+Then the site is rendered from the whole store: `index.html`, the dashboard;
+`releases.html`, the same views per release branch from the weekly runs;
+`report.md`, a Markdown summary; and the JSON exports `report.json`,
+`report-ci.json`, `report-releases.json`, `scorecards.json` and `blame.json`.
+A newest Daily run older than two days fails the run instead of publishing,
+since a regular nightly cadence makes that the sign of a dead token or a
+stalled sync; the per-commit CI and weekly views only warn, because merges are
+bursty and the weekly backfill may still be in progress. Nothing is written to
+any repository, issue or comment, and the only GitHub token the job holds can
+read Actions and contents, not write them.
+
+## The dashboard
+
+The front page shows the `unstable` branch. A strip of badges gives each
+release branch's health from the latest weekly run, then four tabs:
+
+- **Heatmap**: one row per failing test, one column per run, the per-commit
+  CI runs on top and the nightly Daily below. A red run with no test cells
+  under it failed in build, setup or a sanitizer rather than in a test. Rows
+  with identical failure days are folded into one expandable cluster row,
+  since one regression breaking many tests at once would otherwise fill the
+  table with identical lines. A ⚠️ marks a test the statistics judge a likely
+  regression.
+- **Regressions**: each green-to-red onset with the commits between the last
+  pass and the first failure, the test's baseline rate before the onset and
+  how surprising the failures since are under it; onsets that have since gone
+  quiet are folded away as likely fixed.
+- **Run Details**: each run with its failed jobs and the commits it added.
+- **Flakiness Scorecard**: every test with failures on record, with its
+  class, rate, trend and streak; tests quiet for long enough are folded away
+  as resolved.
+
+The page is one self-contained HTML file. Its styles and script live in
+`scripts/ci_health/assets/` and are inlined at render time.
 
 ## What it computes
 
@@ -130,7 +162,11 @@ scripts/ci_health/
   weekly.py       splits the weekly release-branch fan-out into per-branch runs
   sync.py         fills the store from GitHub Actions: runs, jobs, logs,
                   the weekly split; the only module that calls GitHub
-  main.py         the command line: sync, scorecard, blame
+  report.py       the dashboard: heatmap, regressions, run details and
+                  scorecard tabs, as HTML and Markdown
+  releases.py     the same views per release branch from the weekly runs
+  assets/         the dashboard's stylesheet and script, inlined at render
+  main.py         the command line: sync, scorecard, blame, report
 ```
 
 `sync.py` reads GitHub through a small `RunsClient` protocol (list runs, list
@@ -151,19 +187,21 @@ gh workflow run ci-health.yml --repo valkey-io/valkey-ci-agent --field since=202
 
 `since` also lists runs created from that time on, for filling a gap. The
 `ci-health-history` artifact of the run is the store; the
-`ci-health-report-<run id>` artifact holds `scorecards.json`, `blame.json`
-and the sync summary.
+`ci-health-site-<run id>` artifact holds the rendered site and the sync
+summary.
 
 Locally, with a token that can read Actions on `valkey-io/valkey`:
 
 ```bash
-python -m scripts.ci_health.main --db history.sqlite --token "$GITHUB_TOKEN" sync --workflow daily
+python -m scripts.ci_health.main --db history.sqlite --token "$GITHUB_TOKEN" sync --branch unstable
+python -m scripts.ci_health.main --db history.sqlite --token "$GITHUB_TOKEN" report --site site
 python -m scripts.ci_health.main --db history.sqlite scorecard --days 30
 python -m scripts.ci_health.main --db history.sqlite --token "$GITHUB_TOKEN" blame --days 30
 ```
 
-`scorecard` needs no token. `blame` without one still reports every onset,
-with an empty commit range.
+`report` writes the whole site to a directory and exits non-zero when the
+Daily data is stale. `scorecard` needs no token. `blame` and `report` without
+one still report every onset, with an empty commit range.
 
 ## Configuration
 
@@ -171,3 +209,7 @@ The workflow uses the shared GitHub App described in [setup.md](setup.md),
 with `actions: read`, `contents: read` and `metadata: read` on
 `valkey-io/valkey`. Downloading the earlier history uses the workflow's own
 token with `actions: read` on this repository.
+
+Publishing needs GitHub Pages enabled for this repository with GitHub Actions
+as its source, then the `CI_HEALTH_PAGES` variable set to `true`. Until then
+the publish job does not run and the site is only an artifact of each run.

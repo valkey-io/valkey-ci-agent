@@ -120,3 +120,39 @@ def test_scorecard_to_stdout_without_a_token(tmp_path: Path, capsys) -> None:
     Cache(db).close()
     assert main(["--db", db, "scorecard"], make_client=_Client) == 0
     assert isinstance(json.loads(capsys.readouterr().out), dict)
+
+
+def test_report_writes_the_site_and_passes_when_daily_is_fresh(tmp_path: Path, capsys) -> None:
+    from datetime import datetime, timezone
+
+    db = str(tmp_path / "h.sqlite")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    class _FreshClient(_Client):
+        def __init__(self, token: str, repo: str) -> None:
+            super().__init__(token, repo)
+            run = self.runs["daily.yml"][0]
+            run["run_started_at"] = run["created_at"] = f"{today}T00:10:00Z"
+            run["updated_at"] = f"{today}T05:00:00Z"
+
+    assert main(["--db", db, "--token", "t", "sync", "--workflow", "daily"], make_client=_FreshClient) == 0
+    capsys.readouterr()
+    site = tmp_path / "site"
+    assert main(["--db", db, "report", "--site", str(site), "--no-ci"], make_client=_FreshClient) == 0
+    names = sorted(p.name for p in site.iterdir())
+    assert names == ["blame.json", "index.html", "releases.html", "report-releases.json",
+                     "report.json", "report.md", "scorecards.json"]
+    page = (site / "index.html").read_text()
+    assert "some_test" in page and "<script>" in page  # rendered with the bundled assets
+    assert "report-ci.json" not in names
+
+
+def test_report_fails_when_the_newest_daily_run_is_stale(tmp_path: Path, capsys) -> None:
+    db = str(tmp_path / "h.sqlite")
+    # _Client's one run is dated 2026-01-15, long past any two-day window.
+    assert main(["--db", db, "--token", "t", "sync", "--workflow", "daily"], make_client=_Client) == 0
+    capsys.readouterr()
+    site = tmp_path / "site"
+    assert main(["--db", db, "report", "--site", str(site)], make_client=_Client) == 1
+    # The pages are still written, so a stale night can be inspected; only the exit code refuses.
+    assert (site / "index.html").exists() and (site / "report-ci.json").exists()

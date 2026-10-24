@@ -59,8 +59,8 @@ to rebuild and publish. See [CVE scan](docs/cve-scan.md).
 **CI health.** Every morning the agent records the night's Daily run and the
 failures of its failed jobs in a history store, then works out, per test, how
 often it fails, whether it is flaky or simply broken, and which commits turned
-it from green to red. The results are JSON for now; a dashboard and a Slack
-report follow. See [CI health](docs/ci-health.md).
+it from green to red, and renders a dashboard of it all. A Slack report
+follows. See [CI health](docs/ci-health.md).
 
 A PR reviewer with a second, skeptical pass is planned.
 

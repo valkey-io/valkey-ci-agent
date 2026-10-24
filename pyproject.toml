@@ -16,6 +16,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["scripts*"]
 
+[tool.setuptools.package-data]
+"scripts.ci_health" = ["assets/*.css", "assets/*.js"]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4.0",

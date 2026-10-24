@@ -25,6 +25,7 @@ These repository variables adjust its behaviour:
 | `AWS_REGION` | The AWS region to use, for example `us-east-1`. |
 | `CI_AGENT_CLAUDE_MODEL` | Use a different model, for example `opus`. Unset means the default. |
 | `CI_FIX_ISSUES_AUTO_DISPATCH` | Set to `true` to let the CI fix bot start on detector issues by itself. |
+| `CI_HEALTH_PAGES` | Set to `true` to publish the CI health dashboard to GitHub Pages, once Pages is enabled for this repository with GitHub Actions as its source. |
 | `CI_FIX_ISSUES_MAX_RUNS` | How many detector issue fixes can run at once. Defaults to 2. |
 | `CI_FIX_ISSUES_PUBLISH` | How a detector issue's fix is shared: `comment` (the default) or `draft-pr`. |
 

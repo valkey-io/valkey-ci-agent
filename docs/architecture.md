@@ -96,8 +96,7 @@ cut and release automation are built the same way.
 | CI health | [ci-health.md](ci-health.md) | `scripts/ci_health/main.py` |
 
 A PR reviewer with a second, skeptical pass is planned. CI health has its
-store, statistics and workflow; the dashboard and Slack report that present
-them follow.
+store, statistics, workflow and dashboard; the Slack report follows.
 
 ## How Claude is run
 
