@@ -82,6 +82,13 @@ release branch's health from the latest weekly run, then four tabs:
   class, rate, trend and streak; tests quiet for long enough are folded away
   as resolved.
 
+Both pages warn about their own age. The page is static, so whether its data
+is current depends on when it is read, not when it was rendered: a script
+compares the newest run's date with the reader's clock and shows a banner
+when a Daily run is more than two days old or a weekly run more than nine.
+The same thresholds fail or warn the workflow, but a page that keeps being
+served after the workflow has stopped has only the banner.
+
 The page is one self-contained HTML file. Its styles and script live in
 `scripts/ci_health/assets/` and are inlined at render time.
 

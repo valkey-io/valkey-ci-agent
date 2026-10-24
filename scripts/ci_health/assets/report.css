@@ -5,6 +5,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monos
        background: #0d1117; color: #c9d1d9; padding: 20px; font-size: 0.8125rem; }
 h1 { font-size: 1.125rem; margin-bottom: 4px; color: #f0f6fc; }
 .meta { color: #8b949e; margin-bottom: 16px; font-size: 0.75rem; }
+/* Shown by report.js when the newest run is older than the page's data-max-age-days,
+   judged against the viewer's clock: a static page must warn about its own age. */
+.stale-banner { background: #3d2300; color: #f0b429; border: 1px solid #9e6a03; border-radius: 6px;
+  padding: 10px 14px; margin: 0 0 16px; font-size: 0.8125rem; line-height: 1.5; }
+.stale-banner b { color: #ffd166; }
 .stats { display: flex; gap: 24px; margin-bottom: 20px; }
 .stat { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
          padding: 10px 16px; }

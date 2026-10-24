@@ -1,4 +1,30 @@
 (function () {
+  // Staleness banner. The page is static, so whether its data is current
+  // depends on when it is read, not when it was rendered: compare the newest
+  // run's date with the viewer's clock and warn past the page's threshold.
+  var banners = document.querySelectorAll(".stale-banner[data-latest]");
+  Array.prototype.forEach.call(banners, function (el) {
+    var latest = el.getAttribute("data-latest");
+    var maxAge = parseInt(el.getAttribute("data-max-age-days"), 10);
+    var what = el.getAttribute("data-what") || "run";
+    var text;
+    if (!latest) {
+      text = "<b>No " + what + " on record.</b> The sync has not stored any run yet, or stopped before it could.";
+    } else {
+      var then = Date.parse(latest.slice(0, 10) + "T00:00:00Z");
+      if (isNaN(then)) return;
+      var ageDays = Math.floor((Date.now() - then) / 86400000);
+      if (!(ageDays > maxAge)) return;
+      text = "<b>This report is " + ageDays + " days old.</b> The newest " + what +
+        " it knows is from " + latest.slice(0, 10) + "; one is expected within " + maxAge +
+        " days. The job that updates this page has probably stopped.";
+    }
+    el.innerHTML = text;
+    el.hidden = false;
+  });
+})();
+
+(function () {
   var body = document.getElementById("scorecard-body");
   if (!body) return;
   var rows = Array.prototype.slice.call(body.querySelectorAll("tr"));

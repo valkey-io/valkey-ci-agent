@@ -745,6 +745,8 @@ def render_html(
         failed_runs=summary["failed_runs"],
         unique_tests=summary["unique_tests_failed"],
         generated=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        latest_run_date=html.escape(summary.get("latest_run_date") or ""),
+        max_age_days=MAX_RUN_AGE_DAYS,
         heatmap_body=heatmap_body,
         releases_strip=releases_strip,
         ci_scorecard=ci_scorecard,
@@ -1206,6 +1208,7 @@ ${styles}
 </head>
 <body>
 <h1>Valkey CI Failure Report</h1>
+<div class="stale-banner" role="alert" hidden data-latest="${latest_run_date}" data-max-age-days="${max_age_days}" data-what="Daily run"></div>
 <p class="meta">${workflow} · ${branch} · ${repo} · last ${days} days · generated ${generated} · <a href="releases.html" class="rel-branch-link" title="weekly full-suite health per supported release branch (7.2, 8.0, ...)">Release branch health →</a></p>
 <p class="hint">Valkey CI failure trends for the <b>${branch}</b> branch — nightly Daily suite and per-commit CI. Tracks which tests fail, how often, and whether they are getting better or worse.</p>
 ${releases_strip}

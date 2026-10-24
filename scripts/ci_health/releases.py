@@ -33,6 +33,10 @@ from scripts.ci_health.report import (
 from scripts.ci_health.store import Cache
 from scripts.ci_health.weekly import WEEKLY_SPLIT_WORKFLOW
 
+# The weekly run fires on Sunday; a newest week older than this means the
+# Sunday run was missed or the sync stopped.
+WEEKLY_MAX_AGE_DAYS = 9
+
 #: A branch whose latest week has >= this share of jobs failing is "crit".
 CRIT_JOB_FAIL_RATIO = 0.20
 
@@ -352,6 +356,8 @@ def render_releases_html(data: Dict) -> str:
         repo=html.escape(data["summary"]["repo"]),
         branch_count=data["summary"]["branch_count"],
         latest_week=html.escape(data["summary"]["latest_week"] or "no data yet"),
+        latest_week_raw=html.escape(data["summary"]["latest_week"] or ""),
+        max_age_days=WEEKLY_MAX_AGE_DAYS,
         generated=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         summary_table=_summary_table(data["summary_rows"]),
         branch_sections=_branch_sections(data),
@@ -386,6 +392,7 @@ ${styles}
 </head>
 <body>
 <h1>Valkey Release Branch Health</h1>
+<div class="stale-banner" role="alert" hidden data-latest="${latest_week_raw}" data-max-age-days="${max_age_days}" data-what="weekly run"></div>
 <p class="meta">weekly full suite per release branch · ${repo} · ${branch_count} branches · latest week ${latest_week} · generated ${generated}</p>
 <p class="hint">Every Sunday the <b>Weekly</b> workflow runs the full Daily test matrix against each supported release branch. This page tracks per-branch health — the summary below answers "which shipped versions are unhealthy?", the sections underneath show which tests fail per week. Unlike <a href="index.html">the unstable dashboard</a>, the goal here is <b>visibility</b>, not deflaking.</p>
 

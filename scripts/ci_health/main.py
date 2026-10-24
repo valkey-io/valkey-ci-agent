@@ -21,7 +21,12 @@ from typing import Callable, List, Optional
 from github import Auth, Github
 
 from scripts.ci_health.blame import compute_blame
-from scripts.ci_health.releases import generate_releases_data, render_release_strip, render_releases_html
+from scripts.ci_health.releases import (
+    WEEKLY_MAX_AGE_DAYS,
+    generate_releases_data,
+    render_release_strip,
+    render_releases_html,
+)
 from scripts.ci_health.report import generate_report_data, render_html, render_markdown, stale_reason
 from scripts.ci_health.scorecard import compute_scorecards
 from scripts.ci_health.store import Cache
@@ -166,7 +171,7 @@ def run_report(args: argparse.Namespace, make_client: ClientFactory) -> int:
         reason = stale_reason(ci["summary"].get("latest_run_date"), max_age_days=args.max_age_days)
         if reason:
             logger.warning("CI view is stale: %s", reason)
-    reason = stale_reason(releases["summary"].get("latest_week"), max_age_days=9)
+    reason = stale_reason(releases["summary"].get("latest_week"), max_age_days=WEEKLY_MAX_AGE_DAYS)
     if reason:
         logger.warning("Release-branch view is stale: %s", reason)
     reason = stale_reason(daily["summary"].get("latest_run_date"), max_age_days=args.max_age_days)
