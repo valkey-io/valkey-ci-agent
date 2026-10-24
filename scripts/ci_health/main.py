@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -29,6 +30,7 @@ from scripts.ci_health.releases import (
 )
 from scripts.ci_health.report import generate_report_data, render_html, render_markdown, stale_reason
 from scripts.ci_health.scorecard import compute_scorecards
+from scripts.ci_health.slack_report import BAR_RUNS, build_message, post
 from scripts.ci_health.store import Cache
 from scripts.ci_health.sync import WORKFLOW_FILES, GitHubRunsClient, HistorySync, RunsClient
 from scripts.common.logging_utils import configure_logging, log_outcome
@@ -185,6 +187,40 @@ def run_report(args: argparse.Namespace, make_client: ClientFactory) -> int:
     return 0
 
 
+def run_slack(args: argparse.Namespace, make_client: ClientFactory) -> int:
+    """Render the Slack message for the newest Daily run; post it unless ``--dry-run``.
+
+    Without ``--always``, a run with nothing failed is not posted, which is
+    what the message it replaces did too. ``--issues`` names a JSON file
+    mapping a fingerprint to the detector's issue URL, so each line can link
+    its issue.
+    """
+    cache = Cache(args.db)
+    try:
+        data = generate_report_data(cache, days=args.days, branch=args.branch, workflow="daily.yml", repo=args.repo)
+        cards = compute_scorecards(cache, days=args.days, branch=args.branch, workflow="daily.yml", repo=args.repo)
+    finally:
+        cache.close()
+    issue_urls: dict = {}
+    if args.issues:
+        issue_urls = json.loads(Path(args.issues).read_text())
+    message = build_message(
+        data, cards["scorecards"], dashboard_url=args.dashboard_url, issue_urls=issue_urls, bar_runs=args.bar_runs,
+    )
+    print(message.text)
+    if args.dry_run:
+        return 0
+    if not message.failed and not args.always:
+        log_outcome(logger, logging.INFO, "Newest Daily run passed; nothing posted")
+        return 0
+    if not args.webhook_url:
+        log_outcome(logger, logging.ERROR, "No webhook URL: pass --webhook-url or set SLACK_WEBHOOK_URL")
+        return 1
+    post(message, args.webhook_url)
+    log_outcome(logger, logging.INFO, "Posted the Daily CI message to Slack")
+    return 0
+
+
 def _write_text(content: str, path: Path) -> None:
     path.write_text(content)
     logger.info("Wrote %s", path)
@@ -231,6 +267,21 @@ def build_parser() -> argparse.ArgumentParser:
     site.add_argument("--max-age-days", type=int, default=2,
                       help="Fail if the newest Daily run is older than this (default: 2).")
     site.set_defaults(func=run_report)
+
+    slack = sub.add_parser("slack", help="Render the Slack message for the newest Daily run and post it.")
+    slack.add_argument("--dashboard-url", default="https://valkey-io.github.io/valkey-ci-agent/",
+                       help="Where the dashboard is published; every line links its row there.")
+    slack.add_argument("--webhook-url", default=os.environ.get("SLACK_WEBHOOK_URL", ""),
+                       help="Slack incoming webhook (default: $SLACK_WEBHOOK_URL).")
+    slack.add_argument("--issues", default=None,
+                       help="JSON file mapping a failure's fingerprint to its detector issue URL.")
+    slack.add_argument("--days", type=int, default=30, help="Days of history to read (default: 30).")
+    slack.add_argument("--branch", default="unstable", help="Branch to report on (default: unstable).")
+    slack.add_argument("--bar-runs", type=int, default=BAR_RUNS,
+                       help=f"Runs shown in each line's history bar (default: {BAR_RUNS}).")
+    slack.add_argument("--always", action="store_true", help="Post even when the newest run passed.")
+    slack.add_argument("--dry-run", action="store_true", help="Print the message; post nothing.")
+    slack.set_defaults(func=run_slack)
     return parser
 
 

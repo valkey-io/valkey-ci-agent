@@ -10,6 +10,8 @@ h1 { font-size: 1.125rem; margin-bottom: 4px; color: #f0f6fc; }
 .stale-banner { background: #3d2300; color: #f0b429; border: 1px solid #9e6a03; border-radius: 6px;
   padding: 10px 14px; margin: 0 0 16px; font-size: 0.8125rem; line-height: 1.5; }
 .stale-banner b { color: #ffd166; }
+/* The row a #test=<fingerprint> link points at. */
+tr.deep-linked > td { background: #2d3a1f; box-shadow: inset 3px 0 0 #3fb950; }
 .stats { display: flex; gap: 24px; margin-bottom: 20px; }
 .stat { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
          padding: 10px 16px; }

@@ -1007,6 +1007,7 @@ def _render_scorecard_rows(scorecards: List[Dict]) -> str:
 
         rows += (
             f"<tr{tr_cls_attr} "
+            f'data-fingerprint="{html.escape(sc.get("fingerprint", ""))}" '
             f'data-cat="{html.escape(cat)}" data-class="{cls}" '
             f'data-trend="{trend}" data-rate="{rate:.4f}" data-days="{days_failed}" '
             f'data-stale="{int(stale)}">'

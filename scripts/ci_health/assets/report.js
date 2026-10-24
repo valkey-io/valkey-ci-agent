@@ -122,11 +122,30 @@
   function fromHash() {
     return (location.hash || "").replace(/^#/, "");
   }
+  // A link from the Slack message names a test by its fingerprint:
+  // #test=<fingerprint>. That opens the scorecard, where every test with a
+  // failure on record has a row, and scrolls to the row.
+  function showTest(fingerprint) {
+    var row = document.querySelector('[data-fingerprint="' + fingerprint + '"]');
+    if (!row) return false;
+    activate("scorecard");
+    Array.prototype.forEach.call(document.querySelectorAll(".deep-linked"), function (el) {
+      el.classList.remove("deep-linked");
+    });
+    row.classList.add("deep-linked");
+    row.scrollIntoView({ block: "center" });
+    return true;
+  }
+  function honorHash() {
+    var hash = fromHash();
+    if (hash.indexOf("test=") === 0) return showTest(hash.slice(5));
+    return activate(hash);
+  }
   // Honor a deep link on load; fall back to the default (heatmap).
-  if (!activate(fromHash())) activate("heatmap");
+  if (!honorHash()) activate("heatmap");
   // React to back/forward or manual hash edits.
   window.addEventListener("hashchange", function () {
-    activate(fromHash());
+    honorHash();
   });
 })();
 

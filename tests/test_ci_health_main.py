@@ -156,3 +156,41 @@ def test_report_fails_when_the_newest_daily_run_is_stale(tmp_path: Path, capsys)
     assert main(["--db", db, "report", "--site", str(site)], make_client=_Client) == 1
     # The pages are still written, so a stale night can be inspected; only the exit code refuses.
     assert (site / "index.html").exists() and (site / "report-ci.json").exists()
+
+
+def test_slack_dry_run_prints_the_message_and_posts_nothing(tmp_path: Path, capsys, monkeypatch) -> None:
+    from scripts.ci_health import main as main_mod
+
+    db = str(tmp_path / "h.sqlite")
+    assert main(["--db", db, "--token", "t", "sync", "--workflow", "daily"], make_client=_Client) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(main_mod, "post", lambda *a, **k: pytest.fail("posted during --dry-run"))
+    issues = tmp_path / "issues.json"
+    from scripts.ci_health.fingerprint import fingerprint_for_name
+
+    fp = fingerprint_for_name("some_test in tests/unit/type/string.tcl")
+    issues.write_text(json.dumps({fp: "https://github.com/valkey-io/valkey/issues/1"}))
+    rc = main(["--db", db, "slack", "--dry-run", "--days", "400", "--dashboard-url", "https://d/", "--issues", str(issues)],
+              make_client=_Client)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("🔴 *Daily CI failed*")
+    assert f"<https://github.com/valkey-io/valkey/issues/1|issue> · <https://d/#test={fp}|↗>" in out
+
+
+def test_slack_posts_to_the_webhook(tmp_path: Path, capsys, monkeypatch) -> None:
+    from scripts.ci_health import main as main_mod
+
+    db = str(tmp_path / "h.sqlite")
+    assert main(["--db", db, "--token", "t", "sync", "--workflow", "daily"], make_client=_Client) == 0
+    posted = []
+    monkeypatch.setattr(main_mod, "post", lambda message, url: posted.append((message.failed, url)))
+    assert main(["--db", db, "slack", "--days", "400", "--webhook-url", "https://hooks.test/x"], make_client=_Client) == 0
+    assert posted == [(True, "https://hooks.test/x")]
+
+
+def test_slack_without_a_webhook_fails(tmp_path: Path, capsys, monkeypatch) -> None:
+    db = str(tmp_path / "h.sqlite")
+    assert main(["--db", db, "--token", "t", "sync", "--workflow", "daily"], make_client=_Client) == 0
+    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+    assert main(["--db", db, "slack", "--days", "400"], make_client=_Client) == 1

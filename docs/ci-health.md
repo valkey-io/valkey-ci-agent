@@ -9,11 +9,12 @@ every Daily run in a local store and computes per-test statistics over it.
 
 ## Status
 
-The store, the statistics, the workflow that fills the store and the
-dashboard it renders are in. The dashboard is published to GitHub Pages once
-the repository enables it; until then every run uploads it as an artifact.
-The Slack report, and the link from each row to the Test Failure Detector's
-issue, follow as separate changes. The design is in
+The store, the statistics, the workflow that fills the store, the dashboard
+it renders and the Slack message are in. The dashboard is published to
+GitHub Pages once the repository enables it; until then every run uploads it
+as an artifact. The Slack message can be rendered and posted by hand; the
+workflow does not post it yet, and the link from each dashboard row to the
+Test Failure Detector's issue follows with that integration. The design is in
 [issue 115](https://github.com/valkey-io/valkey-ci-agent/issues/115). The
 code is ported from the
 [valkey-daily-dashboard](https://github.com/rainsupreme/valkey-daily-dashboard)
@@ -90,7 +91,32 @@ The same thresholds fail or warn the workflow, but a page that keeps being
 served after the workflow has stopped has only the banner.
 
 The page is one self-contained HTML file. Its styles and script live in
-`scripts/ci_health/assets/` and are inlined at render time.
+`scripts/ci_health/assets/` and are inlined at render time. A link of the
+form `index.html#test=<fingerprint>` opens the scorecard and highlights that
+test's row; the Slack message links each line that way.
+
+## The Slack message
+
+`valkey-io/valkey`'s `daily.yml` posts to Slack when the Daily run fails,
+naming the failed jobs and linking the run. The message rendered here names
+the tests instead, one line per unique failure, however many jobs it broke:
+
+```
+🔴 Daily CI failed — Oct 24 · 3 of 56 jobs · 5c6a0cd · dashboard
+🆕  ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜🟥   1/14   Active defrag - AOF loading — memefficiency.tcl  ↗
+🔴  ⬜⬜⬜🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥  11/14   spawn timeout — repl-compression.tcl  ↗
+🟡  ⬜⬜⬜⬜⬜🟥🟥⬜🟥🟥🟥⬜🟥🟥   7/14   test-macos-latest — server crashed  ↗
+last 14 daily runs, newest right · 🆕 first failure · 🔴 fails most runs · 🟡 intermittent
+```
+
+The bar is the test's last 14 Daily runs, newest on the right, a filled cell
+for each run it failed in. The leading mark is its class: first failure on
+record, failed at least three runs straight, or intermittent. Lines are
+sorted in that order. Each `↗` opens the test's row on the dashboard, and a
+line whose failure the detector has filed also links the issue. A run with
+nothing failed renders a one-line green message that is only posted on
+request. The message is built from the same report data as the dashboard, in
+`slack_report.py`, so the two agree on what a run's failures are called.
 
 ## What it computes
 
@@ -173,7 +199,8 @@ scripts/ci_health/
                   scorecard tabs, as HTML and Markdown
   releases.py     the same views per release branch from the weekly runs
   assets/         the dashboard's stylesheet and script, inlined at render
-  main.py         the command line: sync, scorecard, blame, report
+  slack_report.py the Slack message: one line per failing test, with history
+  main.py         the command line: sync, scorecard, blame, report, slack
 ```
 
 `sync.py` reads GitHub through a small `RunsClient` protocol (list runs, list
@@ -209,6 +236,16 @@ python -m scripts.ci_health.main --db history.sqlite --token "$GITHUB_TOKEN" bla
 `report` writes the whole site to a directory and exits non-zero when the
 Daily data is stale. `scorecard` needs no token. `blame` and `report` without
 one still report every onset, with an empty commit range.
+
+```bash
+python -m scripts.ci_health.main --db history.sqlite slack --dry-run
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/... python -m scripts.ci_health.main --db history.sqlite slack
+```
+
+`slack` prints the message for the newest Daily run and, without
+`--dry-run`, posts it to the webhook when that run failed (`--always` posts
+a passing one too). `--issues` names a JSON file mapping a failure's
+fingerprint to its issue URL, so lines can link their issues.
 
 ## Configuration
 
