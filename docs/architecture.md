@@ -42,7 +42,7 @@ scripts/
   backport/              Backports, suggestions, CI follow-up, onboarding release lines
   ci_fix/                The CI fix bot
   test_failure_detector/ Daily CI failures to issues
-  ci_health/             Daily CI history and flakiness statistics (no workflow yet)
+  ci_health/             Daily CI history and flakiness statistics
   fuzzer/                Fuzzer run triage
   release_notes/         Release notes and review comments on release PRs
   release/               Release preparation, tracking and publication
@@ -93,10 +93,11 @@ cut and release automation are built the same way.
 | Release notes | [release-notes.md](release-notes.md) | `scripts/release_notes/main.py` |
 | Release automation | [release-automation.md](release-automation.md) | `scripts/release/main.py` |
 | CVE scan | [cve-scan.md](cve-scan.md) | `scripts/cve_scan/sweep.py` |
+| CI health | [ci-health.md](ci-health.md) | `scripts/ci_health/main.py` |
 
-A PR reviewer with a second, skeptical pass is planned. Detection of flaky
-tests across Daily runs is in progress: [CI health](ci-health.md) has the
-statistics layer, and the workflow that feeds it follows.
+A PR reviewer with a second, skeptical pass is planned. CI health has its
+store, statistics and workflow; the dashboard and Slack report that present
+them follow.
 
 ## How Claude is run
 

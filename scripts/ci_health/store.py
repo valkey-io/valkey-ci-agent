@@ -107,6 +107,16 @@ class Cache:
         except sqlite3.OperationalError:
             pass
 
+    def close(self) -> None:
+        """Fold the write-ahead log into the database file and close it.
+
+        The store runs in WAL mode, so until this is called part of the data
+        sits in a ``-wal`` file next to the database. A caller that copies or
+        uploads the database file alone must close the store first.
+        """
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._conn.close()
+
     def _migrate(self) -> None:
         """Apply schema migrations for existing databases."""
         for statements in _MIGRATIONS:

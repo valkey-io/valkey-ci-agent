@@ -9,13 +9,47 @@ every Daily run in a local store and computes per-test statistics over it.
 
 ## Status
 
-This is the statistics layer only. It reads and writes a SQLite file and never
-calls GitHub, so it is tested without stubs. The workflow that fills the store
-from Daily runs, the published dashboard and JSON, and the Slack report follow
-as separate changes. The design is in
+The store, the statistics and the workflow that fills the store are in. The
+workflow uploads its results as JSON; the published dashboard and the Slack
+report follow as separate changes. The design is in
 [issue 115](https://github.com/valkey-io/valkey-ci-agent/issues/115). The
-code is ported from the valkey-daily-dashboard prototype, which has run since
-April 2026 over Daily history backfilled to March 2025.
+code is ported from the
+[valkey-daily-dashboard](https://github.com/rainsupreme/valkey-daily-dashboard)
+prototype ([live dashboard](https://rainsupreme.github.io/valkey-daily-dashboard/)),
+running since April 2026 over Daily history backfilled to March 2025.
+
+## When it runs
+
+Daily CI starts at midnight UTC and usually finishes within four to seven
+hours. CI health runs at 06:00 UTC, and a run that comes too early for that
+night's Daily simply records it the next morning: the sync lists every run
+GitHub has and stores the ones it has not seen, so a late Daily is never
+skipped. The weekly release-branch run is split and ingested the same way.
+
+## What it does each run
+
+The workflow carries the history store from run to run as an artifact of
+its own: each run downloads the newest one an earlier run uploaded, adds to
+it, and uploads it again. With no earlier history it starts from what GitHub
+still has.
+
+The sync lists the Daily, weekly and post-merge CI runs of `valkey-io/valkey`
+on `unstable` and stores the ones it has not seen. (Daily also runs on pull
+requests; those runs are not reported on, so the workflow does not store
+them.) For each new failed run it fetches the
+jobs, and for each failed job it downloads the log once, parses it, and stores
+the failures. GitHub keeps job logs for about 90 days; a job whose log has
+expired is recorded as such and never asked for again, and its conclusion
+still counts in the run's history.
+
+The weekly workflow's runs are split into one synthetic run per release
+branch. That backlog is worked through within a budget of API calls per run,
+newest first, so steady state costs only the newest week.
+
+Then the scorecards and blame ranges are computed over the whole store and
+written as JSON. Nothing is written to any repository, issue or comment, and
+the only GitHub token the job holds can read Actions and contents, not write
+them.
 
 ## What it computes
 
@@ -92,7 +126,46 @@ scripts/ci_health/
   stats.py        Beta-Bernoulli regression confidence
   windowing.py    per-day and per-run keying of a workflow's history
   weekly.py       splits the weekly release-branch fan-out into per-branch runs
+  sync.py         fills the store from GitHub Actions: runs, jobs, logs,
+                  the weekly split; the only module that calls GitHub
+  main.py         the command line: sync, scorecard, blame
 ```
+
+`sync.py` reads GitHub through a small `RunsClient` protocol (list runs, list
+jobs, one job log, compare two commits) so the sync and the statistics are
+tested against an in-memory fake. The real client is PyGithub plus the shared
+`ArtifactClient` for logs, which keeps the token off GitHub's redirect to
+storage and answers an expired log with nothing rather than an error.
 
 Tests live in `tests/test_ci_health_*.py`, one module per source module, plus
 real-world log captures in `test_ci_health_log_parser_realworld.py`.
+
+## Running it by hand
+
+```bash
+gh workflow run ci-health.yml --repo valkey-io/valkey-ci-agent
+gh workflow run ci-health.yml --repo valkey-io/valkey-ci-agent --field since=2026-09-01T00:00:00Z
+```
+
+`since` also lists runs created from that time on, for filling a gap. The
+`ci-health-history` artifact of the run is the store; the
+`ci-health-report-<run id>` artifact holds `scorecards.json`, `blame.json`
+and the sync summary.
+
+Locally, with a token that can read Actions on `valkey-io/valkey`:
+
+```bash
+python -m scripts.ci_health.main --db history.sqlite --token "$GITHUB_TOKEN" sync --workflow daily
+python -m scripts.ci_health.main --db history.sqlite scorecard --days 30
+python -m scripts.ci_health.main --db history.sqlite --token "$GITHUB_TOKEN" blame --days 30
+```
+
+`scorecard` needs no token. `blame` without one still reports every onset,
+with an empty commit range.
+
+## Configuration
+
+The workflow uses the shared GitHub App described in [setup.md](setup.md),
+with `actions: read`, `contents: read` and `metadata: read` on
+`valkey-io/valkey`. Downloading the earlier history uses the workflow's own
+token with `actions: read` on this repository.
