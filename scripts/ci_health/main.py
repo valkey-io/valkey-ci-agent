@@ -63,8 +63,9 @@ def run_sync(args: argparse.Namespace, make_client: ClientFactory) -> int:
             progress=logger.info,
         )
         if args.weekly_budget > 0 and args.workflow in (None, "weekly"):
+            # The sync above has just listed the weekly runs.
             summary["weekly"] = syncer.sync_weekly_branches(
-                budget=args.weekly_budget, progress=logger.info,
+                budget=args.weekly_budget, progress=logger.info, refresh_runs=False,
             )
     finally:
         cache.close()

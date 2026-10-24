@@ -6,10 +6,12 @@ log. This module is the only part of ``ci_health`` that talks to GitHub,
 and every call it makes is a read: run and job listings, job logs, and the
 commit comparison blame needs.
 
-Syncing is incremental. A run already stored is not listed again, a job
-list already stored is not fetched again unless a job was still running,
-and a log already stored is never downloaded again. One run of the workflow
-on a day with no new Daily run costs a single API call per workflow file.
+Syncing is incremental. A workflow the store already knows is listed from a
+few days before its newest stored run, a run already stored is kept unless it
+was still running when first seen, a job list already stored is not fetched
+again unless a job was still running, and a log already stored is never
+downloaded again. One run of the workflow on a day with no new Daily run
+costs a single API call per workflow file.
 
 GitHub keeps job logs for about 90 days. A failed job whose log has expired
 is recorded as such so it is never asked for again; its conclusion still
@@ -28,7 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Protocol
 from urllib.error import HTTPError
 
@@ -64,6 +66,15 @@ _WORKFLOW_EVENTS = {
 }
 
 _PER_PAGE = 100
+
+# A run listed before it finished carries one of these instead of a conclusion.
+# It is stored as seen and refreshed from a later listing.
+NON_FINAL_STATUSES = frozenset({"queued", "in_progress", "waiting", "pending", "requested", "unknown", ""})
+
+# A listing of a workflow the store already knows starts this many days before
+# its newest stored run, so a run that started late or was listed late is still
+# caught, instead of starting from the first run GitHub ever recorded.
+LISTING_MARGIN_DAYS = 3
 
 
 class RunsClient(Protocol):
@@ -241,6 +252,35 @@ def map_job(api_job: Dict) -> Dict:
     }
 
 
+def listing_since(stored_runs: List[Dict]) -> Optional[str]:
+    """Where a listing of an already-known workflow should start, or None for all of it.
+
+    Starts ``LISTING_MARGIN_DAYS`` before the newest stored run, and no later
+    than the oldest run still without a conclusion, so that run is listed
+    again and refreshed however long ago it started.
+    """
+    dates = [r["run_date"] for r in stored_runs if r.get("run_date")]
+    if not dates:
+        return None
+    newest = _parse_run_date(max(dates))
+    if newest is None:
+        return None
+    start = newest - timedelta(days=LISTING_MARGIN_DAYS)
+    for run in stored_runs:
+        if run.get("status") in NON_FINAL_STATUSES:
+            pending = _parse_run_date(run.get("run_date", ""))
+            if pending is not None and pending < start:
+                start = pending
+    return start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_run_date(value: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
 class HistorySync:
     """Brings the store up to date with what GitHub Actions has run."""
 
@@ -339,6 +379,7 @@ class HistorySync:
 
         summary: Dict = {
             "new_runs_fetched": 0,
+            "runs_refreshed": 0,
             "new_jobs_fetched": 0,
             "new_logs_fetched": 0,
             "logs_expired": 0,
@@ -352,20 +393,28 @@ class HistorySync:
             workflow_file = WORKFLOW_FILES.get(wf, wf)
             _log(f"Fetching {wf} runs...")
             try:
-                known = {
-                    r["run_id"]
-                    for r in self._cache.query_runs(repo=self._client.repo, workflow=workflow_file)
-                }
+                stored = self._cache.query_runs(
+                    repo=self._client.repo, workflow=workflow_file, branch=branch,
+                )
+                known = {r["run_id"] for r in stored}
+                unfinished = {r["run_id"] for r in stored if r["status"] in NON_FINAL_STATUSES}
+                # The caller's window wins; otherwise list only what can be new
+                # or changed since the last sync.
+                window_start = since if since is not None else listing_since(stored)
                 api_runs = self._client.list_runs(
-                    workflow_file, branch=branch, since=since, until=until,
+                    workflow_file, branch=branch, since=window_start, until=until,
                     event=_WORKFLOW_EVENTS.get(workflow_file),
                 )
-                new_runs = [
-                    run for run in (map_run(raw, self._client.repo) for raw in api_runs)
-                    if run["run_id"] not in known
+                listed = [map_run(raw, self._client.repo) for raw in api_runs]
+                new_runs = [run for run in listed if run["run_id"] not in known]
+                refreshed = [
+                    run for run in listed
+                    if run["run_id"] in unfinished and run["status"] not in NON_FINAL_STATUSES
                 ]
                 if new_runs:
                     self._cache.store_runs(new_runs)
+                if refreshed:
+                    self._cache.update_runs(refreshed)
             except Exception as exc:  # noqa: BLE001 - every failure is reported in the summary
                 summary["errors"].append(f"fetch_runs({wf}): {exc}")
                 if is_auth_failure(exc):
@@ -373,10 +422,11 @@ class HistorySync:
                 _log(f"  Error fetching {wf} runs: {exc}")
                 continue
 
-            _log(f"  {len(new_runs)} new runs")
+            _log(f"  {len(new_runs)} new runs, {len(refreshed)} finished since last seen")
             summary["new_runs_fetched"] += len(new_runs)
+            summary["runs_refreshed"] += len(refreshed)
 
-            failed_runs = [r for r in new_runs if r["status"] == "failure"]
+            failed_runs = [r for r in new_runs + refreshed if r["status"] == "failure"]
             if failed_runs:
                 _log(f"  {len(failed_runs)} failed runs to process")
 
@@ -446,7 +496,13 @@ class HistorySync:
     # Weekly release-branch runs, within a budget
     # ------------------------------------------------------------------
 
-    def sync_weekly_branches(self, budget: int = 300, progress: ProgressCallback = None) -> Dict:
+    def sync_weekly_branches(
+        self,
+        budget: int = 300,
+        progress: ProgressCallback = None,
+        *,
+        refresh_runs: bool = True,
+    ) -> Dict:
         """Split weekly runs into per-branch series and fetch the logs GitHub still has.
 
         Runs are worked newest-first, each marked ``split`` once its jobs
@@ -455,6 +511,9 @@ class HistorySync:
         pass stops when ``budget`` API calls are spent and the next one
         resumes where it left off, so steady state costs only the newest
         run. Jobs the ordinary sync already stored cost nothing.
+
+        ``refresh_runs=False`` skips listing the weekly runs again, for a
+        caller whose :meth:`sync` just did.
         """
 
         def _log(msg: str) -> None:
@@ -480,14 +539,15 @@ class HistorySync:
 
         # Scheduled weekly runs only: a pull request that touches the
         # workflow file runs it without the release-branch fan-out.
-        try:
-            self.fetch_runs("weekly", branch="unstable")
-        except Exception as exc:  # noqa: BLE001
-            summary["errors"].append(f"fetch_runs(weekly): {exc}")
-            if is_auth_failure(exc):
-                summary["auth_failed"] = True
-            summary["budget_used"] = self._client.requests_made - start_requests
-            return summary
+        if refresh_runs:
+            try:
+                self.fetch_runs("weekly", branch="unstable")
+            except Exception as exc:  # noqa: BLE001
+                summary["errors"].append(f"fetch_runs(weekly): {exc}")
+                if is_auth_failure(exc):
+                    summary["auth_failed"] = True
+                summary["budget_used"] = self._client.requests_made - start_requests
+                return summary
 
         weekly_runs = [
             r for r in self._cache.query_runs(

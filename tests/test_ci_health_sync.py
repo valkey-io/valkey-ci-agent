@@ -10,10 +10,12 @@ from github import GithubException, RateLimitExceededException
 
 from scripts.ci_health.store import Cache
 from scripts.ci_health.sync import (
+    LISTING_MARGIN_DAYS,
     GitHubRunsClient,
     HistorySync,
     _compact_commit,
     is_auth_failure,
+    listing_since,
     map_job,
     map_run,
 )
@@ -68,10 +70,12 @@ class FakeGitHub:
         self.jobs = jobs or {}
         self.logs = logs or {}
         self.calls: List[str] = []
+        self.listings: List[Dict] = []
 
     def list_runs(self, workflow_file: str, *, branch=None, since=None, until=None, event=None) -> List[Dict]:
         self.requests_made += 1
         self.calls.append(f"runs:{workflow_file}:{event}")
+        self.listings.append({"workflow_file": workflow_file, "branch": branch, "since": since, "until": until})
         result = self.runs.get(workflow_file, [])
         if isinstance(result, Exception):
             raise result
@@ -238,6 +242,59 @@ class TestSync:
         assert client.requests_made - before == 1  # the listing; no log download
 
 
+class TestIncrementalListing:
+    def test_first_listing_is_unbounded_and_the_next_starts_near_the_newest_run(self, temp_db_path: str) -> None:
+        client = FakeGitHub(runs={"daily.yml": [_api_run(1, date="2026-01-10"), _api_run(2, date="2026-01-15")]})
+        syncer = HistorySync(client, Cache(temp_db_path))
+        syncer.sync(workflow="daily")
+        syncer.sync(workflow="daily")
+        assert client.listings[0]["since"] is None
+        assert client.listings[1]["since"] == "2026-01-12T08:00:00Z"  # newest minus the margin
+
+    def test_callers_window_wins_over_the_derived_one(self, temp_db_path: str) -> None:
+        client = FakeGitHub(runs={"daily.yml": [_api_run(1)]})
+        syncer = HistorySync(client, Cache(temp_db_path))
+        syncer.sync(workflow="daily")
+        syncer.sync(workflow="daily", since="2025-01-01T00:00:00Z")
+        assert client.listings[1]["since"] == "2025-01-01T00:00:00Z"
+
+    def test_listing_since_reaches_back_to_an_unfinished_run(self) -> None:
+        stored = [
+            {"run_id": 1, "status": "in_progress", "run_date": "2025-11-01T00:00:00Z"},
+            {"run_id": 2, "status": "success", "run_date": "2026-01-15T08:00:00Z"},
+        ]
+        assert listing_since(stored) == "2025-11-01T00:00:00Z"
+        assert listing_since([stored[1]]) == f"2026-01-{15 - LISTING_MARGIN_DAYS:02d}T08:00:00Z"
+        assert listing_since([]) is None
+
+    def test_run_seen_in_progress_is_refreshed_and_its_failures_ingested(self, temp_db_path: str) -> None:
+        running = _api_run(40, conclusion="")
+        running["conclusion"] = None
+        running["status"] = "in_progress"
+        client = FakeGitHub(runs={"daily.yml": [running]}, jobs={40: [_api_job(400)]}, logs={400: FAILING_LOG})
+        cache = Cache(temp_db_path)
+        syncer = HistorySync(client, cache)
+        first = syncer.sync(workflow="daily")
+        assert first["new_runs_fetched"] == 1 and "jobs:40" not in client.calls
+        assert cache.query_runs(workflow="daily.yml")[0]["status"] == "in_progress"
+
+        client.runs["daily.yml"] = [_api_run(40, conclusion="failure")]
+        second = syncer.sync(workflow="daily")
+        assert second["new_runs_fetched"] == 0 and second["runs_refreshed"] == 1
+        assert cache.query_runs(workflow="daily.yml")[0]["status"] == "failure"
+        assert "jobs:40" in client.calls and second["new_failures_parsed"] >= 1
+
+    def test_finished_runs_are_not_rewritten(self, temp_db_path: str) -> None:
+        client = FakeGitHub(runs={"daily.yml": [_api_run(50, conclusion="success")]})
+        cache = Cache(temp_db_path)
+        syncer = HistorySync(client, cache)
+        syncer.sync(workflow="daily")
+        client.runs["daily.yml"] = [_api_run(50, conclusion="failure")]  # GitHub would not do this
+        summary = syncer.sync(workflow="daily")
+        assert summary["runs_refreshed"] == 0
+        assert cache.query_runs(workflow="daily.yml")[0]["status"] == "success"
+
+
 class TestAuthFailure:
     def test_401_is_fatal(self, temp_db_path: str) -> None:
         client = FakeGitHub(runs={"daily.yml": GithubException(401, {"message": "Bad credentials"})})  # type: ignore[dict-item]
@@ -336,6 +393,14 @@ class TestSyncWeeklyBranches:
         cache.store_jobs(1000, [map_job(j) for j in client.jobs[1000]])
         summary = syncer.sync_weekly_branches(budget=100)
         assert client.requests_made == 2  # listing + one log
+        assert summary["runs_split"] == 1 and summary["runs_completed"] == 1
+
+    def test_refresh_runs_false_skips_the_listing(self, temp_db_path: str) -> None:
+        syncer, client, cache = _two_branch_setup(temp_db_path)
+        syncer.sync(workflow="weekly", branch="unstable")  # lists weekly.yml once
+        before = client.requests_made
+        summary = syncer.sync_weekly_branches(budget=100, refresh_runs=False)
+        assert not any(c.startswith("runs:") for c in client.calls[before:])
         assert summary["runs_split"] == 1 and summary["runs_completed"] == 1
 
     def test_run_without_branch_jobs_is_done_at_once(self, temp_db_path: str) -> None:

@@ -36,9 +36,11 @@ still has.
 The sync lists the Daily, weekly and post-merge CI runs of `valkey-io/valkey`
 on `unstable` and stores the ones it has not seen. (Daily also runs on pull
 requests; those runs are not reported on, so the workflow does not store
-them.) For each new failed run it fetches the
-jobs, and for each failed job it downloads the log once, parses it, and stores
-the failures. GitHub keeps job logs for about 90 days; a job whose log has
+them.) A workflow the store already knows is listed from a few days before
+its newest stored run rather than from the beginning, and a run first seen
+while it was still running is refreshed once it has a conclusion. For each
+new failed run it fetches the jobs, and for each failed job it downloads the
+log once, parses it, and stores the failures. GitHub keeps job logs for about 90 days; a job whose log has
 expired is recorded as such and never asked for again, and its conclusion
 still counts in the run's history.
 

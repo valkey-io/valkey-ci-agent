@@ -184,6 +184,32 @@ class Cache:
         )
         self._conn.commit()
 
+    def update_runs(self, runs: List[Dict]) -> None:
+        """Overwrite the stored state of runs already present.
+
+        Used for a run first stored while it was still in progress: its
+        conclusion, end time and duration arrive on a later listing. Rows
+        for unknown run ids are left alone; ``store_runs`` adds those.
+        """
+        self._conn.executemany(
+            """UPDATE workflow_runs
+               SET status = :status, commit_sha = :commit_sha, run_date = :run_date,
+                   duration_secs = :duration_secs, raw_json = :raw_json
+               WHERE run_id = :run_id""",
+            [
+                {
+                    "run_id": r["run_id"],
+                    "status": r["status"],
+                    "commit_sha": r["commit_sha"],
+                    "run_date": r["run_date"],
+                    "duration_secs": r.get("duration_secs"),
+                    "raw_json": r["raw_json"],
+                }
+                for r in runs
+            ],
+        )
+        self._conn.commit()
+
     def query_runs(
         self,
         repo: Optional[str] = None,

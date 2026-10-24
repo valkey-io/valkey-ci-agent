@@ -17,6 +17,7 @@ class _Client:
         self.token = token
         self.repo = repo
         self.requests_made = 0
+        self.listings: List[str] = []
         self.runs = {"daily.yml": [{
             "id": 1, "path": ".github/workflows/daily.yml", "conclusion": "failure", "status": "completed",
             "head_branch": "unstable", "head_sha": "abc", "run_started_at": "2026-01-15T08:00:00Z",
@@ -25,6 +26,7 @@ class _Client:
 
     def list_runs(self, workflow_file: str, **kwargs) -> List[Dict]:
         self.requests_made += 1
+        self.listings.append(workflow_file)
         return self.runs.get(workflow_file, [])
 
     def list_jobs(self, run_id: int) -> List[Dict]:
@@ -74,12 +76,21 @@ def test_sync_fills_the_store_and_prints_a_summary(tmp_path: Path, capsys) -> No
     reopened.close()
 
 
-def test_sync_without_workflow_filter_runs_the_weekly_split(tmp_path: Path, capsys) -> None:
+def test_sync_without_workflow_filter_runs_the_weekly_split_without_relisting(tmp_path: Path, capsys) -> None:
+    made: List[_Client] = []
+
+    def factory(token: str, repo: str) -> _Client:
+        client = _Client(token, repo)
+        made.append(client)
+        return client
+
     rc = main(["--db", str(tmp_path / "h.sqlite"), "--token", "t", "sync", "--weekly-budget", "5"],
-              make_client=_Client)
+              make_client=factory)
     assert rc == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["weekly"]["budget_used"] <= 5
+    # Three workflows listed once each; the weekly split did not list again.
+    assert made[0].listings == ["daily.yml", "weekly.yml", "ci.yml"]
 
 
 def test_sync_exits_non_zero_when_the_token_is_refused(tmp_path: Path, capsys) -> None:
