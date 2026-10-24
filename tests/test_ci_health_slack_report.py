@@ -92,7 +92,7 @@ class TestBuildMessage:
         name = "t in tests/unit/x.tcl"
         msg = build_message(_data([name], {name: []}), [_card(name, first_seen=DAYS[-1], fingerprint="abc")],
                             dashboard_url=DASH, issue_urls={"abc": "https://github.com/valkey-io/valkey/issues/5000"})
-        assert "<https://github.com/valkey-io/valkey/issues/5000|issue> · <" in msg.text
+        assert "<https://github.com/valkey-io/valkey/issues/5000|#5000> · <" in msg.text
 
     def test_passed_run_is_green_and_not_failed(self) -> None:
         msg = build_message(_data([], {}, status="success", failed_jobs=0), [], dashboard_url=DASH)
@@ -136,6 +136,13 @@ class TestNames:
         assert _split_name("test-macos-latest: server crash") == ("test-macos-latest", "server crashed")
         assert _split_name("Exception: CLUSTERDOWN The cluster is down") == ("CLUSTERDOWN The cluster is down", "test-client exception")
         assert _split_name("something else") == ("something else", "see dashboard")
+
+    def test_issue_label(self) -> None:
+        from scripts.ci_health.slack_report import _issue_label
+
+        assert _issue_label("https://github.com/valkey-io/valkey/issues/5000") == "#5000"
+        assert _issue_label("https://github.com/valkey-io/valkey/pull/77/") == "#77"
+        assert _issue_label("https://example.test/tracker/abc") == "issue"
 
     def test_chunks(self) -> None:
         assert _chunks([]) == []

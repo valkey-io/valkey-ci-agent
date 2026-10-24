@@ -61,7 +61,7 @@ class FailureLine:
     def mrkdwn(self) -> str:
         link = f"<{self.dashboard_url}|↗>"
         if self.issue_url:
-            link = f"<{self.issue_url}|issue> · " + link
+            link = f"<{self.issue_url}|{_issue_label(self.issue_url)}> · " + link
         return (
             f"{_INDICATOR[self.classification]}  {self.bar}  "
             f"{self.failed_runs:>2}/{self.shown_runs}   "
@@ -207,6 +207,12 @@ def _pretty_day(day: str) -> str:
     except ValueError:
         return day
     return f"{when:%b} {when.day}"
+
+
+def _issue_label(url: str) -> str:
+    """``#N`` for a GitHub issue or pull URL, which is what people search Slack for."""
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    return f"#{tail}" if tail.isdigit() else "issue"
 
 
 def _escape(text: str) -> str:

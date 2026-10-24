@@ -175,7 +175,7 @@ def test_slack_dry_run_prints_the_message_and_posts_nothing(tmp_path: Path, caps
     assert rc == 0
     out = capsys.readouterr().out
     assert out.startswith("🔴 *Daily CI failed*")
-    assert f"<https://github.com/valkey-io/valkey/issues/1|issue> · <https://d/#test={fp}|↗>" in out
+    assert f"<https://github.com/valkey-io/valkey/issues/1|#1> · <https://d/#test={fp}|↗>" in out
 
 
 def test_slack_posts_to_the_webhook(tmp_path: Path, capsys, monkeypatch) -> None:

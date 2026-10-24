@@ -113,7 +113,7 @@ The bar is the test's last 14 Daily runs, newest on the right, a filled cell
 for each run it failed in. The leading mark is its class: first failure on
 record, failed at least three runs straight, or intermittent. Lines are
 sorted in that order. Each `↗` opens the test's row on the dashboard, and a
-line whose failure the detector has filed also links the issue. A run with
+line whose failure the detector has filed also links the issue as `#N`. A run with
 nothing failed renders a one-line green message that is only posted on
 request. The message is built from the same report data as the dashboard, in
 `slack_report.py`, so the two agree on what a run's failures are called.
