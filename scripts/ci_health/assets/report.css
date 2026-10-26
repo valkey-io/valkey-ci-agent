@@ -1,0 +1,146 @@
+/* Root size scales gently with viewport (DPI-independent rem base): ~today's sizes on small screens, a touch larger on wide ones. */
+html { font-size: clamp(16px, 0.45vw + 14px, 19px); }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+       background: #0d1117; color: #c9d1d9; padding: 20px; font-size: 0.8125rem; }
+h1 { font-size: 1.125rem; margin-bottom: 4px; color: #f0f6fc; }
+.meta { color: #8b949e; margin-bottom: 16px; font-size: 0.75rem; }
+/* Shown by report.js when the newest run is older than the page's data-max-age-days,
+   judged against the viewer's clock: a static page must warn about its own age. */
+.stale-banner { background: #3d2300; color: #f0b429; border: 1px solid #9e6a03; border-radius: 6px;
+  padding: 10px 14px; margin: 0 0 16px; font-size: 0.8125rem; line-height: 1.5; }
+.stale-banner b { color: #ffd166; }
+/* The row a #test=<fingerprint> link points at. */
+tr.deep-linked > td { background: #2d3a1f; box-shadow: inset 3px 0 0 #3fb950; }
+.stats { display: flex; gap: 24px; margin-bottom: 20px; }
+.stat { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+         padding: 10px 16px; }
+.stat-val { font-size: 1.375rem; font-weight: 600; color: #f0f6fc; }
+.stat-label { font-size: 0.6875rem; color: #8b949e; }
+table { border-collapse: collapse; margin-bottom: 24px; }
+th, td { padding: 3px 6px; text-align: center; font-size: 0.75rem; }
+th { color: #8b949e; font-weight: 500; position: sticky; top: 0; background: #0d1117; }
+.test-name { text-align: left; max-width: 340px; overflow: hidden;
+              text-overflow: ellipsis; white-space: nowrap; font-family: monospace;
+              font-size: 0.6875rem; padding-right: 8px; }
+.freq { color: #8b949e; font-size: 0.6875rem; white-space: nowrap; padding-right: 4px; }
+.cell { width: 22px; height: 22px; min-width: 22px; border-radius: 3px;
+         font-size: 0.625rem; line-height: 22px; cursor: default; }
+.date-col { width: 32px; min-width: 32px; max-width: 32px; font-size: 0.6875rem; white-space: nowrap; }
+.cell.fail { background: #da3633; color: #fff; font-weight: 600; }
+.cell.pass { background: #238636; }
+.cell.none { background: #21262d; }
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 0.6875rem; font-weight: 600; }
+.badge.pass { background: #238636; color: #fff; }
+.badge.fail { background: #da3633; color: #fff; }
+.section { margin-top: 24px; }
+.section h2 { font-size: 0.875rem; color: #f0f6fc; margin-bottom: 8px; }
+.detail-table { width: 100%; }
+.detail-table th { text-align: left; border-bottom: 1px solid #30363d; padding: 6px 8px; }
+.detail-table td { text-align: left; border-bottom: 1px solid #21262d; padding: 6px 8px; }
+.jobs-cell { font-size: 0.6875rem; vertical-align: top; text-align: left; }
+.job-list { max-height: 150px; overflow-y: auto; }
+.job-entry { white-space: nowrap; padding: 1px 0; }
+.commits-cell { font-size: 0.6875rem; vertical-align: top; }
+.commit-list { max-height: 150px; overflow-y: auto; }
+.commit-entry { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                 max-width: 600px; padding: 1px 0; }
+.commit-author { color: #8b949e; }
+.no-commits { color: #484f58; }
+.failures-cell { font-size: 0.6875rem; vertical-align: top; text-align: left; }
+.failure-list { max-height: 150px; overflow-y: auto; }
+.failure-entry { white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+                  max-width: 400px; padding: 1px 0; color: #f85149; }
+.job-link { color: #58a6ff; text-decoration: none; font-size: 0.625rem; font-family: monospace; }
+.job-link:hover { text-decoration: underline; }
+.sha { color: #58a6ff; text-decoration: none; font-family: monospace; font-size: 0.6875rem; }
+.sha:hover { text-decoration: underline; }
+.hint { color: #8b949e; font-size: 0.6875rem; margin-bottom: 12px; line-height: 1.5; max-width: 720px; }
+details { margin-top: 20px; }
+summary { cursor: pointer; color: #8b949e; font-size: 0.75rem; }
+pre { background: #161b22; padding: 12px; border-radius: 6px; overflow-x: auto;
+       font-size: 0.6875rem; max-height: 400px; }
+.scorecard-table { width: 100%; }
+.scorecard-table th { text-align: left; border-bottom: 1px solid #30363d; padding: 6px 8px; }
+.scorecard-table td { text-align: left; border-bottom: 1px solid #21262d; padding: 4px 8px; vertical-align: middle; }
+.rank { color: #8b949e; font-size: 0.6875rem; }
+.badge-persistent { background:#da3633; color:#fff; padding:1px 7px; border-radius:10px; font-size: 0.625rem; font-weight:600; }
+.badge-flaky { background:#9e6a03; color:#fff; padding:1px 7px; border-radius:10px; font-size: 0.625rem; font-weight:600; }
+.badge-rare { background:#30363d; color:#c9d1d9; padding:1px 7px; border-radius:10px; font-size: 0.625rem; font-weight:600; }
+.trend-up { color:#f85149; font-weight:700; }
+.trend-down { color:#3fb950; font-weight:700; }
+.trend-flat { color:#8b949e; }
+.cat-chip { background:#161b22; border:1px solid #30363d; color:#8b949e; padding:1px 6px; border-radius:4px; font-size: 0.625rem; }
+.spark { vertical-align: middle; width: 100%; min-width: 90px; height: 16px; display: block; }
+.spark-cell { width: 99%; }
+/* Heatmap trend column: fixed footprint so date cells keep their grid */
+.spark-col { min-width: 100px; font-size: 0.6875rem; }
+.heatmap-scroll .spark-cell { width: 100px; min-width: 100px; max-width: 100px; padding: 3px 6px; }
+  font-size: 0.6875rem; text-align: left; white-space: nowrap; }
+.stale-row { opacity: 0.45; }
+.resolved-block { margin-top: 18px; }
+.resolved-block summary { color: #8b949e; font-size: 0.75rem; margin-bottom: 8px; }
+.methodology { margin-top: 16px; }
+.methodology p { margin: 8px 0; max-width: 760px; line-height: 1.5; }
+.methodology a { color: #58a6ff; text-decoration: none; }
+.methodology a:hover { text-decoration: underline; }
+.tabs { display: flex; gap: 4px; margin: 20px 0 16px; border-bottom: 1px solid #30363d; }
+.tab { background: none; border: none; color: #8b949e; font-size: 0.8125rem; padding: 8px 14px;
+       cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-family: inherit; }
+.tab:hover { color: #c9d1d9; }
+.tab.active { color: #f0f6fc; border-bottom-color: #f78166; font-weight: 600; }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+#scorecard-controls { margin-bottom: 8px; font-size: 0.6875rem; color: #8b949e; }
+#scorecard-controls select, #scorecard-controls button { background:#161b22; color:#c9d1d9;
+  border:1px solid #30363d; border-radius:4px; font-size: 0.6875rem; padding:2px 6px; margin:0 2px; cursor:pointer; }
+#scorecard-controls button:hover { background:#21262d; }
+
+.regwarn{text-decoration:none;margin-right:5px;cursor:pointer;font-size:0.85rem}
+
+/* Collapsible failure clusters (rows with identical failure-day signatures) */
+.hm-cluster-toggle{cursor:pointer}
+.hm-cluster-toggle .test-name{color:#adbac7;font-style:italic}
+.hm-cluster-toggle:hover .test-name{color:#f0f6fc}
+.hm-caret{display:inline-block;width:12px;color:#8b949e;font-style:normal}
+.hm-cluster-member .test-name{padding-left:20px}
+.hm-cluster-toggle .cell.fail{background:#7d2724;color:#e6c8c7}
+
+.wf-title{font-size:0.95rem;font-weight:600;margin:16px 0 6px;color:#adbac7;border-top:1px solid #21262d;padding-top:10px}
+.wf-daily>summary{cursor:pointer;color:#8b949e;font-size:0.9rem;margin:10px 0}
+.wf-daily[open]>summary{margin-bottom:6px}
+
+/* Horizontal scroll for wide (CI per-commit) heatmaps */
+.heatmap-scroll{overflow-x:auto;max-width:100%}
+/* CI heatmap: always show a scrollbar with a visible thumb so off-screen
+   content is discoverable even on overlay-scrollbar platforms. */
+.heatmap-scroll.scroll-right{overflow-x:scroll;scrollbar-width:thin;scrollbar-color:#8b949e #21262d}
+.heatmap-scroll.scroll-right::-webkit-scrollbar{height:12px}
+.heatmap-scroll.scroll-right::-webkit-scrollbar-track{background:#21262d;border-radius:6px}
+.heatmap-scroll.scroll-right::-webkit-scrollbar-thumb{background:#8b949e;border-radius:6px;border:2px solid #21262d}
+.heatmap-scroll.scroll-right::-webkit-scrollbar-thumb:hover{background:#adbac7}
+/* Left/right edge fades signalling hidden columns (toggled by JS on scroll) */
+.heatmap-scroll-wrap{position:relative}
+.heatmap-scroll-wrap::before,.heatmap-scroll-wrap::after{content:"";position:absolute;top:0;bottom:14px;width:40px;pointer-events:none;opacity:0;transition:opacity .15s;z-index:2}
+.heatmap-scroll-wrap::before{left:0;background:linear-gradient(to right,#0d1117,rgba(13,17,23,0))}
+.heatmap-scroll-wrap::after{right:0;background:linear-gradient(to left,#0d1117,rgba(13,17,23,0))}
+.heatmap-scroll-wrap.show-left::before{opacity:1}
+.heatmap-scroll-wrap.show-right::after{opacity:1}
+/* Rotated per-commit column headers (SHAs) — read bottom-to-top, sharing a
+   uniform bottom baseline and growing upward so they never overlap Run status.
+   writing-mode reserves real box space (unlike a bare transform), which is
+   what keeps the labels out of the row below. */
+.date-col.rot{vertical-align:bottom;text-align:center;padding:4px 0 3px}
+.date-col.rot span{display:inline-block;writing-mode:vertical-rl;transform:rotate(180deg);white-space:nowrap;font-size:0.7rem;line-height:1.1;font-family:monospace}
+/* Cross-page navigation link (index <-> releases) */
+.rel-branch-link{color:#58a6ff;text-decoration:none}
+.rel-branch-link:hover{text-decoration:underline}
+/* Release-health strip on the main page header */
+.rel-strip{margin:6px 0 12px;font-size:0.85rem;color:#8b949e}
+.rel-strip-label{margin-right:8px}
+.rel-strip-badge{color:#adbac7;text-decoration:none;background:#161b22;border:1px solid #21262d;border-radius:6px;padding:2px 8px;margin-right:6px;white-space:nowrap}
+.rel-strip-badge:hover{border-color:#58a6ff}
+.rel-strip-jobs{font-family:monospace;color:#8b949e}
+/* Failure cells deep-link to the failing job's log on GitHub */
+.cell.fail a{color:inherit;text-decoration:none;display:block;width:100%;height:100%}
+.cell.fail a:hover{text-decoration:underline}

@@ -15,3 +15,9 @@ def block_unstubbed_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(socket, "create_connection", denied)
     monkeypatch.setattr(urllib3.util.connection, "create_connection", denied)
+
+
+@pytest.fixture
+def temp_db_path(tmp_path):
+    """Path to a fresh SQLite file for ``scripts.ci_health.store`` tests."""
+    return str(tmp_path / "ci_health.db")
