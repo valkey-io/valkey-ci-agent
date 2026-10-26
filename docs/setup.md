@@ -25,6 +25,7 @@ These repository variables adjust its behaviour:
 | `AWS_REGION` | The AWS region to use, for example `us-east-1`. |
 | `CI_AGENT_CLAUDE_MODEL` | Use a different model, for example `opus`. Unset means the default. |
 | `CI_FIX_ISSUES_AUTO_DISPATCH` | Set to `true` to let the CI fix bot start on detector issues by itself. |
+| `CI_HEALTH_PAGES` | Set to `true` to publish the CI health dashboard to GitHub Pages, once Pages is enabled for this repository with GitHub Actions as its source. |
 | `CI_FIX_ISSUES_MAX_RUNS` | How many detector issue fixes can run at once. Defaults to 2. |
 | `CI_FIX_ISSUES_PUBLISH` | How a detector issue's fix is shared: `comment` (the default) or `draft-pr`. |
 
@@ -44,7 +45,7 @@ permissions below.
 
 | Installed on | Permissions | Needed for |
 |---|---|---|
-| `valkey` | read administration, actions and checks; write contents, issues and pull requests; read metadata | backports, CI fixes, the detector, release notes and release automation |
+| `valkey` | read administration, actions and checks; write contents, issues and pull requests; read metadata | backports, CI fixes, the detector, CI health, release notes and release automation |
 | `valkey-search`, `valkey-json`, `valkey-bloom` | write contents and pull requests; read metadata | backports and release notes |
 | repositories whose releases list security advisories | read repository advisories | release notes, when reading advisories |
 | `valkey-fuzzer` | read actions and contents; write issues | the fuzzer monitor |
@@ -79,6 +80,7 @@ securing releases, including the tag ruleset.
 | CI Fix Comment Poll | every hour | [Fixing CI failures](ci-fix.md#asking-for-a-fix) |
 | CI Fix Issue Dispatch | every hour at :23, once switched on | [Fixing CI failures](ci-fix.md#fixing-detector-issues) |
 | Test Failure Detector | every day at 23:00 | [Test Failure Detector](test-failure-detector.md) |
+| CI Health | every day at 06:00 | [CI health](ci-health.md) |
 | Monitor Valkey Fuzzer Runs | every four hours at :41 | [Fuzzer monitor](fuzzer-monitor.md) |
 | Watch Release PR Reviews | one per release PR, started by the cut; holds a runner for 55 minutes checking every five minutes, with the next hour's run queued, until the PR closes or is three days old | [Release notes](release-notes.md#applying-review-comments) |
 | Restart Release PR Watchers | every six hours at :23 | [Release notes](release-notes.md#applying-review-comments) |
