@@ -953,10 +953,10 @@ def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S)
     try:
         if user:
             with handed_to(user, Path(repo_dir)) as home:
-                invocation = as_user(user, env, argv, home=home)
+                invocation = as_user(user, env, argv, home=home, cwd=repo_dir)
                 result = _run_in_own_group(
                     list(invocation.argv),
-                    repo_dir,
+                    None,
                     invocation.env,
                     timeout,
                     user=user,
@@ -975,7 +975,7 @@ def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S)
 
 
 def _run_in_own_group(
-    argv: list[str], repo_dir: str, env: dict[str, str] | None, timeout: int, *, user: str = "",
+    argv: list[str], repo_dir: str | None, env: dict[str, str] | None, timeout: int, *, user: str = "",
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``argv``; on timeout kill its whole process group, not just the shell.
 

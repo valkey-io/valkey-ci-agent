@@ -88,6 +88,31 @@ def test_the_command_is_resolved_before_sudo_can_replace_path(monkeypatch):
     assert invocation.argv[-2:] == ("/chosen/claude", "--print")
 
 
+def test_the_command_enters_its_checkout_after_switching_accounts(monkeypatch):
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    monkeypatch.setattr(isolation.os, "geteuid", lambda: 1001)
+    monkeypatch.setattr(isolation.shutil, "which", lambda name: f"/chosen/{name}")
+
+    invocation = isolation.as_user(
+        "v",
+        {},
+        ["make", "test"],
+        home="/h",
+        cwd="/tmp/checkout with spaces",
+    )
+
+    assert invocation.argv[-8:] == (
+        "/chosen/env",
+        "/chosen/sh",
+        "-c",
+        'cd "$1" && shift && exec "$@"',
+        "ci-fix-cwd",
+        "/tmp/checkout with spaces",
+        "/chosen/make",
+        "test",
+    )
+
+
 def test_file_cleanup_drops_roots_already_covered_by_an_ancestor(monkeypatch):
     calls = []
     monkeypatch.setattr(isolation, "_WRITABLE_ROOTS", ("/tmp", "/var/tmp"))
@@ -136,6 +161,7 @@ def credentialed():
 @needs_user
 def test_a_test_command_cannot_read_the_parent_environment_or_change_git(checkout, monkeypatch, credentialed):
     monkeypatch.setenv(isolation.USER_ENV, _USER)
+    checkout.chmod(0o700)
     head = (checkout / ".git" / "HEAD").read_text()
     run = engine.run_test_command(
         str(checkout),
@@ -160,6 +186,7 @@ def test_nothing_the_command_started_outlives_it(checkout, monkeypatch):
 @needs_user
 def test_the_claude_cli_runs_as_the_account(checkout, monkeypatch, tmp_path, credentialed):
     """The real CLI path, with a fake ``claude`` that reports who it is and what it can read."""
+    checkout.chmod(0o700)
     bin_dir = Path(tempfile.mkdtemp(prefix="ci-fix-bin-", dir="/tmp"))
     bin_dir.chmod(0o755)
     fake = bin_dir / "claude"

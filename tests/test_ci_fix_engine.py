@@ -1020,7 +1020,7 @@ def test_a_timed_out_command_run_as_the_account_is_stopped_through_it(tmp_path, 
     monkeypatch.setattr(
         engine_mod,
         "as_user",
-        lambda user, env, argv, home: SimpleNamespace(
+        lambda user, env, argv, home, cwd: SimpleNamespace(
             argv=["sh", "-c", "exec sleep 2"],
             env={},
         ),
