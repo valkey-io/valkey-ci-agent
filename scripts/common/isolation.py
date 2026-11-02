@@ -213,15 +213,20 @@ def as_user(
             os.path.abspath(os.fspath(cwd)),
             *command,
         ]
-    command = [_program("env"), *command]
+    # sudo drops TMPDIR even when it is named, so ``env`` sets it after the
+    # switch. Its value is the fresh home, not a secret.
+    command = [_program("env"), f"TMPDIR={home}", *command]
+    # sudo-rs (Ubuntu 26.04) ignores a bare -E and passes nothing; both sudos
+    # keep the variables named here. Only the names reach the command line.
+    preserve = f"--preserve-env={','.join(sorted(scrubbed))}"
     if sys.platform == "darwin":
         return IsolatedInvocation(
-            (_program("sudo"), "-n", "-E", "-u", user, "--", *command),
+            (_program("sudo"), "-n", preserve, "-u", user, "--", *command),
             scrubbed,
         )
     # runuser, not ``sudo -u``: it needs only root, which a runner's sudo
     # grants. setpriv prevents a setuid helper from restoring privileges.
-    root = () if os.geteuid() == 0 else (_program("sudo"), "-n", "-E")
+    root = () if os.geteuid() == 0 else (_program("sudo"), "-n", preserve)
     return IsolatedInvocation(
         (
             *root,

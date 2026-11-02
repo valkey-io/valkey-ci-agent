@@ -181,6 +181,15 @@ jobs:
         env:
           CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
         run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
+      - name: 'CI fix: ensure the fix has a result'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ensure-result
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh ensure-result
+          fi
       - name: 'CI fix: clean up the isolated checkout'
         if: always()
         shell: bash
@@ -196,7 +205,7 @@ jobs:
         with:
           name: ci-fix-result-${{ inputs.key }}
           path: ${{ runner.temp }}/ci-fix-out/
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 30
           overwrite: true
 
@@ -268,6 +277,15 @@ jobs:
         env:
           CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
         run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
+      - name: 'CI fix: ensure the fix has a result'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ensure-result
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh ensure-result
+          fi
       - name: 'CI fix: clean up the isolated checkout'
         if: always()
         shell: bash
@@ -283,7 +301,7 @@ jobs:
         with:
           name: ci-fix-result-${{ inputs.key }}
           path: ${{ runner.temp }}/ci-fix-out/
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 30
           overwrite: true
 
@@ -336,6 +354,15 @@ jobs:
         env:
           CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
         run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
+      - name: 'CI fix: ensure the fix has a result'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ensure-result
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh ensure-result
+          fi
       - name: 'CI fix: clean up the isolated checkout'
         if: always()
         shell: bash
@@ -351,7 +378,7 @@ jobs:
         with:
           name: ci-fix-result-${{ inputs.key }}
           path: ${{ runner.temp }}/ci-fix-out/
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 30
           overwrite: true
 

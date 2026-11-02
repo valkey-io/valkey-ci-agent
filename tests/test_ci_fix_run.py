@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -219,6 +221,68 @@ def test_the_fix_job_prepares_from_the_plan_alone_with_the_jobs_own_commands(mon
 
     assert seen == {"task": _pr_plan().task, "log": "the log", "repo_dir": "/job", "job": commands}
     assert load(tmp_path / "out" / run.OUTCOME_FILE, FixOutcome) == outcome == FixOutcome(candidate=_CANDIDATE)
+
+
+def test_a_failure_before_the_fix_engine_is_recorded(tmp_path):
+    outcome = run.record_failure(tmp_path / "out", "setup replay failed")
+
+    assert outcome == FixOutcome(error="setup replay failed")
+    assert load(tmp_path / "out" / run.OUTCOME_FILE, FixOutcome) == outcome
+
+
+def test_a_setup_replay_failure_records_its_phase_and_run(tmp_path):
+    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    setup_job = script[script.index("setup_job() {"):script.index("\nrun_fix() {")]
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    record = tmp_path / "record"
+    program = f"""
+set -u
+read_state() {{ :; }}
+python() {{
+  if [[ "$*" == *scripts.ci_fix.sandbox* ]]; then
+    return 23
+  fi
+  printf '%s\\n' "$@" > "$TEST_RECORD"
+}}
+{setup_job}
+mode=job
+user="$(id -un)"
+uid="$(id -u)"
+agent="$TEST_AGENT"
+repo="$TEST_AGENT"
+sandbox="$TEST_AGENT"
+out="$TEST_OUT"
+set +e
+setup_job
+status=$?
+printf '%s\\n' "$status"
+"""
+    result = subprocess.run(
+        ["bash", "-c", program],
+        env={
+            **os.environ,
+            "TEST_AGENT": str(agent),
+            "TEST_OUT": str(tmp_path / "out"),
+            "TEST_RECORD": str(record),
+            "GITHUB_SERVER_URL": "https://github.example",
+            "GITHUB_REPOSITORY": "valkey-io/valkey-ci-agent",
+            "GITHUB_RUN_ID": "41394055294",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "23"
+    recorded = record.read_text(encoding="utf-8")
+    assert "record-failure" in recorded
+    assert "setup and build replay failed before the fix agent ran" in recorded
+    assert (
+        "https://github.example/valkey-io/valkey-ci-agent/actions/runs/41394055294"
+        in recorded
+    )
 
 
 def _publish(tmp_path, outcome_dir):
