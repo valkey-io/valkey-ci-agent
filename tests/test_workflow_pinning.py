@@ -520,6 +520,30 @@ def test_the_agents_code_is_put_back_where_nothing_was_left(tmp_path):
     assert not (temp / "ci-fix-agent").exists()
 
 
+def test_account_cleanup_accepts_userdel_removing_the_private_group(tmp_path):
+    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    functions = "".join(
+        re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", script, re.MULTILINE | re.DOTALL).group(0)
+        for name in ("group_gid", "delete_account")
+    )
+    calls = tmp_path / "calls"
+    program = (
+        "set -euo pipefail\n"
+        "uname() { echo Linux; }\n"
+        "id() { echo 1001; }\n"
+        "getent() { return 2; }\n"
+        "stop_account() { :; }\n"
+        f'as_root() {{ printf "%s\\n" "$*" >> "{calls}"; }}\n'
+        + functions
+        + "user=cifix1234567890\nuid=1001\ngid=1001\ndelete_account\n"
+    )
+
+    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == ["userdel cifix1234567890"]
+
+
 def test_a_container_fix_mode_installs_the_agents_tools_from_the_distribution():
     """setup-python's builds do not run on every distribution, and a container has no sudo."""
     steps = yaml.safe_load(Path(".github/actions/setup-agent/action.yml").read_text(encoding="utf-8"))["runs"]["steps"]

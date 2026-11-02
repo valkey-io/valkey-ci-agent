@@ -75,25 +75,45 @@ PY
   )
 }
 
+group_gid() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    dscl . -read "/Groups/$1" PrimaryGroupID 2>/dev/null | awk 'NR == 1 { print $2 }' || true
+  else
+    getent group "$1" 2>/dev/null | awk -F: 'NR == 1 { print $3 }' || true
+  fi
+}
+
 delete_account() {
-  local live_uid live_gid
+  local live_uid live_gid live_group_gid
   [[ -n "${user:-}" && -n "${uid:-}" && -n "${gid:-}" ]] || return 0
   live_uid="$(id -u "${user}" 2>/dev/null || true)"
   live_gid="$(id -g "${user}" 2>/dev/null || true)"
-  if [[ -z "${live_uid}" ]]; then
-    return 0
-  fi
-  if [[ "${live_uid}" != "${uid}" || "${live_gid}" != "${gid}" ]]; then
+  live_group_gid="$(group_gid "${user}")"
+  if [[ -z "${live_uid}" && -z "${live_group_gid}" ]]; then return 0; fi
+  if [[ -n "${live_uid}" && ( "${live_uid}" != "${uid}" || "${live_gid}" != "${gid}" ) ]] \
+    || [[ -n "${live_group_gid}" && "${live_group_gid}" != "${gid}" ]]; then
     echo "::error::Refusing to delete changed isolation account ${user}"
     return 1
   fi
-  stop_account || return 1
-  if [[ "$(uname -s)" == Darwin ]]; then
-    as_root dscl . -delete "/Users/${user}" || return 1
-    as_root dscl . -delete "/Groups/${user}" || return 1
-  else
-    as_root userdel "${user}" || return 1
-    as_root groupdel "${user}" || return 1
+  if [[ -n "${live_uid}" ]]; then
+    stop_account || return 1
+    if [[ "$(uname -s)" == Darwin ]]; then
+      as_root dscl . -delete "/Users/${user}" || return 1
+    else
+      as_root userdel "${user}" || return 1
+    fi
+  fi
+  live_group_gid="$(group_gid "${user}")"
+  if [[ -n "${live_group_gid}" && "${live_group_gid}" != "${gid}" ]]; then
+    echo "::error::Refusing to delete changed isolation group ${user}"
+    return 1
+  fi
+  if [[ -n "${live_group_gid}" ]]; then
+    if [[ "$(uname -s)" == Darwin ]]; then
+      as_root dscl . -delete "/Groups/${user}" || return 1
+    else
+      as_root groupdel "${user}" || return 1
+    fi
   fi
 }
 

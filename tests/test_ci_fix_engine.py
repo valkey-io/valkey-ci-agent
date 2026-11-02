@@ -25,17 +25,20 @@ from scripts.ci_fix.models import (
 from scripts.ci_fix.reproduce import TestRun
 from tests.git_helpers import git
 
+_REAL_REPRODUCTION_REFUSAL = engine_mod._reproduction_refusal
+
 
 @pytest.fixture(autouse=True)
 def _approving_review_and_no_tests(monkeypatch):
-    """The real review and test runner start agents and processes; these tests are about the rest.
+    """Keep edit-loop tests focused on behavior after the reproduction gate.
 
-    Their test commands are the tests' own scripts, run directly: inside
-    Actions the engine would otherwise insist on the isolated account, which
-    tests/test_isolation.py drives on purpose.
+    Tests of the gate restore the real refusal function through ``_with_plan``.
+    The real review and test runner start agents and processes; these tests use
+    their own scripts directly instead.
     """
     monkeypatch.setattr(engine_mod, "review_candidate", lambda *a, **k: (True, "looks right"))
     monkeypatch.setattr(engine_mod, "isolated_user", lambda: "")
+    monkeypatch.setattr(engine_mod, "_reproduction_refusal", lambda *_args: None)
 
 
 _LOG = "exact failed job log"
@@ -678,6 +681,8 @@ _LOG_WITH_FAILURE = (
 
 
 def _with_plan(monkeypatch, seen=None):
+    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
+
     def plan_for(repo_dir, tests, *, scheduled, job=None):
         if seen is not None:
             seen.update(tests=tests, scheduled=scheduled, job=job)
@@ -692,6 +697,20 @@ def _with_plan(monkeypatch, seen=None):
         )
 
     monkeypatch.setattr(engine_mod, "plan_for", plan_for)
+
+
+def test_no_code_owned_reproduction_plan_stops_before_the_agent(tmp_path, monkeypatch):
+    source, head_sha = _source_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
+    monkeypatch.setattr(engine_mod, "plan_for", lambda *_args, **_kwargs: None)
+    agent = MagicMock(side_effect=AssertionError("the edit agent must not run"))
+
+    candidate = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
+
+    assert candidate.action is CandidateAction.REFUSE
+    assert "no code-owned reproduction command could be established" in candidate.summary
+    agent.assert_not_called()
 
 
 def _runs_value_check(results):
@@ -1001,7 +1020,7 @@ def test_a_timed_out_command_run_as_the_account_is_stopped_through_it(tmp_path, 
     monkeypatch.setattr(
         engine_mod,
         "as_user",
-        lambda user, env, argv, home: SimpleNamespace(
+        lambda user, env, argv, home, cwd: SimpleNamespace(
             argv=["sh", "-c", "exec sleep 2"],
             env={},
         ),

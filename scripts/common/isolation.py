@@ -177,12 +177,21 @@ def _identity(path: Path) -> tuple[int, int] | None:
     return (info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else (-1, -1)
 
 
-def as_user(user: str, env: dict[str, str], argv: list[str], *, home: str) -> IsolatedInvocation:
+def as_user(
+    user: str,
+    env: dict[str, str],
+    argv: list[str],
+    *,
+    home: str,
+    cwd: str | os.PathLike[str] | None = None,
+) -> IsolatedInvocation:
     """Describe ``argv`` running as ``user`` with a scrubbed environment.
 
     Environment values stay in the child environment rather than the
     privileged launcher command line, where credentials would be visible to
-    every process on the runner.
+    every process on the runner. When ``cwd`` is set, the command enters it
+    after switching users: the workflow user may no longer be able to enter a
+    checkout once it belongs to the isolated account.
     """
     if not argv:
         raise ValueError("an isolated invocation needs a command")
@@ -194,7 +203,17 @@ def as_user(user: str, env: dict[str, str], argv: list[str], *, home: str) -> Is
     # sudo may replace PATH with secure_path even with -E. Resolve the
     # executable before switching accounts so it cannot select another copy.
     executable = _program(argv[0]) if "/" not in argv[0] else argv[0]
-    command = [_program("env"), executable, *argv[1:]]
+    command = [executable, *argv[1:]]
+    if cwd is not None:
+        command = [
+            _program("sh"),
+            "-c",
+            'cd "$1" && shift && exec "$@"',
+            "ci-fix-cwd",
+            os.path.abspath(os.fspath(cwd)),
+            *command,
+        ]
+    command = [_program("env"), *command]
     if sys.platform == "darwin":
         return IsolatedInvocation(
             (_program("sudo"), "-n", "-E", "-u", user, "--", *command),
@@ -225,8 +244,15 @@ def _program(name: str) -> str:
 
 
 def _remove_files_of(user: str) -> None:
-    roots = [root for root in (*_WRITABLE_ROOTS, pwd.getpwnam(user).pw_dir) if os.path.isdir(root)]
-    _as_root("find", *roots, "-xdev", "-mindepth", "1", "-user", user, "-delete")
+    roots: list[Path] = []
+    for raw in (*_WRITABLE_ROOTS, pwd.getpwnam(user).pw_dir):
+        root = Path(raw).absolute()
+        if not root.is_dir() or any(root == kept or root.is_relative_to(kept) for kept in roots):
+            continue
+        roots = [kept for kept in roots if not kept.is_relative_to(root)]
+        roots.append(root)
+    if roots:
+        _as_root("find", *(str(root) for root in roots), "-xdev", "-mindepth", "1", "-user", user, "-delete")
 
 
 def kill_all(user: str) -> None:

@@ -9,10 +9,9 @@ that job's own setup and build (``scripts/ci_fix/job.sh``):
    (:mod:`scripts.ci_fix.prior_fixes`).
 2. **Reproduce**: run the failing test on the unfixed code the way its CI job
    did, looped, then under load (:mod:`scripts.ci_fix.reproduce`).
-3. **Fix**: when code planned a reproduction but could not run it or make it
-   fail, stop without editing. Otherwise one agent session, told what steps 1
-   and 2 found and the repository's test conventions, ports an existing fix
-   or writes a patch.
+3. **Fix**: unless code reproduced the failure, stop without editing.
+   Otherwise one agent session, told what steps 1 and 2 found and the
+   repository's test conventions, ports an existing fix or writes a patch.
 4. **Verify and review**: the candidate (a port is cherry-picked into the
    checkout first) must pass the reproduction many times, and a separate
    read-only review must approve it. Otherwise the result goes back to the
@@ -184,14 +183,11 @@ def _reproduction_refusal(
     reproduction: Reproduction | None,
 ) -> FixCandidate | None:
     """Refuse executable changes unless code reproduced the reported failure."""
-    # Build failures and other checks without a focused reproduction plan still
-    # need diagnosis. Fail closed once code did construct a plan but could not
-    # run it or could not make it fail.
     if plan is None:
+        reason = "no code-owned reproduction command could be established"
+    elif reproduction is not None and reproduction.reproduced:
         return None
-    if reproduction is not None and reproduction.reproduced:
-        return None
-    if reproduction is None:
+    elif reproduction is None:
         reason = "the planned reproduction command was not run"
     elif reproduction.status is ReproStatus.UNRUNNABLE:
         reason = "the reproduction command could not run on this runner"
@@ -957,10 +953,10 @@ def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S)
     try:
         if user:
             with handed_to(user, Path(repo_dir)) as home:
-                invocation = as_user(user, env, argv, home=home)
+                invocation = as_user(user, env, argv, home=home, cwd=repo_dir)
                 result = _run_in_own_group(
                     list(invocation.argv),
-                    repo_dir,
+                    None,
                     invocation.env,
                     timeout,
                     user=user,
@@ -979,7 +975,7 @@ def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S)
 
 
 def _run_in_own_group(
-    argv: list[str], repo_dir: str, env: dict[str, str] | None, timeout: int, *, user: str = "",
+    argv: list[str], repo_dir: str | None, env: dict[str, str] | None, timeout: int, *, user: str = "",
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``argv``; on timeout kill its whole process group, not just the shell.
 

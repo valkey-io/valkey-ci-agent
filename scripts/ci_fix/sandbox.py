@@ -29,10 +29,10 @@ def run_setup(repo: Path, setup: Path, user: str) -> int:
         env = filter_env(_SETUP_ENV)
         env["GITHUB_WORKSPACE"] = str(repo)
         env["RUNNER_TEMP"] = home
-        invocation = as_user(user, env, ["sh", str(setup)], home=home)
+        invocation = as_user(user, env, ["sh", str(setup)], home=home, cwd=repo)
         result = subprocess.run(
             list(invocation.argv),
-            cwd=repo,
+            cwd=None,
             env=invocation.env,
             check=False,
         )
