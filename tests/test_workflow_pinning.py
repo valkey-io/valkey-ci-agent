@@ -404,6 +404,7 @@ def test_every_fix_job_uses_the_same_isolated_lifecycle():
             "CI fix: stage the isolated checkout",
             "CI fix: configure AWS credentials",
             "CI fix: prepare the fix in this job",
+            "CI fix: ensure the fix has a result",
             "CI fix: clean up the isolated checkout",
             "CI fix: upload the result",
         ):
@@ -412,8 +413,15 @@ def test_every_fix_job_uses_the_same_isolated_lifecycle():
             "CI fix: configure AWS credentials"
         )
         assert names.index("CI fix: prepare the fix in this job") < names.index(
+            "CI fix: ensure the fix has a result"
+        ) < names.index(
             "CI fix: clean up the isolated checkout"
         ) < names.index("CI fix: upload the result")
+        upload = next(
+            step for step in steps
+            if "actions/upload-artifact@" in step.get("uses", "")
+        )
+        assert upload["with"]["if-no-files-found"] == "error"
         aws = next(step for step in steps if "configure-aws-credentials@" in step.get("uses", ""))
         assert aws["with"]["role-duration-seconds"] == AWS_SESSION_S
 

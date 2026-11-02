@@ -186,6 +186,13 @@ def fix(plan_dir: Path, out: Path, *, repo_dir: str = "") -> FixOutcome:
     return outcome
 
 
+def record_failure(out: Path, error: str) -> FixOutcome:
+    """Save a failure that happened before the fix engine could write one."""
+    outcome = FixOutcome(error=error)
+    save(out / OUTCOME_FILE, outcome)
+    return outcome
+
+
 def publish_and_report(
     gh: Any,
     plan_dir: Path,
@@ -243,6 +250,12 @@ def main(argv: list[str] | None = None) -> int:
     fix_.add_argument("--plan", required=True, type=Path)
     fix_.add_argument("--out", required=True, type=Path)
     fix_.add_argument("--repo-dir", default="", help="the failed job's own checkout, if it hosts the fix")
+    failed_ = commands.add_parser(
+        "record-failure",
+        help="record a fix-job failure that happened before the fix engine ran",
+    )
+    failed_.add_argument("--out", required=True, type=Path)
+    failed_.add_argument("--error", required=True)
     publish_ = commands.add_parser("publish", help="publish the fix and report it")
     publish_.add_argument("--plan", required=True, type=Path)
     publish_.add_argument("--outcome", required=True, type=Path)
@@ -252,6 +265,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "fix":
         outcome = fix(args.plan, args.out, repo_dir=args.repo_dir)
         return 0 if outcome.candidate is not None else 1
+    if args.command == "record-failure":
+        record_failure(args.out, args.error)
+        return 0
 
     token = os.environ.get("TARGET_TOKEN", "")
     if not token:

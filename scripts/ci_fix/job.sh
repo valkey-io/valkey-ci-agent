@@ -240,15 +240,28 @@ stage() {
 }
 
 setup_job() {
+  local status run_url
   read_state || fail "Cannot use an invalid CI-fix sandbox"
   [[ "${mode}" == job ]] || fail "Only a hosted job has setup to replay"
   [[ "$(id -u "${user}" 2>/dev/null || true)" == "${uid}" ]] \
     || fail "The CI-fix isolation account changed"
-  (
+  if (
     cd "${agent}"
     python -m scripts.ci_fix.sandbox \
-      --repo "${repo}" --setup "${sandbox}/setup.sh" --user "${user}"
-  )
+      --repo "${repo}" --setup "${sandbox}/setup.sh"
+  ); then
+    return 0
+  else
+    status=$?
+  fi
+  run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}"
+  (
+    cd "${agent}"
+    python -m scripts.ci_fix.run record-failure \
+      --out "${out}" \
+      --error "the failed job's setup and build replay failed before the fix agent ran (see ${run_url})"
+  ) || true
+  return "${status}"
 }
 
 run_fix() {
@@ -263,6 +276,25 @@ run_fix() {
   cd "${agent}"
   python -m scripts.ci_fix.run fix \
     --plan "${RUNNER_TEMP}/ci-fix-plan" --out "${out}" "${args[@]}"
+}
+
+ensure_result() {
+  local code run_url
+  [[ -f "${out}/outcome.json" ]] && return 0
+  if [[ -d "${agent}" && ! -L "${agent}" ]]; then
+    code="${agent}"
+  elif [[ -d "${home}" && ! -L "${home}" ]]; then
+    code="${home}"
+  else
+    fail "The trusted agent checkout is unavailable to record the interrupted fix"
+  fi
+  run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}"
+  (
+    cd "${code}"
+    python -m scripts.ci_fix.run record-failure \
+      --out "${out}" \
+      --error "the fix job stopped before the fix engine wrote a result (see ${run_url})"
+  )
 }
 
 cleanup() {
@@ -284,9 +316,10 @@ case "${1:-}" in
   stage) stage ;;
   setup) setup_job ;;
   run) run_fix ;;
+  ensure-result) ensure_result ;;
   cleanup) cleanup ;;
   *)
-    echo "usage: $0 stage|setup|run|cleanup" >&2
+    echo "usage: $0 stage|setup|run|ensure-result|cleanup" >&2
     exit 2
     ;;
 esac

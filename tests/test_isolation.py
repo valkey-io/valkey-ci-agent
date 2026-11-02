@@ -50,9 +50,20 @@ def test_the_command_runs_with_its_own_home_and_git_allowed(monkeypatch):
         home="/w/ci-fix-home-1",
     )
     assert invocation.argv[:9] == (
-        "sudo", "-n", "-E", "runuser", "--preserve-environment", "-u", "v", "--", "setpriv",
+        "sudo",
+        "-n",
+        (
+            "--preserve-env=AWS_SESSION_TOKEN,GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,"
+            "GIT_CONFIG_VALUE_0,HOME,LOGNAME,PATH,TMP,TMPDIR,USER"
+        ),
+        "runuser",
+        "--preserve-environment",
+        "-u",
+        "v",
+        "--",
+        "setpriv",
     )
-    assert invocation.argv[-4:] == ("env", "bash", "-c", "make")
+    assert invocation.argv[-5:] == ("env", "TMPDIR=/w/ci-fix-home-1", "bash", "-c", "make")
     assert invocation.env["HOME"] == "/w/ci-fix-home-1"
     assert invocation.env["TMPDIR"] == "/w/ci-fix-home-1"
     assert invocation.env["GIT_CONFIG_VALUE_0"] == "*"
@@ -73,9 +84,18 @@ def test_root_switches_account_without_sudo_and_macos_through_sudo(monkeypatch):
     monkeypatch.setattr(isolation.os, "geteuid", lambda: 501)
     monkeypatch.setattr(isolation.sys, "platform", "darwin")
     macos = isolation.as_user("v", {}, ["make"], home="/h")
-    assert macos.argv[:7] == (
-        "/usr/sbin/sudo", "-n", "-E", "-u", "v", "--", "/usr/sbin/env",
+    assert macos.argv[:6] == (
+        "/usr/sbin/sudo",
+        "-n",
+        (
+            "--preserve-env=GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_VALUE_0,"
+            "HOME,LOGNAME,TMP,TMPDIR,USER"
+        ),
+        "-u",
+        "v",
+        "--",
     )
+    assert macos.argv[6] == "/usr/sbin/env"
 
 
 def test_the_command_is_resolved_before_sudo_can_replace_path(monkeypatch):
@@ -101,8 +121,9 @@ def test_the_command_enters_its_checkout_after_switching_accounts(monkeypatch):
         cwd="/tmp/checkout with spaces",
     )
 
-    assert invocation.argv[-8:] == (
+    assert invocation.argv[-9:] == (
         "/chosen/env",
+        "TMPDIR=/h",
         "/chosen/sh",
         "-c",
         'cd "$1" && shift && exec "$@"',
@@ -111,6 +132,45 @@ def test_the_command_enters_its_checkout_after_switching_accounts(monkeypatch):
         "/chosen/make",
         "test",
     )
+
+
+@needs_user
+def test_the_scrubbed_environment_reaches_the_isolated_account(checkout):
+    checkout.chmod(0o700)
+    with isolation.handed_to(_USER, checkout) as home:
+        invocation = isolation.as_user(
+            _USER,
+            {
+                "CI_FIX_ENV_PROBE": "preserved",
+                "GITHUB_WORKSPACE": str(checkout),
+                "RUNNER_TEMP": home,
+            },
+            [
+                "sh",
+                "-c",
+                'test "$CI_FIX_ENV_PROBE" = preserved'
+                ' && test "$HOME" = "$1"'
+                ' && test "$TMPDIR" = "$1"'
+                ' && test "$USER" = "$2"'
+                ' && test "$GITHUB_WORKSPACE" = "$3"'
+                ' && test "$RUNNER_TEMP" = "$1"',
+                "ci-fix-env",
+                home,
+                _USER,
+                str(checkout),
+            ],
+            home=home,
+            cwd=checkout,
+        )
+        result = subprocess.run(
+            list(invocation.argv),
+            cwd=None,
+            env=invocation.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    assert result.returncode == 0, result.stderr
 
 
 def test_file_cleanup_drops_roots_already_covered_by_an_ancestor(monkeypatch):
@@ -166,9 +226,14 @@ def test_a_test_command_cannot_read_the_parent_environment_or_change_git(checkou
     run = engine.run_test_command(
         str(checkout),
         f"n=$(tr '\\0' '\\n' < {credentialed} 2>/dev/null | grep -c ghs_secret); echo \"seen=${{n:-0}}\"; "
-        "echo evil > .git/HEAD; echo left > /tmp/ci-fix-isolation-marker; echo ok > made; id -un",
+        "echo \"home=$HOME tmp=$TMPDIR git=$GIT_CONFIG_VALUE_0\"; echo evil > .git/HEAD; echo left > /tmp/ci-fix-isolation-marker; echo ok > made; id -un",
     )
     assert "seen=0" in run.output and _USER in run.output
+    # What the command is given does arrive: a sudo that drops the
+    # environment (sudo-rs with -E) would pass the check above too.
+    given = next(line for line in run.output.splitlines() if line.startswith("home="))
+    home, tmp, git = (field.split("=", 1)[1] for field in given.split())
+    assert "/ci-fix-home-" in home and tmp == home and git == "*"
     assert (checkout / ".git" / "HEAD").read_text() == head
     assert not Path("/tmp/ci-fix-isolation-marker").exists()
     assert (checkout / "made").stat().st_uid == os.getuid()  # handed back
@@ -193,14 +258,17 @@ def test_the_claude_cli_runs_as_the_account(checkout, monkeypatch, tmp_path, cre
     fake.write_text(
         "#!/bin/bash\ncat >/dev/null\n"
         f"seen=$(tr '\\0' '\\n' < {credentialed} 2>/dev/null | grep -c ghs_secret)\n"
-        'echo "{\\"type\\":\\"result\\",\\"result\\":\\"user=$(id -un) seen=${seen:-0}\\"}"\n'
+        'echo "{\\"type\\":\\"result\\",\\"result\\":\\"user=$(id -un) seen=${seen:-0} '
+        'bedrock=${CLAUDE_CODE_USE_BEDROCK:-} aws=${AWS_SESSION_TOKEN:-}\\"}"\n'
     )
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    # The CLI's own Bedrock credentials must arrive; the job's other secrets must not.
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "bedrock-token")
     stdout, _stderr, rc = claude_code.run_claude_code("p", cwd=str(checkout), run_as=_USER, timeout=60)
     shutil.rmtree(bin_dir, ignore_errors=True)
     assert rc == 0
-    assert f"user={_USER} seen=0" in stdout
+    assert f"user={_USER} seen=0 bedrock=1 aws=bedrock-token" in stdout
 
 
 def test_a_replaced_git_directory_is_never_handed_back(monkeypatch):

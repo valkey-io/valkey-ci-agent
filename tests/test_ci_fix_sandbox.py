@@ -1,42 +1,37 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from types import SimpleNamespace
+import os
 
 from scripts.ci_fix import sandbox
 
 
-def test_setup_runs_in_the_sandbox_without_workflow_credentials(tmp_path, monkeypatch):
+def test_setup_runs_in_the_checkout_without_workflow_credentials(tmp_path, monkeypatch):
+    """The job's own setup needs root (sudo apt-get, sudo make install), so it runs as the workflow user."""
     repo = tmp_path / "repo"
     repo.mkdir()
     setup = tmp_path / "setup.sh"
-    setup.write_text("true\n", encoding="utf-8")
-    seen = {}
-
-    @contextmanager
-    def handed_to(user, root):
-        seen["handoff"] = (user, root)
-        yield str(tmp_path / "home")
-
-    def as_user(user, env, argv, *, home, cwd):
-        seen["invocation"] = (user, env, argv, home, cwd)
-        return SimpleNamespace(argv=("isolated",), env={"SAFE": "1"})
-
-    def run(argv, *, cwd, env, check):
-        seen["run"] = (argv, cwd, env, check)
-        return SimpleNamespace(returncode=0)
-
+    report = tmp_path / "report"
+    setup.write_text(
+        f'printf "%s\\n" "$(pwd -P)" "$GITHUB_WORKSPACE" "$RUNNER_TEMP" '
+        f'"${{TARGET_TOKEN:-none}}" "$(id -u)" > {report}\n',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("TARGET_TOKEN", "secret")
-    monkeypatch.setattr(sandbox, "handed_to", handed_to)
-    monkeypatch.setattr(sandbox, "as_user", as_user)
-    monkeypatch.setattr(sandbox.subprocess, "run", run)
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path / "agent-temp"))
 
-    assert sandbox.run_setup(repo, setup, "cifix123") == 0
-    user, env, argv, home, cwd = seen["invocation"]
-    assert user == "cifix123"
-    assert argv == ["sh", str(setup)]
-    assert cwd == repo
-    assert env["GITHUB_WORKSPACE"] == str(repo)
-    assert env["RUNNER_TEMP"] == home
-    assert "TARGET_TOKEN" not in env
-    assert seen["run"] == (["isolated"], None, {"SAFE": "1"}, False)
+    assert sandbox.run_setup(repo, setup) == 0
+
+    cwd, workspace, runner_temp, token, uid = report.read_text(encoding="utf-8").splitlines()
+    assert cwd == workspace == str(repo.resolve())
+    assert runner_temp.startswith(str(tmp_path.resolve() / "ci-fix-setup-"))
+    assert token == "none"
+    assert uid == str(os.getuid())
+
+
+def test_a_failed_setup_returns_its_status(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    setup = tmp_path / "setup.sh"
+    setup.write_text("exit 7\n", encoding="utf-8")
+
+    assert sandbox.run_setup(repo, setup) == 7
