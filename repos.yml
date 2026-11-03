@@ -18,7 +18,10 @@ repos:
       - "./utils/gen-test-certs.sh"
     # Pin SERVER_CFLAGS as upstream CI does. Otherwise src/Makefile reuses the
     # previous candidate's -DLOG_REQ_RES flags from the shared worktree.
+    # Rebuild the Lua engine from scratch: src/Makefile skips its sub-make
+    # once the archive exists, and the sub-make does not track headers (9.1+).
     build_commands:
+      - "rm -f src/modules/lua/*.o src/modules/lua/*.a src/modules/lua/*.so"
       - "make -j$(nproc) BUILD_TLS=yes SERVER_CFLAGS='-Werror'"
     validation_profile: valkey-core
     generated_file_rules:
