@@ -61,8 +61,7 @@ def test_ci_fix_profiles_match_the_publication_boundary() -> None:
     assert edit.allowed_tools == "Read,Edit,MultiEdit,Write,Grep"
     assert edit.disallowed_tools == "Bash,Glob"
     assert edit.confined is True
-    assert edit.timeout <= 45 * 60
-    assert edit.max_turns == 160
+    assert edit.timeout is None and edit.max_turns is None
 
     assert suggest.allowed_tools == "Read,Edit,MultiEdit,Write,Grep"
     assert suggest.disallowed_tools == "Bash,Glob"
@@ -71,8 +70,7 @@ def test_ci_fix_profiles_match_the_publication_boundary() -> None:
     # commands, the reviewer reads the tree they left, and a suggestion reads
     # a contributor's checkout.
     assert edit.isolated and suggest.isolated and AGENT_PROFILES["ci_fix_review"].isolated
-    assert suggest.timeout <= 45 * 60
-    assert suggest.max_turns == 160
+    assert suggest.timeout is None and suggest.max_turns is None
 
 
 def test_run_fix_agent_uses_exact_log_and_one_edit_session(tmp_path, monkeypatch) -> None:
@@ -109,6 +107,7 @@ def test_run_fix_agent_uses_exact_log_and_one_edit_session(tmp_path, monkeypatch
     assert "Job: unit tests (job id 456)" in seen["prompt"]
     assert "Other failed jobs, out of scope: lint" in seen["prompt"]
     assert "Normal target-repository CI is authoritative" in seen["prompt"]
+    assert "rather than keep surveying the" in seen["prompt"]
     assert "Do not commit or push" in seen["prompt"]
     assert candidate.action is CandidateAction.PATCH
     assert candidate.failure_type is FailureType.DETERMINISTIC

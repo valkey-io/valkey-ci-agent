@@ -13,7 +13,7 @@ import pytest
 from github import GithubException
 
 from scripts.ci_fix import run
-from scripts.ci_fix.ci_job import JobCommands, JobSpec, setup_script
+from scripts.ci_fix.ci_job import JOB_MINUTES, JobCommands, JobSpec, setup_script
 from scripts.ci_fix.models import (
     CandidateAction,
     Failure,
@@ -93,7 +93,7 @@ def test_a_failure_its_job_can_host_is_fixed_in_that_job(front_door, workflows, 
 
     assert outputs == {
         "mode": "job", "job": "test-ubuntu-latest", "runs_on": "ubuntu-latest", "container": "",
-        "timeout_minutes": "180", "use_repo": "valkey-io/valkey", "use_git_ref": _HEAD,
+        "timeout_minutes": str(JOB_MINUTES), "use_repo": "valkey-io/valkey", "use_git_ref": _HEAD,
         "extra_repository": "ianlancetaylor/libbacktrace", "extra_ref": "b9e40069c0b47a722286b94eb5231f7f05c08713",
         "extra_path": "libbacktrace", "ci_changes": "",
     }

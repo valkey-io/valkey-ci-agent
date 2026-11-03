@@ -206,6 +206,9 @@ class FixContext:
     prior_fixes: str = ""
     prior_fixes_detail: str = ""
     prior_fixes_searched: bool = False
+    # The failing test file's recent commits, with the diff of the one that
+    # added the test (the edit agent has no git).
+    test_history: str = ""
     # Whether and how the failure reproduced on the unfixed code, and whether
     # code verifies a candidate with that reproduction command.
     reproduction: str = ""

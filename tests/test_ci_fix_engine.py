@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from scripts.ci_fix import engine as engine_mod
+from scripts.ci_fix.agent import AgentTimeout
 from scripts.ci_fix.ci_job import JobCommands
 from scripts.ci_fix.models import (
     CandidateAction,
@@ -1096,6 +1097,29 @@ def test_a_later_round_whose_agent_fails_is_a_failed_attempt_not_a_refusal(tmp_p
         engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
 
     assert "With your change" in str(raised.value)
+
+
+@pytest.mark.parametrize("rounds", [1, 2])
+def test_an_agent_that_runs_out_its_session_refuses_without_a_retry(tmp_path, monkeypatch, rounds):
+    """A second session reads what the first read and times out the same way (#5224)."""
+    source, head_sha = _source_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+    first = _value_agent("almost")
+    calls = []
+
+    def agent(task, repo_dir, job_log, **kwargs):
+        calls.append(kwargs["feedback"])
+        if len(calls) == rounds:
+            (Path(repo_dir) / "partial.txt").write_text("unfinished\n", encoding="utf-8")
+            raise AgentTimeout("CI-fix agent failed with exit code 1: timeout after 1200s")
+        return first(task, repo_dir, job_log, **kwargs)
+
+    candidate = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
+
+    assert len(calls) == rounds
+    assert candidate.action is CandidateAction.REFUSE
+    assert "whole session without finding an evidence-backed fix" in candidate.summary
+    assert ("Earlier round: With your change" in candidate.verification) is (rounds == 2)
 
 
 def test_the_review_is_bounded_by_the_deadline(tmp_path, monkeypatch):

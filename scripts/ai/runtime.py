@@ -38,9 +38,11 @@ class AgentProfile:
 
     name: AgentProfileName
     allowed_tools: str
-    timeout: int
+    # None: no limit of its own. The caller's deadline bounds the session
+    # (the CI-fix engine's budget), and the CLI is given no turn cap.
+    timeout: int | None
     effort: str | None = "high"
-    max_turns: int = 200
+    max_turns: int | None = 200
     writes_allowed: bool = False
     output_schema: str = "text"
     failure_policy: str = "fail-closed"
@@ -115,9 +117,9 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
     "ci_fix_edit": AgentProfile(
         name="ci_fix_edit",
         allowed_tools="Read,Edit,MultiEdit,Write,Grep",
-        timeout=2700,
-        effort="max",
-        max_turns=160,
+        timeout=None,
+        effort="xhigh",
+        max_turns=None,
         writes_allowed=True,
         output_schema="candidate-json",
         disallowed_tools="Bash,Glob",
@@ -127,9 +129,9 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
     "ci_fix_review": AgentProfile(
         name="ci_fix_review",
         allowed_tools="Read,Grep",
-        timeout=1200,
-        effort="max",
-        max_turns=80,
+        timeout=None,
+        effort="xhigh",
+        max_turns=None,
         output_schema="review-json",
         disallowed_tools="Bash,Glob,Edit,MultiEdit,Write",
         confined=True,
@@ -140,9 +142,9 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
     "ci_fix_suggest": AgentProfile(
         name="ci_fix_suggest",
         allowed_tools="Read,Edit,MultiEdit,Write,Grep",
-        timeout=2700,
-        effort="max",
-        max_turns=160,
+        timeout=None,
+        effort="xhigh",
+        max_turns=None,
         writes_allowed=True,
         output_schema="candidate-json",
         disallowed_tools="Bash,Glob",
@@ -190,7 +192,8 @@ def run_agent(
     # run_claude_code logs the working directory and the exit; this names
     # which agent it was.
     logger.info("Running the %s agent (model %s)", profile_name, resolved_model or "default")
-    effective_timeout = profile.timeout if timeout is None else min(timeout, profile.timeout)
+    limits = [limit for limit in (timeout, profile.timeout) if limit is not None]
+    effective_timeout = min(limits) if limits else None
     stdout, stderr, rc = run_claude_code(
         prompt,
         cwd=cwd,
