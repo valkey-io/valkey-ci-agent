@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import replace
@@ -232,10 +233,10 @@ def test_a_failure_before_the_fix_engine_is_recorded(tmp_path):
 
 def test_a_setup_replay_failure_records_its_phase_and_run(tmp_path):
     script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    writer = script[script.index("write_failure_outcome() {"):script.index("\nrestore_agent() {")]
     setup_job = script[script.index("setup_job() {"):script.index("\nrun_fix() {")]
     agent = tmp_path / "agent"
     agent.mkdir()
-    record = tmp_path / "record"
     program = f"""
 set -u
 read_state() {{ :; }}
@@ -243,8 +244,9 @@ python() {{
   if [[ "$*" == *scripts.ci_fix.sandbox* ]]; then
     return 23
   fi
-  printf '%s\\n' "$@" > "$TEST_RECORD"
+  return 127
 }}
+{writer}
 {setup_job}
 mode=job
 user="$(id -un)"
@@ -264,7 +266,6 @@ printf '%s\\n' "$status"
             **os.environ,
             "TEST_AGENT": str(agent),
             "TEST_OUT": str(tmp_path / "out"),
-            "TEST_RECORD": str(record),
             "GITHUB_SERVER_URL": "https://github.example",
             "GITHUB_REPOSITORY": "valkey-io/valkey-ci-agent",
             "GITHUB_RUN_ID": "41394055294",
@@ -276,13 +277,41 @@ printf '%s\\n' "$status"
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "23"
-    recorded = record.read_text(encoding="utf-8")
-    assert "record-failure" in recorded
-    assert "setup and build replay failed before the fix agent ran" in recorded
+    recorded = json.loads((tmp_path / "out" / run.OUTCOME_FILE).read_text(encoding="utf-8"))
+    assert "setup and build replay failed before the fix agent ran" in recorded["error"]
     assert (
         "https://github.example/valkey-io/valkey-ci-agent/actions/runs/41394055294"
-        in recorded
+        in recorded["error"]
     )
+
+
+def test_agent_setup_failure_records_a_result_without_python_or_a_staged_checkout(tmp_path):
+    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    writer = script[script.index("write_failure_outcome() {"):script.index("\nrestore_agent() {")]
+    ensure = script[script.index("ensure_result() {"):script.index("\ncleanup() {")]
+    program = f"""
+set -u
+{writer}
+{ensure}
+out="$TEST_OUT"
+GITHUB_SERVER_URL="https://github.example"
+GITHUB_REPOSITORY="valkey-io/valkey-ci-agent"
+GITHUB_RUN_ID="41643802266"
+ensure_result
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", program],
+        env={**os.environ, "TEST_OUT": str(tmp_path / "out")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    recorded = json.loads((tmp_path / "out" / run.OUTCOME_FILE).read_text(encoding="utf-8"))
+    assert "fix job stopped before the fix engine wrote a result" in recorded["error"]
+    assert "https://github.example/valkey-io/valkey-ci-agent/actions/runs/41643802266" in recorded["error"]
 
 
 def _publish(tmp_path, outcome_dir):

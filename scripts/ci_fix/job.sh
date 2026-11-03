@@ -23,6 +23,21 @@ fail() {
   exit 1
 }
 
+write_failure_outcome() {
+  local error escaped temporary
+  error="$1"
+  escaped="${error//\\/\\\\}"
+  escaped="${escaped//\"/\\\"}"
+  escaped="${escaped//$'\n'/\\n}"
+  escaped="${escaped//$'\r'/\\r}"
+  escaped="${escaped//$'\t'/\\t}"
+  mkdir -p -- "${out}"
+  temporary="${out}/.outcome.$$"
+  umask 077
+  printf '{\n  "error": "%s"\n}\n' "${escaped}" > "${temporary}"
+  mv -f -- "${temporary}" "${out}/outcome.json"
+}
+
 restore_agent() {
   [[ -d "${agent}" ]] || return 0
   as_root rm -rf -- "${home}" || return 1
@@ -255,12 +270,8 @@ setup_job() {
     status=$?
   fi
   run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}"
-  (
-    cd "${agent}"
-    python -m scripts.ci_fix.run record-failure \
-      --out "${out}" \
-      --error "the failed job's setup and build replay failed before the fix agent ran (see ${run_url})"
-  ) || true
+  write_failure_outcome \
+    "the failed job's setup and build replay failed before the fix agent ran (see ${run_url})"
   return "${status}"
 }
 
@@ -279,22 +290,11 @@ run_fix() {
 }
 
 ensure_result() {
-  local code run_url
+  local run_url
   [[ -f "${out}/outcome.json" ]] && return 0
-  if [[ -d "${agent}" && ! -L "${agent}" ]]; then
-    code="${agent}"
-  elif [[ -d "${home}" && ! -L "${home}" ]]; then
-    code="${home}"
-  else
-    fail "The trusted agent checkout is unavailable to record the interrupted fix"
-  fi
   run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}"
-  (
-    cd "${code}"
-    python -m scripts.ci_fix.run record-failure \
-      --out "${out}" \
-      --error "the fix job stopped before the fix engine wrote a result (see ${run_url})"
-  )
+  write_failure_outcome \
+    "the fix job stopped before the fix engine wrote a result (see ${run_url})"
 }
 
 cleanup() {
