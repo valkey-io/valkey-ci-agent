@@ -466,8 +466,8 @@ def test_no_matching_job_records_one_terminal_refusal(monkeypatch):
     engine.assert_not_called()
 
 
-def test_a_crash_while_planning_is_recorded_as_a_failed_attempt(monkeypatch):
-    """Unrecorded, the issue would be dispatched again every hour."""
+def test_a_crash_while_planning_is_a_failed_attempt_posted_nowhere(monkeypatch):
+    """The failed run is the record (issue_dispatch.failed_attempts), not a comment."""
     issue = _issue()
     gh, _repo, _run_ = _gh(issue)
 
@@ -480,8 +480,7 @@ def test_a_crash_while_planning_is_recorded_as_a_failed_attempt(monkeypatch):
 
     assert result["action"] == "failed"
     assert "could not be read" in result["summary"]
-    (comment,) = issue.comments
-    assert "outcome=failed" in comment.body
+    assert issue.comments == []
 
 
 def test_expired_source_logs_are_a_terminal_refusal(monkeypatch):

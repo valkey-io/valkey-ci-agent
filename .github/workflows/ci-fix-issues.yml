@@ -5,8 +5,9 @@ name: CI Fix Issues
 # and human review decide whether it is mergeable; this workflow never merges.
 # The fix runs like every other (ci-fix-run.yml), inside the Valkey job that
 # failed when it can host it.
-# ci-fix-issue-dispatch.yml finds active runs for an issue by this name.
-run-name: "CI fix issue #${{ inputs.issue }}"
+# ci-fix-issue-dispatch.yml finds an issue's active runs by this name, and
+# counts its failed attempts for an occurrence, which are never commented.
+run-name: "CI fix issue #${{ inputs.issue }}${{ inputs.run_id && format(' (run {0})', inputs.run_id) || '' }}"
 
 on:
   workflow_dispatch:
@@ -15,6 +16,11 @@ on:
         description: "Test Failure Detector issue number"
         required: true
         type: number
+      run_id:
+        description: "The occurrence's run id (set by the dispatcher; 0 for a manual run)"
+        required: false
+        type: number
+        default: 0
 
 permissions: {}
 

@@ -30,16 +30,22 @@ def _reported(issue, run_id, action="refused"):
     issue.comments[-1].user = SimpleNamespace(login=_BOT)
 
 
-def _workflow(*runs):
-    return SimpleNamespace(get_runs=lambda: [SimpleNamespace(status=status, display_title=title)
-                                             for status, title in runs])
+def _workflow(*runs, failed=()):
+    """``runs`` as (status, title); ``failed`` the titles of failed completed runs."""
+    def get_runs(status=None):
+        if status == "failure":
+            return [SimpleNamespace(status="completed", conclusion="failure", display_title=title)
+                    for title in failed]
+        return [SimpleNamespace(status=s, display_title=title) for s, title in runs]
+    return SimpleNamespace(get_runs=get_runs)
 
 
 def _dispatch(listed, workflow, *, max_runs=3):
     dispatched = []
     decisions = issue_dispatch.dispatch_issues(
         SimpleNamespace(get_issues=lambda **_kwargs: listed), workflow,
-        repo_full_name="o/r", bot_login=_BOT, max_runs=max_runs, dispatch=dispatched.append,
+        repo_full_name="o/r", bot_login=_BOT, max_runs=max_runs,
+        dispatch=lambda issue, run_id: dispatched.append(issue),
     )
     return dispatched, {d.issue: d.reason for d in decisions if d.action == "skipped"}
 
@@ -74,7 +80,7 @@ def test_nothing_is_listed_when_the_cap_is_already_reached():
 
     decisions = issue_dispatch.dispatch_issues(
         SimpleNamespace(get_issues=unlisted), _workflow(("in_progress", "CI fix issue #9")),
-        repo_full_name="o/r", bot_login=_BOT, max_runs=1, dispatch=lambda _n: None,
+        repo_full_name="o/r", bot_login=_BOT, max_runs=1, dispatch=lambda _n, _r: None,
     )
 
     assert decisions == []
@@ -115,15 +121,30 @@ def _done(issue):
     return issues.fix_reported(issue, issues.parse_issue(issue), repo_full_name="o/r", bot_login=_BOT)
 
 
-def test_a_failed_attempt_is_tried_again_once_and_a_result_ends_it():
+def test_a_failed_attempt_posts_nothing_and_its_failed_run_counts_instead():
+    """While the bot is unstable, a failed attempt is not commented on the issue."""
     issue = _detector_issue(4, body=_test_issue_body(run_id=100))
-    assert not _done(issue)
+    issues._terminal_comment(
+        issue, issues.parse_issue(issue), repo_full_name="o/r", action="failed", summary="agent crashed",
+    )
+    assert issue.comments == [] and not _done(issue)
 
-    _reported(issue, 100, action="failed")  # an agent crash, the time running out
-    assert not _done(issue)
-    _reported(issue, 100, action="failed")
-    assert _done(issue)
+    seen = []
+    issue_dispatch.dispatch_issues(
+        SimpleNamespace(get_issues=lambda **_kwargs: [issue]), _workflow(),
+        repo_full_name="o/r", bot_login=_BOT, max_runs=3,
+        dispatch=lambda number, run_id: seen.append((number, run_id)),
+    )
+    assert seen == [(4, 100)]  # the run's name carries the occurrence
 
+    once = _workflow(failed=["CI fix issue #4 (run 100)", "CI fix issue #4 (run 99)", "CI fix issue #4"])
+    assert _dispatch([issue], once)[0] == [4]
+    twice = _workflow(failed=["CI fix issue #4 (run 100)"] * 2)
+    dispatched, skipped = _dispatch([issue], twice)
+    assert dispatched == [] and skipped[4] == "2 attempts at run 100 failed"
+
+
+def test_a_result_ends_the_occurrence():
     opened = _detector_issue(5, body=_test_issue_body(run_id=100))
     _reported(opened, 100, action="opened")
     assert _done(opened)

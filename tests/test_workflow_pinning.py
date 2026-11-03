@@ -285,7 +285,11 @@ def test_ci_fix_issue_runs_are_named_for_the_dispatcher():
 
     workflow = yaml.load(Path(".github/workflows/ci-fix-issues.yml").read_text(encoding="utf-8"),
                          Loader=yaml.BaseLoader)
-    assert RUN_NAME.match(workflow["run-name"].replace("${{ inputs.issue }}", "123"))
+    name = workflow["run-name"].replace("${{ inputs.issue }}", "123")
+    with_run = name.replace("${{ inputs.run_id && format(' (run {0})', inputs.run_id) || '' }}", " (run 456)")
+    without = name.replace("${{ inputs.run_id && format(' (run {0})', inputs.run_id) || '' }}", "")
+    assert RUN_NAME.match(with_run).group("issue", "run") == ("123", "456")
+    assert RUN_NAME.match(without).group("issue", "run") == ("123", None)
 
 
 # --- ci-fix-run.yml: every fix is plan -> fix-in-job | fix-in-container | fix-local -> publish

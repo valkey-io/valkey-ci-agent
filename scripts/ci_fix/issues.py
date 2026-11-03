@@ -398,6 +398,12 @@ def _terminal_comment(
     checked: str = "",
     candidate: Optional[FixCandidate] = None,
 ) -> None:
+    # A failed attempt says nothing about the test, only about the bot: it
+    # stays in the agent repository's run, and its failed run is what the
+    # dispatcher counts (scripts/ci_fix/issue_dispatch.py), not a comment.
+    if action == ResultKind.FAILED.value:
+        logger.info("Issue #%s: the attempt failed; nothing is posted: %s", issue.number, summary)
+        return
     source = f"From {_run_link(repo_full_name, failure)}"
     if job_name:
         source += f", job `{job_name}`"
