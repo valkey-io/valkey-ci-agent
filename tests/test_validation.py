@@ -476,6 +476,30 @@ def test_valkey_profile_does_not_reply_log_top_level_skipped_test(tmp_path) -> N
     assert not any("--log-req-res" in command for command in commands)
 
 
+def test_valkey_profile_can_temporarily_skip_req_res_validator(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    test_path = tmp_path / "tests/integration/replication.tcl"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("test body\n", encoding="utf-8")
+    monkeypatch.setenv("BACKPORT_SKIP_REQ_RES_VALIDATION", "1")
+
+    commands = select_validation_commands(
+        [],
+        [],
+        ["tests/integration/replication.tcl"],
+        validation_profile="valkey-core",
+        repo_dir=str(tmp_path),
+    )
+
+    assert any("--log-req-res" in command for command in commands)
+    assert not any(
+        command.startswith("./utils/req-res-log-validator.py")
+        for command in commands
+    )
+
+
 def test_valkey_profile_uses_module_runner_for_moduleapi_test(tmp_path) -> None:
     test_path = tmp_path / "tests/unit/moduleapi/blockonkeys.tcl"
     test_path.parent.mkdir(parents=True)
