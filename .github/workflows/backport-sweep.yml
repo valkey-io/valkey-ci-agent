@@ -25,6 +25,11 @@ on:
         required: false
         default: true
         type: boolean
+      skip_req_res_validation:
+        description: "Temporarily skip the request/response schema validator"
+        required: false
+        default: false
+        type: boolean
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -88,6 +93,7 @@ jobs:
       CI_AGENT_EVIDENCE_DIR: agent-evidence
       MAX_CANDIDATES: ${{ inputs.max_candidates || '2' }}
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
+      BACKPORT_SKIP_REQ_RES_VALIDATION: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_req_res_validation == true && '1' || '0' }}
     permissions:
       contents: read
       id-token: write

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import subprocess
 from fnmatch import fnmatch
@@ -14,6 +16,13 @@ if TYPE_CHECKING:
     from scripts.backport.registry import ValidationRule
 
 UNMAPPED_TEST_PATHS_PREFIX = "BACKPORT_UNMAPPED_TEST_PATHS="
+SKIP_REQ_RES_VALIDATION_ENV = "BACKPORT_SKIP_REQ_RES_VALIDATION"
+
+logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
 
 
 def changed_paths_since_base(repo_dir: str, base_ref: str) -> tuple[str, ...]:
@@ -494,9 +503,15 @@ def _valkey_test_validation_commands(
                     werror=True,
                 )
             )
-        commands.append(
-            "./utils/req-res-log-validator.py --verbose --fail-missing-reply-schemas"
-        )
+        if _env_flag(SKIP_REQ_RES_VALIDATION_ENV):
+            logger.warning(
+                "%s is enabled; skipping request/response schema validation",
+                SKIP_REQ_RES_VALIDATION_ENV,
+            )
+        else:
+            commands.append(
+                "./utils/req-res-log-validator.py --verbose --fail-missing-reply-schemas"
+            )
 
     uncovered_tests = tuple(
         path

@@ -240,6 +240,24 @@ def test_ci_fix_concurrency_groups_never_drop_a_queued_run():
         }, filename
 
 
+def test_backport_sweep_exposes_scoped_req_res_validation_bypass():
+    workflow = yaml.load(
+        (Path(".github/workflows") / "backport-sweep.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+
+    skip_input = workflow["on"]["workflow_dispatch"]["inputs"][
+        "skip_req_res_validation"
+    ]
+    assert skip_input["type"] == "boolean"
+    assert skip_input["default"] == "false"
+    assert (
+        workflow["jobs"]["sweep"]["env"]["BACKPORT_SKIP_REQ_RES_VALIDATION"]
+        == "${{ github.event_name == 'workflow_dispatch' && "
+        "inputs.skip_req_res_validation == true && '1' || '0' }}"
+    )
+
+
 def test_the_comment_poller_dispatches_with_a_separate_token():
     workflow = yaml.load(Path(".github/workflows/ci-fix-comment-poll.yml").read_text(encoding="utf-8"),
                          Loader=yaml.BaseLoader)
