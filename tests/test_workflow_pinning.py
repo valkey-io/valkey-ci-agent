@@ -193,6 +193,23 @@ def test_backport_workflows_refresh_credentials_after_validation():
     assert "steps.poll.outputs.had_error == 'true'" in poll
 
 
+def test_backport_workflows_remove_container_owned_prepared_worktrees():
+    for filename, job_name in (
+        ("backport-sweep.yml", "sweep"),
+        ("backport-poll.yml", "poll"),
+    ):
+        workflow = yaml.load(
+            (Path(".github/workflows") / filename).read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        cleanup = next(
+            step
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("name") == "Clean up prepared sweep"
+        )
+        assert 'sudo -n rm -rf -- "${RUNNER_TEMP}/backport-sweep"' in cleanup["run"]
+
+
 def test_backport_branch_mutations_share_one_concurrency_group():
     groups = []
     for filename, job_name in (
