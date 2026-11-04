@@ -157,7 +157,20 @@ def _hard_links(root: Path) -> list[str]:
 
 
 def _remove_hard_links(root: Path) -> None:
-    _as_root(*_hard_link_find(root), "-delete")
+    argv = [*_hard_link_find(root), "-delete"]
+    for attempt in range(3):
+        try:
+            _as_root(*argv)
+            return
+        except OSError as exc:
+            error = str(exc)
+            # Cancellation can interrupt a compiler while find is walking the
+            # checkout. A path that disappeared no longer needs unlinking, but
+            # rerun the complete scan so every surviving hard link is removed.
+            if attempt < 2 and "No such file or directory" in error:
+                time.sleep(0.1)
+                continue
+            raise
 
 
 def _remove_nested_git_dirs(root: Path) -> None:

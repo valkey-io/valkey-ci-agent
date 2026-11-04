@@ -189,6 +189,53 @@ def test_file_cleanup_drops_roots_already_covered_by_an_ancestor(monkeypatch):
     assert calls == [("find", "/tmp", "/var/tmp", "-xdev", "-mindepth", "1", "-user", "agent", "-delete")]
 
 
+def test_hard_link_cleanup_retries_when_cancelled_build_files_disappear(monkeypatch, tmp_path):
+    calls = []
+    results = iter(
+        [
+            OSError(
+                f"find: '{tmp_path}/src/rax.c': No such file or directory\n"
+                f"find: '{tmp_path}/src/ziplist.o': No such file or directory\n"
+            ),
+            None,
+        ]
+    )
+
+    def as_root(*argv):
+        calls.append(argv)
+        result = next(results)
+        if result is not None:
+            raise result
+
+    monkeypatch.setattr(
+        isolation.subprocess,
+        "run", lambda *_args, **_kwargs: pytest.fail("subprocess is wrapped by _as_root")
+    )
+    monkeypatch.setattr(isolation, "_as_root", as_root)
+    monkeypatch.setattr(isolation.time, "sleep", lambda _seconds: None)
+
+    isolation._remove_hard_links(tmp_path)
+
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert calls[0][0] == "find"
+
+
+def test_hard_link_cleanup_does_not_retry_other_find_errors(monkeypatch, tmp_path):
+    calls = []
+
+    def as_root(*argv):
+        calls.append(argv)
+        raise OSError("find: Permission denied")
+
+    monkeypatch.setattr(isolation, "_as_root", as_root)
+
+    with pytest.raises(OSError, match="Permission denied"):
+        isolation._remove_hard_links(tmp_path)
+
+    assert len(calls) == 1
+
+
 @pytest.fixture
 def checkout():
     """A checkout under a traversable directory, as the engine makes one."""
