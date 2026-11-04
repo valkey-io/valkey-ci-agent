@@ -1,9 +1,10 @@
 name: Backport Eligibility
 
-# Once a day, look at every PR merged to the development branch on the last
-# seven UTC days and comment on the ones that look eligible for backport,
-# naming the release branches. The overlap re-covers days a failed or skipped
-# run missed (GitHub drops scheduled runs now and then). Each PR is judged
+# Once a day, for each repository in the schedule matrix below, look at every
+# PR merged to the development branch on the last seven UTC days and comment
+# on the ones that look eligible for backport, naming the release branches.
+# The overlap re-covers days a failed or skipped run missed (GitHub drops
+# scheduled runs now and then). Each PR is judged
 # once: the result files of earlier runs settle the PRs they already decided,
 # and the marker comment keeps a PR from being commented on twice. It only
 # suggests: nothing is added to a project.
@@ -46,21 +47,27 @@ permissions: {}
 
 jobs:
   eligibility:
-    name: "eligibility/${{ inputs.repo || 'valkey-io/valkey' }}"
+    name: "eligibility/${{ matrix.repo }}"
     if: github.repository == 'valkey-io/valkey-ci-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Scheduled runs cover every repository listed here; each must also be
+        # in repos.yml. A manual run covers only its repo input.
+        repo: ${{ fromJSON(github.event_name == 'schedule' && '["valkey-io/valkey", "valkey-io/valkey-search"]' || format('["{0}"]', inputs.repo || 'valkey-io/valkey')) }}
     concurrency:
       # Runs for one repo are serialized so two runs over the same date cannot
       # both comment; queue: max keeps every pending dispatch instead of only
       # the latest.
-      group: backport-eligibility-${{ inputs.repo || 'valkey-io/valkey' }}
+      group: backport-eligibility-${{ matrix.repo }}
       cancel-in-progress: false
       queue: max
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
       CLAUDE_CODE_USE_BEDROCK: "1"
-      TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
+      TARGET_REPO: ${{ matrix.repo }}
       MERGE_DATE: ${{ inputs.date || '' }}
       MERGE_DAYS: ${{ inputs.days || '7' }}
       PR_NUMBERS: ${{ inputs.prs || '' }}
@@ -111,12 +118,15 @@ jobs:
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          role-session-name: backport-eligibility-${{ github.run_id }}
+          role-session-name: backport-eligibility-${{ github.run_id }}-${{ steps.target.outputs.name }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Download earlier results
         # Best effort: a result that cannot be read only means its PRs are
         # judged again; the marker comment still prevents a second comment.
+        # A run holds one result per repository, and the pattern also matches
+        # the older unsuffixed name; results for other repositories are
+        # ignored when loaded.
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -128,7 +138,7 @@ jobs:
           found=0
           for id in ${runs}; do
             if gh run download "${id}" --repo "${GITHUB_REPOSITORY}" \
-                --name "backport-eligibility-result-${id}" --dir "prior-results/${id}" >/dev/null 2>&1; then
+                --pattern "backport-eligibility-result-${id}*" --dir "prior-results/${id}" >/dev/null 2>&1; then
               found=$((found + 1))
             fi
           done
@@ -157,7 +167,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: backport-eligibility-result-${{ github.run_id }}
+          name: backport-eligibility-result-${{ github.run_id }}-${{ steps.target.outputs.owner }}-${{ steps.target.outputs.name }}
           path: backport-eligibility-result.json
           if-no-files-found: ignore
           retention-days: 30
