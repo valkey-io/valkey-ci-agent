@@ -158,7 +158,7 @@ def test_a_job_resolves_to_its_runner_checkouts_setup_and_commands():
         name="test-ubuntu-jemalloc",
         runs_on="ubuntu-latest",
         container="",
-        timeout_minutes=ci_job.MAX_JOB_MINUTES,
+        timeout_minutes=ci_job.JOB_MINUTES,
         env={},
         # The step for dispatched runs does not run; the job's own checkout
         # is the fix job's; the tests, and what follows them, are the agent's.
@@ -193,7 +193,7 @@ def test_a_matrix_entry_is_chosen_by_the_name_github_gives_it():
     spec = _resolve(_MATRIX, "test-ubuntu-jemalloc (clang)")
 
     # The fix needs its own time, however short the job's tests were.
-    assert (spec.env, spec.timeout_minutes) == ({"CC": "clang"}, ci_job.MIN_JOB_MINUTES)
+    assert (spec.env, spec.timeout_minutes) == ({"CC": "clang"}, ci_job.JOB_MINUTES)
     # Its environment reaches the rebuilds, which run with a clean one.
     assert spec.commands.build == "export CC='clang'\nmake"
     with pytest.raises(Unsupported):

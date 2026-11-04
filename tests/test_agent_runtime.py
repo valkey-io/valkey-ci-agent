@@ -85,9 +85,14 @@ def test_ci_fix_profiles_match_their_publication_targets() -> None:
     assert edit.confined is True
     assert edit.disallowed_tools == "Bash,Glob"
     assert "Bash" not in edit.allowed_tools
+    # Bounded by the engine's deadline alone: no session timeout or turn cap.
+    assert edit.timeout is None and edit.max_turns is None
+    assert edit.effort == "xhigh"
     assert suggest.writes_allowed is True
     assert suggest.confined is True
     assert suggest.disallowed_tools == "Bash,Glob"
+    assert suggest.timeout is None and suggest.max_turns is None
+    assert suggest.effort == "xhigh"
 
 
 def test_a_caller_cannot_extend_an_agent_profiles_timeout(monkeypatch) -> None:
@@ -100,9 +105,14 @@ def test_a_caller_cannot_extend_an_agent_profiles_timeout(monkeypatch) -> None:
     monkeypatch.setattr(agent_runtime, "run_claude_code", run_claude_code)
     monkeypatch.setattr(agent_runtime, "isolated_user", lambda: "")
 
-    agent_runtime.run_agent("ci_fix_edit", "fix it", timeout=9999)
+    agent_runtime.run_agent("release_notes_review_edit_only", "review it", timeout=9999)
+    assert captured["timeout"] == agent_runtime.AGENT_PROFILES["release_notes_review_edit_only"].timeout
 
-    assert captured["timeout"] == agent_runtime.AGENT_PROFILES["ci_fix_edit"].timeout
+    # A profile with no timeout of its own runs to the caller's deadline, uncapped.
+    agent_runtime.run_agent("ci_fix_edit", "fix it", timeout=9999)
+    assert captured["timeout"] == 9999
+    assert captured["max_turns"] is None
+    assert captured["effort"] == "xhigh"
 
 
 def test_release_notes_review_profile_is_edit_only() -> None:

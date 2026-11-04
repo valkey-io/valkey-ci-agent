@@ -29,12 +29,10 @@ from typing import Any, Callable, Optional
 
 import yaml
 
-# A job fixes one failure, never runs a full Daily; and however short the
-# job's own tests, the fix needs its setup and build plus the engine's budget
-# (scripts/ci_fix/engine.py PREPARE_BUDGET_S).
-MAX_JOB_MINUTES = 180
-MIN_JOB_MINUTES = 90
-_DEFAULT_JOB_MINUTES = 360  # GitHub's
+# Every fix job gets the same time, whatever its own tests took: setup and
+# build, then the engine's AWS session (scripts/ci_fix/engine.py
+# AWS_SESSION_S), under GitHub's 6-hour job limit.
+JOB_MINUTES = 350
 
 
 class Unsupported(ValueError):
@@ -217,9 +215,6 @@ def _spec(job_id: str, name: str, job: dict[str, Any], context: dict[str, Any]) 
     container = _container(job.get("container"), context)
     if container and not runs_on.startswith("ubuntu"):
         raise Unsupported("the job's container is not on an Ubuntu runner")
-    minutes = value(job.get("timeout-minutes", _DEFAULT_JOB_MINUTES), context)
-    if not isinstance(minutes, (int, float)) or isinstance(minutes, bool) or minutes <= 0:
-        raise Unsupported(f"the job's timeout is {minutes!r}")
     env = {**context["env"], **_env(job.get("env"), context)}
     context = {**context, "env": env}
 
@@ -284,7 +279,7 @@ def _spec(job_id: str, name: str, job: dict[str, Any], context: dict[str, Any]) 
         name=name,
         runs_on=runs_on,
         container=container,
-        timeout_minutes=min(max(int(minutes), MIN_JOB_MINUTES), MAX_JOB_MINUTES),
+        timeout_minutes=JOB_MINUTES,
         env=env,
         steps=tuple(setup),
         checkout=checkout,

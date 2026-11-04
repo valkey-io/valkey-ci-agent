@@ -7,30 +7,42 @@
 # - bash, which the steps after this one run in;
 # - git: without it in the container, the job checked Valkey out as an
 #   archive (scripts/ci_fix/job.sh makes that a repository);
-# - Python 3.9 or later, in a virtual environment put first on PATH;
+# - Python 3.11 or later, in a virtual environment put first on PATH;
 # - Node, for Claude Code;
 # - what the agent's own account needs (scripts/common/isolation.py):
 #   useradd, runuser, setpriv, pkill and ps, and find.
 set -eu
 
+retry() {
+  attempt=1
+  while ! "$@"; do
+    if [ "${attempt}" -ge 3 ]; then
+      return 1
+    fi
+    sleep "${attempt}"
+    attempt=$((attempt + 1))
+  done
+}
+
 if command -v apk >/dev/null 2>&1; then
   # Claude Code on musl uses the system's ripgrep, and libstdc++.
-  apk add --no-cache bash git python3 nodejs npm shadow runuser util-linux procps findutils \
+  retry apk add --no-cache bash git python3 nodejs npm shadow runuser util-linux procps findutils \
     libgcc libstdc++ ripgrep
   python=python3
 elif command -v dnf >/dev/null 2>&1; then
   # Enterprise Linux's default Node is older than Claude Code supports;
   # Fedora has no module streams, and a current Node.
-  dnf -y -q module enable nodejs:20 >/dev/null 2>&1 || true
-  dnf -y -q install bash git python3 nodejs npm shadow-utils util-linux procps-ng findutils
+  retry dnf -y -q module enable nodejs:20 >/dev/null 2>&1 || true
+  retry dnf -y -q install bash git python3 nodejs npm shadow-utils util-linux procps-ng findutils
   python=python3
-  if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
-    dnf -y -q install python3.11  # AlmaLinux 8's python3 is 3.6
+  if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+    # AlmaLinux 8 has Python 3.6 and CentOS Stream 9 has Python 3.9.
+    retry dnf -y -q install python3.11
     python=python3.11
   fi
 elif command -v apt-get >/dev/null 2>&1; then
-  apt-get update -q
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+  retry apt-get update -q
+  retry env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
     bash git ca-certificates python3 python3-venv nodejs npm passwd util-linux procps findutils
   python=python3
 else
@@ -38,6 +50,10 @@ else
   exit 1
 fi
 
+"${python}" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {
+  echo "::error::The container does not provide Python 3.11 or later"
+  exit 1
+}
 venv="${RUNNER_TEMP}/ci-fix-python"
 "${python}" -m venv "${venv}"
 echo "${venv}/bin" >> "${GITHUB_PATH}"

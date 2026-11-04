@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -284,7 +285,11 @@ def test_ci_fix_issue_runs_are_named_for_the_dispatcher():
 
     workflow = yaml.load(Path(".github/workflows/ci-fix-issues.yml").read_text(encoding="utf-8"),
                          Loader=yaml.BaseLoader)
-    assert RUN_NAME.match(workflow["run-name"].replace("${{ inputs.issue }}", "123"))
+    name = workflow["run-name"].replace("${{ inputs.issue }}", "123")
+    with_run = name.replace("${{ inputs.run_id && format(' (run {0})', inputs.run_id) || '' }}", " (run 456)")
+    without = name.replace("${{ inputs.run_id && format(' (run {0})', inputs.run_id) || '' }}", "")
+    assert RUN_NAME.match(with_run).group("issue", "run") == ("123", "456")
+    assert RUN_NAME.match(without).group("issue", "run") == ("123", None)
 
 
 # --- ci-fix-run.yml: every fix is plan -> fix-in-job | fix-in-container | fix-local -> publish
@@ -560,10 +565,75 @@ def test_a_container_fix_mode_installs_the_agents_tools_from_the_distribution():
     assert steps[0]["shell"] == "sh" and steps[0]["if"] == "${{ inputs['system-packages'] == 'true' }}"
     assert steps[1]["uses"].startswith("actions/setup-python@")
     assert steps[1]["if"] == "${{ inputs['system-packages'] != 'true' }}"
+    packages = Path(".github/actions/setup-agent/system-packages.sh").read_text(encoding="utf-8")
+    assert "sys.version_info < (3, 11)" in packages
+    assert "install python3.11" in packages
+    assert "retry dnf" in packages
     for job_id, job in _run_jobs().items():
         for step in job.get("steps") or []:
             if step.get("name") == "CI fix: set up the agent":
                 assert (step["with"].get("system-packages") == "true") == bool(job.get("container")), job_id
+
+
+def test_enterprise_linux_container_setup_retries_and_upgrades_python(tmp_path):
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    calls = tmp_path / "dnf-calls"
+    first_install = tmp_path / "first-install"
+
+    (binaries / "dnf").write_text(
+        """#!/bin/sh
+printf '%s\\n' "$*" >> "$TEST_DNF_CALLS"
+case "$*" in
+  *"module enable"*) exit 0 ;;
+esac
+if [ ! -e "$TEST_FIRST_INSTALL" ]; then
+  : > "$TEST_FIRST_INSTALL"
+  exit 1
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    (binaries / "python3").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    (binaries / "python3.11").write_text(
+        """#!/bin/sh
+if [ "$1" = "-c" ]; then
+  exit 0
+fi
+if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+  mkdir -p "$3/bin"
+  exit 0
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    for binary in binaries.iterdir():
+        binary.chmod(0o755)
+
+    github_path = tmp_path / "github-path"
+    result = subprocess.run(
+        ["sh", ".github/actions/setup-agent/system-packages.sh"],
+        env={
+            **os.environ,
+            "PATH": f"{binaries}:/usr/bin:/bin",
+            "RUNNER_TEMP": str(tmp_path / "runner"),
+            "GITHUB_PATH": str(github_path),
+            "TEST_DNF_CALLS": str(calls),
+            "TEST_FIRST_INSTALL": str(first_install),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    recorded = calls.read_text(encoding="utf-8").splitlines()
+    base_install = next(call for call in recorded if "install bash git python3 " in call)
+    assert recorded.count(base_install) == 2
+    assert any("install python3.11" in call for call in recorded)
+    assert github_path.read_text(encoding="utf-8").strip().endswith("/runner/ci-fix-python/bin")
 
 
 def test_the_isolation_tests_also_run_as_root_in_a_container():

@@ -294,3 +294,53 @@ def summarize_prior_fixes(fixes: tuple[PriorFix, ...]) -> str:
         )
         lines.append(f"`{fix.sha[:12]}` {fix.subject} ({state})")
     return "\n".join(lines)
+
+
+# How much of a failing test file's history the agent is shown.
+_HISTORY_COMMITS = 5
+
+
+def failing_test_history(repo_dir: str, tests: tuple[FailedTest, ...]) -> str:
+    """Markdown: each failing test file's recent commits, and the diff of the newest one that added or changed the test.
+
+    The commit that added a test is the best evidence for why it fails, and
+    the edit agent cannot run git. The adding commit is the newest of the
+    recent ones whose patch adds a line naming the test; a name built from a
+    variable (``$mode``) is matched up to the variable.
+    """
+    sections: list[str] = []
+    for path in dict.fromkeys(test.file for test in tests):
+        if not _inside(repo_dir, path):
+            continue
+        names = [test.name.split("$", 1)[0].strip() for test in tests if test.file == path]
+        try:
+            section = _file_history(repo_dir, path, names)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.info("Could not read the history of %s: %s", path, exc)
+            continue
+        if section:
+            sections.append(section)
+    return "\n\n".join(sections) + "\n" if sections else ""
+
+
+def _file_history(repo_dir: str, path: str, names: list[str]) -> str:
+    shas = _log(repo_dir, "HEAD", f"--max-count={_HISTORY_COMMITS}", "--", path)
+    if not shas:
+        return ""
+    names = [name for name in names if len(name) >= _MIN_NAME_CHARS]
+    lines = [f"# `{path}`", ""]
+    added = ""
+    for sha in shas:
+        subject, date = _subject_and_date(repo_dir, sha)
+        lines.append(f"- `{sha[:12]}` {date} {subject}")
+        if added or not names:
+            continue
+        patch = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha, "--", path)
+        if any(line.startswith("+") and name in line for line in patch.splitlines() for name in names):
+            added = sha
+    if added:
+        diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--stat", "--patch", added)
+        if len(diff) > _DIFF_CHARS:
+            diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+        lines += ["", f"## The newest commit that added or changed the test: `{added[:12]}`", "", "```diff", diff, "```"]
+    return "\n".join(lines)

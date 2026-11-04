@@ -5,6 +5,7 @@ from pathlib import Path
 
 from scripts.ci_fix.models import FailedTest
 from scripts.ci_fix.prior_fixes import (
+    failing_test_history,
     find_prior_fixes,
     render_prior_fixes,
     summarize_prior_fixes,
@@ -192,3 +193,43 @@ def test_a_log_path_leaving_the_checkout_is_ignored(tmp_path):
     log = "src/../../../etc/hosts.c:1:1: error\nserver.c:3:1: error\nlink.c:1:1: error\n"
 
     assert paths_in_log(str(tmp_path), log) == ("src/server.c",)
+
+
+def test_the_history_shows_the_commit_that_added_the_failing_test(tmp_path):
+    """The edit agent cannot run git: the commit that added a new test is its best lead."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "unstable")
+    git(repo, "config", "user.name", "T")
+    git(repo, "config", "user.email", "t@example.com")
+    commit(repo, TEST_FILE, "test {Older test} {}\n", "Add an older test")
+    commit(repo, TEST_FILE, f"test {{Older test}} {{}}\ntest {{{TEST.name}}} {{}}\n", "Add the reconnect test (#5150)")
+    commit(repo, "src/other.c", "x\n", "Touch something else")
+    added = git(repo, "rev-parse", "HEAD~1")
+
+    history = failing_test_history(str(repo), (TEST,))
+
+    assert "Add an older test" in history and "Add the reconnect test (#5150)" in history
+    assert "Touch something else" not in history
+    assert f"newest commit that added or changed the test: `{added[:12]}`" in history
+    assert f"+test {{{TEST.name}}}" in history
+
+
+def test_a_test_name_built_from_a_variable_matches_up_to_it(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "unstable")
+    git(repo, "config", "user.name", "T")
+    git(repo, "config", "user.email", "t@example.com")
+    commit(repo, TEST_FILE, 'test "Corrupt buffered $mode stream retries" {}\n', "Add the stream test")
+
+    history = failing_test_history(str(repo), (FailedTest("Corrupt buffered $mode stream retries", TEST_FILE),))
+
+    assert "newest commit that added or changed the test" in history
+
+
+def test_no_history_outside_a_repository_or_the_checkout(tmp_path):
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    (tmp_path / TEST_FILE).write_text("x\n", encoding="utf-8")
+    assert failing_test_history(str(tmp_path), (TEST,)) == ""
+    assert failing_test_history(str(tmp_path), (FailedTest("x" * 20, "../escape.tcl"),)) == ""

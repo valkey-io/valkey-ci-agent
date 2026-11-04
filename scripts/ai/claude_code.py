@@ -56,10 +56,10 @@ def run_claude_code(
     prompt: str,
     *,
     cwd: str | None = None,
-    timeout: int = _DEFAULT_TIMEOUT_SECONDS,
+    timeout: int | None = _DEFAULT_TIMEOUT_SECONDS,
     model: str | None = _DEFAULT_CLAUDE_MODEL,
     effort: str | None = "max",
-    max_turns: int = 200,
+    max_turns: int | None = 200,
     allowed_tools: str = "Read,Edit,MultiEdit,Write,Bash,Glob,Grep",
     disallowed_tools: str | None = None,
     env_allowlist: tuple[str, ...] | None = None,
@@ -80,6 +80,8 @@ def run_claude_code(
     A confined profile cannot use Bash, which would stall on an approval, or
     Glob, whose absolute patterns are not boundary-checked.
     """
+    if timeout is None:
+        timeout = _DEFAULT_TIMEOUT_SECONDS
     env = _build_claude_env(env_allowlist)
     env["CLAUDE_CODE_USE_BEDROCK"] = "1"
     # Resolve once here so the env-var override (CI_AGENT_CLAUDE_MODEL)
@@ -99,7 +101,7 @@ def run_claude_code(
 
     cmd = [
         "claude", "--print",
-        "--max-turns", str(max_turns),
+        *(("--max-turns", str(max_turns)) if max_turns is not None else ()),
         "--tools", allowed_tools,
         # Three layers, each doing distinct work: --tools is the set of tools
         # that exist, --disallowedTools (below) hard-denies specific ones, and

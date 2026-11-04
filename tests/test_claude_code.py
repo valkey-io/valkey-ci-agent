@@ -369,3 +369,23 @@ def test_unconfined_runs_keep_their_existing_flags(monkeypatch):
     cmd = _captured_cmd(monkeypatch, allowed_tools="Read,Edit,Bash")
     assert "--dangerously-skip-permissions" in cmd
     assert "--permission-mode" not in cmd
+
+
+def test_an_uncapped_run_passes_no_turn_limit(monkeypatch):
+    """A CI-fix profile has no turn cap: the CLI is given no --max-turns at all."""
+    captured = {}
+    stream = '{"type":"result","subtype":"success","num_turns":1,"result":"done"}\n'
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _FakeProcess(cmd, stdout_text=stream, **kwargs)
+
+    monkeypatch.setattr(claude_code.subprocess, "Popen", fake_popen)
+
+    _stdout, _stderr, rc = claude_code.run_claude_code(
+        "fix this", cwd="/tmp/checkout", max_turns=None, timeout=None, effort="xhigh",
+    )
+
+    assert rc == 0
+    assert "--max-turns" not in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--effort") + 1] == "xhigh"
