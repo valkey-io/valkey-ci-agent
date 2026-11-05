@@ -309,6 +309,35 @@ def test_an_exception_is_located_by_the_first_test_file_in_its_stack():
     ]
 
 
+def test_an_exception_inside_a_named_test_is_attributed_to_that_test():
+    """Daily run 41744961340: Tcl 8.5 rejected lsort -stride inside a test body."""
+    log = (
+        "### Starting test PHPREFIXES COUNT 1 replaces longest-prefix lookup "
+        "in tests/unit/type/path_hash.tcl\n"
+        '[exception]: Executing test client: bad option "-stride": must be -ascii or -command.\n'
+        'bad option "-stride": must be -ascii or -command\n'
+        '    while executing\n'
+        '"lsort -stride 2 [lindex $match 1]"\n'
+        '    invoked from within\n'
+        '"test {PHPREFIXES COUNT 1 replaces longest-prefix lookup} {\n'
+        '        r del tree\n'
+        '        r phset tree {} fields 1 root root-value ..."\n'
+        '    (file "tests/unit/type/path_hash.tcl" line 1)\n'
+        "##[error]Process completed with exit code 1.\n"
+    )
+
+    tests, failures = _find([_job(1, "test-macos-latest")], {1: log})
+
+    assert failures == []
+    assert [(test.test_name, test.test_file, test.error) for test in tests] == [(
+        "PHPREFIXES COUNT 1 replaces longest-prefix lookup",
+        "tests/unit/type/path_hash.tcl",
+        '[exception]: Executing test client: bad option "-stride": must be -ascii or -command. '
+        "at tests/unit/type/path_hash.tcl",
+    )]
+    assert [ref.job for ref in tests[0].jobs] == ["test-macos-latest"]
+
+
 def test_a_valgrind_report_is_identified_by_its_first_error_and_frames():
     def report(pid, function):
         return (

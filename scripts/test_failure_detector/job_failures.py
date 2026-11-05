@@ -45,6 +45,9 @@ _SUMMARY_RE = re.compile(r"^\*\*\* \[(?P<status>[A-Za-z]+)\]: (?P<data>.+)$")
 # frame in a test file, past the test framework's own, says where.
 _EXCEPTION_RE = re.compile(r"^\[exception\]: (?P<data>.+)$")
 _TCL_FRAME_RE = re.compile(r"^\s*in \S+ at (?P<file>tests/\S+\.tcl):\d+$")
+_TCL_FILE_FRAME_RE = re.compile(r'^\s*\(file "(?P<file>tests/\S+\.tcl)" line \d+\)$')
+_TCL_TEST_INVOCATION_RE = re.compile(r'^"test \{(?P<name>.+)\} \{$')
+_TEST_START_RE = re.compile(r"^### Starting test (?P<name>.+) in (?P<file>tests/\S+\.tcl)$")
 _TCL_FRAMEWORK_RE = re.compile(r"^tests/(?:support/|helpers/|test_helper\.tcl$)")
 # Where the log has moved on without a stack: an Actions annotation, another
 # runtest status line, or runtest's own cleanup.
@@ -106,6 +109,15 @@ class JobFailure:
         return ("cause",), self.summary
 
 
+@dataclass(frozen=True)
+class _LogFinding:
+    """One failure found in a job log, with its original error when attributed."""
+
+    status: str
+    data: str
+    error: str = ""
+
+
 def normalize_job_name(name: str) -> str:
     """Compare a run's job name with an artifact key, ignoring separators.
 
@@ -161,13 +173,16 @@ def find_unrecorded_failures(
                 unread.append(name)
             continue
         causes: dict[str, None] = {}  # ordered, without repeats
-        for status, data in summary:
+        for finding in summary:
+            status, data = finding.status, finding.data
             test = test_in_file(data)
             if test is None or status == "exception" or _LEAK_CHECK_RE.match(data):
                 causes[f"[{status}]: {data}"] = None
                 continue
             failure = tests.setdefault(test, UniqueFailure(
-                test_name=test[0], test_file=test[1], error=f"[{status}]: {data}",
+                test_name=test[0],
+                test_file=test[1],
+                error=finding.error or f"[{status}]: {data}",
             ))
             if not any(ref.job == name for ref in failure.jobs):
                 failure.jobs.append(JobReference(job=name, url=url))
@@ -213,7 +228,7 @@ def _failure_summary(
     artifact_client: ArtifactClient,
     repo_full_name: str,
     job: Any,
-) -> tuple[list[tuple[str, str]] | None, bool]:
+) -> tuple[list[_LogFinding] | None, bool]:
     """The job-log summary and whether an unavailable log has expired."""
     try:
         log = artifact_client.download_job_log(repo_full_name, int(job.id))
@@ -225,18 +240,28 @@ def _failure_summary(
         logger.warning("The log of job %s is gone (expired)", getattr(job, "id", "?"))
         return None, True
     plain = [strip_log_prefix(raw) for raw in log.splitlines()]
-    lines: list[tuple[str, str]] = []
+    lines: list[_LogFinding] = []
     for index, line in enumerate(plain):
         if match := _SUMMARY_RE.match(line):
             data = match.group("data").strip()
             if report := _REPORT_RE.match(data):
                 data = _report_cause(report.group("kind"), data, plain[index + 1:index + 1 + _REPORT_LINES])
-            lines.append((match.group("status"), data))
+            lines.append(_LogFinding(match.group("status"), data))
         elif match := _EXCEPTION_RE.match(line):
-            where = _exception_location(plain[index + 1:index + 1 + _EXCEPTION_LINES])
-            lines.append(("exception", match.group("data").strip() + (f" at {where}" if where else "")))
+            before = plain[max(0, index - _EXCEPTION_LINES):index]
+            following = plain[index + 1:index + 1 + _EXCEPTION_LINES]
+            where = _exception_location(following)
+            message = match.group("data").strip() + (f" at {where}" if where else "")
+            if test := _exception_test(before, following, where):
+                lines.append(_LogFinding(
+                    "err",
+                    f"{test[0]} in {test[1]}",
+                    error=f"[exception]: {message}",
+                ))
+            else:
+                lines.append(_LogFinding("exception", message))
         elif (unit_test := gtest_failure(line)) is not None:
-            lines.append(("err", _gtest_cause(unit_test, plain[:index])))
+            lines.append(_LogFinding("err", _gtest_cause(unit_test, plain[:index])))
     return lines, False
 
 
@@ -255,7 +280,7 @@ def _exception_location(following: list[str]) -> str:
     """The test file the exception's Tcl stack first reaches past the framework, or ""."""
     in_stack = False
     for line in following:
-        frame = _TCL_FRAME_RE.match(line)
+        frame = _TCL_FRAME_RE.match(line) or _TCL_FILE_FRAME_RE.match(line)
         if frame is not None:
             in_stack = True
             if not _TCL_FRAMEWORK_RE.match(frame.group("file")):
@@ -266,6 +291,36 @@ def _exception_location(following: list[str]) -> str:
         if in_stack or _LOG_BOUNDARY_RE.match(line):
             break
     return ""
+
+
+def _exception_test(
+    before: list[str],
+    following: list[str],
+    file: str,
+) -> tuple[str, str] | None:
+    """The test whose Tcl invocation is in an exception stack, or None.
+
+    Tcl 8.5 errors can escape a ``test {name} { ... }`` body before runtest
+    emits its normal ``[err]: name in file`` result. The stack still quotes
+    that invocation and later names the sourced test file. When the latter is
+    absent, an exact matching ``### Starting test`` line supplies the file.
+    """
+    name = ""
+    for line in following:
+        if match := _TCL_TEST_INVOCATION_RE.match(line):
+            name = match.group("name")
+            break
+        if _LOG_BOUNDARY_RE.match(line):
+            break
+    if not name:
+        return None
+    if file:
+        return name, file
+    for line in reversed(before):
+        if match := _TEST_START_RE.match(line):
+            if match.group("name") == name:
+                return name, match.group("file")
+    return None
 
 
 def _report_cause(kind: str, first: str, following: list[str]) -> str:
