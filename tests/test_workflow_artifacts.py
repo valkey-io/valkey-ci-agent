@@ -3,11 +3,16 @@ from __future__ import annotations
 
 import io
 import zipfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from scripts.common.workflow_artifacts import ArtifactClient, _extract_zip
+from scripts.common.workflow_artifacts import (
+    ArtifactClient,
+    WorkflowArtifact,
+    _extract_zip,
+)
 
 
 def test_extract_zip_valid():
@@ -126,6 +131,32 @@ def test_list_run_artifacts_skips_malformed_entries():
     client = ArtifactClient(mock_gh, token="t")
     arts = client.list_run_artifacts("r", 99)
     assert [a.name for a in arts] == ["good"]
+
+
+def test_list_named_artifacts_includes_the_workflow_run():
+    artifacts = [
+        SimpleNamespace(
+            id=7,
+            name="ci-fix-plan-x",
+            size_in_bytes=123,
+            expired=False,
+            workflow_run=SimpleNamespace(id=99),
+        )
+    ]
+    mock_repo = MagicMock()
+    mock_repo.get_artifacts.return_value = artifacts
+    mock_gh = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+
+    listed = ArtifactClient(mock_gh, token="t").list_named_artifacts(
+        "o/r",
+        "ci-fix-plan-x",
+    )
+
+    assert listed == [
+        WorkflowArtifact(7, "ci-fix-plan-x", 123, False, run_id=99)
+    ]
+    mock_repo.get_artifacts.assert_called_once_with(name="ci-fix-plan-x")
 
 
 def _zip_with_unsupported_member(*, include_good: bool):

@@ -33,6 +33,7 @@ jobs:
   fix:
     if: github.repository == 'valkey-io/valkey-ci-agent'
     permissions:
+      actions: read
       contents: read
       id-token: write
     uses: ./.github/workflows/ci-fix-run.yml

@@ -54,6 +54,15 @@ class ResultKind(str, Enum):
     REFUSED = "refused"
     FAILED = "failed"
 
+    @property
+    def successful(self) -> bool:
+        """Whether the attempt published a fix worth reporting to the target."""
+        return self in (
+            type(self).PUSHED,
+            type(self).SUGGESTED,
+            type(self).OPENED,
+        )
+
 
 # A failed attempt (an agent crash, the time running out) says nothing about
 # the failure, so it is tried again, this many times in all, before every
@@ -282,9 +291,9 @@ class FixPlan:
     job_log: str = ""
     # ISSUE: the occurrence the issue records; publication rechecks it.
     issue: Optional[IssueFailure] = None
-    # PR: the command comment, which gets the outcome as a reaction.
+    # PR: the command comment, which gets a success reaction after publication.
     comment_id: int = 0
-    # FOLLOW-UP: the markers that retire the job once its result is terminal.
+    # FOLLOW-UP: successful-result markers and identities for silent attempts.
     markers: tuple[str, ...] = ()
 
 

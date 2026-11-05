@@ -56,6 +56,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
+      actions: read
       contents: read
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
@@ -88,7 +89,8 @@ jobs:
           owner: ${{ inputs.target_owner }}
           repositories: ${{ inputs.target_repo }}
           # The plan reads the PR, the run, its log and the workflow file,
-          # and answers on the PR or the issue: it writes nothing else.
+          # and reads target PR/issue state. It writes only when reporting a
+          # successfully recovered publication from an earlier attempt.
           permission-members: read
           permission-actions: read
           permission-contents: read
@@ -101,14 +103,16 @@ jobs:
         shell: bash
         env:
           TARGET_TOKEN: ${{ steps.target-token.outputs.token }}
+          AGENT_TOKEN: ${{ github.token }}
           FRONT_DOOR: ${{ inputs.front_door }}
           REQUEST: ${{ inputs.request }}
+          KEY: ${{ inputs.key }}
         run: |
           python -m scripts.ci_fix.run plan --front-door "${FRONT_DOOR}" \
-            --request "${REQUEST}" --out ci-fix-plan
+            --request "${REQUEST}" --out ci-fix-plan --key "${KEY}"
 
       - name: Upload the plan
-        if: hashFiles('ci-fix-plan/plan.json') != ''
+        if: always() && hashFiles('ci-fix-plan/plan.json') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-fix-plan-${{ inputs.key }}

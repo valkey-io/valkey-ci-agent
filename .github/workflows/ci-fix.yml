@@ -47,6 +47,7 @@ jobs:
   ci-fix:
     if: github.repository == 'valkey-io/valkey-ci-agent'
     permissions:
+      actions: read
       contents: read
       id-token: write
     concurrency:

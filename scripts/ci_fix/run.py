@@ -11,9 +11,9 @@ request's red head (:mod:`scripts.backport.ci_followup`).
 2. ``fix``: :func:`scripts.ci_fix.engine.prepare_fix`, inside that job after
    its own setup and build (``scripts/ci_fix/job.sh``), or on the bot's own
    runner. It holds no GitHub token.
-3. ``publish``: the candidate is published as its target says, and the
-   front door reports it (a draft PR and an issue comment, or a push or a suggestion and
-   a PR comment), also when the fix job failed or never finished.
+3. ``publish``: the candidate is published as its target says. A published
+   fix is reported on the target PR or issue; failures and refusals remain in
+   this repository's workflow logs and retry state.
 
 The plan, the resolved job and the fix's outcome pass between the jobs as
 JSON (:mod:`scripts.ci_fix.state`).
@@ -48,7 +48,7 @@ from scripts.ci_fix.models import (
 )
 from scripts.ci_fix.policy import allows_ci_changes
 from scripts.ci_fix.publish import publish_candidate
-from scripts.ci_fix.state import load, save
+from scripts.ci_fix.state import decode, load, save
 from scripts.common.git_auth import GitAuth
 from scripts.common.identity import APP_LOGIN
 from scripts.common.workflow_artifacts import ArtifactClient
@@ -59,6 +59,7 @@ PLAN_FILE = "plan.json"
 JOB_FILE = "job.json"
 SETUP_FILE = "setup.sh"
 OUTCOME_FILE = "outcome.json"
+_PRIOR_PLAN_ARTIFACTS = 20
 # How a detector issue's fix is published (models.IssuePublication): a
 # repository variable, so that the draft PRs can be turned on without a change.
 ISSUE_PUBLICATION_ENV = "CI_FIX_ISSUES_PUBLISH"
@@ -83,6 +84,7 @@ def plan(
     *,
     bot_login: str,
     out: Path,
+    prior_plans: tuple[FixPlan, ...] = (),
 ) -> dict[str, str]:
     """Plan one request; the workflow's outputs.
 
@@ -93,10 +95,17 @@ def plan(
     ``action``).
     """
     planner, reporter = _FRONT_DOORS[front_door]
-    planned = planner(gh, artifact_client, request, bot_login=bot_login)
+    planner_options: dict[str, Any] = {"bot_login": bot_login}
+    if front_door is FrontDoor.FOLLOW_UP:
+        planner_options["prior_plans"] = prior_plans
+    planned = planner(gh, artifact_client, request, **planner_options)
     if not isinstance(planned, FixPlan):
         print(json.dumps(planned, indent=2))
         return {"mode": "done", "action": str(planned.get("action") or "")}
+    # This artifact is the retry ledger for silent follow-up failures. Save it
+    # before log download/job resolution, then replace it below with the bound
+    # plan that contains the job log.
+    save(out / PLAN_FILE, planned)
     try:
         return _plan_job(gh, artifact_client, planned, out)
     except Exception as exc:  # noqa: BLE001 - a planned request always gets a reported result
@@ -227,6 +236,43 @@ def publish_and_report(
     return reporter(gh, fix_plan, result)
 
 
+def load_prior_plans(
+    artifact_client: ArtifactClient,
+    repo_full_name: str,
+    artifact_name: str,
+    *,
+    current_run_id: int,
+) -> tuple[FixPlan, ...]:
+    """Load recent plans for one reusable-workflow key from agent artifacts."""
+    plans: list[FixPlan] = []
+    artifacts = artifact_client.list_named_artifacts(
+        repo_full_name,
+        artifact_name,
+        max_artifacts=_PRIOR_PLAN_ARTIFACTS,
+    )
+    for artifact in artifacts:
+        if artifact.expired or artifact.run_id == current_run_id:
+            continue
+        try:
+            files = artifact_client.download_artifact(
+                repo_full_name,
+                artifact.artifact_id,
+            )
+            payload = next(
+                data
+                for path, data in files.items()
+                if Path(path).name == PLAN_FILE
+            )
+            plans.append(decode(FixPlan, json.loads(payload)))
+        except (StopIteration, UnicodeDecodeError, ValueError, TypeError, KeyError) as exc:
+            logger.warning(
+                "Ignoring unreadable prior plan artifact %s: %s",
+                artifact.artifact_id,
+                exc,
+            )
+    return tuple(plans)
+
+
 def issue_publication() -> IssuePublication:
     """How a detector issue's fix is published, from the environment; a comment unless told otherwise."""
     value = os.environ.get(ISSUE_PUBLICATION_ENV, "").strip().lower()
@@ -246,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     plan_.add_argument("--front-door", required=True, choices=[door.value for door in FrontDoor])
     plan_.add_argument("--request", required=True, help="the front door's request, as JSON")
     plan_.add_argument("--out", required=True, type=Path)
+    plan_.add_argument("--key", default="", help="this fix's workflow artifact key")
     fix_ = commands.add_parser("fix", help="prepare the planned fix; needs no GitHub token")
     fix_.add_argument("--plan", required=True, type=Path)
     fix_.add_argument("--out", required=True, type=Path)
@@ -281,12 +328,29 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--request must be JSON")
         if not isinstance(request, dict):
             parser.error("--request must be a JSON object")
+        prior_plans: tuple[FixPlan, ...] = ()
+        agent_token = os.environ.get("AGENT_TOKEN", "")
+        agent_repo = os.environ.get("GITHUB_REPOSITORY", "")
+        if (
+            FrontDoor(args.front_door) is FrontDoor.FOLLOW_UP
+            and args.key
+            and agent_token
+            and agent_repo
+        ):
+            agent_gh = Github(auth=Auth.Token(agent_token))
+            prior_plans = load_prior_plans(
+                ArtifactClient(agent_gh, token=agent_token),
+                agent_repo,
+                f"ci-fix-plan-{args.key}",
+                current_run_id=int(os.environ.get("GITHUB_RUN_ID", "0") or 0),
+            )
         outputs = plan(
             gh, ArtifactClient(gh, token=token), FrontDoor(args.front_door), request,
-            bot_login=bot_login, out=args.out,
+            bot_login=bot_login, out=args.out, prior_plans=prior_plans,
         )
         _write_outputs(outputs)
-        return 1 if outputs.get("action") == ResultKind.FAILED.value else 0
+        action = outputs.get("action", "")
+        return 1 if action == ResultKind.FAILED.value else 0
 
     run_url = "{}/{}/actions/runs/{}".format(
         os.environ.get("GITHUB_SERVER_URL", "https://github.com"),

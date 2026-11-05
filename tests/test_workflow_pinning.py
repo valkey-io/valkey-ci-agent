@@ -344,7 +344,9 @@ def test_every_fix_front_door_runs_the_shared_fix():
                              ("ci-fix-issues.yml", "fix")):
         job = yaml.safe_load((Path(".github/workflows") / filename).read_text(encoding="utf-8"))["jobs"][job_id]
         assert job["uses"] == f"./{_RUN.as_posix()}", filename
-        assert job["permissions"] == {"contents": "read", "id-token": "write"}, filename
+        # actions: read lets the plan job read earlier plans, which record
+        # the failed attempts no comment does.
+        assert job["permissions"] == {"actions": "read", "contents": "read", "id-token": "write"}, filename
         # Exactly what the run declares, not every secret of the repository.
         assert job["secrets"] == {
             name: f"${{{{ secrets.{name} }}}}"
@@ -390,7 +392,9 @@ def test_only_the_plan_and_publish_jobs_hold_a_github_token():
             assert publish_step["env"]["TARGET_TOKEN"] == (
                 "${{ steps.ci-token.outputs.token || steps.target-token.outputs.token }}"
             )
-        assert jobs[job_id]["permissions"] == {"contents": "read"}, job_id
+        assert jobs[job_id]["permissions"] == {
+            **({"actions": "read"} if job_id == "plan" else {}), "contents": "read",
+        }, job_id
         assert jobs[job_id]["runs-on"] == "ubuntu-24.04", job_id
     assert _RUN.read_text(encoding="utf-8").count("actions/create-github-app-token@") == 3
     assert jobs["plan"]["outputs"]["ci_changes"] == "${{ steps.plan.outputs.ci_changes }}"
