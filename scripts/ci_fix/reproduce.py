@@ -103,9 +103,13 @@ class ReproPlan:
     valgrind: bool = False
     notes: tuple[str, ...] = ()
     tests: tuple[FailedTest, ...] = ()
+    # The failure is the job's build itself (``build_plan``): no test runs.
+    build_only: bool = False
 
     def command(self, loops: int, *, under_load: bool = False) -> str:
         """The build and test command; ``under_load`` busies every core around it."""
+        if self.build_only:
+            return self.build
         command = f"{self.build} && {self.test.replace(LOOPS, str(loops))}"
         return _CONTENTION.replace("@COMMAND@", command) if under_load else command
 
@@ -114,6 +118,8 @@ class ReproPlan:
         return VALGRIND_REPRO_LOOPS if self.valgrind else REPRO_LOOPS
 
     def verify_loops(self, reproduced_on_first_loop: bool) -> int:
+        if self.build_only:
+            return 1
         if self.valgrind:
             return VALGRIND_VERIFY_LOOPS
         return DETERMINISTIC_VERIFY_LOOPS if reproduced_on_first_loop else VERIFY_LOOPS
@@ -124,11 +130,13 @@ class ReproPlan:
         A build break, or a harness error outside the tests, is a failed
         command but not a failed test.
         """
+        if self.build_only:
+            return not result.passed and not result.timed_out
         return not result.passed and shows_failure_of(result.report, self.tests)
 
     def ran(self, result: TestRun) -> bool:
         """Whether ``result`` shows the planned tests running at all."""
-        return ran_tests(result.report, self.tests)
+        return self.build_only or ran_tests(result.report, self.tests)
 
 
 @dataclass(frozen=True)
@@ -405,6 +413,19 @@ def _selection(repo_dir: str, tests: tuple[FailedTest, ...], notes: list[str]) -
     return selection
 
 
+def build_plan(job: JobCommands) -> ReproPlan:
+    """The plan for a failure no test names: the failed job's own build.
+
+    A job that broke in its ``make`` step names no test, so there is nothing
+    to loop: the build failing on the unfixed code is the failure, and the
+    build passing with a change is its fix.
+    """
+    return ReproPlan(
+        build=_one_line_build(job.build), test="", build_only=True,
+        notes=("No test failed: the reproduction is the job's own build, and its compiler output is the failure.",),
+    )
+
+
 def reproduce(
     plan: ReproPlan,
     run: Callable[[str, int], TestRun],
@@ -415,9 +436,20 @@ def reproduce(
 
     ``run(command, timeout)`` runs one command. Attempts stop at ``deadline``
     (a ``time.monotonic()`` value); the build in the first run is the slow part.
+    A build plan runs once: a compiler gives the same answer every time.
     """
     attempts: list[str] = []
     plain = plan.command(1)
+    if plan.build_only:
+        result = run(plain, _remaining(deadline))
+        if plan.failed(result):
+            return Reproduction(ReproStatus.REPRODUCED, command=plain, output=result.output,
+                                deterministic=True, attempts=("the build failed",))
+        if result.passed:
+            return Reproduction(ReproStatus.NOT_REPRODUCED, command=plain, output=result.output,
+                                all_attempts_passed=True, attempts=("the build passed",))
+        return Reproduction(ReproStatus.UNRUNNABLE, command=plain, output=result.output,
+                            reason="the build did not finish")
     first = run(plain, _remaining(deadline))
     if plan.failed(first):
         # One failure may be a frequent flake; a second plain run tells.

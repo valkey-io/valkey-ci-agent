@@ -60,6 +60,7 @@ from scripts.ci_fix.reproduce import (
     ReproPlan,
     ReproStatus,
     TestRun,
+    build_plan,
     failure_report,
     plan_for,
     ran_tests,
@@ -339,6 +340,8 @@ def _establish(
     described = ""
     if run_test is not None:
         plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
+        if plan is None and not tests and job is not None and job.build:
+            plan = build_plan(job)
     if plan is not None:
         assert run_test is not None  # a plan is only made to be run
         logger.info("Reproducing with: %s", plan.command(1))
@@ -1027,7 +1030,8 @@ def _excerpt(output: str) -> str:
     if len(output) <= _TEST_OUTPUT_CHARS:
         return output
     tail = output[-_TEST_OUTPUT_CHARS // 2:]
-    found = [at for at in (output.find(marker) for marker in FAILURE_MARKERS) if at >= 0]
+    # A build break has no test report: its first compiler error says what broke.
+    found = [at for at in (output.find(marker) for marker in (*FAILURE_MARKERS, ": error: ")) if at >= 0]
     if not found:
         return output[-_TEST_OUTPUT_CHARS:]
     at = min(found)

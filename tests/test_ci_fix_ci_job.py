@@ -537,6 +537,18 @@ def test_the_setup_stops_at_the_first_failing_step_and_names_it(tmp_path):
     ]
 
 
+def test_a_failing_build_step_is_the_failure_to_fix_not_the_end_of_setup(tmp_path):
+    """A job that broke in make (a compile error) is what a build fix is for."""
+    spec = _spec(Step("make", "echo compiling\nfalse"), Step("after", "echo after"))
+
+    result = _drive(tmp_path, spec)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "compiling", "::warning::The job's build failed with exit status 1; the fix starts from that", "after",
+    ]
+
+
 @pytest.mark.parametrize(("shell", "passes"), [
     ("", True),  # bash -e: a failure inside a pipeline does not stop it
     ("bash", False),  # bash -o pipefail
