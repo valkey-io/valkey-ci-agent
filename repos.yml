@@ -20,8 +20,12 @@ repos:
     # previous candidate's -DLOG_REQ_RES flags from the shared worktree.
     # Rebuild the Lua engine from scratch: src/Makefile skips its sub-make
     # once the archive exists, and the sub-make does not track headers (9.1+).
+    # Build with libc malloc first, as the libc-malloc and sanitizer jobs do:
+    # the jemalloc headers include <stdbool.h>, so a file that uses bool
+    # without it compiles only with jemalloc (#5128 broke 8.0 and 8.1 so).
     build_commands:
       - "rm -f src/modules/lua/*.o src/modules/lua/*.a src/modules/lua/*.so"
+      - "make -j$(nproc) MALLOC=libc SERVER_CFLAGS='-Werror'"
       - "make -j$(nproc) BUILD_TLS=yes SERVER_CFLAGS='-Werror'"
     validation_profile: valkey-core
     generated_file_rules:
