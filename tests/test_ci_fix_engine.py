@@ -1356,6 +1356,43 @@ def test_in_a_jobs_checkout_only_what_the_agent_left_is_removed_before_verificat
     assert (job / "libbacktrace" / "configure").exists()
 
 
+def test_a_build_break_no_test_names_is_fixed_and_verified_by_the_jobs_build(tmp_path, monkeypatch):
+    """#5077: the job failed in make. The build is the reproduction and the check."""
+    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
+    source, head_sha = _source_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+    build = 'test "$(cat value.txt)" = right || { echo "value.c:1:5: error: unknown type name bool"; exit 2; }'
+    seen = []
+
+    def agent(task, repo_dir, job_log, **kwargs):
+        seen.append(kwargs["context"])
+        return _value_agent("right", command="")(task, repo_dir, job_log, **kwargs)
+
+    candidate = engine_mod.prepare_fix(
+        _task(head_sha), "make: *** [Makefile:6: all] Error 2", agent_func=agent,
+        job=JobCommands(build=build, runtest="./runtest"),
+    )
+
+    assert candidate.action is CandidateAction.PATCH
+    assert "the job's own build" in seen[0].reproduction and "the build failed" in seen[0].reproduction
+    assert "error: unknown type name bool" in seen[0].reproduction_output
+    assert f"the reproduction passed 1 loop(s): `{build}`" in candidate.verification
+
+
+def test_a_build_that_passes_when_no_test_names_the_failure_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
+    source, head_sha = _source_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+
+    candidate = engine_mod.prepare_fix(
+        _task(head_sha), "make: *** Error 2", agent_func=lambda *a, **k: pytest.fail("no edit"),
+        job=JobCommands(build="true", runtest="./runtest"),
+    )
+
+    assert candidate.action is CandidateAction.REFUSE
+    assert "every reproduction probe passed" in candidate.summary
+
+
 def test_a_jobs_checkout_at_another_commit_is_refused(tmp_path):
     source, _ = _source_repo(tmp_path)
     job = _job_checkout(tmp_path, source)

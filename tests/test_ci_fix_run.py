@@ -30,8 +30,9 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.state import load, save
+from scripts.ci_fix.state import encode, load, save
 from scripts.common.valkey_ci import Source
+from scripts.common.workflow_artifacts import WorkflowArtifact
 
 _BOT = "valkeyrie-ops[bot]"
 _HEAD = "b" * 40
@@ -178,7 +179,7 @@ def test_a_suggestion_is_never_run_in_a_job(front_door, workflows, tmp_path):
 
 
 def test_a_crash_after_the_plan_is_reported_as_a_failed_attempt(front_door, tmp_path):
-    """The publish job needs a plan to run: without this, nothing would be said."""
+    """The saved plan records the silent attempt even when planning later fails."""
     front_door.planned = _pr_plan()
 
     def unreadable(_repo, _job):
@@ -190,6 +191,7 @@ def test_a_crash_after_the_plan_is_reported_as_a_failed_attempt(front_door, tmp_
     assert outputs == {"mode": "done", "action": "failed"}
     (result,) = front_door.reported
     assert result.kind is ResultKind.FAILED and "the log download kept failing" in result.summary
+    assert load(tmp_path / run.PLAN_FILE, FixPlan) == front_door.planned
 
 
 @pytest.mark.parametrize(("final", "outputs"), [
@@ -413,7 +415,8 @@ def test_every_front_door_plans_publishes_and_reports():
     assert set(run._FRONT_DOORS) == set(FrontDoor)
 
 
-def test_the_cli_fails_for_a_failed_publication(monkeypatch):
+@pytest.mark.parametrize(("action", "exit_code"), [("failed", 1), ("refused", 0)])
+def test_the_cli_fails_only_for_failed_publication(monkeypatch, action, exit_code):
     class AuthContext:
         def __enter__(self):
             return self
@@ -427,9 +430,39 @@ def test_the_cli_fails_for_a_failed_publication(monkeypatch):
     monkeypatch.setenv("TARGET_TOKEN", "token")
     monkeypatch.setattr(run, "Github", lambda **_kwargs: MagicMock())
     monkeypatch.setattr(run, "GitAuth", lambda *_args, **_kwargs: AuthContext())
-    monkeypatch.setattr(run, "publish_and_report", lambda *_args, **_kwargs: {"action": "failed"})
+    monkeypatch.setattr(run, "publish_and_report", lambda *_args, **_kwargs: {"action": action})
 
-    assert run.main(["publish", "--plan", "plan", "--outcome", "outcome"]) == 1
+    assert run.main(["publish", "--plan", "plan", "--outcome", "outcome"]) == exit_code
+
+
+def test_prior_followup_plans_load_from_agent_artifacts() -> None:
+    plan = replace(_pr_plan(), front_door=FrontDoor.FOLLOW_UP)
+    client = MagicMock()
+    client.list_named_artifacts.return_value = [
+        WorkflowArtifact(1, "ci-fix-plan-x", 1, False, run_id=10),
+        WorkflowArtifact(2, "ci-fix-plan-x", 1, True, run_id=9),
+        WorkflowArtifact(3, "ci-fix-plan-x", 1, False, run_id=8),
+        WorkflowArtifact(4, "ci-fix-plan-x", 1, False, run_id=7),
+    ]
+    client.download_artifact.side_effect = [
+        {"plan.json": json.dumps(encode(plan)).encode()},
+        {"plan.json": b"{bad"},
+    ]
+
+    loaded = run.load_prior_plans(
+        client,
+        "o/agent",
+        "ci-fix-plan-x",
+        current_run_id=10,
+    )
+
+    assert loaded == (plan,)
+    client.list_named_artifacts.assert_called_once_with(
+        "o/agent",
+        "ci-fix-plan-x",
+        max_artifacts=run._PRIOR_PLAN_ARTIFACTS,
+    )
+    assert client.download_artifact.call_count == 2
 
 
 def test_a_publication_that_raises_is_reported_as_failed(front_door, monkeypatch, tmp_path):

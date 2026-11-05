@@ -114,12 +114,13 @@ def _marker(
 ):
     attempt_text = f" attempt={attempt}" if attempt is not None else ""
     key_text = f" key={key}" if key else ""
-    key_text += f" outcome={outcome}" if outcome else ""
+    outcome_text = f" outcome={outcome}" if outcome else ""
     return SimpleNamespace(
         user=SimpleNamespace(login=author),
         body=(
             "<!-- valkey-ci-agent:auto-ci-followup "
-            f"head={head} run={run}{attempt_text} job={job}{key_text} -->"
+            f"head={head} run={run}{attempt_text} job={job}"
+            f"{key_text}{outcome_text} -->"
         ),
     )
 
@@ -131,6 +132,7 @@ def _select(
     runs=None,
     jobs=None,
     entry=None,
+    prior_plans=(),
 ):
     pr = pr or _pr()
     runs = runs if runs is not None else [_run()]
@@ -162,6 +164,7 @@ def _select(
         repo_entry=entry or _entry(),
         target_branch="9.0",
         bot_login=_BOT,
+        prior_plans=prior_plans,
     )
     return target, reason, gh
 
@@ -500,16 +503,52 @@ def test_a_terminal_result_is_posted_with_the_marker_that_retires_the_job(monkey
     assert "<!-- valkey-ci-agent:auto-ci-followup" in body and " outcome=pushed -->" in body
 
 
-def test_a_failed_result_is_posted_with_a_failed_marker(monkeypatch) -> None:
+def test_a_failed_result_does_not_comment(monkeypatch) -> None:
     report, pr = _report(monkeypatch, ResultKind.FAILED)
 
     assert report["action"] == "failed"
+    assert pr.posted == []
+
+
+def test_a_refusal_is_posted_with_a_terminal_marker(monkeypatch) -> None:
+    report, pr = _report(monkeypatch, ResultKind.REFUSED)
+
+    assert report["action"] == "refused"
     (body,) = pr.posted
-    assert "<!-- valkey-ci-agent:auto-ci-followup" in body and " outcome=failed -->" in body
+    assert "result: the summary" in body
+    assert " outcome=refused -->" in body
+
+
+def test_failed_attempts_post_nothing_and_their_plans_bound_the_retries(monkeypatch) -> None:
+    """A failure is not commented on the PR; the plans of earlier runs record it."""
+    report, pr = _report(monkeypatch, ResultKind.FAILED)
+    assert report["action"] == "failed" and pr.posted == []
+
+    pr = _pr()
+    first = _plan(monkeypatch, _target(pr))
+    target, reason, _gh = _select(monkeypatch, pr=pr, prior_plans=(first,))
+    assert reason == "actionable" and target is not None
+
+    target, reason, _gh = _select(monkeypatch, pr=pr, prior_plans=(first, first))
+    assert target is None and reason == "no-unhandled-actionable-failures"
+
+
+def test_a_plan_whose_attempt_was_commented_is_not_counted_again(monkeypatch) -> None:
+    """A fix or refusal is already on the PR: its plan is not also a failed attempt."""
+    pr = _pr()
+    first = _plan(monkeypatch, _target(pr))
+    refused = tuple(
+        SimpleNamespace(user=SimpleNamespace(login=_BOT), body=marker.removesuffix(" -->") + " outcome=refused -->")
+        for marker in first.markers
+    )
+    target, reason, _gh = _select(
+        monkeypatch, pr=_pr(comments=refused), prior_plans=(first, first, first),
+    )
+    assert reason != "attempt-budget-exhausted"
 
 
 def test_a_job_that_keeps_failing_is_retried_a_bounded_number_of_times(monkeypatch) -> None:
-    """A failure says nothing about the job, so it is tried again, but not every hour forever."""
+    """Failure comments posted before failures went silent still count."""
     once = (_marker(run=10, job=3, outcome="failed"),)
     target, reason, _gh = _select(monkeypatch, pr=_pr(comments=once))
     assert reason == "actionable" and target is not None and target.job.id == 3

@@ -35,6 +35,7 @@ class WorkflowArtifact:
     name: str
     size_in_bytes: int
     expired: bool
+    run_id: int = 0
 
 
 class ArtifactClient:
@@ -91,6 +92,38 @@ class ArtifactClient:
             if isinstance(a, dict)
             and isinstance(a.get("id"), int)
             and isinstance(a.get("name"), str)
+        ]
+
+    def list_named_artifacts(
+        self,
+        repo_full_name: str,
+        name: str,
+        *,
+        max_artifacts: int = 20,
+    ) -> list[WorkflowArtifact]:
+        """List the newest artifacts named ``name`` across workflow runs."""
+        repo = self._gh.get_repo(repo_full_name)
+
+        def _fetch() -> list[Any]:
+            return list(islice(repo.get_artifacts(name=name), max_artifacts))
+
+        artifacts = retry_github_call(
+            _fetch,
+            retries=self._retries,
+            description=f"list artifacts named {name}",
+        )
+        return [
+            WorkflowArtifact(
+                artifact_id=int(artifact.id),
+                name=str(artifact.name),
+                size_in_bytes=int(getattr(artifact, "size_in_bytes", 0) or 0),
+                expired=bool(getattr(artifact, "expired", False)),
+                run_id=int(
+                    getattr(getattr(artifact, "workflow_run", None), "id", 0)
+                    or 0
+                ),
+            )
+            for artifact in artifacts
         ]
 
     def download_artifact(

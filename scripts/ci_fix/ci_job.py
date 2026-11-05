@@ -568,7 +568,10 @@ ci_fix_step() {
     exec ${ci_fix_shell} "${ci_fix_script}"
   )
   ci_fix_status=$?
-  if [ "${ci_fix_status}" -ne 0 ]; then
+  if [ "${ci_fix_status}" -ne 0 ] && [ "${ci_fix_name}" = make ]; then
+    # A build break is a failure to fix: the engine rebuilds and reproduces it.
+    echo "::warning::The job's build failed with exit status ${ci_fix_status}; the fix starts from that"
+  elif [ "${ci_fix_status}" -ne 0 ]; then
     echo "::error::The job's setup step '${ci_fix_name}' failed with exit status ${ci_fix_status}"
     exit "${ci_fix_status}"
   fi
@@ -585,7 +588,8 @@ _SHELL_COMMANDS = {"": "${ci_fix_default}", "bash": "bash --noprofile --norc -eo
 def setup_script(spec: JobSpec) -> str:
     """A POSIX ``sh`` script that runs ``spec``'s setup steps as GitHub runs them, in the job's env.
 
-    It stops at the first step that fails, naming it.
+    It stops at the first step that fails, naming it, except the job's
+    ``make`` step: a build break is what the fix is for.
     """
     lines = [_DRIVER.replace("@TITLE@", f"The setup steps of {spec.name}.").rstrip("\n"), ""]
     lines += [f"export {name}={_quoted(item)}" for name, item in spec.env.items()]

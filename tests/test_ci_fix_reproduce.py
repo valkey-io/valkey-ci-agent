@@ -13,6 +13,7 @@ from scripts.ci_fix.reproduce import (
     ReproPlan,
     ReproStatus,
     TestRun,
+    build_plan,
     failure_report,
     plan_for,
     ran_tests,
@@ -446,3 +447,21 @@ def test_in_a_valgrind_job_its_own_options_are_kept(checkout):
     plan = plan_for(checkout, (TEST,), scheduled=True, job=job)
 
     assert plan.valgrind and plan.test.count("--clients") == 1
+
+
+@pytest.mark.parametrize(("result", "status"), [
+    (TestRun(passed=False, output="hyperloglog.c:1224:5: error: unknown type name 'bool'"), ReproStatus.REPRODUCED),
+    (TestRun(passed=True, output="built"), ReproStatus.NOT_REPRODUCED),
+    (TestRun(passed=False, output="killed", timed_out=True), ReproStatus.UNRUNNABLE),
+])
+def test_a_build_break_is_reproduced_by_the_jobs_build_alone_and_once(result, status):
+    plan = build_plan(JobCommands(build="export CC=gcc\nmake MALLOC=libc", runtest="./runtest"))
+    commands = []
+
+    reproduction = reproduce(plan, lambda command, _timeout: commands.append(command) or result,
+                             deadline=time.monotonic() + 60)
+
+    assert commands == ['export CC=gcc && make -j"$(nproc)" MALLOC=libc']  # no runtest, no loops
+    assert reproduction.status is status
+    assert plan.verify_loops(True) == 1 and plan.command(10) == commands[0]
+    assert plan.ran(TestRun(passed=True, output="")) and not plan.tests

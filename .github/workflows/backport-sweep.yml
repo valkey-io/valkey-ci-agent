@@ -191,7 +191,9 @@ jobs:
         shell: bash
         run: |
           if [[ "${SWEEP_STATE_FILE:-}" == "${RUNNER_TEMP}/backport-sweep/state.json" ]]; then
-            rm -rf -- "${RUNNER_TEMP}/backport-sweep"
+            # Repository validation may use a container that leaves root-owned
+            # build artifacts in the prepared worktree.
+            sudo -n rm -rf -- "${RUNNER_TEMP}/backport-sweep"
           fi
 
       - name: Upload result
