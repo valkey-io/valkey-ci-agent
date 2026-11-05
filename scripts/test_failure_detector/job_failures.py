@@ -25,6 +25,7 @@ jobs are reported to the caller (``unexplained``) instead. One in a setup step
 
 from __future__ import annotations
 
+import ast
 import logging
 import re
 from dataclasses import dataclass, field
@@ -72,6 +73,16 @@ _SANITIZER_ERROR_RE = re.compile(r"(?P<error>ERROR: \w+Sanitizer: [\w-]+|runtime
 _SANITIZER_FRAME_RE = re.compile(r"^\s*#\d+ 0x[0-9a-f]+ in (?P<function>\S+)")
 _REPORT_FRAMES = 3
 _REPORT_LINES = 400
+# The reply-schema validator prints a stable error followed by the request and
+# response that disagreed with commands.def. It is not a runtest result, but it
+# is precise enough to file and reproduce instead of leaving the failed job
+# unexplained.
+_REPLY_SCHEMA_ERROR_RE = re.compile(
+    r"^JSON schema validation error on \S+: (?P<error>.+)$"
+)
+_REPLY_SCHEMA_ARGV_RE = re.compile(r"^argv: (?P<argv>\[.*\])$")
+_REPLY_SCHEMA_RESPONSE_RE = re.compile(r"^Response: (?P<response>.+)$")
+_REPLY_SCHEMA_LINES = 20
 # The leak check runtest runs at each server's shutdown is reported as a test
 # named by that server's pid ("Check for memory leaks (pid 4321)"). Like a
 # valgrind report it is not a test's own failure, and runtest's artifact
@@ -262,6 +273,14 @@ def _failure_summary(
                 lines.append(_LogFinding("exception", message))
         elif (unit_test := gtest_failure(line)) is not None:
             lines.append(_LogFinding("err", _gtest_cause(unit_test, plain[:index])))
+        elif match := _REPLY_SCHEMA_ERROR_RE.match(line):
+            lines.append(_LogFinding(
+                "err",
+                _reply_schema_cause(
+                    match.group("error"),
+                    plain[index + 1:index + 1 + _REPLY_SCHEMA_LINES],
+                ),
+            ))
     return lines, False
 
 
@@ -321,6 +340,50 @@ def _exception_test(
             if match.group("name") == name:
                 return name, match.group("file")
     return None
+
+
+def _reply_schema_cause(error: str, following: list[str]) -> str:
+    """A stable command-level cause from a reply-schema validator failure."""
+    argv: list[object] = []
+    response = ""
+    for line in following:
+        if match := _REPLY_SCHEMA_ARGV_RE.match(line):
+            try:
+                value = ast.literal_eval(match.group("argv"))
+            except (SyntaxError, ValueError):
+                value = []
+            if isinstance(value, list):
+                argv = value
+        elif match := _REPLY_SCHEMA_RESPONSE_RE.match(line):
+            response = match.group("response").strip()
+        if argv and response:
+            break
+    command = _reply_schema_command(argv)
+    cause = f"Reply schema validation failed{f' for {command}' if command else ''}: {error}"
+    if response:
+        cause += f" (response: {response[:160]})"
+    return cause
+
+
+def _reply_schema_command(argv: list[object]) -> str:
+    """The stable command identity in validator ``argv``, excluding data keys."""
+    tokens = [str(value) for value in argv]
+    if not tokens:
+        return ""
+    command = tokens[0].upper()
+    if len(tokens) < 2:
+        return command
+    subcommand = tokens[1].upper()
+    command_with_subcommand = {
+        "ACL", "CLIENT", "CLUSTER", "COMMAND", "CONFIG", "DEBUG", "FUNCTION",
+        "MEMORY", "MODULE", "SCRIPT", "SENTINEL", "XGROUP",
+    }
+    if command not in command_with_subcommand:
+        return command
+    command += f" {subcommand}"
+    if command == "CONFIG SET" and len(tokens) >= 3:
+        command += f" {tokens[2]}"
+    return command
 
 
 def _report_cause(kind: str, first: str, following: list[str]) -> str:

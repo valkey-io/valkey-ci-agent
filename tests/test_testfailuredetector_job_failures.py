@@ -338,6 +338,35 @@ def test_an_exception_inside_a_named_test_is_attributed_to_that_test():
     assert [ref.job for ref in tests[0].jobs] == ["test-macos-latest"]
 
 
+def test_a_reply_schema_mismatch_is_a_reproducible_job_failure():
+    """Daily run 41939533851: the validator named the command and bad response."""
+    log = (
+        "Processing /tmp/server.10512.47/stdout.reqres ...\n"
+        "JSON schema validation error on /tmp/server.10512.47/stdout.reqres: 'OK' was expected\n"
+        "\n"
+        "Failed validating 'const' in schema:\n"
+        "    {'const': 'OK'}\n"
+        "\n"
+        "On instance:\n"
+        "    None\n"
+        "argv: ['config', 'set', 'min-io-threads-avoid-copy-reply', '1']\n"
+        "Response: null\n"
+        "Schema: {\n"
+        '  "const": "OK"\n'
+        "}\n"
+        "Traceback (most recent call last):\n"
+    )
+
+    tests, (failure,) = _find([_job(1, "reply-schemas-validator")], {1: log})
+
+    assert tests == []
+    assert failure.summary == (
+        "[err]: Reply schema validation failed for CONFIG SET "
+        "min-io-threads-avoid-copy-reply: 'OK' was expected (response: null)",
+    )
+    assert [ref.job for ref in failure.jobs] == ["reply-schemas-validator"]
+
+
 def test_a_valgrind_report_is_identified_by_its_first_error_and_frames():
     def report(pid, function):
         return (
