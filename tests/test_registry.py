@@ -73,6 +73,15 @@ def test_valkey_registry_pins_clang_format_from_pypi():
     assert not any("apt-get install" in command and "clang-format" in command for command in setup)
 
 
+def test_valkey_registry_pins_tls_modes_for_shared_worktree():
+    project_root = Path(__file__).resolve().parents[1]
+    registry = load_registry(str(project_root / "repos.yml"))
+    valkey = next(entry for entry in registry.repos if entry.repo == "valkey-io/valkey")
+
+    assert "MALLOC=libc BUILD_TLS=no" in valkey.build_commands[1]
+    assert "BUILD_TLS=yes" in valkey.build_commands[2]
+
+
 class TestLoadRegistry:
     def test_valid_minimal(self, tmp_path):
         path = _write_registry(tmp_path, _minimal_registry())
