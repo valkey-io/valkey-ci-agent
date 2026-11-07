@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 # otherwise compromise the later publication step and its fresh GitHub token.
 _BUILD_ENV_ALLOWLIST = PROCESS_BASICS + NETWORK_ENV
 
+_DEFAULT_COMMAND_TIMEOUT_SECONDS = 1800
+_REQ_RES_VALIDATOR_TIMEOUT_SECONDS = 90 * 60
+_REQ_RES_VALIDATOR_COMMAND = "./utils/req-res-log-validator.py"
+
 
 def run_build_commands(
     repo_dir: str,
@@ -52,6 +56,7 @@ def run_build_commands(
     for index, command in enumerate(commands, start=1):
         logger.info("Running backport validation command %d/%d: %s", index, len(commands), command)
         started = time.monotonic()
+        timeout = _command_timeout_seconds(command)
         try:
             # Registry build commands are operator-controlled repo config, not
             # user input from PRs or issues; shell=True is intentional so repos
@@ -62,7 +67,7 @@ def run_build_commands(
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=1800,
+                timeout=timeout,
                 env=filter_env(_BUILD_ENV_ALLOWLIST),
             )
         except subprocess.TimeoutExpired as exc:
@@ -80,7 +85,7 @@ def run_build_commands(
                 part for part in [_tail_text(full_stdout), _tail_text(full_stderr)]
                 if part
             ).strip()
-            return False, summary or f"`{command}` timed out after 1800 seconds"
+            return False, summary or f"`{command}` timed out after {timeout} seconds"
         full_log_parts.append(
             _full_log_section(command, result.returncode, result.stdout, result.stderr)
         )
@@ -104,6 +109,17 @@ def run_build_commands(
     if log_path:
         Path(log_path).write_text("\n".join(full_log_parts), encoding="utf-8")
     return True, ""
+
+
+def _command_timeout_seconds(command: str) -> int:
+    """Give Valkey's long-running reply-schema validator a larger budget."""
+    normalized = command.strip()
+    if (
+        normalized == _REQ_RES_VALIDATOR_COMMAND
+        or normalized.startswith(f"{_REQ_RES_VALIDATOR_COMMAND} ")
+    ):
+        return _REQ_RES_VALIDATOR_TIMEOUT_SECONDS
+    return _DEFAULT_COMMAND_TIMEOUT_SECONDS
 
 
 def _skipped_note(remaining: int) -> str:
