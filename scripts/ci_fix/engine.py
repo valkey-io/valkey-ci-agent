@@ -55,6 +55,7 @@ from scripts.ci_fix.prior_fixes import (
 )
 from scripts.ci_fix.push import PushFailed, PushRefused, check_port, cherry_pick_refusal
 from scripts.ci_fix.reproduce import (
+    ISOLATED_COPY_PATTERN,
     JobCommands,
     Reproduction,
     ReproPlan,
@@ -62,6 +63,7 @@ from scripts.ci_fix.reproduce import (
     TestRun,
     build_plan,
     failure_report,
+    matches_ci,
     plan_for,
     ran_tests,
     reproduce,
@@ -106,6 +108,8 @@ _MIN_ROUND_S = 8 * 60
 # verification (looped tests, possibly under valgrind) and review come after it.
 _VERIFY_RESERVE_S = 10 * 60
 _TEST_OUTPUT_CHARS = 6_000
+# A make that stopped on an error; ``make[1]: [...] Error 2 (ignored)`` is not one.
+_BUILD_BROKE_RE = re.compile(r"make(?:\[\d+\])?: \*\*\* .*Error \d+")
 # At most this many of a job's failing tests are searched for and reproduced.
 _MAX_TESTS = 3
 
@@ -166,7 +170,7 @@ def prepare_fix(
         context, plan, reproduction = _establish(
             task, repo_dir, tests, paths_in_log(repo_dir, job_log),
             run_test if runs_tests else None,
-            repro_deadline=min(deadline, time.monotonic() + REPRO_BUDGET_S), job=job,
+            repro_deadline=min(deadline, time.monotonic() + REPRO_BUDGET_S), job=job, job_log=job_log,
         )
         if runs_tests:
             refusal = _reproduction_refusal(context, plan, reproduction)
@@ -330,6 +334,7 @@ def _establish(
     *,
     repro_deadline: float,
     job: JobCommands | None = None,
+    job_log: str = "",
 ) -> tuple[FixContext, ReproPlan | None, Reproduction | None]:
     """Reproduce the failure and search for existing fixes, before any edit.
 
@@ -340,10 +345,11 @@ def _establish(
     described = ""
     if run_test is not None:
         plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
-        if plan is None and not tests and job is not None and job.build:
+        if plan is None and not tests and job is not None and job.build and _BUILD_BROKE_RE.search(job_log):
             plan = build_plan(job)
     if plan is not None:
         assert run_test is not None  # a plan is only made to be run
+        _ignore_generated_copies(repo_dir)
         logger.info("Reproducing with: %s", plan.command(1))
         reproduction = reproduce(
             plan,
@@ -351,6 +357,19 @@ def _establish(
             deadline=repro_deadline,
         )
         logger.info("Reproduction: %s", reproduction.describe())
+        while reproduction.status is ReproStatus.UNRUNNABLE and plan.fallback is not None:
+            plan = plan.fallback
+            logger.info("Reproducing another way: %s", plan.command(1))
+            reproduction = reproduce(
+                plan,
+                lambda command, timeout: run_test(repo_dir, command, timeout),
+                deadline=repro_deadline,
+            )
+            if reproduction.reproduced and not matches_ci(plan, reproduction.output, job_log):
+                # The copy, not the code, may be what failed: try the whole file.
+                reproduction = replace(reproduction, status=ReproStatus.UNRUNNABLE,
+                                       reason="the test's own block failed differently from CI")
+            logger.info("Reproduction: %s", reproduction.describe())
         described = " ".join([reproduction.describe(), *plan.notes])
     history = failing_test_history(repo_dir, tests)
     found = find_prior_fixes(
@@ -373,6 +392,24 @@ def _establish(
         guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
     return context, plan, reproduction
+
+
+def _ignore_generated_copies(repo_dir: str) -> None:
+    """Keep a fallback's copy of a test file out of every patch, even a killed run's.
+
+    The run removes its copy when it ends; one killed by its timeout cannot,
+    and an untracked file would be part of the tree the patch is built from.
+    Ignored, it is not, and is removed before each verification instead.
+    """
+    exclude = Path(repo_dir) / ".git" / "info" / "exclude"
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if ISOLATED_COPY_PATTERN not in existing.splitlines():
+            exclude.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n")
+                               + ISOLATED_COPY_PATTERN + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not ignore generated test copies in %s: %s", repo_dir, exc)
 
 
 def guide_for(repo_full_name: str) -> str:
