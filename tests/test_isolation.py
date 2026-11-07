@@ -258,11 +258,26 @@ def credentialed():
     and a broken isolation would go unnoticed.
     """
     holder = subprocess.Popen(["sleep", "60"], env={**os.environ, "TARGET_TOKEN": "ghs_secret"})
-    environ = f"/proc/{holder.pid}/environ"
-    assert b"ghs_secret" in Path(environ).read_bytes()  # the workflow user can read it
-    yield environ
-    holder.kill()
-    holder.wait()
+    environ = Path(f"/proc/{holder.pid}/environ")
+    try:
+        deadline = time.monotonic() + 5
+        visible = b""
+        while time.monotonic() < deadline:
+            try:
+                visible = environ.read_bytes()
+            except FileNotFoundError:
+                visible = b""
+            if b"ghs_secret" in visible:
+                break
+            if holder.poll() is not None:
+                break
+            time.sleep(0.01)
+        assert b"ghs_secret" in visible  # the workflow user can read it
+        yield str(environ)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait()
 
 
 @needs_user
