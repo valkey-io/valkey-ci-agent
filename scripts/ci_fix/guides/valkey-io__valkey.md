@@ -41,8 +41,8 @@ Valgrind and sanitizer builds are many times slower; scale a wait with
 
 ## Running a test
 
-The reproduction section of your briefing names the exact command the bot
-used, with the job's own build; prefer it. In general:
+The verification section of your briefing names the exact command the bot
+checks your change with, with the job's own build; prefer it. In general:
 
 ```sh
 make -j"$(nproc)"

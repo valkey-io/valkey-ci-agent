@@ -25,26 +25,25 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.reproduce import Reproduction, ReproPlan, ReproStatus, TestRun
+from scripts.ci_fix.verification import TestRun, VerifyPlan
 from tests.git_helpers import git
-
-_REAL_REPRODUCTION_REFUSAL = engine_mod._reproduction_refusal
 
 
 @pytest.fixture(autouse=True)
 def _approving_review_and_no_tests(monkeypatch):
-    """Keep edit-loop tests focused on behavior after the reproduction gate.
+    """Keep edit-loop tests focused on the edit loop.
 
-    Tests of the gate restore the real refusal function through ``_with_plan``.
+    Tests of the "cannot be checked" refusal restore it themselves.
     The real review and test runner start agents and processes; these tests use
     their own scripts directly instead.
     """
     monkeypatch.setattr(engine_mod, "review_candidate", lambda *a, **k: (True, "looks right"))
     monkeypatch.setattr(engine_mod, "isolated_user", lambda: "")
-    monkeypatch.setattr(engine_mod, "_reproduction_refusal", lambda *_args: None)
+    monkeypatch.setattr(engine_mod, "_unverifiable_refusal", lambda *_args: None)
 
 
 _LOG = "exact failed job log"
+_REAL_UNVERIFIABLE_REFUSAL = engine_mod._unverifiable_refusal
 
 
 def test_a_c_unit_tests_file_is_located_in_the_checkout(tmp_path):
@@ -112,10 +111,9 @@ def _install_clone(monkeypatch, source: Path):
     return calls
 
 
-def test_the_budget_fits_the_aws_session_and_leaves_a_round_after_reproduction() -> None:
+def test_the_budget_fits_the_aws_session_and_leaves_a_round_after_verification() -> None:
     assert engine_mod.PREPARE_BUDGET_S < engine_mod.AWS_SESSION_S
-    after_reproduction = engine_mod.PREPARE_BUDGET_S - engine_mod.REPRO_BUDGET_S
-    assert after_reproduction - engine_mod._VERIFY_RESERVE_S >= engine_mod._MIN_ROUND_S
+    assert engine_mod.PREPARE_BUDGET_S - engine_mod._VERIFY_RESERVE_S >= engine_mod._MIN_ROUND_S
 
 
 def test_prepare_fix_binds_exact_job_and_builds_binary_patch(tmp_path, monkeypatch) -> None:
@@ -546,12 +544,12 @@ def _prepare(tmp_path, monkeypatch, agent, *, kind=TargetKind.UPDATE_PR, review=
     )
 
 
-def test_a_fix_whose_test_fails_without_it_and_passes_with_it_is_accepted(tmp_path, monkeypatch):
+def test_a_fix_whose_test_passes_with_it_is_accepted(tmp_path, monkeypatch):
     agent = _value_agent("right")
     candidate = _prepare(tmp_path, monkeypatch, agent)
     assert candidate.action is CandidateAction.PATCH
     assert agent.feedback == [""]
-    assert "failed without the patch (on run 1) and passed 2 time(s) with it" in candidate.verification
+    assert 'With the fix, `test "$(cat value.txt)" = right` passed 2 time(s)' in candidate.verification
     assert "Review: fixes the stale value" in candidate.verification
 
 
@@ -564,12 +562,11 @@ def test_a_fix_whose_test_still_fails_goes_back_with_the_output(tmp_path, monkey
     assert "+right" in candidate.patch and "almost" not in candidate.patch
 
 
-def test_a_test_that_passes_without_the_fix_does_not_count(tmp_path, monkeypatch):
-    agent = _value_agent("right", "right", "right", command="true")
+def test_a_fix_whose_test_fails_with_it_goes_back(tmp_path, monkeypatch):
+    agent = _value_agent("almost", "right")
     candidate = _prepare(tmp_path, monkeypatch, agent)
-    assert candidate.action is CandidateAction.REFUSE
-    assert "passes 2 time(s) without your change" in agent.feedback[1]
-    assert "No candidate passed its test and review in 3 attempts" in candidate.summary
+    assert candidate.action is CandidateAction.PATCH
+    assert "failed on run 1 of 2" in agent.feedback[1]
 
 
 def test_a_rejected_review_goes_back_to_the_agent(tmp_path, monkeypatch):
@@ -592,7 +589,7 @@ def test_a_flaky_fix_must_pass_ten_times(tmp_path, monkeypatch):
 
     candidate = _prepare(tmp_path, monkeypatch, _value_agent("right", failure_type=FailureType.FLAKY), test=test)
     assert candidate.action is CandidateAction.PATCH
-    assert runs == ["before\n"] + ["right\n"] * engine_mod.FLAKY_TEST_RUNS
+    assert runs == ["right\n"] * engine_mod.FLAKY_TEST_RUNS
     assert f"passed {engine_mod.FLAKY_TEST_RUNS} time(s)" in candidate.verification
 
 
@@ -604,56 +601,35 @@ def test_a_suggestion_is_reviewed_but_its_code_is_never_run(tmp_path, monkeypatc
     assert test == []
 
 
-def _agent_command_check(monkeypatch, baseline, patched, *, tests=()):
-    """``_test_feedback`` with the unpatched runs giving ``baseline`` and the patched ones ``patched``."""
-    from contextlib import contextmanager
-
-    state = {"patched": True}
-
-    @contextmanager
-    def without_patch(_repo_dir, _patch):
-        state["patched"] = False
-        try:
-            yield
-        finally:
-            state["patched"] = True
-
-    monkeypatch.setattr(engine_mod, "_without_patch", without_patch)
-    candidate = FixCandidate(action=CandidateAction.PATCH, test_command="./runtest --single unit/value")
+def _agent_command_check(monkeypatch, patched, *, tests=()):
+    """``_test_feedback`` with every run of the patched code giving ``patched``."""
+    candidate = FixCandidate(action=CandidateAction.PATCH, test_command="./runtest --single unit/value", patch="p")
     checks = []
     feedback = engine_mod._test_feedback(
-        candidate, "repo", lambda *_a: patched if state["patched"] else baseline,
-        engine_mod.time.monotonic() + 3600, checks, tests,
+        candidate, "/repo", lambda *_args: patched, time.monotonic() + 600, checks, tests,
     )
     return feedback, checks
 
 
-def test_an_agent_command_killed_for_time_is_not_a_reproduction(monkeypatch):
-    feedback, checks = _agent_command_check(
-        monkeypatch, TestRun(False, "timed out after 60s", timed_out=True), TestRun(True, ""),
-    )
-    assert "did not finish" in feedback and checks == []
+def test_an_agent_command_killed_for_time_is_a_failed_attempt(monkeypatch):
+    with pytest.raises(RuntimeError, match="did not finish"):
+        _agent_command_check(monkeypatch, TestRun(False, "timed out after 60s", timed_out=True))
 
 
 def test_an_agent_command_must_run_the_failing_test_with_the_patch(monkeypatch):
     test = FailedTest("value is right", "tests/unit/value.tcl")
-    failing = TestRun(False, "", "[err]: value is right in tests/unit/value.tcl")
     renamed = TestRun(True, "", "[ok]: value is renamed (1 ms)")
-    feedback, checks = _agent_command_check(monkeypatch, failing, renamed, tests=(test,))
+    feedback, checks = _agent_command_check(monkeypatch, renamed, tests=(test,))
     assert "without running the failing test" in feedback and checks == []
 
     ran = TestRun(True, "", "[ok]: value is right (1 ms)")
-    feedback, checks = _agent_command_check(monkeypatch, failing, ran, tests=(test,))
+    feedback, checks = _agent_command_check(monkeypatch, ran, tests=(test,))
     assert feedback == "" and checks
 
 
-def test_an_agent_command_that_is_not_runtest_is_judged_by_its_exit_status(monkeypatch):
-    """A gtest or other command names no runtest test; its exit status is the result."""
-    test = FailedTest("value is right", "tests/unit/value.tcl")
-    feedback, checks = _agent_command_check(
-        monkeypatch, TestRun(False, "[  FAILED  ] ValueTest.Right"), TestRun(True, "[  PASSED  ] 1 test"),
-        tests=(test,),
-    )
+def test_an_agent_command_is_judged_by_its_exit_status_without_named_tests(monkeypatch):
+    """A gtest or other command, with no runtest test to look for: its exit status is the result."""
+    feedback, checks = _agent_command_check(monkeypatch, TestRun(True, "[  PASSED  ] 1 test"))
     assert feedback == "" and checks
 
 
@@ -671,11 +647,11 @@ def test_no_new_round_starts_without_time_to_finish_it(tmp_path, monkeypatch):
     assert len(agent.feedback) == 1
 
 
-# --- existing fixes and reproduction before the agent starts -----------------
+# --- existing fixes, and the command that verifies the patch -----------------
 
 from scripts.ci_fix.models import FailedTest  # noqa: E402
 from scripts.ci_fix.prior_fixes import PriorFix  # noqa: E402
-from scripts.ci_fix.reproduce import LOOPS, ReproPlan  # noqa: E402
+from scripts.ci_fix.verification import LOOPS, VerifyPlan  # noqa: E402
 
 _LOG_WITH_FAILURE = (
     "2026-10-15T01:33:46.2219673Z [err]: value is right in tests/unit/value.tcl\n"
@@ -684,15 +660,13 @@ _LOG_WITH_FAILURE = (
 
 
 def _with_plan(monkeypatch, seen=None):
-    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
-
     def plan_for(repo_dir, tests, *, scheduled, job=None):
         if seen is not None:
             seen.update(tests=tests, scheduled=scheduled, job=job)
         # The loop count rides along as an argument, not a comment: under load
         # the whole command is one line, where a comment would hide its end.
         notes = ("The failed job could not host the fix, so a plain build stands in for it.",) if job is None else ()
-        return ReproPlan(
+        return VerifyPlan(
             build="true",
             test=f'test "$(head -1 value.txt)" = right && : loops={LOOPS}',
             notes=notes,
@@ -702,18 +676,17 @@ def _with_plan(monkeypatch, seen=None):
     monkeypatch.setattr(engine_mod, "plan_for", plan_for)
 
 
-def test_no_code_owned_reproduction_plan_stops_before_the_agent(tmp_path, monkeypatch):
+def test_without_a_verification_plan_no_fix_is_attempted(tmp_path, monkeypatch):
+    """A fix the bot publishes as tested must run; review alone is not a check."""
+    monkeypatch.setattr(engine_mod, "_unverifiable_refusal", _REAL_UNVERIFIABLE_REFUSAL)
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
-    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
     monkeypatch.setattr(engine_mod, "plan_for", lambda *_args, **_kwargs: None)
-    agent = MagicMock(side_effect=AssertionError("the edit agent must not run"))
 
-    candidate = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
+    candidate = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=lambda *a, **k: pytest.fail("no edit"))
 
     assert candidate.action is CandidateAction.REFUSE
-    assert "no code-owned reproduction command could be established" in candidate.summary
-    agent.assert_not_called()
+    assert "could not be checked" in candidate.summary
 
 
 def _runs_value_check(results):
@@ -730,7 +703,8 @@ def _runs_value_check(results):
     return run
 
 
-def test_the_failure_is_reproduced_first_and_the_fix_verified_with_the_same_command(tmp_path, monkeypatch):
+def test_the_fix_is_verified_with_the_jobs_command(tmp_path, monkeypatch):
+    """CI's failure is the evidence: the unfixed code is never run, only the patched one."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     seen, runs = {}, []
@@ -751,16 +725,13 @@ def test_the_failure_is_reproduced_first_and_the_fix_verified_with_the_same_comm
 
     assert candidate.action is CandidateAction.PATCH
     assert seen["tests"] == (FailedTest("value is right", "tests/unit/value.tcl"),)
-    # Reproduced on the unfixed code before the agent ran; verified with the fix.
-    # Reproduced twice on the unfixed code (so not a lucky flake), verified with the fix.
-    assert runs == [("before", "1"), ("before", "1"), ("right", "10")]
-    assert contexts[0].reproduction.startswith("Reproduced on every run")
+    assert runs == [("right", "40")]  # only with the fix
+    assert contexts[0].verification.startswith("Code checks your change with")
     assert contexts[0].verified_by_code
-    assert "Reproduced on every run" in candidate.verification
-    assert "the reproduction passed 10 loop(s)" in candidate.verification
+    assert "passed 40 loop(s)" in candidate.verification
 
 
-def test_a_detector_issue_for_a_c_unit_test_is_reproduced_with_gtest_and_the_fix_verified(tmp_path, monkeypatch):
+def test_a_detector_issue_for_a_c_unit_test_is_verified_with_gtest(tmp_path, monkeypatch):
     """The whole path: the issue's test, located in the checkout, repeated by name with the real planner."""
     source, head_sha = _source_repo(tmp_path)
     (source / "src" / "unit").mkdir(parents=True)
@@ -798,13 +769,12 @@ def test_a_detector_issue_for_a_c_unit_test_is_reproduced_with_gtest_and_the_fix
     candidate = engine_mod.prepare_fix(task, _LOG, agent_func=recording_agent, test_func=gtest_runner)
 
     assert candidate.action is CandidateAction.PATCH
-    assert runs == [("before", "1"), ("before", "1"), ("right", "10")]
-    assert contexts[0].reproduction.startswith("Reproduced on every run with `make")
-    assert "--repeat=1 --gtest_filter=Crc64Test.TestCrc64)`" in contexts[0].reproduction
-    assert "the reproduction passed 10 loop(s)" in candidate.verification
+    assert runs == [("right", "40")]
+    assert "--repeat=40 --gtest_filter=Crc64Test.TestCrc64)`" in contexts[0].verification
+    assert "passed 40 loop(s)" in candidate.verification
 
 
-def test_a_flake_that_failed_both_plain_runs_is_still_verified_as_a_flake(tmp_path, monkeypatch):
+def test_a_flaky_fix_is_verified_with_a_flakes_loops(tmp_path, monkeypatch):
     from scripts.ci_fix.models import FailureType
 
     source, head_sha = _source_repo(tmp_path)
@@ -819,12 +789,10 @@ def test_a_flake_that_failed_both_plain_runs_is_still_verified_as_a_flake(tmp_pa
     )
 
     assert candidate.action is CandidateAction.PATCH
-    # Both plain runs failed, but the agent judged it flaky: a flake's loops.
-    assert runs == [("before", "1"), ("before", "1"), ("right", "40")]
-    assert "the reproduction passed 40 loop(s)" in candidate.verification
+    assert runs == [("right", "40")]
 
 
-def test_a_fix_that_does_not_stop_the_reproduction_goes_back(tmp_path, monkeypatch):
+def test_a_fix_that_does_not_stop_the_failure_goes_back(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     _with_plan(monkeypatch)
@@ -836,60 +804,7 @@ def test_a_fix_that_does_not_stop_the_reproduction_goes_back(tmp_path, monkeypat
     )
 
     assert candidate.action is CandidateAction.PATCH
-    assert "the reproduction still fails within 10 loop(s)" in agent.feedback[1]
-
-
-@pytest.mark.parametrize("job", [None, JobCommands(build="make", runtest="./runtest")])
-def test_a_planned_failure_that_does_not_reproduce_stops_before_the_agent(
-    tmp_path, monkeypatch, job,
-):
-    source, head_sha = _source_repo(tmp_path)
-    (source / "value.txt").write_text("right\n", encoding="utf-8")
-    git(source, "commit", "-qam", "already right")
-    head_sha = git(source, "rev-parse", "HEAD")
-    _install_clone(monkeypatch, source)
-    _with_plan(monkeypatch)
-    runs = []
-    agent = MagicMock(side_effect=AssertionError("the edit agent must not run"))
-
-    candidate = engine_mod.prepare_fix(
-        _task(head_sha), _LOG_WITH_FAILURE,
-        agent_func=agent,
-        test_func=_runs_value_check(runs),
-        job=job,
-    )
-
-    assert candidate.action is CandidateAction.REFUSE
-    assert "every reproduction probe passed" in candidate.summary
-    assert [loops for _value, loops in runs] == ["1", "20", "20"]
-    assert "Did not reproduce" in candidate.verification
-    agent.assert_not_called()
-
-
-def test_an_incomplete_nonreproduction_stops_before_the_agent(tmp_path, monkeypatch):
-    source, head_sha = _source_repo(tmp_path)
-    (source / "value.txt").write_text("right\n", encoding="utf-8")
-    git(source, "commit", "-qam", "already right")
-    head_sha = git(source, "rev-parse", "HEAD")
-    _install_clone(monkeypatch, source)
-    _with_plan(monkeypatch)
-    runs = iter([
-        TestRun(True, "", "[ok]: value is right (1 ms)"),
-        TestRun(False, "timed out after 60s", timed_out=True),
-        TestRun(True, "", "[ok]: value is right (1 ms)"),
-    ])
-    agent = MagicMock(side_effect=AssertionError("the edit agent must not run"))
-
-    candidate = engine_mod.prepare_fix(
-        _task(head_sha), _LOG_WITH_FAILURE,
-        agent_func=agent,
-        test_func=lambda *_args: next(runs),
-    )
-
-    assert candidate.action is CandidateAction.REFUSE
-    assert "reproduction stopped without reproducing" in candidate.summary
-    assert "20 loops did not finish" in candidate.verification
-    agent.assert_not_called()
+    assert "the failing test still fails within 40 loop(s)" in agent.feedback[1]
 
 
 def test_existing_fixes_and_the_test_guide_reach_the_agent_and_the_report(tmp_path, monkeypatch):
@@ -936,8 +851,6 @@ def test_a_fix_that_skips_the_failing_test_is_sent_back(tmp_path, monkeypatch):
     _install_clone(monkeypatch, source)
     _with_plan(monkeypatch)
     calls = iter([
-        TestRun(False, "", "[err]: value is right in tests/unit/value.tcl"),  # reproduction,
-        TestRun(False, "", "[err]: value is right in tests/unit/value.tcl"),  # confirmed
         TestRun(True, "", ""),  # with the fix: nothing ran
         TestRun(True, "", "[ok]: value is right (1 ms)"),
     ])
@@ -957,8 +870,6 @@ def test_a_harness_error_with_the_fix_is_not_reported_as_the_same_failure(tmp_pa
     _install_clone(monkeypatch, source)
     _with_plan(monkeypatch)
     calls = iter([
-        TestRun(False, "", "[err]: value is right in tests/unit/value.tcl"),
-        TestRun(False, "", "[err]: value is right in tests/unit/value.tcl"),
         TestRun(False, "", "[exception]: Executing test client: broken pipe"),
         TestRun(True, "", "[ok]: value is right (1 ms)"),
     ])
@@ -1182,7 +1093,7 @@ def test_a_merge_commit_port_is_refused_before_a_round_is_spent_on_it(tmp_path, 
     assert "merge commits require an explicit mainline parent" in agent.feedback[1]
 
 
-def test_a_detector_issue_reproduces_only_its_own_test(tmp_path, monkeypatch):
+def test_a_detector_issue_verifies_only_its_own_test(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     seen = {}
@@ -1203,8 +1114,6 @@ def test_a_verification_that_runs_out_of_time_is_a_failed_attempt(tmp_path, monk
     _install_clone(monkeypatch, source)
     _with_plan(monkeypatch)
     calls = iter([
-        TestRun(False, "", "[err]: value is right in tests/unit/value.tcl"),
-        TestRun(False, "", "[err]: value is right in tests/unit/value.tcl"),
         TestRun(False, "timed out after 60s", timed_out=True),
         TestRun(True, "", "[ok]: value is right (1 ms)"),
     ])
@@ -1249,7 +1158,7 @@ def _only_tests_pass(repo_dir, command, _timeout=None):
     """Pass when every test the command selects has a good line in the tree."""
     import re as _re
 
-    from scripts.ci_fix.reproduce import TestRun
+    from scripts.ci_fix.verification import TestRun
 
     names = _re.findall(r"--only (?:'([^']*)'|(\S+))", command)
     names = [quoted or bare for quoted, bare in names]
@@ -1283,18 +1192,18 @@ def _prepare_with_others(tmp_path, monkeypatch, others):
     )
 
 
-def test_another_issue_is_claimed_only_after_its_own_test_is_verified(tmp_path, monkeypatch):
+def test_another_issue_whose_test_passes_with_the_patch_is_touched_not_claimed(tmp_path, monkeypatch):
     candidate = _prepare_with_others(tmp_path, monkeypatch, [(11, "B")])
     assert candidate.action is CandidateAction.PATCH
-    assert (candidate.also_fixes, candidate.also_touches) == ((11,), ())
-    assert "Also fixes issue #11: `B` failed without the patch and passed with it." in candidate.verification
+    assert (candidate.also_fixes, candidate.also_touches) == ((), (11,))
+    assert "The patch changes `B`, issue `#11`'s test, which passed 40 loop(s) with it." in candidate.verification
 
 
-def test_an_issue_whose_test_the_patch_does_not_fix_is_only_mentioned(tmp_path, monkeypatch):
-    # C is not in the file, so its reproduction never fails: nothing is shown.
+def test_an_issue_whose_test_does_not_pass_with_the_patch_is_only_mentioned(tmp_path, monkeypatch):
+    # C is not in the file, so its test never runs.
     candidate = _prepare_with_others(tmp_path, monkeypatch, [(12, "C")])
     assert (candidate.also_fixes, candidate.also_touches) == ((), (12,))
-    assert "The patch changes `C`, issue `#12`'s test, but it was not shown to fix it." in candidate.verification
+    assert "The patch changes `C`, issue `#12`'s test, which did not pass with it." in candidate.verification
     # Unlinked: a bare #12 would let this PR keep #12 from a fix of its own.
     assert "#12" not in candidate.verification.replace("`#12`", "")
 
@@ -1359,8 +1268,7 @@ def test_in_a_jobs_checkout_only_what_the_agent_left_is_removed_before_verificat
 
 
 def test_a_build_break_no_test_names_is_fixed_and_verified_by_the_jobs_build(tmp_path, monkeypatch):
-    """#5077: the job failed in make. The build is the reproduction and the check."""
-    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
+    """#5077: the job failed in make. The job's build is the check."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     build = 'test "$(cat value.txt)" = right || { echo "value.c:1:5: error: unknown type name bool"; exit 2; }'
@@ -1376,14 +1284,13 @@ def test_a_build_break_no_test_names_is_fixed_and_verified_by_the_jobs_build(tmp
     )
 
     assert candidate.action is CandidateAction.PATCH
-    assert "the job's own build" in seen[0].reproduction and "the build failed" in seen[0].reproduction
-    assert "error: unknown type name bool" in seen[0].reproduction_output
-    assert f"the reproduction passed 1 loop(s): `{build}`" in candidate.verification
+    assert f"`{build}` (1 loop(s))" in seen[0].verification
+    assert f"`{build}` passed 1 loop(s)" in candidate.verification
 
 
 def test_a_job_that_did_not_break_in_make_gets_no_build_plan(tmp_path, monkeypatch):
     """A reply-schema validator failure names no test either, but its build passed (#5306)."""
-    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
+    monkeypatch.setattr(engine_mod, "_unverifiable_refusal", _REAL_UNVERIFIABLE_REFUSAL)
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
 
@@ -1392,43 +1299,44 @@ def test_a_job_that_did_not_break_in_make_gets_no_build_plan(tmp_path, monkeypat
         agent_func=lambda *a, **k: pytest.fail("no edit"), job=JobCommands(build="false", runtest="./runtest"),
     )
 
-    assert candidate.action is CandidateAction.REFUSE
-    assert "no code-owned reproduction command" in candidate.summary
+    assert candidate.action is CandidateAction.REFUSE and "could not be checked" in candidate.summary
 
 
-def test_an_unrunnable_reproduction_falls_back_to_the_block_then_the_whole_file(tmp_path, monkeypatch):
+def _chain():
+    test = FailedTest("t", "tests/unit/a.tcl")
+    whole = VerifyPlan(build="make", test="whole", tests=(test,), single_run=True, attributed=True)
+    isolated = VerifyPlan(build="make", test="isolated", tests=(test,), fallback=whole, attributed=True)
+    return VerifyPlan(build="make", test="only", tests=(test,), fallback=isolated)
+
+
+def test_a_test_that_fails_under_only_is_verified_in_its_own_block(tmp_path):
+    """#5073: with --only the setup is skipped and the test always fails; in its block it passes."""
+    seen, checks = [], []
+    results = {"only": TestRun(False, "", "[err]: t in tests/unit/a.tcl"),
+               "isolated": TestRun(True, "", "[ok]: t (1 ms)")}
+
+    def run(_repo, command, _timeout):
+        name = command.split(" && ")[-1].split()[0]
+        seen.append(name)
+        return results[name]
+
+    feedback = engine_mod._verify_with_plan(_chain(), str(tmp_path), run, time.monotonic() + 600, checks)
+
+    assert feedback == "" and seen == ["only", "isolated"]
+    assert "`make && isolated` passed 40 loop(s)" in checks[0]
+
+
+def test_a_patch_that_fails_every_way_gets_the_last_runs_feedback(tmp_path):
     seen = []
-    whole = ReproPlan(build="make", test="whole", tests=(), single_run=True)
-    isolated = ReproPlan(build="make", test="isolated", tests=(), fallback=whole)
-    plan = ReproPlan(build="make", test="only", tests=(), fallback=isolated)
-    monkeypatch.setattr(engine_mod, "plan_for", lambda *a, **k: plan)
 
-    def fake_reproduce(selected, run, *, deadline):
-        seen.append(selected.test)
-        status = ReproStatus.REPRODUCED if selected is whole else ReproStatus.UNRUNNABLE
-        return Reproduction(status, command=selected.test)
+    def run(_repo, command, _timeout):
+        seen.append(command.split(" && ")[-1].split()[0])
+        return TestRun(False, "boom", "[err]: t in tests/unit/a.tcl")
 
-    monkeypatch.setattr(engine_mod, "reproduce", fake_reproduce)
-    _context, chosen, reproduction = engine_mod._establish(
-        _task("a" * 40), str(tmp_path), (), (), lambda *a: None, repro_deadline=time.monotonic() + 60,
-    )
+    feedback = engine_mod._verify_with_plan(_chain(), str(tmp_path), run, time.monotonic() + 600, [])
 
     assert seen == ["only", "isolated", "whole"]
-    assert chosen is whole and reproduction.reproduced
-
-
-def test_a_build_that_passes_when_no_test_names_the_failure_is_refused(tmp_path, monkeypatch):
-    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
-    source, head_sha = _source_repo(tmp_path)
-    _install_clone(monkeypatch, source)
-
-    candidate = engine_mod.prepare_fix(
-        _task(head_sha), "make: *** Error 2", agent_func=lambda *a, **k: pytest.fail("no edit"),
-        job=JobCommands(build="true", runtest="./runtest"),
-    )
-
-    assert candidate.action is CandidateAction.REFUSE
-    assert "every reproduction probe passed" in candidate.summary
+    assert "still fails within 1 loop(s): `make && whole`" in feedback
 
 
 def test_a_jobs_checkout_at_another_commit_is_refused(tmp_path):
@@ -1538,70 +1446,7 @@ def test_a_fallback_copy_a_killed_run_left_never_reaches_the_patch(tmp_path):
     assert exclude.count("tests/**/*.ci-fix-isolated.tcl") == 1
 
 
-def test_an_isolated_failure_unlike_cis_falls_through_to_the_whole_file(tmp_path, monkeypatch):
-    seen = []
-    whole = ReproPlan(build="make", test="whole", tests=(), single_run=True, attributed=True)
-    isolated = ReproPlan(build="make", test="isolated", tests=(), fallback=whole, attributed=True, isolated_block=True)
-    plan = ReproPlan(build="make", test="only", tests=(), fallback=isolated)
-    monkeypatch.setattr(engine_mod, "plan_for", lambda *a, **k: plan)
-    monkeypatch.setattr(engine_mod, "matches_ci", lambda selected, output, log: selected is not isolated)
-
-    def fake_reproduce(selected, run, *, deadline):
-        seen.append(selected.test)
-        status = ReproStatus.UNRUNNABLE if selected is plan else ReproStatus.REPRODUCED
-        return Reproduction(status, command=selected.test)
-
-    monkeypatch.setattr(engine_mod, "reproduce", fake_reproduce)
-    _context, chosen, reproduction = engine_mod._establish(
-        _task("a" * 40), str(tmp_path), (), (), lambda *a: None, repro_deadline=time.monotonic() + 60,
-    )
-
-    assert seen == ["only", "isolated", "whole"] and chosen is whole and reproduction.reproduced
-
-
 def test_verification_may_use_the_rest_of_the_deadline_not_one_commands_default():
     """#5301 and 9.2's 40-loop checks died at 1800s with hours of the session left."""
     assert engine_mod._timeout(time.monotonic() + 3 * 3600) > engine_mod.TEST_TIMEOUT_S
     assert engine_mod._timeout(time.monotonic() - 5) == 60
-
-
-def test_a_reproduction_that_cannot_run_is_a_failed_attempt_not_a_refusal():
-    """About the runner, not the test: retried and posted nowhere, unlike a refusal that retires it."""
-    plan = ReproPlan(build="make", test="t", tests=())
-    unrunnable = Reproduction(ReproStatus.UNRUNNABLE, command="t", reason="exited in 30s")
-
-    with pytest.raises(engine_mod.ReproductionUnrunnable, match="could not run"):
-        _REAL_REPRODUCTION_REFUSAL(FixContext(), plan, unrunnable)
-    passed = Reproduction(ReproStatus.NOT_REPRODUCED, command="t", all_attempts_passed=True)
-    assert _REAL_REPRODUCTION_REFUSAL(FixContext(), plan, passed).action is CandidateAction.REFUSE
-
-
-def test_a_block_that_passes_is_followed_by_one_whole_file_run(tmp_path, monkeypatch):
-    seen = []
-    whole = ReproPlan(build="make", test="whole", tests=(), single_run=True, attributed=True)
-    isolated = ReproPlan(build="make", test="isolated", tests=(), fallback=whole, attributed=True, isolated_block=True)
-    plan = ReproPlan(build="make", test="only", tests=(), fallback=isolated)
-    monkeypatch.setattr(engine_mod, "plan_for", lambda *a, **k: plan)
-    statuses = {"only": ReproStatus.UNRUNNABLE, "isolated": ReproStatus.NOT_REPRODUCED,
-                "whole": ReproStatus.REPRODUCED}
-    monkeypatch.setattr(engine_mod, "reproduce", lambda selected, run, *, deadline: (
-        seen.append(selected.test) or Reproduction(statuses[selected.test], command=selected.test)))
-
-    _context, chosen, reproduction = engine_mod._establish(
-        _task("a" * 40), str(tmp_path), (), (), lambda *a: None, repro_deadline=time.monotonic() + 60,
-    )
-
-    assert seen == ["only", "isolated", "whole"] and chosen is whole and reproduction.reproduced
-
-
-def test_the_reproduction_transcript_is_saved_for_the_runs_artifact(tmp_path, monkeypatch):
-    monkeypatch.setenv(engine_mod.EVIDENCE_DIR_ENV, str(tmp_path / "evidence"))
-    plan = ReproPlan(build="make", test="t", tests=(), notes=("a note",))
-    output = "\n".join(f"line {n}" for n in range(500)) + "\nwait_for_sync failed"
-
-    engine_mod._write_transcript(plan, Reproduction(ReproStatus.UNRUNNABLE, command="make && t",
-                                                    output=output, reason="exited in 30s"))
-
-    text = (tmp_path / "evidence" / "reproduction.md").read_text(encoding="utf-8")
-    assert "Status: unrunnable" in text and "Reason: exited in 30s" in text and "`make && t`" in text
-    assert "a note" in text and "wait_for_sync failed" in text and "line 100\n" not in text

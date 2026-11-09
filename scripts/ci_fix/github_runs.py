@@ -177,8 +177,8 @@ def failed_jobs(jobs: Iterable[Any]) -> list[FailedJob]:
 def job_priority(name: str) -> int:
     """Rank a failed job by how likely the bot is to fix it and show the fix works.
 
-    A test failure comes first: code reproduces it, and verifies the fix with
-    it. A formatting, lint or build job comes next. Its fix is often in the
+    A test failure comes first: code verifies the fix by running the failing
+    test. A formatting, lint or build job comes next. Its fix is often in the
     CI definition or the toolchain, which the bot changes only on a backport
     branch it owns, and a build break in the code also fails every test job,
     whose log shows it. A

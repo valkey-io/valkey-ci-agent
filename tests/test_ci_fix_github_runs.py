@@ -189,7 +189,7 @@ def test_a_whole_suite_schema_validator_is_not_ranked_as_a_build_break():
 
 def test_a_test_job_is_tried_before_the_lint_and_build_jobs_of_the_same_run():
     """A lint or build failure's fix is often in the CI definition, which the bot never
-    changes, while a test failure is reproduced and verified: the fork's follow-up spent
+    changes, while a test failure's fix is verified: the fork's follow-up spent
     two rounds on format-yaml and build-debian-old before it reached the test."""
     from scripts.ci_fix.github_runs import FailedJob, job_priority, select_job
 

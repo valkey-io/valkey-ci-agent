@@ -483,7 +483,7 @@ def test_every_type_a_fix_job_decodes_resolves_on_the_oldest_python_the_job_may_
     import dataclasses
     import typing
 
-    from scripts.ci_fix import ci_job, models, reproduce
+    from scripts.ci_fix import ci_job, models, verification
 
     def decoded(kind, seen):
         if kind in seen or not (isinstance(kind, type) and dataclasses.is_dataclass(kind)):
@@ -505,7 +505,7 @@ def test_every_type_a_fix_job_decodes_resolves_on_the_oldest_python_the_job_may_
                 for item in node.body:
                     if isinstance(item, ast.AnnAssign) and "|" in ast.unparse(item.annotation):
                         offenders.append(f"{kind.__name__}.{ast.unparse(item.target)}")
-    assert {models.Failure, ci_job.JobSpec, reproduce.JobCommands} <= seen
+    assert {models.Failure, ci_job.JobSpec, verification.JobCommands} <= seen
     assert offenders == []
 
 
@@ -514,9 +514,9 @@ def test_the_run_page_says_whether_a_fix_was_published(tmp_path, monkeypatch):
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
 
-    run.write_summary({"action": "refused", "summary": "Did not reproduce."})
+    run.write_summary({"action": "refused", "summary": "No safe fix."})
     run.write_summary({"action": "suggested", "summary": "Patched the test."})
 
     text = summary.read_text(encoding="utf-8")
-    assert "**refused** (no fix published)" in text and "Did not reproduce." in text
+    assert "**refused** (no fix published)" in text and "No safe fix." in text
     assert "**suggested** (a fix was published)" in text

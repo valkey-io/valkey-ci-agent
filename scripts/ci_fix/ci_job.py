@@ -385,7 +385,7 @@ def _build_command(exports: dict[str, str], script: str) -> str:
     """The ``make`` step as one command, with the environment it ran in.
 
     Without its comments: the fix runs these lines as one command
-    (scripts/ci_fix/reproduce.py), where a comment would hide the rest.
+    (scripts/ci_fix/verification.py), where a comment would hide the rest.
     Without the system setup the job already did as root: the fix rebuilds
     as an unprivileged account. A line continued with a backslash is one
     line, so that a dropped install does not leave its packages as a command.
@@ -569,7 +569,7 @@ ci_fix_step() {
   )
   ci_fix_status=$?
   if [ "${ci_fix_status}" -ne 0 ] && [ "${ci_fix_name}" = make ]; then
-    # A build break is a failure to fix: the engine rebuilds and reproduces it.
+    # A build break is a failure to fix: the fix is checked by building again.
     echo "::warning::The job's build failed with exit status ${ci_fix_status}; the fix starts from that"
   elif [ "${ci_fix_status}" -ne 0 ]; then
     echo "::error::The job's setup step '${ci_fix_name}' failed with exit status ${ci_fix_status}"

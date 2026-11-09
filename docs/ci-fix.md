@@ -66,11 +66,7 @@ same build flags and the same test command. Many failures only happen on one
 platform or with one build configuration, so this matters. When the job can't
 be recreated faithfully, for example because it runs in a VM or one of its
 steps depends on a secret, the bot works on a plain Ubuntu runner with a
-default build instead. If that fallback completes and passes once, in a loop,
-and under load without reproducing the failure, the bot reports that evidence
-and stops without asking Claude to edit for an environment it could not
-recreate. A timed-out, failed or skipped fallback attempt is incomplete, so
-Claude can still diagnose it from the log.
+default build instead.
 [How the failed job is recreated](#how-the-failed-job-is-recreated) has the
 details.
 
@@ -82,16 +78,13 @@ On a release branch, the answer is often a fix that already landed on
 new one. On `unstable`, a matching commit newer than the failure suggests the
 problem may already be fixed.
 
-**It tries to reproduce the failure.** For Tcl tests and C unit tests, the
-bot builds the code the way the job did and runs only the failing test. It
-runs it once, then in a loop of 20, then in the same loop with every CPU core
-kept busy, because a lot of flaky tests only fail under load. A run only
-counts as a reproduction if that test actually fails, or valgrind or a
-sanitizer reports an error. A broken build or a crash in the test harness
-doesn't count.
+**It works out how the fix will be checked.** The job's log is the evidence
+of what fails. The bot works out the command that will verify a fix (the
+job's own build and test command, for the failing test only) and tells
+Claude what it is.
 
 **Claude diagnoses and edits.** Claude gets the job's log, whatever the
-history search found, the result of the reproduction, and Valkey's testing
+history search found, the verification command, and Valkey's testing
 conventions: the bot's own guide in `scripts/ci_fix/guides/valkey-io__valkey.md`
 plus the repository's `tests/README.md` and contributor docs. It then does one
 of three things: ports an existing fix (preferred when one fits), writes a
@@ -107,16 +100,16 @@ commit or is already on the branch, or a suggested patch that is too large.
 ## How the fix is tested
 
 A fix for a bot PR or a detector issue has to pass a feedback loop before it
-is published. The loop runs at most three rounds and has an hour in total,
-of which reproducing the failure may take up to twenty minutes.
+is published. The loop runs at most three rounds within the fix's time
+budget, an hour of which is kept back for verification and review.
 
 In each round, a port is first cherry-picked into the code. If it conflicts,
 Claude can adapt it into a patch instead. Then the failing test is run again
-with the fix applied, in a loop, and under load if that is how it failed
-before: 10 times if it failed on every plain run, 40 times if it only failed
-sometimes or Claude judged it flaky, and 4 times under valgrind. If the bot
-never managed to reproduce the failure, Claude can supply its own test command
-instead, and that command has to fail without the fix and pass with it.
+with the fix applied, in a loop: 40 times, 4 under valgrind, once for a build
+break or a whole-file run. The test has to run and pass every loop. When it
+cannot pass alone (with `--only`, runtest skips the other tests but still
+runs the code between them, which may need what a skipped test set up), it
+is run in its own top-level block, then its whole file once.
 
 Finally a second Claude session, which can read the code but not change it,
 reviews the fix with the same conventions and test results in front of it,
@@ -126,15 +119,10 @@ next round. If the build or Claude's test command changes any tracked file
 while the fix is being tested, the fix that was tested is no longer the fix
 in the tree, so that also goes back for another round.
 
-A fix that doesn't pass within three rounds is declined. In the exact failed
-job, a failure the bot could never reproduce can still be fixed from the log,
-but the bot says clearly that the fix is unproven. When the exact job cannot
-host the fix and its plain-Ubuntu fallback runs successfully but never
-reproduces the failure across all three attempts, the fix agent is not
-launched. If any attempt does not finish, or there is not enough time to run
-it, diagnosis continues normally. If the bot runs out of time or crashes,
-that isn't treated as declining: the CI follow-up and detector issues get one
-more attempt at the same failure.
+A fix that doesn't pass within three rounds is declined. If the bot runs out
+of time or crashes, that isn't treated as declining: the CI follow-up and
+detector issues get one more attempt at the same failure, and nothing is
+posted about the failed attempt.
 
 Patches suggested on contributor PRs are reviewed but not run.
 
@@ -156,7 +144,7 @@ retried can never post a second patch.
 
 The fix is prepared on the current tip of the branch that Daily CI tested,
 normally `unstable`, using the original log and commit as evidence. Only the
-issue's own test is reproduced and checked. Other tests that failed in the
+issue's own test is checked. Other tests that failed in the
 same job have issues of their own.
 
 By default the bot posts the tested patch on the issue, together with the root
@@ -167,10 +155,8 @@ test fails again.
 If `CI_FIX_ISSUES_PUBLISH` is set to `draft-pr`, the bot instead pushes a
 branch named `agent/ci-fix/issue-<issue>-<run>` and opens a draft PR that says
 `Fixes #<issue>`. One test file often has several open issues, so if the patch
-touches the test of another open detector issue, the bot runs that issue's
-test as well. It only adds `Fixes` for that issue if the test fails without
-the patch and passes with it. Otherwise the issue is mentioned in the PR
-without closing it.
+touches the test of another open detector issue, the bot runs that test as
+well and mentions the issue in the PR, without closing it.
 
 ## How the failed job is recreated
 
@@ -215,9 +201,9 @@ create, so a prebuilt binary can't stand in for the real build.
 The bot pushes a change under `.github/` only to a backport branch it owns,
 where a release branch often needs an upstream CI fix; only that push gets a
 token with `workflows: write`. Anywhere else it refuses, and its tokens
-couldn't push one anyway. The PR's own CI and a maintainer's review always have the final
-say. The bot's comment lists everything it checked, including the history
-search and the reproduction.
+couldn't push one anyway. The PR's own CI and a maintainer's review always
+have the final say. The bot's comment lists everything it checked, including the history
+search and the verification.
 
 ## Running it by hand
 
@@ -270,7 +256,7 @@ backport PRs, is set per repository in [`repos.yml`](registry.md).
 
 Comment requests are currently limited to `valkey-io/valkey`. Most of the
 engine doesn't care which repository it works on, but recreating a job and
-reproducing a failure follow Valkey's `make` and `runtest` conventions, and
+verifying a fix follow Valkey's `make` and `runtest` conventions, and
 another repository would need its own tokens and triggers.
 
 ## Where the code lives
@@ -292,13 +278,8 @@ issues.
 
 `ci_job.py` reads the workflow file and writes the script that replays a
 job's setup, and `job.sh` runs the fix inside that job. `engine.py` runs the
-fix itself. It calls `prior_fixes.py` to search the history, `reproduce.py`
-to reproduce the failure, and `agent.py` for the Claude sessions that fix and
-review. `publish.py` and `push.py` check the destination again and publish.
+fix itself. It calls `prior_fixes.py` to search the history, `verification.py`
+to plan the command that verifies a fix, and `agent.py` for the Claude
+sessions that fix and review. `publish.py` and `push.py` check the destination again and publish.
 `comment.py` writes the bot's reply. `policy.py` lists what each kind of
 target allows, and `models.py` has the shared data types.
-
-The limits mentioned on this page are constants in `engine.py`:
-`PREPARE_BUDGET_S` (an hour), `REPRO_BUDGET_S` (twenty minutes),
-`MAX_ROUNDS` (three), and `TEST_RUNS` and `FLAKY_TEST_RUNS` (two and ten
-tries for Claude's own test command).
