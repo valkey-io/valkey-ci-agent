@@ -58,6 +58,27 @@ def test_run_build_commands_returns_failure_on_timeout(tmp_path) -> None:
     assert "partial stderr" in output
 
 
+def test_run_build_commands_gives_req_res_validator_90_minutes(tmp_path) -> None:
+    completed = subprocess.CompletedProcess(
+        args="command", returncode=0, stdout="", stderr="",
+    )
+    with patch(
+        "scripts.common.build_validator.subprocess.run",
+        return_value=completed,
+    ) as run:
+        ok, _ = run_build_commands(
+            str(tmp_path),
+            [
+                "make",
+                "./utils/req-res-log-validator.py "
+                "--verbose --fail-missing-reply-schemas",
+            ],
+        )
+
+    assert ok is True
+    assert [call.kwargs["timeout"] for call in run.call_args_list] == [1800, 5400]
+
+
 def test_run_build_commands_skips_empty_command_list(tmp_path) -> None:
     ok, output = run_build_commands(str(tmp_path), [])
 

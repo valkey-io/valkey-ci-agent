@@ -361,7 +361,23 @@ def main(argv: list[str] | None = None) -> int:
             gh, args.plan, args.outcome, git_env=auth.env(), run_url=run_url,
         )
     print(json.dumps(result, indent=2))
+    write_summary(result)
     return 1 if result.get("action") == ResultKind.FAILED.value else 0
+
+
+def write_summary(result: dict[str, Any]) -> None:
+    """One line on the run's page: what the fix did, so a refusal does not read as a fix."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+    if not path:
+        return
+    action = str(result.get("action") or "unknown")
+    summary = " ".join(str(result.get("summary") or "").split())[:500]
+    published = action in {kind.value for kind in ResultKind if kind.successful}
+    lines = [f"### CI fix: **{action}**{' (a fix was published)' if published else ' (no fix published)'}", ""]
+    if summary:
+        lines += [summary, ""]
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
 
 
 def _write_outputs(outputs: dict[str, str]) -> None:

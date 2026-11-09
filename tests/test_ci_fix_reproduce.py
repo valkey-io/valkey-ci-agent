@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -153,17 +155,19 @@ def test_without_gtest_parallel_the_binary_repeats_in_one_process_and_no_gtest_m
     assert any("no gtest-parallel" in note for note in plan.notes)
 
 
-def test_a_jobs_shorter_runtest_watchdog_is_kept_and_a_longer_one_is_not(checkout):
-    """runtest takes the last --timeout; a hang must still be reported inside the reproduction budget."""
-    shorter = JobCommands(build="make", runtest="./runtest --timeout 300 --dump-logs")
-    longer = JobCommands(build="make valgrind", runtest="./runtest --valgrind --clients 1 --timeout 2400 --dump-logs")
+def test_the_jobs_own_runtest_watchdog_is_kept_up_to_the_cap(checkout):
+    """A valgrind job's 2400s is kept: lowered to 600s, slow tests timed out instead of failing as CI did."""
+    def plan(runtest):
+        return plan_for(checkout, (TEST,), scheduled=True, job=JobCommands(build="make", runtest=runtest))
 
-    kept, lowered = plan_for(checkout, (TEST,), scheduled=True, job=shorter), plan_for(checkout, (TEST,), scheduled=True, job=longer)
-    assert kept.test.endswith("--timeout 300") and kept.notes == ()
-    assert lowered.test.endswith("--timeout 600")
-    # So that a [TIMEOUT] at 600s is not read as the failure the job saw.
-    assert lowered.notes == ("The job's --timeout 2400 was lowered to 600s for the reproduction: "
-                             "a test that times out at 600s may be slow here, not hung.",)
+    assert plan("./runtest --timeout 300 --dump-logs").test.endswith("--timeout 300")
+    assert plan("./runtest --dump-logs").test.endswith("--timeout 600")
+    valgrind = plan("./runtest --valgrind --clients 1 --timeout 2400 --dump-logs")
+    assert valgrind.test.endswith("--timeout 2400") and valgrind.notes == ()
+    longer = plan("./runtest --timeout 3600 --dump-logs")
+    assert longer.test.endswith("--timeout 2400")
+    assert longer.notes == ("The job's --timeout 3600 was lowered to 2400s for the reproduction: "
+                            "a test that times out at 2400s may be slow here, not hung.",)
 
 
 def test_there_is_no_plan_without_runtest(tmp_path):
@@ -465,3 +469,140 @@ def test_a_build_break_is_reproduced_by_the_jobs_build_alone_and_once(result, st
     assert reproduction.status is status
     assert plan.verify_loops(True) == 1 and plan.command(10) == commands[0]
     assert plan.ran(TestRun(passed=True, output="")) and not plan.tests
+
+
+_FILE_WITH_SETUP_BETWEEN_TESTS = """\
+proc helper {} { return helped }
+set shared 1
+
+start_server {tags {"repl"}} {
+    test {Earlier test that starts replication} { r slaveof 127.0.0.1 1 }
+    wait_for_sync r
+}
+
+start_server {tags {"repl"}} {
+    foreach mode {disabled swapdb} {
+        test "[string toupper flushdb] during sync replays (load=$mode)" { helper }
+    }
+}
+"""
+
+
+@pytest.mark.skipif(shutil.which("tclsh") is None, reason="needs tclsh")
+def test_a_test_that_only_cannot_reach_runs_alone_in_its_own_block(checkout):
+    """--only skips the earlier test but still runs wait_for_sync, which then never syncs (#5301)."""
+    path = Path(checkout) / "tests" / "integration" / "replication.tcl"
+    path.parent.mkdir()
+    path.write_text(_FILE_WITH_SETUP_BETWEEN_TESTS, encoding="utf-8")
+    test = FailedTest("FLUSHDB during sync replays (load=swapdb)", "tests/integration/replication.tcl")
+
+    plan = plan_for(checkout, (test,), scheduled=False,
+                    job=JobCommands(build="true", runtest="./runtest --valgrind --clients 1"))
+    isolated = plan.fallback
+
+    assert isolated is not None and isolated.valgrind
+    assert isolated.tests == (FailedTest(test.name, "tests/integration/replication.ci-fix-isolated.tcl"),)
+    # Generate the copy the way a run does, then stop before runtest.
+    command = isolated.command(1).replace("./runtest", "cat tests/integration/replication.ci-fix-isolated.tcl; true")
+    out = subprocess.run(["bash", "-c", command], cwd=checkout,
+                         capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
+    assert "proc helper" in out.stdout and "set shared 1" in out.stdout
+    assert "foreach mode" in out.stdout and "wait_for_sync" not in out.stdout
+    assert "--single integration/replication.ci-fix-isolated --fastfail --loops 1" in isolated.command(1)
+    assert not (path.parent / "replication.ci-fix-isolated.tcl").exists()  # removed after the run
+
+
+def test_the_fallbacks_are_the_tests_own_block_then_its_whole_file_once(checkout):
+    (Path(checkout) / "tests" / "unit").mkdir()
+    (Path(checkout) / "tests" / "unit" / "a.tcl").write_text("", encoding="utf-8")
+    (Path(checkout) / "tests" / "unit" / "b.tcl").write_text("", encoding="utf-8")
+    one = FailedTest("first named test", "tests/unit/a.tcl")
+    other = FailedTest("second named test", "tests/unit/b.tcl")
+
+    isolated = plan_for(checkout, (one,), scheduled=False).fallback
+    assert ".ci-fix-isolated" in isolated.test
+    whole = isolated.fallback
+    assert whole.single_run and whole.fallback is None and whole.tests == (one,)
+    assert whole.command(20).endswith("--single unit/a --loops 1 --timeout 600")
+    assert "--only" not in whole.command(20) and whole.verify_loops(False) == 1
+
+    # Two files have no single block: their whole files run, both at once.
+    both = plan_for(checkout, (one, other), scheduled=False).fallback
+    assert both.single_run and "--single unit/a --single unit/b --loops 1" in both.command(1)
+
+
+@pytest.mark.parametrize(("result", "status"), [
+    (TestRun(passed=False, output="", report="[err]: first named test in tests/unit/a.tcl"), ReproStatus.REPRODUCED),
+    (TestRun(passed=True, output="", report="[ok]: first named test (2 ms)"), ReproStatus.NOT_REPRODUCED),
+    (TestRun(passed=True, output="", report=""), ReproStatus.UNRUNNABLE),  # never ran the test
+])
+def test_a_whole_file_run_happens_once(checkout, result, status):
+    (Path(checkout) / "tests" / "unit").mkdir(exist_ok=True)
+    (Path(checkout) / "tests" / "unit" / "a.tcl").write_text("", encoding="utf-8")
+    one = FailedTest("first named test", "tests/unit/a.tcl")
+    whole = plan_for(checkout, (one,), scheduled=False).fallback.fallback
+    commands = []
+
+    reproduction = reproduce(whole, lambda command, _t: commands.append(command) or result,
+                             deadline=time.monotonic() + 60)
+
+    assert len(commands) == 1 and reproduction.status is status
+
+
+def test_a_plan_that_already_runs_whole_files_has_no_fallback(checkout):
+    """A client timeout outside any test runs its whole file; rerunning it would repeat it."""
+    (Path(checkout) / "tests" / "unit").mkdir(exist_ok=True)
+    (Path(checkout) / "tests" / "unit" / "a.tcl").write_text("", encoding="utf-8")
+    timed_out = FailedTest("", "tests/unit/a.tcl")
+
+    assert plan_for(checkout, (timed_out,), scheduled=False).fallback is None
+
+
+@pytest.mark.skipif(shutil.which("tclsh") is None, reason="needs tclsh")
+def test_top_level_setup_in_an_if_or_foreach_is_kept_in_the_copy(checkout):
+    """Review of #147: dropping setup made the copy fail where the file passes."""
+    from scripts.ci_fix.reproduce import _ISOLATE_TCL
+
+    path = Path(checkout) / "tests" / "unit" / "setup.tcl"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(
+        "if {1} { set ::needed 42 }\n"
+        "foreach v {a b} { set ::seen($v) 1 }\n"
+        "start_server {} { test {other test} { r ping } }\n"
+        "start_server {} { test {target} { assert_equal 42 $::needed } }\n",
+        encoding="utf-8",
+    )
+    out = subprocess.run(["tclsh", "/dev/stdin", "tests/unit/setup.tcl", "target"], input=_ISOLATE_TCL,
+                         cwd=checkout, capture_output=True, text=True, check=True).stdout
+
+    assert "set ::needed 42" in out and "set ::seen" in out
+    assert "target" in out and "other test" not in out
+
+
+def test_a_fallback_counts_only_the_named_tests_own_failure(checkout):
+    """Review of #147: a sibling's valgrind report is not the target failing."""
+    (Path(checkout) / "tests" / "unit").mkdir(exist_ok=True)
+    (Path(checkout) / "tests" / "unit" / "a.tcl").write_text("", encoding="utf-8")
+    target = FailedTest("first named test", "tests/unit/a.tcl")
+    plan = plan_for(checkout, (target,), scheduled=False)
+    sibling = TestRun(passed=False, output="", report=failure_report("[err]: Valgrind error: Invalid read\n"))
+
+    assert plan.failed(sibling)  # --only ran the target alone: the report is its
+    for fallback in (plan.fallback, plan.fallback.fallback):
+        assert fallback.attributed and not fallback.failed(sibling)
+    own = TestRun(passed=False, output="", report=f"[err]: first named test in {plan.fallback.tests[0].file}")
+    assert plan.fallback.failed(own)
+
+
+def test_an_isolated_failure_must_be_the_one_ci_saw(checkout):
+    from scripts.ci_fix.reproduce import matches_ci
+
+    (Path(checkout) / "tests" / "unit").mkdir(exist_ok=True)
+    (Path(checkout) / "tests" / "unit" / "a.tcl").write_text("", encoding="utf-8")
+    isolated = plan_for(checkout, (FailedTest("first named test", "tests/unit/a.tcl"),), scheduled=False).fallback
+    output = "[err]: first named test in tests/unit/a.ci-fix-isolated.tcl\nExpected '5' to be equal to '7'\n"
+
+    assert matches_ci(isolated, output, "*** [err]: first named test in tests/unit/a.tcl\nExpected '3' to be equal to '9'")
+    assert not matches_ci(isolated, output, "*** [err]: first named test in tests/unit/a.tcl\nReplica didn't sync")
+    assert matches_ci(isolated.fallback, output, "")  # a whole-file run is the file itself
