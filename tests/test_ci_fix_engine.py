@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from scripts.ci_fix.models import (
     CandidateAction,
     Failure,
     FixCandidate,
+    FixContext,
     FixPolicy,
     FixResult,
     FixTarget,
@@ -23,7 +25,7 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.reproduce import TestRun
+from scripts.ci_fix.reproduce import Reproduction, ReproPlan, ReproStatus, TestRun
 from tests.git_helpers import git
 
 _REAL_REPRODUCTION_REFUSAL = engine_mod._reproduction_refusal
@@ -1379,6 +1381,42 @@ def test_a_build_break_no_test_names_is_fixed_and_verified_by_the_jobs_build(tmp
     assert f"the reproduction passed 1 loop(s): `{build}`" in candidate.verification
 
 
+def test_a_job_that_did_not_break_in_make_gets_no_build_plan(tmp_path, monkeypatch):
+    """A reply-schema validator failure names no test either, but its build passed (#5306)."""
+    monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
+    source, head_sha = _source_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+
+    candidate = engine_mod.prepare_fix(
+        _task(head_sha), "make[1]: [Makefile:849: distclean] Error 2 (ignored)\nJSON schema validation error",
+        agent_func=lambda *a, **k: pytest.fail("no edit"), job=JobCommands(build="false", runtest="./runtest"),
+    )
+
+    assert candidate.action is CandidateAction.REFUSE
+    assert "no code-owned reproduction command" in candidate.summary
+
+
+def test_an_unrunnable_reproduction_falls_back_to_the_block_then_the_whole_file(tmp_path, monkeypatch):
+    seen = []
+    whole = ReproPlan(build="make", test="whole", tests=(), single_run=True)
+    isolated = ReproPlan(build="make", test="isolated", tests=(), fallback=whole)
+    plan = ReproPlan(build="make", test="only", tests=(), fallback=isolated)
+    monkeypatch.setattr(engine_mod, "plan_for", lambda *a, **k: plan)
+
+    def fake_reproduce(selected, run, *, deadline):
+        seen.append(selected.test)
+        status = ReproStatus.REPRODUCED if selected is whole else ReproStatus.UNRUNNABLE
+        return Reproduction(status, command=selected.test)
+
+    monkeypatch.setattr(engine_mod, "reproduce", fake_reproduce)
+    _context, chosen, reproduction = engine_mod._establish(
+        _task("a" * 40), str(tmp_path), (), (), lambda *a: None, repro_deadline=time.monotonic() + 60,
+    )
+
+    assert seen == ["only", "isolated", "whole"]
+    assert chosen is whole and reproduction.reproduced
+
+
 def test_a_build_that_passes_when_no_test_names_the_failure_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(engine_mod, "_reproduction_refusal", _REAL_REPRODUCTION_REFUSAL)
     source, head_sha = _source_repo(tmp_path)
@@ -1486,3 +1524,84 @@ def test_a_test_command_that_rewrites_the_patched_file_does_not_get_its_patch_pu
     assert candidate.action is CandidateAction.REFUSE
     assert "changed tracked files while the candidate was being verified" in candidate.summary
     assert all(engine_mod._TREE_CHANGED in text for text in feedback_seen[1:])
+
+
+def test_a_fallback_copy_a_killed_run_left_never_reaches_the_patch(tmp_path):
+    source, _ = _source_repo(tmp_path)
+    engine_mod._ignore_generated_copies(str(source))
+    engine_mod._ignore_generated_copies(str(source))  # idempotent
+    (source / "tests" / "unit").mkdir(parents=True)
+    (source / "tests" / "unit" / "a.ci-fix-isolated.tcl").write_text("left by a killed run", encoding="utf-8")
+
+    assert engine_mod.tree_patch(str(source)) == ""
+    exclude = (source / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert exclude.count("tests/**/*.ci-fix-isolated.tcl") == 1
+
+
+def test_an_isolated_failure_unlike_cis_falls_through_to_the_whole_file(tmp_path, monkeypatch):
+    seen = []
+    whole = ReproPlan(build="make", test="whole", tests=(), single_run=True, attributed=True)
+    isolated = ReproPlan(build="make", test="isolated", tests=(), fallback=whole, attributed=True, isolated_block=True)
+    plan = ReproPlan(build="make", test="only", tests=(), fallback=isolated)
+    monkeypatch.setattr(engine_mod, "plan_for", lambda *a, **k: plan)
+    monkeypatch.setattr(engine_mod, "matches_ci", lambda selected, output, log: selected is not isolated)
+
+    def fake_reproduce(selected, run, *, deadline):
+        seen.append(selected.test)
+        status = ReproStatus.UNRUNNABLE if selected is plan else ReproStatus.REPRODUCED
+        return Reproduction(status, command=selected.test)
+
+    monkeypatch.setattr(engine_mod, "reproduce", fake_reproduce)
+    _context, chosen, reproduction = engine_mod._establish(
+        _task("a" * 40), str(tmp_path), (), (), lambda *a: None, repro_deadline=time.monotonic() + 60,
+    )
+
+    assert seen == ["only", "isolated", "whole"] and chosen is whole and reproduction.reproduced
+
+
+def test_verification_may_use_the_rest_of_the_deadline_not_one_commands_default():
+    """#5301 and 9.2's 40-loop checks died at 1800s with hours of the session left."""
+    assert engine_mod._timeout(time.monotonic() + 3 * 3600) > engine_mod.TEST_TIMEOUT_S
+    assert engine_mod._timeout(time.monotonic() - 5) == 60
+
+
+def test_a_reproduction_that_cannot_run_is_a_failed_attempt_not_a_refusal():
+    """About the runner, not the test: retried and posted nowhere, unlike a refusal that retires it."""
+    plan = ReproPlan(build="make", test="t", tests=())
+    unrunnable = Reproduction(ReproStatus.UNRUNNABLE, command="t", reason="exited in 30s")
+
+    with pytest.raises(engine_mod.ReproductionUnrunnable, match="could not run"):
+        _REAL_REPRODUCTION_REFUSAL(FixContext(), plan, unrunnable)
+    passed = Reproduction(ReproStatus.NOT_REPRODUCED, command="t", all_attempts_passed=True)
+    assert _REAL_REPRODUCTION_REFUSAL(FixContext(), plan, passed).action is CandidateAction.REFUSE
+
+
+def test_a_block_that_passes_is_followed_by_one_whole_file_run(tmp_path, monkeypatch):
+    seen = []
+    whole = ReproPlan(build="make", test="whole", tests=(), single_run=True, attributed=True)
+    isolated = ReproPlan(build="make", test="isolated", tests=(), fallback=whole, attributed=True, isolated_block=True)
+    plan = ReproPlan(build="make", test="only", tests=(), fallback=isolated)
+    monkeypatch.setattr(engine_mod, "plan_for", lambda *a, **k: plan)
+    statuses = {"only": ReproStatus.UNRUNNABLE, "isolated": ReproStatus.NOT_REPRODUCED,
+                "whole": ReproStatus.REPRODUCED}
+    monkeypatch.setattr(engine_mod, "reproduce", lambda selected, run, *, deadline: (
+        seen.append(selected.test) or Reproduction(statuses[selected.test], command=selected.test)))
+
+    _context, chosen, reproduction = engine_mod._establish(
+        _task("a" * 40), str(tmp_path), (), (), lambda *a: None, repro_deadline=time.monotonic() + 60,
+    )
+
+    assert seen == ["only", "isolated", "whole"] and chosen is whole and reproduction.reproduced
+
+
+def test_the_reproduction_transcript_is_saved_for_the_runs_artifact(tmp_path, monkeypatch):
+    monkeypatch.setenv(engine_mod.EVIDENCE_DIR_ENV, str(tmp_path / "evidence"))
+    plan = ReproPlan(build="make", test="t", tests=(), notes=("a note",))
+    output = "\n".join(f"line {n}" for n in range(500)) + "\nwait_for_sync failed"
+
+    engine_mod._write_transcript(plan, Reproduction(ReproStatus.UNRUNNABLE, command="make && t",
+                                                    output=output, reason="exited in 30s"))
+
+    text = (tmp_path / "evidence" / "reproduction.md").read_text(encoding="utf-8")
+    assert "Status: unrunnable" in text and "Reason: exited in 30s" in text and "`make && t`" in text
+    assert "a note" in text and "wait_for_sync failed" in text and "line 100\n" not in text

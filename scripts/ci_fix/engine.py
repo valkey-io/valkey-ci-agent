@@ -55,6 +55,7 @@ from scripts.ci_fix.prior_fixes import (
 )
 from scripts.ci_fix.push import PushFailed, PushRefused, check_port, cherry_pick_refusal
 from scripts.ci_fix.reproduce import (
+    ISOLATED_COPY_PATTERN,
     JobCommands,
     Reproduction,
     ReproPlan,
@@ -62,6 +63,7 @@ from scripts.ci_fix.reproduce import (
     TestRun,
     build_plan,
     failure_report,
+    matches_ci,
     plan_for,
     ran_tests,
     reproduce,
@@ -69,6 +71,7 @@ from scripts.ci_fix.reproduce import (
 )
 from scripts.common.git_clone import is_full_sha, shallow_clone_at_sha
 from scripts.common.isolation import as_user, handed_to, isolated_user, kill_all
+from scripts.common.logging_utils import log_group
 from scripts.common.proc import (
     PROCESS_BASICS,
     EmptyPatch,
@@ -100,12 +103,14 @@ TEST_TIMEOUT_S = 30 * 60
 # budget runs low. Reproduction may use part of it.
 AWS_SESSION_S = 5 * 60 * 60
 PREPARE_BUDGET_S = 4 * 60 * 60 + 30 * 60
-REPRO_BUDGET_S = 20 * 60
+REPRO_BUDGET_S = 60 * 60
 _MIN_ROUND_S = 8 * 60
 # Of each round's time, what the agent may not use: the candidate's
 # verification (looped tests, possibly under valgrind) and review come after it.
-_VERIFY_RESERVE_S = 10 * 60
+_VERIFY_RESERVE_S = 60 * 60
 _TEST_OUTPUT_CHARS = 6_000
+# A make that stopped on an error; ``make[1]: [...] Error 2 (ignored)`` is not one.
+_BUILD_BROKE_RE = re.compile(r"make(?:\[\d+\])?: \*\*\* .*Error \d+")
 # At most this many of a job's failing tests are searched for and reproduced.
 _MAX_TESTS = 3
 
@@ -166,7 +171,7 @@ def prepare_fix(
         context, plan, reproduction = _establish(
             task, repo_dir, tests, paths_in_log(repo_dir, job_log),
             run_test if runs_tests else None,
-            repro_deadline=min(deadline, time.monotonic() + REPRO_BUDGET_S), job=job,
+            repro_deadline=min(deadline, time.monotonic() + REPRO_BUDGET_S), job=job, job_log=job_log,
         )
         if runs_tests:
             refusal = _reproduction_refusal(context, plan, reproduction)
@@ -177,6 +182,10 @@ def prepare_fix(
             agent_func=agent_func, review=review_func or review_candidate,
             run_test=run_test if runs_tests else None, deadline=deadline, job=job, tests=tests,
         )
+
+
+class ReproductionUnrunnable(RuntimeError):
+    """The reproduction could not run the test on this runner."""
 
 
 def _reproduction_refusal(
@@ -192,7 +201,12 @@ def _reproduction_refusal(
     elif reproduction is None:
         reason = "the planned reproduction command was not run"
     elif reproduction.status is ReproStatus.UNRUNNABLE:
-        reason = "the reproduction command could not run on this runner"
+        # About the bot's runner, not the test: a failed attempt, retried a
+        # bounded number of times and posted nowhere, not a refusal.
+        raise ReproductionUnrunnable(
+            f"the reproduction could not run: {reproduction.describe()}"
+            f" See reproduction.md in the run's artifact."
+        )
     elif reproduction.all_attempts_passed:
         reason = "every reproduction probe passed without reproducing the failure"
     else:
@@ -330,6 +344,7 @@ def _establish(
     *,
     repro_deadline: float,
     job: JobCommands | None = None,
+    job_log: str = "",
 ) -> tuple[FixContext, ReproPlan | None, Reproduction | None]:
     """Reproduce the failure and search for existing fixes, before any edit.
 
@@ -340,10 +355,11 @@ def _establish(
     described = ""
     if run_test is not None:
         plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
-        if plan is None and not tests and job is not None and job.build:
+        if plan is None and not tests and job is not None and job.build and _BUILD_BROKE_RE.search(job_log):
             plan = build_plan(job)
     if plan is not None:
         assert run_test is not None  # a plan is only made to be run
+        _ignore_generated_copies(repo_dir)
         logger.info("Reproducing with: %s", plan.command(1))
         reproduction = reproduce(
             plan,
@@ -351,7 +367,26 @@ def _establish(
             deadline=repro_deadline,
         )
         logger.info("Reproduction: %s", reproduction.describe())
+        while plan.fallback is not None and (
+            reproduction.status is ReproStatus.UNRUNNABLE
+            # The block passing does not mean the file does: what the copy
+            # dropped may be what makes the test fail. Run the whole file once.
+            or (reproduction.status is ReproStatus.NOT_REPRODUCED and plan.isolated_block)
+        ):
+            plan = plan.fallback
+            logger.info("Reproducing another way: %s", plan.command(1))
+            reproduction = reproduce(
+                plan,
+                lambda command, timeout: run_test(repo_dir, command, timeout),
+                deadline=repro_deadline,
+            )
+            if reproduction.reproduced and not matches_ci(plan, reproduction.output, job_log):
+                # The copy, not the code, may be what failed: try the whole file.
+                reproduction = replace(reproduction, status=ReproStatus.UNRUNNABLE,
+                                       reason="the test's own block failed differently from CI")
+            logger.info("Reproduction: %s", reproduction.describe())
         described = " ".join([reproduction.describe(), *plan.notes])
+        _write_transcript(plan, reproduction)
     history = failing_test_history(repo_dir, tests)
     found = find_prior_fixes(
         repo_dir, tests, tested_sha=task.failure.head_sha, issue_number=task.failure.issue_number,
@@ -373,6 +408,61 @@ def _establish(
         guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
     return context, plan, reproduction
+
+
+# Where the run's artifact collects evidence (scripts/ci_fix/job.sh).
+EVIDENCE_DIR_ENV = "CI_AGENT_EVIDENCE_DIR"
+_TRANSCRIPT_TAIL_LINES = 200
+
+
+def _write_transcript(plan: ReproPlan, reproduction: Reproduction) -> None:
+    """Save what the reproduction ran and printed, for the run's artifact.
+
+    A refusal or a failed attempt says why in a sentence; this says what the
+    command printed. The output is the test's own: the isolated account ran
+    it with a scrubbed environment, so it holds no credential.
+    """
+    directory = os.environ.get(EVIDENCE_DIR_ENV, "")
+    if not directory:
+        return
+    tail = "\n".join(reproduction.output.splitlines()[-_TRANSCRIPT_TAIL_LINES:])
+    text = "\n".join([
+        "# Reproduction", "",
+        f"- Status: {reproduction.status.value}",
+        f"- Attempts: {'; '.join(reproduction.attempts) or '-'}",
+        f"- Reason: {reproduction.reason or '-'}",
+        f"- Command: `{reproduction.command or plan.command(1)}`",
+        *(f"- Note: {note}" for note in plan.notes), "",
+        f"## Output (last {_TRANSCRIPT_TAIL_LINES} lines)", "", "```", tail, "```", "",
+    ])
+    try:
+        path = Path(directory) / "reproduction.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as transcript:
+            transcript.write(text)
+    except OSError as exc:
+        logger.warning("Could not save the reproduction transcript: %s", exc)
+    if reproduction.status is ReproStatus.UNRUNNABLE:
+        with log_group("Reproduction output (last 40 lines)"):
+            logger.info("%s", "\n".join(reproduction.output.splitlines()[-40:]))
+
+
+def _ignore_generated_copies(repo_dir: str) -> None:
+    """Keep a fallback's copy of a test file out of every patch, even a killed run's.
+
+    The run removes its copy when it ends; one killed by its timeout cannot,
+    and an untracked file would be part of the tree the patch is built from.
+    Ignored, it is not, and is removed before each verification instead.
+    """
+    exclude = Path(repo_dir) / ".git" / "info" / "exclude"
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        if ISOLATED_COPY_PATTERN not in existing.splitlines():
+            exclude.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n")
+                               + ISOLATED_COPY_PATTERN + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not ignore generated test copies in %s: %s", repo_dir, exc)
 
 
 def guide_for(repo_full_name: str) -> str:
@@ -837,7 +927,12 @@ def _remove_ignored(repo_dir: str) -> None:
 
 
 def _timeout(deadline: float) -> int:
-    return max(60, min(TEST_TIMEOUT_S, int(deadline - time.monotonic())))
+    """What a verification or review may use: the rest of the deadline.
+
+    A looped verification (40 loops of a flaky test, or valgrind) can need
+    more than one test command's default; the deadline already bounds it.
+    """
+    return max(60, int(deadline - time.monotonic()))
 
 
 def _checked_candidate(task: FixTask, repo_dir: str, original_head: str, candidate: FixCandidate) -> FixCandidate:
