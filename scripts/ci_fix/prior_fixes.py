@@ -48,6 +48,9 @@ _CHANGES_FILE = 2
 _NAMES_TEST_START = 2
 _MIN_SCORE = 3
 _FIX_WORDS_RE = re.compile(r"\b(?:flak\w*|deflake\w*|fix\w*|race|timing|timeout|unstable test)\b", re.IGNORECASE)
+# "Fix typos" fixes no failure: such a commit changes many files and would
+# rank as a fix for every one of them.
+_NOT_A_FIX_RE = re.compile(r"\b(?:typos?|spelling)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -109,7 +112,8 @@ def _find(
     for revision_range, on_target in ranges:
         for sha, reasons in _matches(repo_dir, revision_range, tests, issue_number, paths).items():
             subject, date = _subject_and_date(repo_dir, sha)
-            score = sum(weight for weight, _text in reasons) + (1 if _FIX_WORDS_RE.search(subject) else 0)
+            fixes = _FIX_WORDS_RE.search(subject) and not _NOT_A_FIX_RE.search(subject)
+            score = sum(weight for weight, _text in reasons) + (1 if fixes else 0)
             if score < _MIN_SCORE:
                 continue
             ported_as = "" if on_target else _ported_as(repo_dir, sha, subject, head)
@@ -281,6 +285,36 @@ def render_prior_fixes(repo_dir: str, fixes: tuple[PriorFix, ...]) -> str:
             diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
         lines += ["", f"## `{fix.sha[:12]}` {fix.subject}", "", "```diff", diff, "```"]
     return "\n".join(lines) + "\n"
+
+
+# How many of the default branch's commits per file the agent is shown.
+_UNPORTED_COMMITS = 30
+
+
+def unported_changes(repo_dir: str, paths: tuple[str, ...]) -> str:
+    """Markdown: the default branch's newest commits that change ``paths`` and this checkout lacks.
+
+    For a failure only an upstream change may fix. The search above ranks
+    commits by what their message says; the fix for a failure that names no
+    test (a sanitizer report) says nothing it can match, but its subject
+    tells the agent, which cannot run git, what it is.
+    """
+    default_ref = default_branch_ref(repo_dir)
+    if not default_ref or not paths:
+        return ""
+    sections: list[str] = []
+    for path in dict.fromkeys(paths):
+        lines = []
+        try:
+            for sha in _log(repo_dir, f"HEAD..{default_ref}", f"--max-count={_UNPORTED_COMMITS}", "--", path):
+                subject, date = _subject_and_date(repo_dir, sha)
+                lines.append(f"- `{sha}` {date} {subject}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.info("Could not list upstream changes to %s: %s", path, exc)
+            continue
+        if lines:
+            sections.append("\n".join([f"# `{path}`", "", *lines]))
+    return "\n\n".join(sections) + "\n" if sections else ""
 
 
 def summarize_prior_fixes(fixes: tuple[PriorFix, ...]) -> str:

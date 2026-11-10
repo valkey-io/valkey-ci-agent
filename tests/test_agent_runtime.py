@@ -140,3 +140,15 @@ def test_run_agent_warns_when_evidence_cannot_be_written(tmp_path, monkeypatch, 
     messages = [r.getMessage() for r in caplog.records]
     assert any("Could not write agent evidence" in m for m in messages)
     assert result.profile == "conflict_resolve_edit_only"
+
+
+def test_only_a_ci_fix_session_is_kept_with_its_evidence(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(agent_runtime, "run_claude_code", lambda *_args, **_kwargs: ("the event stream", "", 0))
+    monkeypatch.setattr(agent_runtime, "isolated_user", lambda: "")
+
+    agent_runtime.run_agent("ci_fix_review", "review", cwd=str(tmp_path), evidence_dir=tmp_path / "fix")
+    agent_runtime.run_agent("conflict_resolve_edit_only", "resolve", cwd=str(tmp_path), evidence_dir=tmp_path / "other")
+
+    kept = list((tmp_path / "fix").glob("*.stream.jsonl"))
+    assert [path.read_text(encoding="utf-8") for path in kept] == ["the event stream"]
+    assert not list((tmp_path / "other").glob("*.stream.jsonl"))

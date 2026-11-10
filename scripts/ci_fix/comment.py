@@ -84,6 +84,8 @@ def candidate_context(
         lines += [f"**Root cause:** {cause}", ""]
     if include_reasoning and candidate.reasoning:
         lines += [f"**The fix:** {prose(candidate.reasoning, 3_000)}", ""]
+    if include_reasoning and candidate.adapts:
+        lines += [f"**Adapts upstream:** `{candidate.adapts[:12]}`", ""]
     checks = check_items(candidate.verification)
     if checks:
         lines += ["**What the bot checked**", "", *checks, ""]

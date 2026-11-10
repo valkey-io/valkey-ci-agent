@@ -19,6 +19,7 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any
 
 from scripts.backport.registry import RepoEntry, load_registry
@@ -34,6 +35,7 @@ from scripts.ci_fix.github_runs import (
 )
 from scripts.ci_fix.models import (
     MAX_FAILED_ATTEMPTS,
+    CandidateAction,
     Failure,
     FixPlan,
     FixPolicy,
@@ -54,9 +56,17 @@ _MARKER_RE = re.compile(
     r"<!-- valkey-ci-agent:auto-ci-followup "
     r"head=(?P<head>[0-9a-f]{40}) run=(?P<run>\d+)"
     r"(?: attempt=(?P<attempt>\d+))? job=(?P<job>\d+)"
-    r"(?: key=(?P<key>[0-9a-f]{64}))?(?: outcome=(?P<outcome>[a-z]+))? -->"
+    r"(?: key=(?P<key>[0-9a-f]{64}))?(?: outcome=(?P<outcome>[a-z]+))?"
+    r"(?: reason=(?P<reason>[a-z]+))? -->"
 )
+# On a refusal's marker when the fixer itself declined the job, rather than a
+# prepared fix being refused at publication (the head moved, the PR closed).
+_DECLINED = "declined"
 _MAX_ATTEMPTS_PER_HEAD = 3
+# A job the fixer declined this many times on one PR is left alone on later
+# heads too: a new head rarely changes why it could not be fixed, and each
+# time costs a session and a comment on the PR.
+_MAX_REFUSALS_PER_JOB = 2
 
 
 @dataclass(frozen=True)
@@ -129,9 +139,9 @@ def _bot_prs_into(
     found = [sweep] if sweep is not None else []
     try:
         others = retry_github_call(
-            lambda: list(gh.get_repo(repo_entry.repo).get_pulls(
+            lambda: list(islice(gh.get_repo(repo_entry.repo).get_pulls(
                 state="open", base=target_branch, sort="created", direction="desc",
-            )[:_MAX_SCANNED_PRS]),
+            ), _MAX_SCANNED_PRS)),
             retries=2,
             description=f"list open PRs into {target_branch}",
         )
@@ -274,8 +284,10 @@ def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:
     if result.kind is not ResultKind.FAILED:
         what = "backport" if is_backport_branch(plan.task.target.branch) else "pull request"
         body = f"Automatic follow-up on this {what}'s CI.\n\n" + render_result(result)
+        declined = result.candidate is not None and result.candidate.action is CandidateAction.REFUSE
+        reason = f" reason={_DECLINED}" if declined else ""
         body += "\n\n" + "\n".join(
-            marker.removesuffix(" -->") + f" outcome={result.kind.value} -->" for marker in plan.markers
+            marker.removesuffix(" -->") + f" outcome={result.kind.value}{reason} -->" for marker in plan.markers
         )
         retry_github_call(
             lambda: gh.get_repo(failure.repo_full_name).get_pull(failure.pr_number).create_issue_comment(body),
@@ -347,12 +359,15 @@ def _handled_failures(
     after ``MAX_FAILED_ATTEMPTS`` of them, since it says nothing about the job.
     A fix or a refusal is commented on the PR; a failure is not, and is found
     in ``prior_plans``, the plans of this branch's earlier runs: a plan whose
-    attempt left no comment is a failed one.
+    attempt left no comment is a failed one. A job the fixer declined
+    ``_MAX_REFUSALS_PER_JOB`` times on any of the PR's heads is retired on
+    this one too.
     """
     job_ids: set[int] = set()
     job_keys: set[str] = set()
     failed_ids: Counter[int] = Counter()
     failed_keys: Counter[str] = Counter()
+    refused_keys: Counter[str] = Counter()
     attempt_count = 0
     commented: set[tuple[str | Any, ...]] = set()
     comments = retry_github_call(
@@ -366,13 +381,12 @@ def _handled_failures(
         )
         if author != bot_login:
             continue
-        matches = tuple(
-            match
-            for match in _MARKER_RE.finditer(
-                str(getattr(comment, "body", "") or "")
-            )
-            if match.group("head") == head_sha
+        every_head = tuple(_MARKER_RE.finditer(str(getattr(comment, "body", "") or "")))
+        refused_keys.update(
+            match.group("key") for match in every_head
+            if match.group("key") and match.group("reason") == _DECLINED
         )
+        matches = tuple(match for match in every_head if match.group("head") == head_sha)
         if any(match.group("outcome") != ResultKind.REFUSED.value for match in matches):
             attempt_count += 1
         for match in matches:
@@ -409,6 +423,7 @@ def _handled_failures(
                 failed_keys[key] += 1
     job_ids.update(job for job, count in failed_ids.items() if count >= MAX_FAILED_ATTEMPTS)
     job_keys.update(key for key, count in failed_keys.items() if count >= MAX_FAILED_ATTEMPTS)
+    job_keys.update(key for key, count in refused_keys.items() if count >= _MAX_REFUSALS_PER_JOB)
     return _HandledFailures(
         job_ids=frozenset(job_ids),
         job_keys=frozenset(job_keys),

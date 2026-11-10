@@ -123,6 +123,8 @@ class TestRun:
     report: str = ""
     # The command ran out of time and was killed, so it says nothing.
     timed_out: bool = False
+    # How long the command took: one loop's time sizes the looped run.
+    seconds: float = 0.0
 
 
 def failure_report(output: str) -> str:
@@ -257,7 +259,7 @@ def _one_line_build(build: str) -> str:
     One line because every report quotes the command it ran.
     """
     return " && ".join(
-        _MAKE_LINE_RE.sub(r'\1 -j"$(nproc)"', line.strip())
+        _MAKE_LINE_RE.sub(rf"\1 {_ALL_CORES}", line.strip())
         for line in _CONTINUATION_RE.sub(" ", build).splitlines() if line.strip()
     )
 
@@ -330,6 +332,8 @@ def _unit_test_invocation(line: str) -> tuple[list[str], list[str]]:
     return test_args, make_vars
 
 
+# macOS has no nproc; getconf answers on every runner and container the jobs use.
+_ALL_CORES = '-j"$(getconf _NPROCESSORS_ONLN)"'
 _MAKE_LINE_RE = re.compile(r"^(\s*make)(?=\s|$)(?!.*\s-j)", re.MULTILINE)
 # A line the job's own script continued on the next one.
 _CONTINUATION_RE = re.compile(r"\s*\\\n\s*")
@@ -475,6 +479,20 @@ def build_plan(job: JobCommands) -> VerifyPlan:
     return VerifyPlan(
         build=_one_line_build(job.build), test="", build_only=True,
         notes=("No test failed: the job's own build is the check, and its compiler output in the log is the failure.",),
+    )
+
+
+def upstream_plan(job: JobCommands | None) -> VerifyPlan:
+    """The plan for a failure no command here can run: the build alone.
+
+    For a change already merged upstream only (the engine accepts nothing
+    else with this plan): the default branch's CI ran it there, and the pull
+    request's own CI runs the failing check here.
+    """
+    return VerifyPlan(
+        build=_one_line_build(job.build if job is not None and job.build else "make"), test="", build_only=True,
+        notes=("No command here can run the failing check, so code only checks that the change builds; "
+               "the pull request's own CI runs the check.",),
     )
 
 

@@ -56,6 +56,10 @@ class AgentProfile:
     # profile with Bash in an untrusted checkout, which must not reach the
     # job's environment.
     isolated: bool = False
+    # Keep the session (the CLI's event stream) with the evidence, not only
+    # its hash: for sessions over public code and logs, where what the agent
+    # read and concluded is otherwise gone once the job's log is.
+    keeps_session: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,6 +129,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         disallowed_tools="Bash,Glob",
         confined=True,
         isolated=True,
+        keeps_session=True,
     ),
     "ci_fix_review": AgentProfile(
         name="ci_fix_review",
@@ -138,6 +143,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         # It reads a tree the isolated account just ran commands in; a link
         # left there must not reach this process's environment.
         isolated=True,
+        keeps_session=True,
     ),
     "ci_fix_suggest": AgentProfile(
         name="ci_fix_suggest",
@@ -151,6 +157,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         confined=True,
         # A contributor or fork PR's checkout may hold links out of it.
         isolated=True,
+        keeps_session=True,
     ),
     "release_notes_review_edit_only": AgentProfile(
         name="release_notes_review_edit_only",
@@ -248,6 +255,8 @@ def _write_evidence(
             f"{result.started_at.replace(':', '').replace('+', 'Z')}-{result.profile}-{result.prompt_sha256[:12]}.json"
         )
         path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+        if profile.keeps_session:
+            path.with_suffix(".stream.jsonl").write_text(result.stdout, encoding="utf-8")
     except OSError as exc:
         logger.warning(
             "Could not write agent evidence for profile %s to %s: %s",

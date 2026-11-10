@@ -81,7 +81,11 @@ problem may already be fixed.
 **It works out how the fix will be checked.** The job's log is the evidence
 of what fails. The bot works out the command that will verify a fix (the
 job's own build and test command, for the failing test only) and tells
-Claude what it is.
+Claude what it is. Some failures have no command the bot can run: a sanitizer
+or valgrind report that names no test, a sentinel or legacy-cluster test, a
+lint. For those the bot only accepts a change that is already merged upstream,
+checks that it builds, and leaves the rest to the PR's own CI. When there is
+nothing upstream to port, as on `unstable` itself, it declines.
 
 **Claude diagnoses and edits.** Claude gets the job's log, whatever the
 history search found, the verification command, and Valkey's testing
@@ -92,32 +96,54 @@ small patch, or declines. Declining is a legitimate answer, since some
 failures need a person. Claude works in a scratch copy of the code. It can
 edit files there but cannot commit or push.
 
+On a backport branch Claude may not write a fix of its own. It ports a commit
+that is merged upstream, or adapts one and names it, and the bot checks that
+the named commit is merged, is not on the branch yet, and changes a file the
+patch changes. A test that is flaky upstream too is fixed upstream first. A
+backport that broke the build is the exception: that is repaired by hand.
+
 **Code checks what Claude handed back.** The bot rejects anything that doesn't
 add up: a commit Claude made itself, files changed that Claude didn't
 declare, a diagnosis with parts missing, a port that isn't a real merged
-commit or is already on the branch, or a suggested patch that is too large.
+commit or is already on the branch, a hand-written fix where only an upstream
+change is accepted, or a suggested patch that is too large.
 
 ## How the fix is tested
 
 A fix for a bot PR or a detector issue has to pass a feedback loop before it
 is published. The loop runs at most three rounds within the fix's time
-budget, an hour of which is kept back for verification and review.
+budget. One Claude session gets at most two hours of it, and an hour is kept
+back for verification and review.
 
 In each round, a port is first cherry-picked into the code. If it conflicts,
-Claude can adapt it into a patch instead. Then the failing test is run again
-with the fix applied, in a loop: 40 times, 4 under valgrind, once for a build
-break or a whole-file run. The test has to run and pass every loop. When it
-cannot pass alone (with `--only`, runtest skips the other tests but still
-runs the code between them, which may need what a skipped test set up), it
-is run in its own top-level block, then its whole file once.
+Claude can adapt it into a patch instead. The fix is then built, and a build
+that breaks goes straight back to Claude. A fix under `deps/` makes the build
+start clean, because Valkey's makefile otherwise keeps the libraries it built
+before.
+
+Then the failing test is run with the fix applied, once. When it cannot pass
+alone (with `--only`, runtest skips the other tests but still runs the code
+between them, which may need what a skipped test set up), it is run in its
+own top-level block, then its whole file once. Whichever passed is then run
+in a loop: 40 times, or 4 under valgrind, or as many as fit in 45 minutes
+when one loop is slow. The test has to run and pass every loop. A whole-file
+run is not looped.
+
+The bot does not first reproduce the failure, so a passing loop shows that
+the test passes with the fix, not that it failed without it. The bot's
+report says so.
 
 Finally a second Claude session, which can read the code but not change it,
-reviews the fix with the same conventions and test results in front of it,
-and has to approve. If the tests fail or the reviewer objects, the output or
-the reviewer's reasoning goes back to Claude, which revises its fix for the
-next round. If the build or Claude's test command changes any tracked file
-while the fix is being tested, the fix that was tested is no longer the fix
-in the tree, so that also goes back for another round.
+reviews the fix with the same conventions and the test results in front of
+it, and has to approve. It is told to check Claude's diagnosis against the
+log rather than take it as given, and to reject a longer timeout or a looser
+threshold that comes without a reason, and any change made so that a test can
+run alone. If the tests fail or the reviewer objects, the output or the
+reviewer's reasoning goes back to Claude, along with what its last session
+concluded, and it revises its fix for the next round. If the build or the
+tests change any tracked file while the fix is being tested, the fix that was
+tested is no longer the fix in the tree, so that also goes back for another
+round.
 
 A fix that doesn't pass within three rounds is declined. If the bot runs out
 of time or crashes, that isn't treated as declining: the CI follow-up and
@@ -134,9 +160,10 @@ dispatcher also starts it for every open detector issue that is eligible.
 Setting the repository variable `CI_FIX_ISSUES_AUTO_DISPATCH` to `false`
 turns the dispatcher off.
 
-An issue is eligible when it is open, unassigned and has no open PR linked to
-it, and when the bot hasn't already posted a fix, declined, or failed twice
-for the failure it currently records. A newer failure makes the issue
+An issue is eligible when it is open, unassigned and no open PR says it
+closes it (`Fixes #1234`; a PR that only mentions the issue doesn't count),
+and when the bot hasn't already posted a fix, declined, or failed twice for
+the failure it currently records. A newer failure makes the issue
 eligible again. At most two of these fixes run at once, which
 `CI_FIX_ISSUES_MAX_RUNS` can change. Right before starting, the bot checks
 again that it hasn't already reported on that failure, so a dispatch that is
@@ -204,6 +231,10 @@ token with `workflows: write`. Anywhere else it refuses, and its tokens
 couldn't push one anyway. The PR's own CI and a maintainer's review always
 have the final say. The bot's comment lists everything it checked, including the history
 search and the verification.
+
+Each Claude session's full event stream is saved in the fix run's
+`ci-fix-result` artifact, next to the outcome, so what the agent read and
+concluded can be looked at after the job's log is gone.
 
 ## Running it by hand
 

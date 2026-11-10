@@ -115,13 +115,20 @@ merge it.
 
 A few rules keep this from going in circles. The agent makes at most three
 attempts on any one commit. A job it tried and failed to fix gets one more
-try; a job it declined to fix is left for a human. Jobs that only report on
+try; a job it declined to fix is left for a human, and one it declined twice
+is left alone on later commits too. Jobs that only report on
 other jobs, such as Daily CI's result aggregators and the coverage upload, are
 listed in `ci_followup_ignored_jobs` and never touched. Checks that come from
 other GitHub Apps, like DCO and Codecov, aren't workflow jobs and are never
-considered. Because a backport usually fails when it depends on an earlier
-change the release branch doesn't have, the fixer is told to look for that
-first.
+considered.
+
+A backport usually fails because it depends on an earlier change the release
+branch doesn't have, so on a backport branch the fixer only takes changes
+that are already merged on `unstable`: it ports the commit, or adapts it when
+it doesn't apply as it is. It does not write a fix of its own for a test that
+is flaky on `unstable` too; that fix belongs on `unstable` first. The one
+exception is a backport that broke the build, which has no upstream commit to
+port and is repaired where it broke.
 
 ## Suggesting backports
 

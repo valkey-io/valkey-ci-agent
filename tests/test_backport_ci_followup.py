@@ -17,6 +17,8 @@ from scripts.backport.registry import BranchEntry, RepoEntry
 from scripts.ci_fix import github_runs
 from scripts.ci_fix.github_runs import FailedJob
 from scripts.ci_fix.models import (
+    CandidateAction,
+    FixCandidate,
     FixPolicy,
     FixResult,
     FrontDoor,
@@ -111,10 +113,11 @@ def _marker(
     key: str = "",
     author: str = _BOT,
     outcome: str = "",
+    reason: str = "",
 ):
     attempt_text = f" attempt={attempt}" if attempt is not None else ""
     key_text = f" key={key}" if key else ""
-    outcome_text = f" outcome={outcome}" if outcome else ""
+    outcome_text = (f" outcome={outcome}" if outcome else "") + (f" reason={reason}" if reason else "")
     return SimpleNamespace(
         user=SimpleNamespace(login=author),
         body=(
@@ -350,6 +353,36 @@ def test_logical_marker_deduplicates_twin_event_runs(
     assert reason == "no-unhandled-actionable-failures"
 
 
+def test_job_the_fixer_declined_twice_on_earlier_heads_is_left_alone(monkeypatch) -> None:
+    key = ci_followup._job_key(_run(10, workflow_id=100), "asan tests")
+    older = tuple(
+        _marker(head=head * 40, run=run, job=run, key=key, outcome="refused", reason="declined")
+        for head, run in (("c", 5), ("d", 6))
+    )
+    jobs = [FailedJob("asan tests", id=22)]
+
+    target, reason, _gh_client = _select(
+        monkeypatch, pr=_pr(comments=older), runs=[_run(11, workflow_id=100)], jobs=jobs,
+    )
+    assert target is None
+    assert reason == "no-unhandled-actionable-failures"
+
+    # One time, two pushed fixes, or two fixes refused at publication (a head that moved) do not retire the job.
+    target, reason, _gh_client = _select(
+        monkeypatch, pr=_pr(comments=older[:1]), runs=[_run(11, workflow_id=100)], jobs=jobs,
+    )
+    assert reason == "actionable"
+    for outcome in ("pushed", "refused"):
+        earlier = tuple(
+            _marker(head=head * 40, run=run, job=run, key=key, outcome=outcome)
+            for head, run in (("c", 5), ("d", 6))
+        )
+        target, reason, _gh_client = _select(
+            monkeypatch, pr=_pr(comments=earlier), runs=[_run(11, workflow_id=100)], jobs=jobs,
+        )
+        assert reason == "actionable"
+
+
 def test_same_job_name_in_another_workflow_remains_actionable(
     monkeypatch,
 ) -> None:
@@ -517,6 +550,16 @@ def test_a_refusal_is_posted_with_a_terminal_marker(monkeypatch) -> None:
     (body,) = pr.posted
     assert "result: the summary" in body
     assert " outcome=refused -->" in body
+
+
+def test_a_refusal_says_whether_the_fixer_declined_or_a_prepared_fix_went_unpublished(monkeypatch) -> None:
+    """Only the first says something about the job, and counts toward leaving it alone."""
+    _report_, declined = _report(monkeypatch, ResultKind.REFUSED, candidate=FixCandidate(CandidateAction.REFUSE))
+    _report_, unpublished = _report(monkeypatch, ResultKind.REFUSED, candidate=FixCandidate(CandidateAction.PATCH))
+
+    assert " outcome=refused reason=declined -->" in declined.posted[0]
+    assert " outcome=refused -->" in unpublished.posted[0]
+    assert ci_followup._MARKER_RE.search(declined.posted[0]).group("reason") == "declined"
 
 
 def test_failed_attempts_post_nothing_and_their_plans_bound_the_retries(monkeypatch) -> None:

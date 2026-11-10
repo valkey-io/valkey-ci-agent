@@ -88,7 +88,7 @@ def test_nothing_is_listed_when_the_cap_is_already_reached():
 
 def test_issues_that_need_no_run_are_skipped_with_their_reason():
     linked = _detector_issue(5)
-    linked.timeline.append(_linked_pr_event())
+    linked.timeline.append(_linked_pr_event(5))
     tried = _detector_issue(4)
     _reported(tried, run_id=100)
     listed = [

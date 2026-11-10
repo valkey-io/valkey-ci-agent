@@ -194,15 +194,14 @@ class FixCandidate:
     changed_paths: tuple[str, ...] = ()
     port_commit: str = ""
     validation: str = ""
-    # A focused command, run from the checkout root, that runs the failing
-    # test or check. Code runs it before and after the patch.
-    test_command: str = ""
+    # The merged upstream commit a patch adapts to this branch, checked by
+    # code; set only where nothing else is accepted (FixContext.upstream_only).
+    adapts: str = ""
     # What code established about the candidate (local test runs and the
     # review), for the maintainer report. Never written by the agent.
     verification: str = ""
-    # Other detector issues this patch was shown to fix, and ones whose test
-    # it changed without that being shown. Never written by the agent.
-    also_fixes: tuple[int, ...] = ()
+    # Other detector issues whose test the patch changed, without showing
+    # that it fixes them. Never written by the agent.
     also_touches: tuple[int, ...] = ()
 
 
@@ -218,9 +217,16 @@ class FixContext:
     # The failing test file's recent commits, with the diff of the one that
     # added the test (the edit agent has no git).
     test_history: str = ""
+    # The default branch's commits to the failure's files that the checkout
+    # lacks, when only one of those may fix it (``upstream_only``).
+    unported_changes: str = ""
     # How code verifies a candidate, and whether it does.
     verification: str = ""
     verified_by_code: bool = False
+    # Only a change already merged upstream is accepted: a port, or a patch
+    # that adapts one. So on a backport branch, and for a failure no command
+    # here can run.
+    upstream_only: bool = False
     # The repository's test conventions, and its own docs in the checkout.
     guide: str = ""
     guide_paths: tuple[str, ...] = ()

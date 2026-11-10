@@ -585,7 +585,7 @@ def test_a_daily_draft_closes_its_issue():
     assert body.startswith("Fixes #9\n\n") and "[See the run](https://github.com/o/r/actions/runs/1)" in body
 
 
-def test_a_draft_closes_only_the_extra_issues_whose_tests_were_verified():
+def test_a_draft_closes_only_its_own_issue_and_mentions_the_ones_it_touched():
     from dataclasses import replace
 
     from scripts.ci_fix.models import Failure, FixPolicy, FixTarget, FixTask, TargetKind
@@ -593,11 +593,11 @@ def test_a_draft_closes_only_the_extra_issues_whose_tests_were_verified():
 
     failure = Failure("o/r", 1, "a" * 40, 2, "job", base_branch="unstable", issue_number=9, source=Source.DAILY)
     target = FixTarget(TargetKind.DRAFT_PR, "o/r", branch="agent/ci-fix/x")
-    candidate = replace(_candidate(), also_fixes=(10, 11), also_touches=(12,))
+    candidate = replace(_candidate(), also_touches=(12,))
 
     body = publish_mod._draft_body(FixTask(failure, target, FixPolicy.GENERAL), candidate)
 
-    assert "Fixes #9 Fixes #10 Fixes #11" in body
+    assert "Fixes #9\n" in body
     assert "Fixes #12" not in body
     assert "It also changes the test of issue `#12`, without showing that it fixes it." in body
     # In code, so GitHub does not link it: a linked open PR would keep #12 from its own fix.

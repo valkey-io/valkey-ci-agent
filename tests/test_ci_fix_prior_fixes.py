@@ -9,6 +9,7 @@ from scripts.ci_fix.prior_fixes import (
     find_prior_fixes,
     render_prior_fixes,
     summarize_prior_fixes,
+    unported_changes,
 )
 from tests.git_helpers import commit, git
 
@@ -233,3 +234,33 @@ def test_no_history_outside_a_repository_or_the_checkout(tmp_path):
     (tmp_path / TEST_FILE).write_text("x\n", encoding="utf-8")
     assert failing_test_history(str(tmp_path), (TEST,)) == ""
     assert failing_test_history(str(tmp_path), (FailedTest("x" * 20, "../escape.tcl"),)) == ""
+
+
+def test_a_typo_commit_is_not_ranked_as_a_fix(tmp_path):
+    """"Fix typos" touches many files and fixes no failure (refusals on #5075 listed two as port candidates)."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, TEST_FILE, "test v2\n", "Fix various typos around otherwise with a comma")
+    fix = commit(upstream, TEST_FILE, "test v3\n", "Fix the replication test's wait")
+    _refresh(clone, "origin/9.0")
+
+    assert [f.sha for f in find_prior_fixes(str(clone), (TEST,))] == [fix]
+
+
+def test_the_upstream_commits_a_branch_lacks_are_listed_by_file(tmp_path):
+    """Its subject says what a fix is, even when its message names no test the search can match (#5274)."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, "src/valkey-cli.c", "v1\n", "Add a hint test mode")
+    git(upstream, "branch", "-f", "9.0")
+    leak_fix = commit(upstream, "src/valkey-cli.c", "v2\n", "Free valkey-cli test hint before exiting (#5274)")
+    commit(upstream, "src/server.c", "unrelated\n", "Speed up something")
+    _refresh(clone, "origin/9.0")
+
+    listed = unported_changes(str(clone), ("src/valkey-cli.c", "src/missing.c"))
+
+    assert listed.startswith("# `src/valkey-cli.c`\n\n")
+    assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [leak_fix]
+    assert "Free valkey-cli test hint before exiting (#5274)" in listed
+    # Nothing to port on the default branch itself, or with no file named.
+    assert unported_changes(str(clone), ()) == ""
+    _refresh(clone, "origin/unstable")
+    assert unported_changes(str(clone), ("src/valkey-cli.c",)) == ""

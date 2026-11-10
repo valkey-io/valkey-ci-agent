@@ -10,11 +10,15 @@ that job's own setup and build (``scripts/ci_fix/job.sh``):
 2. **Fix**: the CI job's log is the evidence of what fails. One agent session, told what step 1 found, the job log and the
    repository's test conventions, ports an existing fix or writes a patch.
 3. **Verify and review**: the candidate (a port is cherry-picked into the
-   checkout first) must build and pass the failing test many times, the way
-   its CI job runs it (:mod:`scripts.ci_fix.verification` plans the command;
-   when the test cannot run alone, its own block, then its whole file), and
-   a separate read-only review must approve it. Otherwise the result goes
-   back to the agent, up to ``MAX_ROUNDS`` times.
+   checkout first) must build and pass the failing test, once and then
+   looped, the way its CI job runs it (:mod:`scripts.ci_fix.verification`
+   plans the command; when the test cannot run alone, its own block, then
+   its whole file), and a separate read-only review must approve it.
+   Otherwise the result goes back to the agent, up to ``MAX_ROUNDS`` times.
+
+On a backport branch, and for a failure no command here can run, only a
+change already merged upstream is accepted: a port, or a patch that adapts
+one (``FixContext.upstream_only``).
 """
 
 from __future__ import annotations
@@ -38,9 +42,9 @@ from scripts.ci_fix.agent import AgentTimeout, review_candidate, run_fix_agent
 from scripts.ci_fix.models import (
     CandidateAction,
     FailedTest,
-    FailureType,
     FixCandidate,
     FixContext,
+    FixPolicy,
     FixTask,
     TargetKind,
 )
@@ -51,6 +55,7 @@ from scripts.ci_fix.prior_fixes import (
     paths_in_log,
     render_prior_fixes,
     summarize_prior_fixes,
+    unported_changes,
 )
 from scripts.ci_fix.push import PushFailed, PushRefused, check_port, cherry_pick_refusal
 from scripts.ci_fix.verification import (
@@ -61,17 +66,20 @@ from scripts.ci_fix.verification import (
     build_plan,
     failure_report,
     plan_for,
-    ran_tests,
+    upstream_plan,
 )
 from scripts.common.git_clone import is_full_sha, shallow_clone_at_sha
 from scripts.common.isolation import as_user, handed_to, isolated_user, kill_all
+from scripts.common.logging_utils import log_group
 from scripts.common.proc import (
     PROCESS_BASICS,
     EmptyPatch,
     build_approved_patch,
+    default_branch_ref,
     filter_env,
     git_output,
     git_paths,
+    is_ancestor,
     run_git,
     worktree_changed_paths,
 )
@@ -86,10 +94,6 @@ JOB_LOG_HEAD_CHARS = 40_000
 # A candidate that fails its test or its review goes back to the agent with
 # the result, this many times in all.
 MAX_ROUNDS = 3
-# How many times the agent's own test command must pass with the patch, when
-# code has no command of its own: once is luck for a flaky failure.
-TEST_RUNS = 2
-FLAKY_TEST_RUNS = 10
 TEST_TIMEOUT_S = 30 * 60
 # The model's AWS session (ci-fix-run.yml's role-duration-seconds). The whole
 # preparation, review included, must end inside it, so rounds stop when the
@@ -100,6 +104,12 @@ _MIN_ROUND_S = 8 * 60
 # Of each round's time, what the agent may not use: the candidate's
 # verification (looped tests, possibly under valgrind) and review come after it.
 _VERIFY_RESERVE_S = 60 * 60
+# One agent session's share of the budget, so that a first round cannot use
+# all of it: a candidate that fails its test still gets a second round.
+_MAX_AGENT_ROUND_S = 2 * 60 * 60
+# What the looped run of a verification may take. A slow test gets as many
+# loops as fit (a 79s test cannot loop 40 times in the time kept back).
+_LOOP_BUDGET_S = 45 * 60
 _TEST_OUTPUT_CHARS = 6_000
 # A make that stopped on an error; ``make[1]: [...] Error 2 (ignored)`` is not one.
 _BUILD_BROKE_RE = re.compile(r"make(?:\[\d+\])?: \*\*\* .*Error \d+")
@@ -321,18 +331,30 @@ def _establish(
     search found, and the repository's test guide, go to the agent too.
     """
     plan = None
+    upstream_only = False
     described = ""
     if runs_tests:
         plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
         if plan is None and not tests and job is not None and job.build and _BUILD_BROKE_RE.search(job_log):
             plan = build_plan(job)
+        elif plan is None and _can_port(task, repo_dir):
+            # A sanitizer or valgrind report, a sentinel or legacy-cluster
+            # test, a lint: nothing here runs it, but the default branch may
+            # already hold its fix, which the pull request's own CI checks.
+            plan = upstream_plan(job)
+            upstream_only = True
+        elif plan is not None and task.policy is FixPolicy.BACKPORT:
+            # A release branch takes the upstream change, not a fix of its
+            # own that the default branch never gets.
+            upstream_only = True
     if plan is not None:
         _ignore_generated_copies(repo_dir)
         loops = plan.loops
         logger.info("Verification plan: %s", plan.command(loops))
         described = " ".join([
-            f"Code checks your change with `{plan.command(loops)}`"
-            f" ({loops} loop(s)); the build must pass and the failing test must run and pass every loop.",
+            f"Code checks your change with `{plan.command(loops)}`: the build must pass." if plan.build_only else
+            f"Code checks your change with `{plan.command(loops)}`: the build must pass and the failing test "
+            f"must run and pass, once and then looped (up to {loops} loop(s), fewer when one loop is slow).",
             *plan.notes,
         ])
     history = failing_test_history(repo_dir, tests)
@@ -349,12 +371,25 @@ def _establish(
         prior_fixes_detail=render_prior_fixes(repo_dir, fixes),
         prior_fixes_searched=found is not None,
         test_history=history,
+        unported_changes=(
+            unported_changes(repo_dir, tuple(dict.fromkeys([*(test.file for test in tests), *paths])))
+            if upstream_only else ""
+        ),
         verification=described,
         verified_by_code=plan is not None,
+        upstream_only=upstream_only,
         guide=guide,
         guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
     return context, plan
+
+
+def _can_port(task: FixTask, repo_dir: str) -> bool:
+    """Whether a port could fix ``task``: its target takes one, and the default branch has commits this checkout lacks."""
+    if not target_capabilities(task.target.kind).allows(CandidateAction.PORT):
+        return False
+    default_ref = default_branch_ref(repo_dir)
+    return bool(default_ref) and is_ancestor(repo_dir, default_ref, "HEAD") is False
 
 
 def _ignore_generated_copies(repo_dir: str) -> None:
@@ -408,6 +443,7 @@ def _fix_loop(
         if attempt > 1 and remaining < _MIN_ROUND_S:
             raise RuntimeError(f"Ran out of time after {attempt - 1} attempt(s). Last: {last}")
         agent_timeout = remaining - _VERIFY_RESERVE_S if run_test is not None else remaining
+        agent_timeout = min(agent_timeout, _MAX_AGENT_ROUND_S)
         try:
             outcome = agent_round(
                 task, repo_dir, original_head, job_log, context, feedback,
@@ -442,15 +478,16 @@ def _fix_loop(
         # rewrite the tracked files they run on. Only this exact change is
         # accepted; a changed tree is a changed candidate, and goes back.
         checked_tree = tree_patch(repo_dir)
-        fixes: tuple[int, ...] = ()
         touches: tuple[int, ...] = ()
         try:
             failed = ""
-            if run_test is not None:
-                failed = _verify(reviewed, repo_dir, plan, run_test, deadline, checks, tests)
+            if run_test is not None and plan is not None:
+                failed = _verify(reviewed, repo_dir, plan, run_test, deadline, checks)
             if not failed:
+                # The reviewer sees what the checks showed, not only the plan.
                 approved, reasoning = review(
-                    reviewed, repo_dir, job_log, context=context, timeout=_timeout(deadline),
+                    replace(reviewed, verification="\n".join(checks)), repo_dir, job_log,
+                    context=context, timeout=_timeout(deadline),
                 )
                 if not approved:
                     failed = f"A reviewer rejected the {_noun(candidate)}: {reasoning}"
@@ -462,7 +499,7 @@ def _fix_loop(
                     checks.append(f"Accepted on attempt {attempt} of {MAX_ROUNDS}.")
                 # While the change is still in the tree: a port's cherry-pick
                 # is undone below, and its patch is the one it applied.
-                fixes, touches = other_issues_fixed(task, reviewed, repo_dir, run_test, deadline, checks, job=job)
+                touches = other_issues_touched(task, reviewed, repo_dir, run_test, deadline, checks, job=job)
             if not failed and tree_patch(repo_dir) != checked_tree:
                 failed = _TREE_CHANGED
                 logger.info("CI-fix round %d: the tree changed during verification", attempt)
@@ -472,12 +509,10 @@ def _fix_loop(
         if failed:
             last = failed
             tree = _RESET_TREE if candidate.action is CandidateAction.PORT else _KEPT_TREE
-            feedback = f"{failed}\n\n{tree}"
+            feedback = "\n\n".join(part for part in (failed, _earlier_diagnosis(candidate), tree) if part)
             logger.info("CI-fix round %d: %s", attempt, failed.splitlines()[0])
             continue
-        return replace(
-            candidate, verification="\n".join(checks), also_fixes=fixes, also_touches=touches,
-        )
+        return replace(candidate, verification="\n".join(checks), also_touches=touches)
     return _refusal(
         f"No candidate passed its test and review in {MAX_ROUNDS} attempts. Last: {last}",
         verification="\n".join(established),
@@ -519,7 +554,9 @@ def agent_round(
         # on to porting instead.
         restore(repo_dir)
     try:
-        candidate = _checked_candidate(task, repo_dir, original_head, candidate)
+        candidate = _checked_candidate(
+            task, repo_dir, original_head, candidate, upstream_only=context.upstream_only,
+        )
     except _Rejected as exc:
         tree = _KEPT_TREE if worktree_changed_paths(repo_dir, strict=True) else _RESET_TREE
         return RoundOutcome(candidate, feedback=f"{exc}\n\n{tree}")
@@ -539,10 +576,32 @@ def agent_round(
 _KEPT_TREE = "The working tree still holds your previous edits; revise them."
 _RESET_TREE = "The working tree was reset to the working commit; it holds no earlier edits."
 _TREE_CHANGED = (
-    "The build or your test command changed tracked files while the candidate was being "
-    "verified, so the tree no longer matches the patch that was checked. A test command "
-    "must not edit the repository: make the fix itself, and give a command that only runs it."
+    "The build or the tests changed tracked files while the candidate was being "
+    "verified, so the tree no longer matches the patch that was checked. Make the fix "
+    "itself: nothing the build or a test writes can be part of it."
 )
+_UPSTREAM_ONLY = (
+    "Only a change already merged upstream is accepted here: choose `port`, or a `patch` "
+    "whose `adapts_commit` is the full SHA of the merged default-branch commit it adapts to "
+    "this branch. A fix with no upstream counterpart belongs on the default branch first: "
+    "choose `refuse` and say so."
+)
+_NOT_REPRODUCED = (
+    "The failure was not reproduced before the fix: the passing run shows that the test "
+    "passes with the change, not that it failed without it."
+)
+
+
+def _earlier_diagnosis(candidate: FixCandidate) -> str:
+    """What the last session concluded, for the next one, which starts without its reading."""
+    found = [
+        f"- {label}: {text}" for label, text in (
+            ("Root cause", candidate.root_cause), ("Change", candidate.reasoning), ("Notes", candidate.validation),
+        ) if text
+    ]
+    if not found:
+        return ""
+    return "\n".join(["Your previous session concluded (the result above may show it wrong):", *found])
 
 
 def tree_patch(repo_dir: str) -> str:
@@ -571,7 +630,7 @@ def _established_checks(context: FixContext) -> list[str]:
     return checks
 
 
-def other_issues_fixed(
+def other_issues_touched(
     task: FixTask,
     candidate: FixCandidate,
     repo_dir: str,
@@ -580,22 +639,21 @@ def other_issues_fixed(
     checks: list[str],
     *,
     job: JobCommands | None = None,
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Which other detector issues this patch was shown to fix, and which it only touched.
+) -> tuple[int, ...]:
+    """The other detector issues whose test this patch changes.
 
     One file often holds several open failures, so a patch for one issue can
-    change another's test. Each such issue's test must still pass with the
-    patch, the way the target's is verified; the draft PR then names it as
-    touched. Passing with the patch does not show the patch fixes it, so no
-    other issue is claimed as fixed (and closed by the PR).
+    change another's test. Each such issue's test is run with the patch, the
+    way the target's is verified, and the draft PR names it as touched.
+    Passing with the patch does not show the patch fixes it, so no other
+    issue is claimed as fixed (and closed by the PR).
     """
     changed = changed_lines(candidate.patch)
     others = [issue for issue in task.other_issues if _changes_test(repo_dir, changed, issue.test)]
     touched: list[int] = []
     for issue in others:
-        # In code: GitHub links a bare #N, and a linked open PR keeps that
-        # issue from a fix of its own (issue_state.has_open_linked_pr), which
-        # a PR that has not shown it fixes the issue must not do.
+        # In code, so that GitHub does not link the PR from that issue: it
+        # has not shown that it fixes it.
         name, ref = f"`{issue.test.name or issue.test.file}`", f"`#{issue.number}`"
         touched.append(issue.number)
         plan = plan_for(repo_dir, (issue.test,), scheduled=task.failure.scheduled, job=job)
@@ -608,7 +666,7 @@ def other_issues_fixed(
             if result.passed and plan.ran(result) else
             f"The patch changes {name}, issue {ref}'s test, which did not pass with it."
         )
-    return (), tuple(touched)
+    return tuple(touched)
 
 
 def changed_lines(patch: str) -> dict[str, set[int]]:
@@ -672,25 +730,32 @@ def _changes_test(repo_dir: str, changed: dict[str, set[int]], test: FailedTest)
 def _verify(
     candidate: FixCandidate,
     repo_dir: str,
-    plan: VerifyPlan | None,
+    plan: VerifyPlan,
     run_test: TestFunc,
     deadline: float,
     checks: list[str],
-    tests: tuple[FailedTest, ...] = (),
 ) -> str:
     """Run the candidate's tests; "" when they hold, else feedback for the agent.
 
-    The agent's commands could leave ignored files the patch does not show (a
-    prebuilt server binary that keeps ``make`` from rebuilding), so those go
-    first: the build and tests run from source.
+    The build or an earlier run could leave ignored files the patch does not
+    show (a prebuilt server binary that keeps ``make`` from rebuilding), so
+    those go first: the build and tests run from source.
     """
     _remove_ignored(repo_dir)
-    if plan is not None:
-        return _verify_with_plan(plan, repo_dir, run_test, deadline, checks)
-    if candidate.test_command:
-        return _test_feedback(candidate, repo_dir, run_test, deadline, checks, tests)
-    checks.append("No test command could run this check on the bot's runner.")
-    return ""
+    if any(path.startswith("deps/") for path in changed_lines(candidate.patch)):
+        _rebuild_dependencies(repo_dir)
+    return _verify_with_plan(plan, repo_dir, run_test, deadline, checks)
+
+
+def _rebuild_dependencies(repo_dir: str) -> None:
+    """Make the next build rebuild ``deps/``.
+
+    Valkey's src/Makefile builds its dependencies only when its saved build
+    settings change, and a job's own build output is kept, so a fix under
+    ``deps/`` would be verified against the library built without it.
+    Without the saved settings, make cleans and rebuilds everything.
+    """
+    Path(repo_dir, "src", ".make-settings").unlink(missing_ok=True)
 
 
 def _verify_with_plan(
@@ -700,42 +765,75 @@ def _verify_with_plan(
     deadline: float,
     checks: list[str],
 ) -> str:
-    """The patched test passing its loops, the way the CI job runs it; feedback when it does not.
+    """The patched code building and its test passing, the way the CI job runs it; feedback when not.
 
-    With ``--only`` a test may not run at all, or fail for want of what a
-    skipped test set up (integration/replication.tcl, cluster/slave-selection.tcl),
-    so a plan that does not pass is followed by its fallbacks: the test's own
-    block, then its whole file once. The first that runs and passes the test
-    is the verification; otherwise the last one's result is the feedback.
+    The build runs first, alone, so a build break is reported as one and the
+    test's time is its own. Then the test runs once: with ``--only`` it may
+    not run at all, or fail for want of what a skipped test set up
+    (integration/replication.tcl, cluster/slave-selection.tcl), so a plan
+    whose first run does not pass is followed by its fallbacks, the test's own
+    block and then its whole file. The plan that passed once is then looped,
+    as many times as fit, and has to pass every loop.
     """
-    current: VerifyPlan | None = plan
-    while current is not None:
-        loops = current.loops
-        command = current.command(loops)
-        result = run_test(repo_dir, command, _timeout(deadline))
-        if result.timed_out:
-            # Nothing is known about the change, and nothing the agent can do
-            # about it: the attempt failed, and is retried.
-            raise RuntimeError(f"`{command}` did not finish in the time left ({result.output}).")
-        if result.passed and current.ran(result):
-            checks.append(f"With the fix, `{command}` passed {loops} loop(s).")
-            return ""
-        last, last_command, last_loops = current, command, loops
+    built = _run(run_test, repo_dir, plan.build, deadline)
+    if not built.passed:
+        return f"With your change, `{plan.build}` does not build.\n\nIts output:\n{built.output}"
+    if plan.build_only:
+        checks.append(f"With the fix, `{plan.build}` builds.")
+        return ""
+    current = plan
+    while True:
+        command = current.command(1)
+        first = _run(run_test, repo_dir, command, deadline)
+        if first.passed and current.ran(first):
+            break
+        if current.fallback is None:
+            return _not_passing(current, command, 1, first)
         current = current.fallback
+    loops = _loops_that_fit(current, first.seconds, deadline)
+    if loops > 1:
+        command = current.command(loops)
+        looped = _run(run_test, repo_dir, command, deadline)
+        if not (looped.passed and current.ran(looped)):
+            return _not_passing(current, command, loops, looped)
+    checks.append(f"With the fix, `{command}` passed {loops} loop(s).")
+    if loops < current.loops:
+        checks.append(f"One loop takes {first.seconds:.0f}s, so {loops} loop(s) ran, not {current.loops}.")
+    checks.append(_NOT_REPRODUCED)
+    return ""
+
+
+def _run(run_test: TestFunc, repo_dir: str, command: str, deadline: float) -> TestRun:
+    result = run_test(repo_dir, command, _timeout(deadline))
+    if result.timed_out:
+        # Nothing is known about the change, and nothing the agent can do
+        # about it: the attempt failed, and is retried.
+        raise RuntimeError(f"`{command}` did not finish in the time left ({result.output}).")
+    return result
+
+
+def _loops_that_fit(plan: VerifyPlan, seconds: float, deadline: float) -> int:
+    """The plan's loops, or as many as fit in the time for them when one loop took ``seconds``."""
+    available = min(_LOOP_BUDGET_S, deadline - time.monotonic())
+    return max(1, min(plan.loops, int(available // max(seconds, 1.0))))
+
+
+def _not_passing(plan: VerifyPlan, command: str, loops: int, result: TestRun) -> str:
+    """The agent's feedback for a run that did not pass the failing test."""
     if result.passed:
         return (
-            f"With your change, `{last_command}` passed without running the failing test. "
+            f"With your change, `{command}` passed without running the failing test. "
             "Do not rename, skip, or tag out the test: fix why it fails.\n\n"
             f"Its output:\n{result.output}"
         )
-    if last.failed(result):
+    if plan.failed(result):
         return (
-            f"With your change, the failing test still fails within {last_loops} loop(s): `{last_command}`.\n\n"
+            f"With your change, the failing test still fails within {loops} loop(s): `{command}`.\n\n"
             f"Its output:\n{result.output}"
         )
     return (
-        f"With your change, `{last_command}` could not build or run the tests (a build "
-        "break, or a server or test client failing outside the test).\n\n"
+        f"With your change, `{command}` could not run the tests (a server or test client "
+        "failing outside the test).\n\n"
         f"Its output:\n{result.output}"
     )
 
@@ -800,12 +898,15 @@ def _timeout(deadline: float) -> int:
     return max(60, int(deadline - time.monotonic()))
 
 
-def _checked_candidate(task: FixTask, repo_dir: str, original_head: str, candidate: FixCandidate) -> FixCandidate:
+def _checked_candidate(
+    task: FixTask, repo_dir: str, original_head: str, candidate: FixCandidate, *, upstream_only: bool = False,
+) -> FixCandidate:
     """``candidate`` with its patch built from the checkout, or a refusal.
 
     A commit is a refusal: the agent broke the one rule its checkout depends
     on. Anything else wrong with what it handed back raises
-    :class:`_Rejected`, which goes back to it like a failing test.
+    :class:`_Rejected`, which goes back to it like a failing test. With
+    ``upstream_only``, a patch must adapt a merged upstream commit.
     """
     current_head = git_output(repo_dir, "rev-parse", "HEAD").strip()
     if current_head != original_head:
@@ -816,7 +917,7 @@ def _checked_candidate(task: FixTask, repo_dir: str, original_head: str, candida
     changed_paths = worktree_changed_paths(repo_dir, strict=True)
     declared_paths = tuple(sorted(candidate.changed_paths))
     if candidate.action is CandidateAction.REFUSE:
-        return replace(candidate, patch="", changed_paths=(), port_commit="", validation="", test_command="")
+        return replace(candidate, patch="", changed_paths=(), port_commit="", adapts="", validation="")
 
     capabilities = target_capabilities(task.target.kind)
     if not capabilities.allows(candidate.action):
@@ -833,7 +934,7 @@ def _checked_candidate(task: FixTask, repo_dir: str, original_head: str, candida
             raise _Rejected(_INCOMPLETE_DIAGNOSIS)
         if not is_full_sha(candidate.port_commit):
             raise _Rejected("The proposed upstream port is not a full commit SHA.")
-        return replace(candidate, patch="", changed_paths=(), validation="", test_command="")
+        return replace(candidate, patch="", changed_paths=(), adapts="", validation="")
 
     if not changed_paths:
         raise _Rejected("The agent selected a patch but made no working-tree changes.")
@@ -848,6 +949,8 @@ def _checked_candidate(task: FixTask, repo_dir: str, original_head: str, candida
         )
     if not _has_complete_diagnosis(candidate):
         raise _Rejected(_INCOMPLETE_DIAGNOSIS)
+    if upstream_only:
+        _check_adapts(repo_dir, candidate.adapts, changed_paths)
     try:
         patch = build_approved_patch(repo_dir, changed_paths, strict=True)
     except EmptyPatch:
@@ -863,39 +966,31 @@ def _checked_candidate(task: FixTask, repo_dir: str, original_head: str, candida
         patch=patch,
         changed_paths=changed_paths,
         port_commit="",
+        # Only a checked claim is kept, and reported.
+        adapts=candidate.adapts if upstream_only else "",
     )
 
 
-def _test_feedback(
-    candidate: FixCandidate, repo_dir: str, run_test: TestFunc, deadline: float, checks: list[str],
-    tests: tuple[FailedTest, ...] = (),
-) -> str:
-    """Run the agent's test with its patch; "" when it passes every run.
+def _check_adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...]) -> None:
+    """Raise :class:`_Rejected` unless the patch adapts ``commit``, a merged upstream change.
 
-    Otherwise returns what went wrong, for the agent's next round. On success
-    ``checks`` gains a line for the maintainer report. When the command names
-    one of the job's ``tests``, it must run them, not just exit 0.
+    The commit has to pass what a port must (merged on the default branch,
+    not on this one), and change one of the files the patch does: a patch
+    that shares no file with it adapts something else.
     """
-    command = candidate.test_command
-    runs = FLAKY_TEST_RUNS if candidate.failure_type is FailureType.FLAKY else TEST_RUNS
-    for run in range(1, runs + 1):
-        result = run_test(repo_dir, command, _timeout(deadline))
-        if result.timed_out:
-            raise RuntimeError(f"`{command}` did not finish in the time left ({result.output}).")
-        if not result.passed:
-            return (
-                f"With your change, `{command}` failed on run {run} of {runs}; "
-                "it must pass every time.\n\n"
-                f"Its output:\n{result.output}"
-            )
-        if tests and not ran_tests(result.report, tests):
-            return (
-                f"With your change, `{command}` passed without running the failing test. "
-                "Do not rename, skip, or tag out the test: fix why it fails.\n\n"
-                f"Its output:\n{result.output}"
-            )
-    checks.append(f"With the fix, `{command}` passed {runs} time(s).")
-    return ""
+    if not is_full_sha(commit):
+        raise _Rejected(_UPSTREAM_ONLY)
+    try:
+        check_port(Path(repo_dir), commit, "HEAD")
+        touched = git_paths(repo_dir, "show", "--no-ext-diff", "--name-only", "--format=", "-z", commit)
+    except (PushRefused, PushFailed) as exc:
+        raise _Rejected(f"{exc} {_UPSTREAM_ONLY}") from exc
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        raise _Rejected(f"Commit {commit[:12]} could not be read. {_UPSTREAM_ONLY}") from exc
+    if not set(touched) & set(changed_paths):
+        raise _Rejected(
+            f"The patch changes none of the files {commit[:12]} changes, so it does not adapt it. {_UPSTREAM_ONLY}"
+        )
 
 
 def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S) -> TestRun:
@@ -918,13 +1013,21 @@ def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S)
         else:
             result = _run_in_own_group(argv, repo_dir, env, timeout)
     except subprocess.TimeoutExpired:
+        logger.info("Test command timed out after %ds: %s", timeout, command)
         return TestRun(passed=False, output=f"timed out after {timeout}s", timed_out=True)
+    seconds = time.monotonic() - started
     output = strip_ansi((result.stdout + result.stderr).decode("utf-8", errors="replace"))
-    logger.info("Test command exited %d after %.0fs", result.returncode, time.monotonic() - started)
+    logger.info("Test command exited %d after %.0fs: %s", result.returncode, seconds, command)
+    excerpt = _excerpt(output)
+    if result.returncode != 0:
+        # The only record of why a command failed, once the run is over.
+        with log_group("Failed test command output"):
+            logger.info("%s", excerpt)
     return TestRun(
         passed=result.returncode == 0,
-        output=_excerpt(output),
+        output=excerpt,
         report=failure_report(output),
+        seconds=seconds,
     )
 
 

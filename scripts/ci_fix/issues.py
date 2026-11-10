@@ -19,6 +19,7 @@ import logging
 import re
 from dataclasses import replace
 from datetime import datetime, timezone
+from itertools import islice
 from typing import Any, Optional
 
 from github.GithubException import GithubException
@@ -305,7 +306,8 @@ _MAX_OTHER_ISSUES = 20
 def open_detector_issues(repo: Any, bot_login: str, *, limit: int) -> list[tuple[Any, IssueFailure]]:
     """The newest ``limit`` open issues the detector filed, with the failure each records."""
     issues = retry_github_call(
-        lambda: list(repo.get_issues(state="open", labels=[LABEL_NAME])[:limit]),
+        # islice, not a slice: PyGithub's slice raises IndexError when a page comes back short.
+        lambda: list(islice(repo.get_issues(state="open", labels=[LABEL_NAME]), limit)),
         retries=2,
         description="list open detector issues",
     )

@@ -506,11 +506,7 @@ def _draft_body(task: FixTask, candidate: FixCandidate | None) -> str:
     failure = task.failure
     lines = []
     if failure.issue_number:
-        # One file often holds several open failures, so a patch can fix more
-        # than the issue it was asked about. Each extra issue was verified on
-        # its own test; the ones that were not are only mentioned.
-        closes = [failure.issue_number, *(candidate.also_fixes if candidate else ())]
-        lines += [" ".join(f"Fixes #{number}" for number in closes), ""]
+        lines += [f"Fixes #{failure.issue_number}", ""]
     description = prose(failure.description, 2_000) if failure.description else (
         f"`{failure.job_name}` failed in a {_source_label(failure)} run."
     )
