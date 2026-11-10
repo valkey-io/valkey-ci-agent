@@ -8,18 +8,15 @@ from pathlib import Path
 import pytest
 
 from scripts.ci_fix.models import FailedTest
-from scripts.ci_fix.reproduce import (
+from scripts.ci_fix.verification import (
     LOOPS,
-    REPRO_LOOPS,
     JobCommands,
-    ReproPlan,
-    ReproStatus,
     TestRun,
+    VerifyPlan,
     build_plan,
     failure_report,
     plan_for,
     ran_tests,
-    reproduce,
     shows_failure_of,
 )
 from scripts.common.text_utils import strip_ansi
@@ -166,7 +163,7 @@ def test_the_jobs_own_runtest_watchdog_is_kept_up_to_the_cap(checkout):
     assert valgrind.test.endswith("--timeout 2400") and valgrind.notes == ()
     longer = plan("./runtest --timeout 3600 --dump-logs")
     assert longer.test.endswith("--timeout 2400")
-    assert longer.notes == ("The job's --timeout 3600 was lowered to 2400s for the reproduction: "
+    assert longer.notes == ("The job's --timeout 3600 was lowered to 2400s for verification: "
                             "a test that times out at 2400s may be slow here, not hung.",)
 
 
@@ -174,9 +171,9 @@ def test_there_is_no_plan_without_runtest(tmp_path):
     assert plan_for(str(tmp_path / "missing"), (TEST,), scheduled=True) is None
 
 
-# --- reproduce ---------------------------------------------------------------
+# --- results ----------------------------------------------------------------
 
-PLAN = ReproPlan(build="make", test=f"./runtest --loops {LOOPS}", tests=(TEST,))
+PLAN = VerifyPlan(build="make", test=f"./runtest --loops {LOOPS}", tests=(TEST,))
 PASS = TestRun(passed=True, output="all passed", report=f"[ok]: {TEST.name} (5 ms)")
 FAIL = TestRun(passed=False, output="", report=f"[err]: {TEST.name} in {TEST.file}")
 BROKEN = TestRun(passed=False, output="tclsh: command not found")
@@ -198,74 +195,6 @@ def _deadline(seconds=3600):
     return time.monotonic() + seconds
 
 
-def test_a_failure_on_two_plain_runs_is_deterministic():
-    run = _runner(FAIL, FAIL)
-    result = reproduce(PLAN, run, deadline=_deadline())
-
-    assert result.status is ReproStatus.REPRODUCED and result.deterministic
-    assert run.calls == ["make && ./runtest --loops 1"] * 2
-    assert PLAN.verify_loops(result.deterministic) == 10
-
-
-def test_one_failure_then_a_pass_is_a_flake():
-    result = reproduce(PLAN, _runner(FAIL, PASS), deadline=_deadline())
-
-    assert result.reproduced and not result.deterministic
-    assert PLAN.verify_loops(result.deterministic) == 40
-
-
-def test_a_flaky_failure_reproduces_under_loops():
-    run = _runner(PASS, FAIL)
-    result = reproduce(PLAN, run, deadline=_deadline())
-
-    assert result.status is ReproStatus.REPRODUCED and not result.deterministic
-    assert run.calls[1] == f"make && ./runtest --loops {REPRO_LOOPS}"
-    assert f"failed within {REPRO_LOOPS} loops" in result.describe()
-    assert "intermittently" in result.describe()
-
-
-def test_a_timing_flake_reproduces_with_every_core_busy():
-    run = _runner(PASS, PASS, FAIL)
-    result = reproduce(PLAN, run, deadline=_deadline())
-
-    assert result.reproduced
-    assert "while :; do :; done" in run.calls[2] and run.calls[1] in run.calls[2]
-    assert "with every core busy" in result.describe()
-
-
-def test_a_failure_that_never_shows_is_not_reproduced():
-    result = reproduce(PLAN, _runner(PASS, PASS, PASS), deadline=_deadline())
-
-    assert result.status is ReproStatus.NOT_REPRODUCED
-    assert result.all_attempts_passed
-    assert result.describe().startswith("Did not reproduce")
-
-
-def test_a_build_break_is_not_a_reproduction():
-    result = reproduce(PLAN, _runner(BROKEN), deadline=_deadline())
-
-    assert result.status is ReproStatus.UNRUNNABLE
-    assert "tclsh" in result.output
-
-
-def test_looped_attempts_stop_at_the_deadline():
-    run = _runner(PASS)
-    result = reproduce(PLAN, run, deadline=_deadline(60))
-
-    assert result.status is ReproStatus.NOT_REPRODUCED
-    assert not result.all_attempts_passed
-    assert len(run.calls) == 1 and "no time left" in result.describe()
-
-
-def test_a_loop_that_does_not_finish_is_an_incomplete_nonreproduction():
-    timed_out = TestRun(False, "timed out after 60s", timed_out=True)
-    result = reproduce(PLAN, _runner(PASS, timed_out, PASS), deadline=_deadline())
-
-    assert result.status is ReproStatus.NOT_REPRODUCED
-    assert not result.all_attempts_passed
-    assert "20 loops did not finish" in result.describe()
-
-
 HARNESS_EXCEPTION = """\
 # Failed opening Unix socket: unix socket path too long (289), must be under 104
 [exception]: Executing test client: error flushing "sock820d74890": broken pipe.
@@ -274,15 +203,7 @@ HARNESS_EXCEPTION = """\
 """
 
 
-def test_a_harness_exception_outside_the_test_is_not_a_reproduction():
-    report = failure_report(HARNESS_EXCEPTION)
-
-    assert not shows_failure_of(report, (TEST,))
-    run = _runner(TestRun(False, HARNESS_EXCEPTION, report))
-    assert reproduce(PLAN, run, deadline=_deadline()).status is ReproStatus.UNRUNNABLE
-
-
-def test_an_exception_inside_the_test_is_a_reproduction():
+def test_an_exception_inside_the_test_is_its_failure():
     output = (
         "[exception]: Executing test client: I/O error reading reply.\n"
         f'"test "{TEST.name}" {{\n'
@@ -304,30 +225,14 @@ def test_only_the_planned_tests_failing_counts():
     assert not shows_failure_of(failure_report("make: *** [Makefile:6: all] Error 2"), (TEST,))
 
 
-def test_a_pass_that_ran_no_failing_test_is_not_evidence():
-    ok_other = "[ok]: Some other test (3 ms)"
-
-    result = reproduce(PLAN, _runner(TestRun(True, "", ok_other)), deadline=_deadline())
-
-    assert result.status is ReproStatus.UNRUNNABLE
-    assert "without running the failing test" in result.describe()
-    assert ran_tests(f"[ok]: {TEST.name} (12 ms)", (TEST,))
-    assert ran_tests(ok_other, (FailedTest("", TEST.file),))
-    assert not ran_tests("", (FailedTest("", TEST.file),))
-    # A client timeout in the list does not excuse a named test from running.
-    mixed = (TEST, FailedTest("", "tests/unit/other.tcl"))
-    assert not ran_tests(ok_other, mixed)
-    assert ran_tests(f"{ok_other}\n[ok]: {TEST.name} (12 ms)", mixed)
-
-
-def test_runtest_reports_a_hang_well_inside_the_reproduction_budget(checkout):
-    from scripts.ci_fix.engine import REPRO_BUDGET_S
+def test_runtest_reports_a_hang_well_inside_the_verification_reserve(checkout):
+    from scripts.ci_fix.engine import _VERIFY_RESERVE_S
 
     valgrind = JobCommands(build="make valgrind", runtest="./runtest --valgrind --timeout 2400")
     for job in (None, valgrind):
         test = plan_for(checkout, (TEST,), scheduled=True, job=job).test
         watchdog = int(test.rsplit("--timeout ", 1)[1].split()[0])  # runtest takes the last
-        assert watchdog < REPRO_BUDGET_S - 5 * 60, job
+        assert watchdog < _VERIFY_RESERVE_S - 5 * 60, job
 
 
 def test_a_renamed_or_sibling_test_is_not_the_failing_test():
@@ -348,26 +253,10 @@ def test_a_branch_without_fastfail_runs_its_loops_to_the_end(checkout):
     assert "no --fastfail" in " ".join(plan.notes)
 
 
-def test_a_rejected_option_is_reported_as_the_reason():
-    broken = TestRun(False, "Wrong argument: --fastfail\n")
-
-    result = reproduce(PLAN, _runner(broken), deadline=_deadline())
-
-    assert result.status is ReproStatus.UNRUNNABLE
-    assert "Wrong argument: --fastfail" in result.describe()
-
-
-def test_an_ok_line_from_an_earlier_loop_does_not_make_a_harness_exception_a_reproduction():
+def test_an_ok_line_from_an_earlier_loop_does_not_make_a_harness_exception_its_failure():
     report = failure_report(f"[ok]: {TEST.name} (12 ms)\n" + HARNESS_EXCEPTION)
 
     assert not shows_failure_of(report, (TEST,))
-
-
-def test_a_flake_seen_only_under_load_is_verified_under_load():
-    result = reproduce(PLAN, _runner(PASS, PASS, FAIL), deadline=_deadline())
-
-    assert result.under_load
-    assert "while :; do :; done" in PLAN.command(40, under_load=result.under_load)
 
 
 def test_a_test_name_with_braces_is_quoted_not_formatted(checkout):
@@ -390,9 +279,9 @@ def test_a_file_with_run_solo_loops_one_client_at_a_time(checkout):
 
 
 def test_valgrind_verification_stays_short_even_after_a_deterministic_failure():
-    valgrind = ReproPlan(build="make valgrind", test=f"./runtest --loops {LOOPS}", valgrind=True, tests=(TEST,))
+    valgrind = VerifyPlan(build="make valgrind", test=f"./runtest --loops {LOOPS}", valgrind=True, tests=(TEST,))
 
-    assert valgrind.verify_loops(True) == valgrind.verify_loops(False) == 4
+    assert valgrind.loops == valgrind.loops == 4
 
 
 # --- inside the failed job: its own commands ------------------------------------
@@ -431,7 +320,7 @@ def test_a_jobs_multi_line_build_becomes_one_command(checkout):
         "apt-get update && apt-get install -y make gcc-13 && update-alternatives --install x"
         " && make -j\"$(nproc)\" CC=gcc"
     )
-    assert "\n" not in plan.command(3) and "\n" not in plan.command(3, under_load=True)
+    assert "\n" not in plan.command(3)
 
 
 def test_in_the_job_a_module_api_test_runs_through_runtest_moduleapi(checkout):
@@ -453,21 +342,16 @@ def test_in_a_valgrind_job_its_own_options_are_kept(checkout):
     assert plan.valgrind and plan.test.count("--clients") == 1
 
 
-@pytest.mark.parametrize(("result", "status"), [
-    (TestRun(passed=False, output="hyperloglog.c:1224:5: error: unknown type name 'bool'"), ReproStatus.REPRODUCED),
-    (TestRun(passed=True, output="built"), ReproStatus.NOT_REPRODUCED),
-    (TestRun(passed=False, output="killed", timed_out=True), ReproStatus.UNRUNNABLE),
+@pytest.mark.parametrize(("result", "failed"), [
+    (TestRun(passed=False, output="hyperloglog.c:1224:5: error: unknown type name 'bool'"), True),
+    (TestRun(passed=True, output="built"), False),
+    (TestRun(passed=False, output="killed", timed_out=True), False),
 ])
-def test_a_build_break_is_reproduced_by_the_jobs_build_alone_and_once(result, status):
+def test_a_build_break_is_checked_by_the_jobs_build_alone_and_once(result, failed):
     plan = build_plan(JobCommands(build="export CC=gcc\nmake MALLOC=libc", runtest="./runtest"))
-    commands = []
 
-    reproduction = reproduce(plan, lambda command, _timeout: commands.append(command) or result,
-                             deadline=time.monotonic() + 60)
-
-    assert commands == ['export CC=gcc && make -j"$(nproc)" MALLOC=libc']  # no runtest, no loops
-    assert reproduction.status is status
-    assert plan.verify_loops(True) == 1 and plan.command(10) == commands[0]
+    assert plan.command(10) == 'export CC=gcc && make -j"$(nproc)" MALLOC=libc'  # no runtest, no loops
+    assert plan.loops == 1 and plan.failed(result) is failed
     assert plan.ran(TestRun(passed=True, output="")) and not plan.tests
 
 
@@ -525,29 +409,21 @@ def test_the_fallbacks_are_the_tests_own_block_then_its_whole_file_once(checkout
     whole = isolated.fallback
     assert whole.single_run and whole.fallback is None and whole.tests == (one,)
     assert whole.command(20).endswith("--single unit/a --loops 1 --timeout 600")
-    assert "--only" not in whole.command(20) and whole.verify_loops(False) == 1
+    assert "--only" not in whole.command(20) and whole.loops == 1
 
     # Two files have no single block: their whole files run, both at once.
     both = plan_for(checkout, (one, other), scheduled=False).fallback
     assert both.single_run and "--single unit/a --single unit/b --loops 1" in both.command(1)
 
 
-@pytest.mark.parametrize(("result", "status"), [
-    (TestRun(passed=False, output="", report="[err]: first named test in tests/unit/a.tcl"), ReproStatus.REPRODUCED),
-    (TestRun(passed=True, output="", report="[ok]: first named test (2 ms)"), ReproStatus.NOT_REPRODUCED),
-    (TestRun(passed=True, output="", report=""), ReproStatus.UNRUNNABLE),  # never ran the test
-])
-def test_a_whole_file_run_happens_once(checkout, result, status):
+def test_a_whole_file_run_is_one_loop(checkout):
     (Path(checkout) / "tests" / "unit").mkdir(exist_ok=True)
     (Path(checkout) / "tests" / "unit" / "a.tcl").write_text("", encoding="utf-8")
-    one = FailedTest("first named test", "tests/unit/a.tcl")
-    whole = plan_for(checkout, (one,), scheduled=False).fallback.fallback
-    commands = []
+    whole = plan_for(checkout, (FailedTest("first named test", "tests/unit/a.tcl"),), scheduled=False).fallback.fallback
 
-    reproduction = reproduce(whole, lambda command, _t: commands.append(command) or result,
-                             deadline=time.monotonic() + 60)
-
-    assert len(commands) == 1 and reproduction.status is status
+    assert whole.single_run and whole.loops == 1
+    assert whole.failed(TestRun(passed=False, output="", report="[err]: first named test in tests/unit/a.tcl"))
+    assert not whole.ran(TestRun(passed=True, output="", report=""))
 
 
 def test_a_plan_that_already_runs_whole_files_has_no_fallback(checkout):
@@ -562,7 +438,7 @@ def test_a_plan_that_already_runs_whole_files_has_no_fallback(checkout):
 @pytest.mark.skipif(shutil.which("tclsh") is None, reason="needs tclsh")
 def test_top_level_setup_in_an_if_or_foreach_is_kept_in_the_copy(checkout):
     """Review of #147: dropping setup made the copy fail where the file passes."""
-    from scripts.ci_fix.reproduce import _ISOLATE_TCL
+    from scripts.ci_fix.verification import _ISOLATE_TCL
 
     path = Path(checkout) / "tests" / "unit" / "setup.tcl"
     path.parent.mkdir(exist_ok=True)
@@ -593,16 +469,3 @@ def test_a_fallback_counts_only_the_named_tests_own_failure(checkout):
         assert fallback.attributed and not fallback.failed(sibling)
     own = TestRun(passed=False, output="", report=f"[err]: first named test in {plan.fallback.tests[0].file}")
     assert plan.fallback.failed(own)
-
-
-def test_an_isolated_failure_must_be_the_one_ci_saw(checkout):
-    from scripts.ci_fix.reproduce import matches_ci
-
-    (Path(checkout) / "tests" / "unit").mkdir(exist_ok=True)
-    (Path(checkout) / "tests" / "unit" / "a.tcl").write_text("", encoding="utf-8")
-    isolated = plan_for(checkout, (FailedTest("first named test", "tests/unit/a.tcl"),), scheduled=False).fallback
-    output = "[err]: first named test in tests/unit/a.ci-fix-isolated.tcl\nExpected '5' to be equal to '7'\n"
-
-    assert matches_ci(isolated, output, "*** [err]: first named test in tests/unit/a.tcl\nExpected '3' to be equal to '9'")
-    assert not matches_ci(isolated, output, "*** [err]: first named test in tests/unit/a.tcl\nReplica didn't sync")
-    assert matches_ci(isolated.fallback, output, "")  # a whole-file run is the file itself

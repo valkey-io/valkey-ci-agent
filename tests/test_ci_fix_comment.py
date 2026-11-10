@@ -149,19 +149,14 @@ def test_a_long_command_gets_a_block_of_its_own_below_its_check():
 
     command = "make -j4 && ./runtest --single unit/type/incr --only 'INCR on a counter' --fastfail --loops 20"
     items = check_items(
-        f"Reproduced on every run with `{command}` (failed on both of two runs).\n"
-        f"With the fix, the reproduction passed 10 loop(s): `{command}`.\n"
-        f"`{command}` failed without the patch (on run 1) and passed 1 time(s) with it.\n"
-        f"Did not reproduce with `{command}` (passed once). The failed job could not host the fix."
+        f"Code checks your change with `{command}` (40 loop(s)). The failed job could not host the fix.\n"
+        f"With the fix, `{command}` passed 40 loop(s).\n"
     )
 
     assert items == [
-        "- Reproduced on every run (failed on both of two runs):", "", "  ```sh", f"  {command}", "  ```",
-        "- With the fix, the reproduction passed 10 loops:", "", "  ```sh", f"  {command}", "  ```",
-        "- This command failed without the patch (on run 1) and passed 1 time with it:",
-        "", "  ```sh", f"  {command}", "  ```",
-        "- Did not reproduce (passed once):", "", "  ```sh", f"  {command}", "  ```",
+        "- Code checks your change (40 loops):", "", "  ```sh", f"  {command}", "  ```",
         "", "  The failed job could not host the fix.",
+        "- With the fix, this command passed 40 loops:", "", "  ```sh", f"  {command}", "  ```",
     ]
 
 

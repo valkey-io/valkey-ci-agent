@@ -637,7 +637,7 @@ def test_a_fix_published_as_a_comment_is_the_patch_on_the_issue_and_closes_the_o
     candidate = FixCandidate(
         action=CandidateAction.PATCH, patch="--- a/tests/x.tcl\n+++ b/tests/x.tcl\n@@ -1 +1 @@\n-a\n+b",
         root_cause="The wait is too short.", reasoning="Wait for the replica.",
-        verification="Reproduced: 3 of 20 loops failed without the patch, 0 of 20 with it.",
+        verification="With the fix, the test passed 40 loop(s).",
     )
     monkeypatch.setitem(_ENGINE, "run_fix", lambda _gh, task, *a, **k: FixResult(
         kind=ResultKind.SUGGESTED, summary="Prepared a patch, to post on the issue.", task=task, candidate=candidate,
@@ -649,7 +649,7 @@ def test_a_fix_published_as_a_comment_is_the_patch_on_the_issue_and_closes_the_o
     assert comment.body.startswith("A tentative fix, prepared and checked in that job. Nothing was pushed and no PR")
     assert "**Root cause:** The wait is too short." in comment.body
     assert "**The fix:** Wait for the replica." in comment.body
-    assert "- Reproduced: 3 of 20 loops failed" in comment.body
+    assert "- With the fix, the test passed 40 loops" in comment.body
     assert "```diff\n--- a/tests/x.tcl" in comment.body
     assert comment.body.rstrip().endswith("<!-- valkey-ci-agent:ci-fix-result run=100 outcome=suggested -->")
     assert (result["action"], result["pr"]) == ("suggested", 0)
@@ -663,7 +663,7 @@ def test_the_issue_comment_lists_what_the_bot_checked(monkeypatch):
     issue = _issue()
     gh, _repo, _run_ = _gh(issue)
     monkeypatch.setattr(issues_mod, "_failing_jobs", lambda *a, **k: (FailedJob("test-ubuntu-jemalloc", 22),))
-    checked = "Existing fixes found: `abc123` Deflake (#9) (port candidate)\nDid not reproduce with `./runtest`."
+    checked = "Existing fixes found: `abc123` Deflake (#9) (port candidate)\nWith the fix, `./runtest`."
     monkeypatch.setitem(_ENGINE, "run_fix", lambda _gh, task, *a, **k: FixResult(
         kind=ResultKind.REFUSED, summary="no fix", task=task,
         candidate=FixCandidate(action=CandidateAction.REFUSE, verification=checked),
@@ -673,7 +673,7 @@ def test_the_issue_comment_lists_what_the_bot_checked(monkeypatch):
 
     body = issue.comments[-1].body
     assert "**What the bot checked**" in body
-    assert "- Existing fixes found: `abc123`" in body and "- Did not reproduce" in body
+    assert "- Existing fixes found: `abc123`" in body and "- With the fix, `./runte" in body
 
 
 # --- other open detector issues the same patch might fix --------------------------

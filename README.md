@@ -27,8 +27,8 @@ also comments on newly merged PRs that look like they should be backported.
 See [Backports](docs/backport.md).
 
 **Fixing CI failures.** A maintainer can comment `@valkeyrie-ops fix` on a PR
-with a failing job. The bot reproduces the failure, asks Claude for a fix,
-reruns the failing test to make sure the fix works, has a second Claude session
+with a failing job. The bot asks Claude for a fix from the job's log,
+reruns the failing test the way the job ran it to check the fix, has a second Claude session
 review it, and then pushes it or posts it as a suggested patch. It does the
 same on its own when one of its backport PRs goes red. See
 [Fixing CI failures](docs/ci-fix.md).

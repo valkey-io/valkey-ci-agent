@@ -219,8 +219,7 @@ def test_the_agent_is_told_what_code_established_and_shown_ports_first(tmp_path,
     context = FixContext(
         prior_fixes="`cccccccccccc` Deflake the test (#9) (port candidate)",
         prior_fixes_detail="# detail with the diff",
-        reproduction="Reproduced intermittently with `./runtest ...` (failed within 20 loops).",
-        reproduction_output="[err]: the test in tests/unit/a.tcl",
+        verification="Code checks your change with `./runtest ...` (40 loop(s)).",
         verified_by_code=True,
         guide="# Fixing a failing Valkey test",
         guide_paths=("tests/README.md",),
@@ -231,28 +230,28 @@ def test_the_agent_is_told_what_code_established_and_shown_ports_first(tmp_path,
     prompt = seen["prompt"]
     assert "Deflake the test (#9) (port candidate)" in prompt
     assert "choose `port` with its full SHA rather than writing a new fix" in prompt
-    assert "Reproduced intermittently" in prompt
+    assert "### Verification\nCode checks your change with `./runtest ...`" in prompt
+    assert "CI job log is your evidence" in prompt
     assert "`tests/README.md`" in prompt
-    # Code verifies with its own reproduction, so no model command is accepted.
-    assert "only code-owned checks are accepted as verification" in prompt
+    # Code verifies with its own command, so no model command is accepted.
+    assert "only code-owned checks are\naccepted as verification" in prompt
     assert prompt.index("- `port`:") < prompt.index("- `patch`:")
     assert seen["files"]["prior-fixes.md"] == "# detail with the diff"
-    assert seen["files"]["reproduction.log"] == "[err]: the test in tests/unit/a.tcl"
     assert seen["files"]["test-guide.md"] == "# Fixing a failing Valkey test"
 
 
-def test_without_a_reproduction_the_agent_must_not_invent_a_test_command(tmp_path, monkeypatch) -> None:
+def test_without_a_verification_plan_the_agent_must_not_invent_a_test_command(tmp_path, monkeypatch) -> None:
     seen = {}
     monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
         {"action": "refuse", "summary": "no"}))
 
     agent_mod.run_fix_agent(_task(), str(tmp_path), "log")
 
-    assert "Leave\n`test_command` empty" in seen["prompt"]
+    assert "Leave `test_command`\nempty" in seen["prompt"]
     assert "What code established" not in seen["prompt"]
 
 
-def test_the_review_sees_the_port_reproduction_and_guide(tmp_path, monkeypatch) -> None:
+def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) -> None:
     from scripts.ci_fix.models import FixCandidate, FixContext
 
     seen = {}
@@ -263,12 +262,12 @@ def test_the_review_sees_the_port_reproduction_and_guide(tmp_path, monkeypatch) 
 
     approved, _ = agent_mod.review_candidate(
         candidate, str(tmp_path), "log",
-        context=FixContext(reproduction="Reproduced every time.", guide="# guide"),
+        context=FixContext(verification="Code checks your change with `make`.", guide="# guide"),
     )
 
     assert approved
     assert f"ports upstream commit {'c' * 40}" in seen["prompt"]
-    assert "Reproduction, by code: Reproduced every time." in seen["prompt"]
+    assert "Verification, by code: Code checks your change with `make`." in seen["prompt"]
     assert "a skip tag instead of a fix, is a rejection" in seen["prompt"]
 
 

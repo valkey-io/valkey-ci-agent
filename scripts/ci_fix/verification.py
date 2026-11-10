@@ -1,35 +1,27 @@
-"""Reproduce a failing Valkey test before anyone tries to fix it.
+"""Plan how code verifies a CI fix: the failing test, run the way its CI job ran it.
 
-A fix is only evidence of anything if the failure was seen first. Code (not
-the agent) builds the reproduction command from what the CI job ran: inside
-the failed job itself (``scripts/ci_fix/job.sh``), the job's own ``make`` and
-``runtest`` commands (:class:`JobCommands`); anywhere else, plain ``make`` and
-``runtest``. For a Tcl test, ``runtest`` runs only the failing tests
-(``--single <unit> --only <name>``) many times in one invocation
-(``--loops N --fastfail``). With several test clients the loop copies run in
-parallel, which is the load that exposes most timing flakes. For a C unit
-test (Google Test), the unit-test binary runs only the failing tests
-(``--gtest_filter``) as many times (``--gtest_repeat``).
-
-A flaky failure may not show up in a few loops on an idle runner, so a second
-attempt runs the same loops while every core is busy. A failure that still
-does not reproduce is reported as such: the fix can still be prepared from
-the log, but it cannot be shown to fix anything, and the report says so.
+The CI job's failure is the evidence; this module only plans the command that
+checks a candidate. Code (not the agent) builds it from what the job ran:
+inside the failed job itself (``scripts/ci_fix/job.sh``), the job's own
+``make`` and ``runtest`` commands (:class:`JobCommands`); anywhere else, plain
+``make`` and ``runtest``. For a Tcl test, ``runtest`` runs only the failing
+tests (``--single <unit> --only <name>``) many times in one invocation
+(``--loops N --fastfail``). For a C unit test (Google Test), the unit-test
+binary runs only the failing tests (``--gtest_filter``) as many times
+(``--gtest_repeat``). When a test cannot run alone, a plan's fallbacks run
+its own top-level block, then its whole file once.
 """
 
 from __future__ import annotations
 
 import re
 import shlex
-import time
 from dataclasses import dataclass, replace
-from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 from scripts.ci_fix.ci_job import JobCommands
 from scripts.ci_fix.models import FailedTest
-from scripts.common.text_utils import strip_ansi
 from scripts.common.valkey_ci import FAILURE_MARKERS, FILE_TIMEOUT_TEST_NAME, ResultLine, parse_result_line
 
 # Valkey's Google Test binary, the make target that builds it with the server,
@@ -41,19 +33,12 @@ UNIT_TEST_RUNNER = "deps/gtest-parallel/gtest_parallel.py"
 # ``make test-unit``'s own per-test watchdog (src/unit/Makefile).
 _UNIT_TEST_TIMEOUT_S = 300
 
-# Loops per reproduction attempt, and with the fix applied. Valgrind is ~20x
-# slower and runs one client at a time, as the Daily job does.
-REPRO_LOOPS = 20
+# Loops a fix must pass. Valgrind is ~20x slower and runs one client at a
+# time, as the Daily job does.
 VERIFY_LOOPS = 40
-VALGRIND_REPRO_LOOPS = 2
 VALGRIND_VERIFY_LOOPS = 4
-# A failure seen on both of two plain runs. It may still be a frequent flake,
-# so the fix must pass enough loops that a no-op would not.
-DETERMINISTIC_VERIFY_LOOPS = 10
-# Stands for the loop count in ``ReproPlan.test``; no test name can hold a NUL.
+# Stands for the loop count in ``VerifyPlan.test``; no test name can hold a NUL.
 LOOPS = "\0loops\0"
-# Do not start a looped attempt with less time than this.
-_MIN_ATTEMPT_S = 3 * 60
 
 # The lines of a run's output that say what failed: the failure lines, and
 # the Tcl stack frames that name the test an exception happened in. ``[ok]``
@@ -69,37 +54,16 @@ _TEST_FRAME_RE = re.compile(r"\btest [\"{]")
 _MAX_FAILURE_LINES = 200
 _MAX_OK_LINES = 2_000
 # runtest's no-progress watchdog (default 20 minutes, Daily's valgrind jobs
-# 40). It must fire well inside the reproduction budget, or a hanging test is
+# 40). It must fire well inside the verification budget, or a hanging test is
 # killed from outside before runtest can report it as ``[TIMEOUT]``. One test,
 # even under valgrind, makes progress well within it.
-# A test's watchdog in the reproduction: the job's own, up to the cap, else
+# A test's watchdog in verification: the job's own, up to the cap, else
 # the default (a hang without valgrind shows well before 600s).
 _RUNTEST_TIMEOUT_S = 600
 _MAX_RUNTEST_TIMEOUT_S = 2400
 
-# Busy-loop every core around the test command, and stop the loops
-# afterwards whatever the command's exit status. The command runs in a
-# subshell on lines of its own, so nothing in it can skip the cleanup.
-# One line, like every command a report quotes: a Markdown code span holds no
-# newline, and a maintainer can paste this one as it stands.
-_CONTENTION = (
-    'cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)"; '
-    'for _ in $(seq "$cores"); do (while :; do :; done) & done; '
-    "( @COMMAND@ ); status=$?; "
-    "{ kill $(jobs -p); wait; } 2>/dev/null; "
-    "exit $status"
-)
-
-
-class ReproStatus(str, Enum):
-    REPRODUCED = "reproduced"
-    NOT_REPRODUCED = "not-reproduced"
-    # The command could not run the test (a build break, a missing tool).
-    UNRUNNABLE = "unrunnable"
-
-
 @dataclass(frozen=True)
-class ReproPlan:
+class VerifyPlan:
     """How to build and run the failing tests the way their CI job did."""
 
     build: str
@@ -113,33 +77,25 @@ class ReproPlan:
     # test's own top-level block (a file whose code between tests relies on
     # the tests it skips), then the whole file once, as backport validation
     # runs it (``_isolated_plan``, ``_whole_file_plan``).
-    fallback: Optional["ReproPlan"] = None
+    fallback: Optional["VerifyPlan"] = None
     # Run once, never looped: a whole file is too slow to loop.
     single_run: bool = False
     # Other tests run too (a fallback), so only the named tests' own results
     # count: a valgrind or sanitizer report cannot be told apart from theirs.
     attributed: bool = False
-    # A copy of the file without its other test blocks: a failure there must
-    # be CI's own failure, not one of the copy's making (``matches_ci``).
-    isolated_block: bool = False
 
-    def command(self, loops: int, *, under_load: bool = False) -> str:
-        """The build and test command; ``under_load`` busies every core around it."""
+    def command(self, loops: int) -> str:
+        """The build and test command, the test looped ``loops`` times."""
         if self.build_only:
             return self.build
-        command = f"{self.build} && {self.test.replace(LOOPS, str(loops))}"
-        return _CONTENTION.replace("@COMMAND@", command) if under_load else command
+        return f"{self.build} && {self.test.replace(LOOPS, str(loops))}"
 
     @property
-    def repro_loops(self) -> int:
-        return VALGRIND_REPRO_LOOPS if self.valgrind else REPRO_LOOPS
-
-    def verify_loops(self, reproduced_on_first_loop: bool) -> int:
+    def loops(self) -> int:
+        """How many loops a fix must pass."""
         if self.build_only or self.single_run:
             return 1
-        if self.valgrind:
-            return VALGRIND_VERIFY_LOOPS
-        return DETERMINISTIC_VERIFY_LOOPS if reproduced_on_first_loop else VERIFY_LOOPS
+        return VALGRIND_VERIFY_LOOPS if self.valgrind else VERIFY_LOOPS
 
     def failed(self, result: TestRun) -> bool:
         """Whether ``result`` shows one of the planned tests failing.
@@ -154,37 +110,6 @@ class ReproPlan:
     def ran(self, result: TestRun) -> bool:
         """Whether ``result`` shows the planned tests running at all."""
         return self.build_only or ran_tests(result.report, self.tests)
-
-
-@dataclass(frozen=True)
-class Reproduction:
-    status: ReproStatus
-    command: str = ""
-    output: str = ""
-    attempts: tuple[str, ...] = ()
-    # The one-shot, looped and under-load attempts all completed and passed.
-    # False for a reproduction that stopped early or whose harness timed out
-    # or failed without showing the planned test failure.
-    all_attempts_passed: bool = False
-    # Why an unrunnable command could not run, when code knows.
-    reason: str = ""
-    # The failure showed up on both of two plain runs, before any loop.
-    deterministic: bool = False
-    # It showed up only with every core busy, so the fix is verified that way.
-    under_load: bool = False
-
-    @property
-    def reproduced(self) -> bool:
-        return self.status is ReproStatus.REPRODUCED
-
-    def describe(self) -> str:
-        if self.status is ReproStatus.REPRODUCED:
-            kind = "on every run" if self.deterministic else "intermittently"
-            return f"Reproduced {kind} with `{self.command}` ({'; '.join(self.attempts)})."
-        if self.status is ReproStatus.NOT_REPRODUCED:
-            return f"Did not reproduce with `{self.command}` ({'; '.join(self.attempts)})."
-        reason = f" ({self.reason})" if self.reason else ""
-        return f"Could not run the test on this runner: `{self.command}`{reason}."
 
 
 @dataclass(frozen=True)
@@ -243,7 +168,7 @@ def shows_failure_of(report: str, tests: tuple[FailedTest, ...], *, attributed: 
 
     A server that cannot start, or a test client that loses its connection,
     raises an ``[exception]`` outside any test: that is the harness failing,
-    not a reproduction. A valgrind or sanitizer report is the failure itself.
+    not the test failing. A valgrind or sanitizer report is the failure itself.
     """
     for line in report.splitlines():
         if not attributed and ("Valgrind error" in line or "Sanitizer error" in line):
@@ -269,7 +194,7 @@ def plan_for(
     *,
     scheduled: bool,
     job: JobCommands | None = None,
-) -> ReproPlan | None:
+) -> VerifyPlan | None:
     """The plan that rebuilds and runs ``tests`` the way their CI ``job`` did, or None.
 
     Tests in the main Tcl suite (sentinel and the legacy cluster suite use
@@ -300,12 +225,12 @@ def plan_for(
     base = job.moduleapi if moduleapi else job.runtest
     # runtest keeps the last --timeout. The job's own watchdog is kept (Daily's
     # valgrind jobs pass 2400: a test under valgrind is slow, not hung) up to
-    # the cap; past it, the notes say a [TIMEOUT] may be the reproduction's.
+    # the cap; past it, the notes say a [TIMEOUT] may be verification's own.
     job_timeout = _job_timeout(base)
     options = ["--timeout", str(min(job_timeout or _RUNTEST_TIMEOUT_S, _MAX_RUNTEST_TIMEOUT_S))]
     if job_timeout > _MAX_RUNTEST_TIMEOUT_S:
         notes.append(
-            f"The job's --timeout {job_timeout} was lowered to {_MAX_RUNTEST_TIMEOUT_S}s for the reproduction: "
+            f"The job's --timeout {job_timeout} was lowered to {_MAX_RUNTEST_TIMEOUT_S}s for verification: "
             f"a test that times out at {_MAX_RUNTEST_TIMEOUT_S}s may be slow here, not hung."
         )
     if "--clients" not in base.split() and any(_runs_solo(repo_dir, test) for test in tests):
@@ -318,7 +243,7 @@ def plan_for(
     if default:
         notes.append("The failed job could not host the fix, so plain make and runtest stand in for it.")
     command = " ".join([base, *selection, "--loops", LOOPS, *options])
-    return ReproPlan(build=_one_line_build(job.build), test=command, valgrind="--valgrind" in base.split(),
+    return VerifyPlan(build=_one_line_build(job.build), test=command, valgrind="--valgrind" in base.split(),
                      notes=tuple(notes), tests=tests,
                      # Without --only the files already run whole: nothing else to try.
                      fallback=(_isolated_plan(repo_dir, tests, base, options, job.build, notes)
@@ -339,7 +264,7 @@ def _one_line_build(build: str) -> str:
 
 def _unit_test_plan(
     repo_dir: str, tests: tuple[FailedTest, ...], *, scheduled: bool, job: JobCommands | None,
-) -> ReproPlan | None:
+) -> VerifyPlan | None:
     """The plan that builds the unit-test binary like the job and repeats only ``tests`` as it ran them.
 
     None without ``src/unit/Makefile`` in the checkout (a branch before Google
@@ -374,7 +299,7 @@ def _unit_test_plan(
     else:
         notes.append("This branch has no gtest-parallel, so the repeats run in one process.")
         command = " ".join([f"{UNIT_TEST_BINARY} --gtest_filter={shlex.quote(names)} --gtest_repeat={LOOPS}", *test_args])
-    return ReproPlan(build=build, test=command, notes=tuple(notes), tests=tests)
+    return VerifyPlan(build=build, test=command, notes=tuple(notes), tests=tests)
 
 
 # ``make test-unit``'s variables that become the binary's arguments
@@ -481,7 +406,7 @@ def _isolated_plan(
     options: list[str],
     build: str,
     notes: list[str],
-) -> Optional["ReproPlan"]:
+) -> Optional["VerifyPlan"]:
     """``tests`` run in their own top-level block of their file, whole, or None.
 
     Only for named tests in one Tcl file. The copy is written next to the file
@@ -504,13 +429,13 @@ def _isolated_plan(
     fastfail = ["--fastfail"] if _runtest_supports(repo_dir, "--fastfail") else []
     run = " ".join([base, "--single", shlex.quote(unit), *fastfail, "--loops", LOOPS, *options])
     test = f"{{ {generate} && {run}; }}; ci_fix_status=$?; rm -f {shlex.quote(copy)}; exit $ci_fix_status"
-    return ReproPlan(
+    return VerifyPlan(
         build=_one_line_build(build), test=test, valgrind="--valgrind" in base.split(),
         notes=(*notes, f"With --only, {source} failed before reaching the test, so the test runs in its own "
                        f"top-level block of the file, whole ({copy}, regenerated for each run)."),
         tests=tuple(replace(test, file=copy) for test in tests),
         fallback=_whole_file_plan(repo_dir, tests, base, options, build, notes),
-        attributed=True, isolated_block=True,
+        attributed=True,
     )
 
 
@@ -521,7 +446,7 @@ def _whole_file_plan(
     options: list[str],
     build: str,
     notes: list[str],
-) -> Optional["ReproPlan"]:
+) -> Optional["VerifyPlan"]:
     """``tests``' files run whole, once, as backport validation runs them, or None.
 
     Every test the file depends on runs, so this works whatever the file's
@@ -532,7 +457,7 @@ def _whole_file_plan(
         return None
     units = [arg for file in files for arg in ("--single", shlex.quote(file.removeprefix("tests/").removesuffix(".tcl")))]
     test = " ".join([base, *units, "--loops", "1", *options])
-    return ReproPlan(
+    return VerifyPlan(
         build=_one_line_build(build), test=test, valgrind="--valgrind" in base.split(), single_run=True,
         attributed=True,
         notes=(*notes, "The test could not run alone, so its whole file runs once, without loops."),
@@ -540,116 +465,17 @@ def _whole_file_plan(
     )
 
 
-def matches_ci(plan: ReproPlan, output: str, job_log: str) -> bool:
-    """Whether an isolated run failed the named test the way the CI job did.
-
-    The copy drops the file's other test blocks, so a test that relied on one
-    could fail in the copy for a reason CI never saw: the message runtest
-    prints after the test's ``[err]`` line must be in the job log, numbers
-    aside (ports, counts and pids differ between runs).
-    """
-    if not plan.isolated_block:
-        return True
-    lines = [strip_ansi(line).strip() for line in output.splitlines()]
-    names = {test.name for test in plan.tests}
-    messages = [
-        lines[index + 1] for index, line in enumerate(lines[:-1])
-        if (result := parse_result_line(line)) and result.status == "err" and result.name in names and lines[index + 1]
-    ]
-    log = _NUMBER_RE.sub("N", strip_ansi(job_log))
-    return any(_NUMBER_RE.sub("N", message)[:200] in log for message in messages)
-
-
-_NUMBER_RE = re.compile(r"\d+")
-
-
-def build_plan(job: JobCommands) -> ReproPlan:
+def build_plan(job: JobCommands) -> VerifyPlan:
     """The plan for a failure no test names: the failed job's own build.
 
     A job that broke in its ``make`` step names no test, so there is nothing
     to loop: the build failing on the unfixed code is the failure, and the
     build passing with a change is its fix.
     """
-    return ReproPlan(
+    return VerifyPlan(
         build=_one_line_build(job.build), test="", build_only=True,
-        notes=("No test failed: the reproduction is the job's own build, and its compiler output is the failure.",),
+        notes=("No test failed: the job's own build is the check, and its compiler output in the log is the failure.",),
     )
-
-
-def reproduce(
-    plan: ReproPlan,
-    run: Callable[[str, int], TestRun],
-    *,
-    deadline: float,
-) -> Reproduction:
-    """Run ``plan`` on the unfixed code: once, then looped, then under load.
-
-    ``run(command, timeout)`` runs one command. Attempts stop at ``deadline``
-    (a ``time.monotonic()`` value); the build in the first run is the slow part.
-    A build plan runs once: a compiler gives the same answer every time.
-    """
-    attempts: list[str] = []
-    plain = plan.command(1)
-    if plan.single_run:
-        result = run(plain, _remaining(deadline))
-        if plan.failed(result):
-            return Reproduction(ReproStatus.REPRODUCED, command=plain, output=result.output,
-                                deterministic=True, attempts=("failed in a whole-file run",))
-        if result.passed and plan.ran(result):
-            return Reproduction(ReproStatus.NOT_REPRODUCED, command=plain, output=result.output,
-                                all_attempts_passed=True, attempts=("passed a whole-file run",))
-        return Reproduction(ReproStatus.UNRUNNABLE, command=plain, output=result.output,
-                            reason=_wrong_argument(result.output) or "the whole-file run did not finish")
-    if plan.build_only:
-        result = run(plain, _remaining(deadline))
-        if plan.failed(result):
-            return Reproduction(ReproStatus.REPRODUCED, command=plain, output=result.output,
-                                deterministic=True, attempts=("the build failed",))
-        if result.passed:
-            return Reproduction(ReproStatus.NOT_REPRODUCED, command=plain, output=result.output,
-                                all_attempts_passed=True, attempts=("the build passed",))
-        return Reproduction(ReproStatus.UNRUNNABLE, command=plain, output=result.output,
-                            reason="the build did not finish")
-    first = run(plain, _remaining(deadline))
-    if plan.failed(first):
-        # One failure may be a frequent flake; a second plain run tells.
-        second = run(plain, _remaining(deadline))
-        both = plan.failed(second)
-        return Reproduction(
-            ReproStatus.REPRODUCED, command=plain, output=first.output, deterministic=both,
-            attempts=("failed on both of two runs",) if both else ("failed on the first run, passed on the second",),
-        )
-    if not first.passed:
-        return Reproduction(ReproStatus.UNRUNNABLE, command=plain, output=first.output,
-                            reason=_wrong_argument(first.output))
-    if not plan.ran(first):
-        return Reproduction(ReproStatus.UNRUNNABLE, command=plain, output=first.output,
-                            reason="runtest passed without running the failing test")
-    attempts.append("passed once")
-    all_attempts_passed = True
-
-    for label, under_load in (
-        (f"{plan.repro_loops} loops", False),
-        (f"{plan.repro_loops} loops with every core busy", True),
-    ):
-        if _remaining(deadline) < _MIN_ATTEMPT_S:
-            attempts.append(f"no time left for {label}")
-            all_attempts_passed = False
-            break
-        command = plan.command(plan.repro_loops, under_load=under_load)
-        result = run(command, _remaining(deadline))
-        if plan.failed(result):
-            attempts.append(f"failed within {label}")
-            return Reproduction(ReproStatus.REPRODUCED, command=command, output=result.output,
-                                attempts=tuple(attempts), under_load=under_load)
-        if not result.passed:
-            # A timeout or a crash of the harness, not a test failure.
-            attempts.append(f"{label} did not finish: {result.output.strip()[-200:]}")
-            all_attempts_passed = False
-            continue
-        attempts.append(f"passed {label}")
-    return Reproduction(ReproStatus.NOT_REPRODUCED, command=plan.command(plan.repro_loops),
-                        attempts=tuple(attempts), all_attempts_passed=all_attempts_passed)
 
 
 def _job_timeout(command: str) -> int:
@@ -659,18 +485,6 @@ def _job_timeout(command: str) -> int:
         if word == "--timeout" and words[index + 1].isdigit():
             return int(words[index + 1])
     return 0
-
-
-def _wrong_argument(output: str) -> str:
-    """runtest's complaint about an option this branch does not have, or ""."""
-    for line in output.splitlines():
-        if "Wrong argument" in line:
-            return line.strip()[:200]
-    return ""
-
-
-def _remaining(deadline: float) -> int:
-    return max(1, int(deadline - time.monotonic()))
 
 
 def _runs_solo(repo_dir: str, test: FailedTest) -> bool:

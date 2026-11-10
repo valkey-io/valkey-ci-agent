@@ -7,7 +7,7 @@ workflow at the checked-out commit as the job itself did, and only a trusted
 tree gets here: a target branch tip, or a bot-owned branch of the target
 repository (a fork's PR only gets a suggestion, which replays no setup).
 The setup runs before the AWS credentials exist and without the workflow's
-environment; the reproduction, tests and edit agent that follow still run as
+environment; the tests and edit agent that follow still run as
 the isolated account.
 """
 

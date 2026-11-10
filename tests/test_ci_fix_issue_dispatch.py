@@ -25,7 +25,7 @@ def _reported(issue, run_id, action="refused"):
     failure = issues.parse_issue(issue)
     issues._terminal_comment(  # the comment the issue fix posts on finishing
         issue, replace(failure, run_id=run_id),
-        repo_full_name="o/r", action=action, summary="did not reproduce",
+        repo_full_name="o/r", action=action, summary="no safe fix",
     )
     issue.comments[-1].user = SimpleNamespace(login=_BOT)
 

@@ -7,15 +7,14 @@ that job's own setup and build (``scripts/ci_fix/job.sh``):
 1. **Find existing fixes**: search history for a merged change that names the
    failing test, changes its file, or references its issue
    (:mod:`scripts.ci_fix.prior_fixes`).
-2. **Reproduce**: run the failing test on the unfixed code the way its CI job
-   did, looped, then under load (:mod:`scripts.ci_fix.reproduce`).
-3. **Fix**: unless code reproduced the failure, stop without editing.
-   Otherwise one agent session, told what steps 1 and 2 found and the
+2. **Fix**: the CI job's log is the evidence of what fails. One agent session, told what step 1 found, the job log and the
    repository's test conventions, ports an existing fix or writes a patch.
-4. **Verify and review**: the candidate (a port is cherry-picked into the
-   checkout first) must pass the reproduction many times, and a separate
-   read-only review must approve it. Otherwise the result goes back to the
-   agent, up to ``MAX_ROUNDS`` times.
+3. **Verify and review**: the candidate (a port is cherry-picked into the
+   checkout first) must build and pass the failing test many times, the way
+   its CI job runs it (:mod:`scripts.ci_fix.verification` plans the command;
+   when the test cannot run alone, its own block, then its whole file), and
+   a separate read-only review must approve it. Otherwise the result goes
+   back to the agent, up to ``MAX_ROUNDS`` times.
 """
 
 from __future__ import annotations
@@ -54,24 +53,18 @@ from scripts.ci_fix.prior_fixes import (
     summarize_prior_fixes,
 )
 from scripts.ci_fix.push import PushFailed, PushRefused, check_port, cherry_pick_refusal
-from scripts.ci_fix.reproduce import (
+from scripts.ci_fix.verification import (
     ISOLATED_COPY_PATTERN,
     JobCommands,
-    Reproduction,
-    ReproPlan,
-    ReproStatus,
     TestRun,
+    VerifyPlan,
     build_plan,
     failure_report,
-    matches_ci,
     plan_for,
     ran_tests,
-    reproduce,
-    shows_failure_of,
 )
 from scripts.common.git_clone import is_full_sha, shallow_clone_at_sha
 from scripts.common.isolation import as_user, handed_to, isolated_user, kill_all
-from scripts.common.logging_utils import log_group
 from scripts.common.proc import (
     PROCESS_BASICS,
     EmptyPatch,
@@ -94,16 +87,15 @@ JOB_LOG_HEAD_CHARS = 40_000
 # the result, this many times in all.
 MAX_ROUNDS = 3
 # How many times the agent's own test command must pass with the patch, when
-# code has no reproduction of its own: once is luck for a flaky failure.
+# code has no command of its own: once is luck for a flaky failure.
 TEST_RUNS = 2
 FLAKY_TEST_RUNS = 10
 TEST_TIMEOUT_S = 30 * 60
 # The model's AWS session (ci-fix-run.yml's role-duration-seconds). The whole
 # preparation, review included, must end inside it, so rounds stop when the
-# budget runs low. Reproduction may use part of it.
+# budget runs low.
 AWS_SESSION_S = 5 * 60 * 60
 PREPARE_BUDGET_S = 4 * 60 * 60 + 30 * 60
-REPRO_BUDGET_S = 60 * 60
 _MIN_ROUND_S = 8 * 60
 # Of each round's time, what the agent may not use: the candidate's
 # verification (looped tests, possibly under valgrind) and review come after it.
@@ -111,7 +103,7 @@ _VERIFY_RESERVE_S = 60 * 60
 _TEST_OUTPUT_CHARS = 6_000
 # A make that stopped on an error; ``make[1]: [...] Error 2 (ignored)`` is not one.
 _BUILD_BROKE_RE = re.compile(r"make(?:\[\d+\])?: \*\*\* .*Error \d+")
-# At most this many of a job's failing tests are searched for and reproduced.
+# At most this many of a job's failing tests are searched for and verified.
 _MAX_TESTS = 3
 
 # Where a repository's test conventions for the agent live, and the
@@ -168,52 +160,29 @@ def prepare_fix(
         runs_tests = task.target.kind is not TargetKind.SUGGEST
         run_test = test_func or run_test_command
         tests = locate_unit_tests(repo_dir, failed_tests(task, job_log))
-        context, plan, reproduction = _establish(
+        context, plan = _establish(
             task, repo_dir, tests, paths_in_log(repo_dir, job_log),
-            run_test if runs_tests else None,
-            repro_deadline=min(deadline, time.monotonic() + REPRO_BUDGET_S), job=job, job_log=job_log,
+            runs_tests=runs_tests, job=job, job_log=job_log,
         )
         if runs_tests:
-            refusal = _reproduction_refusal(context, plan, reproduction)
+            refusal = _unverifiable_refusal(context, plan)
             if refusal is not None:
                 return refusal
         return _fix_loop(
-            task, repo_dir, original_head, job_log, context, plan, reproduction,
+            task, repo_dir, original_head, job_log, context, plan,
             agent_func=agent_func, review=review_func or review_candidate,
             run_test=run_test if runs_tests else None, deadline=deadline, job=job, tests=tests,
         )
 
 
-class ReproductionUnrunnable(RuntimeError):
-    """The reproduction could not run the test on this runner."""
-
-
-def _reproduction_refusal(
-    context: FixContext,
-    plan: ReproPlan | None,
-    reproduction: Reproduction | None,
-) -> FixCandidate | None:
-    """Refuse executable changes unless code reproduced the reported failure."""
-    if plan is None:
-        reason = "no code-owned reproduction command could be established"
-    elif reproduction is not None and reproduction.reproduced:
+def _unverifiable_refusal(context: FixContext, plan: VerifyPlan | None) -> FixCandidate | None:
+    """Refuse when no command can run the failing test: the fix would be published on review alone."""
+    if plan is not None:
         return None
-    elif reproduction is None:
-        reason = "the planned reproduction command was not run"
-    elif reproduction.status is ReproStatus.UNRUNNABLE:
-        # About the bot's runner, not the test: a failed attempt, retried a
-        # bounded number of times and posted nowhere, not a refusal.
-        raise ReproductionUnrunnable(
-            f"the reproduction could not run: {reproduction.describe()}"
-            f" See reproduction.md in the run's artifact."
-        )
-    elif reproduction.all_attempts_passed:
-        reason = "every reproduction probe passed without reproducing the failure"
-    else:
-        reason = "the reproduction stopped without reproducing the failure"
     return _refusal(
-        f"The reported failure was not reproduced by code: {reason}. No edit was attempted.",
-        verification="\n".join(_established_checks(context, reproduction)),
+        "No command on this runner can run the failing test, so a fix could not be checked. "
+        "No edit was attempted.",
+        verification="\n".join(_established_checks(context)),
     )
 
 
@@ -303,7 +272,7 @@ def _digest(path: Path) -> str:
 
 
 def failed_tests(task: FixTask, job_log: str) -> tuple[FailedTest, ...]:
-    """The tests to search fixes for and reproduce: the front door's, then the log's.
+    """The tests to search fixes for and verify: the front door's, then the log's.
 
     A detector issue is about its own test; other tests the same job failed
     have issues of their own, and a fix for this one must not wait on them.
@@ -340,53 +309,32 @@ def _establish(
     repo_dir: str,
     tests: tuple[FailedTest, ...],
     paths: tuple[str, ...],
-    run_test: TestFunc | None,
     *,
-    repro_deadline: float,
+    runs_tests: bool,
     job: JobCommands | None = None,
     job_log: str = "",
-) -> tuple[FixContext, ReproPlan | None, Reproduction | None]:
-    """Reproduce the failure and search for existing fixes, before any edit.
+) -> tuple[FixContext, VerifyPlan | None]:
+    """What the agent is told before it starts, and how code will check its patch.
 
-    What both found, and the repository's test guide, is what the agent is
-    told before it starts.
+    The CI job's log shows the failure; the plan is the command that
+    verifies a candidate. What the history
+    search found, and the repository's test guide, go to the agent too.
     """
-    plan = reproduction = None
+    plan = None
     described = ""
-    if run_test is not None:
+    if runs_tests:
         plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
         if plan is None and not tests and job is not None and job.build and _BUILD_BROKE_RE.search(job_log):
             plan = build_plan(job)
     if plan is not None:
-        assert run_test is not None  # a plan is only made to be run
         _ignore_generated_copies(repo_dir)
-        logger.info("Reproducing with: %s", plan.command(1))
-        reproduction = reproduce(
-            plan,
-            lambda command, timeout: run_test(repo_dir, command, timeout),
-            deadline=repro_deadline,
-        )
-        logger.info("Reproduction: %s", reproduction.describe())
-        while plan.fallback is not None and (
-            reproduction.status is ReproStatus.UNRUNNABLE
-            # The block passing does not mean the file does: what the copy
-            # dropped may be what makes the test fail. Run the whole file once.
-            or (reproduction.status is ReproStatus.NOT_REPRODUCED and plan.isolated_block)
-        ):
-            plan = plan.fallback
-            logger.info("Reproducing another way: %s", plan.command(1))
-            reproduction = reproduce(
-                plan,
-                lambda command, timeout: run_test(repo_dir, command, timeout),
-                deadline=repro_deadline,
-            )
-            if reproduction.reproduced and not matches_ci(plan, reproduction.output, job_log):
-                # The copy, not the code, may be what failed: try the whole file.
-                reproduction = replace(reproduction, status=ReproStatus.UNRUNNABLE,
-                                       reason="the test's own block failed differently from CI")
-            logger.info("Reproduction: %s", reproduction.describe())
-        described = " ".join([reproduction.describe(), *plan.notes])
-        _write_transcript(plan, reproduction)
+        loops = plan.loops
+        logger.info("Verification plan: %s", plan.command(loops))
+        described = " ".join([
+            f"Code checks your change with `{plan.command(loops)}`"
+            f" ({loops} loop(s)); the build must pass and the failing test must run and pass every loop.",
+            *plan.notes,
+        ])
     history = failing_test_history(repo_dir, tests)
     found = find_prior_fixes(
         repo_dir, tests, tested_sha=task.failure.head_sha, issue_number=task.failure.issue_number,
@@ -401,50 +349,12 @@ def _establish(
         prior_fixes_detail=render_prior_fixes(repo_dir, fixes),
         prior_fixes_searched=found is not None,
         test_history=history,
-        reproduction=described,
-        reproduction_output=reproduction.output if reproduction else "",
-        verified_by_code=reproduction is not None and reproduction.status is not ReproStatus.UNRUNNABLE,
+        verification=described,
+        verified_by_code=plan is not None,
         guide=guide,
         guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
-    return context, plan, reproduction
-
-
-# Where the run's artifact collects evidence (scripts/ci_fix/job.sh).
-EVIDENCE_DIR_ENV = "CI_AGENT_EVIDENCE_DIR"
-_TRANSCRIPT_TAIL_LINES = 200
-
-
-def _write_transcript(plan: ReproPlan, reproduction: Reproduction) -> None:
-    """Save what the reproduction ran and printed, for the run's artifact.
-
-    A refusal or a failed attempt says why in a sentence; this says what the
-    command printed. The output is the test's own: the isolated account ran
-    it with a scrubbed environment, so it holds no credential.
-    """
-    directory = os.environ.get(EVIDENCE_DIR_ENV, "")
-    if not directory:
-        return
-    tail = "\n".join(reproduction.output.splitlines()[-_TRANSCRIPT_TAIL_LINES:])
-    text = "\n".join([
-        "# Reproduction", "",
-        f"- Status: {reproduction.status.value}",
-        f"- Attempts: {'; '.join(reproduction.attempts) or '-'}",
-        f"- Reason: {reproduction.reason or '-'}",
-        f"- Command: `{reproduction.command or plan.command(1)}`",
-        *(f"- Note: {note}" for note in plan.notes), "",
-        f"## Output (last {_TRANSCRIPT_TAIL_LINES} lines)", "", "```", tail, "```", "",
-    ])
-    try:
-        path = Path(directory) / "reproduction.md"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as transcript:
-            transcript.write(text)
-    except OSError as exc:
-        logger.warning("Could not save the reproduction transcript: %s", exc)
-    if reproduction.status is ReproStatus.UNRUNNABLE:
-        with log_group("Reproduction output (last 40 lines)"):
-            logger.info("%s", "\n".join(reproduction.output.splitlines()[-40:]))
+    return context, plan
 
 
 def _ignore_generated_copies(repo_dir: str) -> None:
@@ -479,8 +389,7 @@ def _fix_loop(
     original_head: str,
     job_log: str,
     context: FixContext,
-    plan: ReproPlan | None,
-    reproduction: Reproduction | None,
+    plan: VerifyPlan | None,
     *,
     agent_func: AgentFunc,
     review: ReviewFunc,
@@ -489,7 +398,7 @@ def _fix_loop(
     job: JobCommands | None = None,
     tests: tuple[FailedTest, ...] = (),
 ) -> FixCandidate:
-    established = _established_checks(context, reproduction)
+    established = _established_checks(context)
     feedback = ""
     last = "no attempt was made"
     for attempt in range(1, MAX_ROUNDS + 1):
@@ -538,7 +447,7 @@ def _fix_loop(
         try:
             failed = ""
             if run_test is not None:
-                failed = _verify(reviewed, repo_dir, plan, reproduction, run_test, deadline, checks, tests)
+                failed = _verify(reviewed, repo_dir, plan, run_test, deadline, checks, tests)
             if not failed:
                 approved, reasoning = review(
                     reviewed, repo_dir, job_log, context=context, timeout=_timeout(deadline),
@@ -651,14 +560,14 @@ def _noun(candidate: FixCandidate) -> str:
     return "port" if candidate.action is CandidateAction.PORT else "patch"
 
 
-def _established_checks(context: FixContext, reproduction: Reproduction | None) -> list[str]:
+def _established_checks(context: FixContext) -> list[str]:
     checks = []
     if context.prior_fixes:
         checks.append("Existing fixes found: " + "; ".join(context.prior_fixes.splitlines()))
     elif context.prior_fixes_searched:
         checks.append("No merged change that looks like a fix was found.")
-    if context.reproduction:
-        checks.append(context.reproduction)
+    if context.verification:
+        checks.append(context.verification)
     return checks
 
 
@@ -675,39 +584,31 @@ def other_issues_fixed(
     """Which other detector issues this patch was shown to fix, and which it only touched.
 
     One file often holds several open failures, so a patch for one issue can
-    change another's test. Each such issue is verified on its own, exactly as
-    the target was: its test must fail without the patch and pass with it.
-    Only then may the draft PR say it fixes it.
+    change another's test. Each such issue's test must still pass with the
+    patch, the way the target's is verified; the draft PR then names it as
+    touched. Passing with the patch does not show the patch fixes it, so no
+    other issue is claimed as fixed (and closed by the PR).
     """
     changed = changed_lines(candidate.patch)
     others = [issue for issue in task.other_issues if _changes_test(repo_dir, changed, issue.test)]
-    if not others:
-        return (), ()
-    fixed: list[int] = []
     touched: list[int] = []
     for issue in others:
         # In code: GitHub links a bare #N, and a linked open PR keeps that
         # issue from a fix of its own (issue_state.has_open_linked_pr), which
         # a PR that has not shown it fixes the issue must not do.
         name, ref = f"`{issue.test.name or issue.test.file}`", f"`#{issue.number}`"
-        if run_test is None or time.monotonic() > deadline:
-            touched.append(issue.number)
-            checks.append(f"The patch changes {name}, issue {ref}'s test; "
-                          "there was no time left to verify that it fixes it.")
-            continue
+        touched.append(issue.number)
         plan = plan_for(repo_dir, (issue.test,), scheduled=task.failure.scheduled, job=job)
-        if plan is None:
-            touched.append(issue.number)
-            checks.append(f"The patch changes {name}, issue {ref}'s test, which cannot be run on this runner.")
+        if run_test is None or plan is None or time.monotonic() > deadline:
+            checks.append(f"The patch changes {name}, issue {ref}'s test, which could not be run.")
             continue
-        shown = _patch_fixes(plan, candidate, repo_dir, run_test, deadline)
-        (fixed if shown else touched).append(issue.number)
+        result = run_test(repo_dir, plan.command(plan.loops), _timeout(deadline))
         checks.append(
-            f"Also fixes issue #{issue.number}: {name} failed without the patch and passed with it."
-            if shown else
-            f"The patch changes {name}, issue {ref}'s test, but it was not shown to fix it."
+            f"The patch changes {name}, issue {ref}'s test, which passed {plan.loops} loop(s) with it."
+            if result.passed and plan.ran(result) else
+            f"The patch changes {name}, issue {ref}'s test, which did not pass with it."
         )
-    return tuple(fixed), tuple(touched)
+    return (), tuple(touched)
 
 
 def changed_lines(patch: str) -> dict[str, set[int]]:
@@ -768,31 +669,10 @@ def _changes_test(repo_dir: str, changed: dict[str, set[int]], test: FailedTest)
     return False
 
 
-def _patch_fixes(
-    plan: ReproPlan,
-    candidate: FixCandidate,
-    repo_dir: str,
-    run_test: TestFunc,
-    deadline: float,
-) -> bool:
-    """Whether ``plan``'s test fails without ``candidate``'s patch and passes with it."""
-    def run(command: str) -> TestRun:
-        return run_test(repo_dir, command, _timeout(deadline))
-
-    with _without_patch(repo_dir, candidate.patch):
-        without = reproduce(plan, lambda command, _timeout_s: run(command), deadline=deadline)
-    if not without.reproduced:
-        return False
-    loops = plan.verify_loops(without.deterministic)
-    with_patch = run(plan.command(loops, under_load=without.under_load))
-    return with_patch.passed and plan.ran(with_patch)
-
-
 def _verify(
     candidate: FixCandidate,
     repo_dir: str,
-    plan: ReproPlan | None,
-    reproduction: Reproduction | None,
+    plan: VerifyPlan | None,
     run_test: TestFunc,
     deadline: float,
     checks: list[str],
@@ -805,14 +685,8 @@ def _verify(
     first: the build and tests run from source.
     """
     _remove_ignored(repo_dir)
-    if plan is not None and reproduction is not None and reproduction.status is not ReproStatus.UNRUNNABLE:
-        flaky = candidate.failure_type is FailureType.FLAKY
-        failed = _verify_with_plan(plan, reproduction, repo_dir, run_test, deadline, checks, flaky=flaky)
-        if failed or reproduction.reproduced or not candidate.test_command:
-            return failed
-        # Code's reproduction never failed; the agent's own command may show
-        # the failure, and so whether the fix works.
-        return _test_feedback(candidate, repo_dir, run_test, deadline, checks, tests)
+    if plan is not None:
+        return _verify_with_plan(plan, repo_dir, run_test, deadline, checks)
     if candidate.test_command:
         return _test_feedback(candidate, repo_dir, run_test, deadline, checks, tests)
     checks.append("No test command could run this check on the bot's runner.")
@@ -820,46 +694,47 @@ def _verify(
 
 
 def _verify_with_plan(
-    plan: ReproPlan,
-    reproduction: Reproduction,
+    plan: VerifyPlan,
     repo_dir: str,
     run_test: TestFunc,
     deadline: float,
     checks: list[str],
-    *,
-    flaky: bool = False,
 ) -> str:
-    # Two failing runs can be a frequent flake's luck: when the agent judged
-    # the failure flaky, the fix must pass a flake's full loops.
-    loops = plan.verify_loops(reproduction.deterministic and not flaky)
-    command = plan.command(loops, under_load=reproduction.under_load)
-    result = run_test(repo_dir, command, _timeout(deadline))
-    if result.passed and not plan.ran(result):
+    """The patched test passing its loops, the way the CI job runs it; feedback when it does not.
+
+    With ``--only`` a test may not run at all, or fail for want of what a
+    skipped test set up (integration/replication.tcl, cluster/slave-selection.tcl),
+    so a plan that does not pass is followed by its fallbacks: the test's own
+    block, then its whole file once. The first that runs and passes the test
+    is the verification; otherwise the last one's result is the feedback.
+    """
+    current: VerifyPlan | None = plan
+    while current is not None:
+        loops = current.loops
+        command = current.command(loops)
+        result = run_test(repo_dir, command, _timeout(deadline))
+        if result.timed_out:
+            # Nothing is known about the change, and nothing the agent can do
+            # about it: the attempt failed, and is retried.
+            raise RuntimeError(f"`{command}` did not finish in the time left ({result.output}).")
+        if result.passed and current.ran(result):
+            checks.append(f"With the fix, `{command}` passed {loops} loop(s).")
+            return ""
+        last, last_command, last_loops = current, command, loops
+        current = current.fallback
+    if result.passed:
         return (
-            f"With your change, `{command}` passed without running the failing test. "
+            f"With your change, `{last_command}` passed without running the failing test. "
             "Do not rename, skip, or tag out the test: fix why it fails.\n\n"
             f"Its output:\n{result.output}"
         )
-    if result.passed:
-        if reproduction.reproduced:
-            checks.append(f"With the fix, the reproduction passed {loops} loop(s): `{command}`.")
-        else:
-            checks.append(
-                f"With the fix, `{command}` passed {loops} loop(s), but the failure never "
-                "reproduced without it, so this does not show the fix works."
-            )
-        return ""
-    if plan.failed(result):
+    if last.failed(result):
         return (
-            f"With your change, the reproduction still fails within {loops} loop(s): `{command}`.\n\n"
+            f"With your change, the failing test still fails within {last_loops} loop(s): `{last_command}`.\n\n"
             f"Its output:\n{result.output}"
         )
-    if result.timed_out:
-        # Nothing is known about the change, and nothing the agent can do
-        # about it: the attempt failed, and is retried.
-        raise RuntimeError(f"`{command}` did not finish in the time left ({result.output}).")
     return (
-        f"With your change, `{command}` could not build or run the tests (a build "
+        f"With your change, `{last_command}` could not build or run the tests (a build "
         "break, or a server or test client failing outside the test).\n\n"
         f"Its output:\n{result.output}"
     )
@@ -901,16 +776,6 @@ def restore(repo_dir: str) -> None:
             run_git(repo_dir, *args)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             logger.warning("Could not run git %s after a port", " ".join(args))
-
-
-@contextmanager
-def _without_patch(repo_dir: str, patch: str) -> Iterator[None]:
-    """The working tree with ``patch`` taken out, and put back afterwards."""
-    run_git(repo_dir, "apply", "-R", "--whitespace=nowarn", "-", input=patch)
-    try:
-        yield
-    finally:
-        run_git(repo_dir, "apply", "--whitespace=nowarn", "-", input=patch)
 
 
 def _remove_ignored(repo_dir: str) -> None:
@@ -1005,53 +870,31 @@ def _test_feedback(
     candidate: FixCandidate, repo_dir: str, run_test: TestFunc, deadline: float, checks: list[str],
     tests: tuple[FailedTest, ...] = (),
 ) -> str:
-    """Run the agent's test without and with its patch; "" when both hold.
+    """Run the agent's test with its patch; "" when it passes every run.
 
     Otherwise returns what went wrong, for the agent's next round. On success
-    ``checks`` gains a line for the maintainer report. A run killed for time
-    shows nothing either way; when the command fails one of the job's
-    ``tests`` without the patch, it must run them with it, not just exit 0.
+    ``checks`` gains a line for the maintainer report. When the command names
+    one of the job's ``tests``, it must run them, not just exit 0.
     """
     command = candidate.test_command
     runs = FLAKY_TEST_RUNS if candidate.failure_type is FailureType.FLAKY else TEST_RUNS
-    # Without the patch, the test must fail: one that passes does not
-    # exercise the failure, and a pass with the patch would mean nothing. A
-    # flaky failure may need several runs to show.
-    baseline_runs = 0
-    with _without_patch(repo_dir, candidate.patch):
-        for baseline_runs in range(1, runs + 1):
-            baseline = run_test(repo_dir, command, _timeout(deadline))
-            if not baseline.passed:
-                break
-    if baseline.timed_out:
-        return (
-            f"`{command}` did not finish in the time left without your change ({baseline.output}), "
-            "so it shows nothing. Give a test command that fails quickly on the unpatched code."
-        )
-    if baseline.passed:
-        return (
-            f"`{command}` passes {runs} time(s) without your change, so it does not reproduce "
-            "the failure. Give a test command that fails on the unpatched code the way the job did.\n\n"
-            f"Its output without your change:\n{baseline.output}"
-        )
-    named = tests if shows_failure_of(baseline.report, tests) else ()
     for run in range(1, runs + 1):
         result = run_test(repo_dir, command, _timeout(deadline))
+        if result.timed_out:
+            raise RuntimeError(f"`{command}` did not finish in the time left ({result.output}).")
         if not result.passed:
             return (
                 f"With your change, `{command}` failed on run {run} of {runs}; "
                 "it must pass every time.\n\n"
                 f"Its output:\n{result.output}"
             )
-        if named and not ran_tests(result.report, named):
+        if tests and not ran_tests(result.report, tests):
             return (
                 f"With your change, `{command}` passed without running the failing test. "
                 "Do not rename, skip, or tag out the test: fix why it fails.\n\n"
                 f"Its output:\n{result.output}"
             )
-    checks.append(
-        f"`{command}` failed without the patch (on run {baseline_runs}) and passed {runs} time(s) with it."
-    )
+    checks.append(f"With the fix, `{command}` passed {runs} time(s).")
     return ""
 
 

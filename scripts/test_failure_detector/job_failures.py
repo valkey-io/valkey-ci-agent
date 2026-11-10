@@ -75,7 +75,7 @@ _REPORT_FRAMES = 3
 _REPORT_LINES = 400
 # The reply-schema validator prints a stable error followed by the request and
 # response that disagreed with commands.def. It is not a runtest result, but it
-# is precise enough to file and reproduce instead of leaving the failed job
+# is precise enough to file and fix instead of leaving the failed job
 # unexplained.
 _REPLY_SCHEMA_ERROR_RE = re.compile(
     r"^JSON schema validation error on \S+: (?P<error>.+)$"

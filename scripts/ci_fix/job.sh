@@ -2,7 +2,7 @@
 # Run one CI fix in a disposable checkout below the system temp directory.
 #
 # The workflow checkout remains runner-owned for Actions cleanup. Target setup,
-# reproduction, tests, and the edit agent use the copied checkout, whose parent
+# tests, and the edit agent use the copied checkout, whose parent
 # is naturally traversable; no ACL is granted on the runner's home or on /.
 set -euo pipefail
 

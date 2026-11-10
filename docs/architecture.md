@@ -70,7 +70,7 @@ produces a description of the task. It doesn't diagnose or publish anything
 itself.
 
 The second part does the work. It prepares one result from that task: it
-clones, searches, reproduces, calls Claude, and checks what comes back.
+clones, searches, calls Claude, and verifies what comes back.
 
 The third part publishes. Right before writing, it checks again that the
 destination is what it expects, such as the same commit at the head of the

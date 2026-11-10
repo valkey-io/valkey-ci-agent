@@ -218,10 +218,8 @@ class FixContext:
     # The failing test file's recent commits, with the diff of the one that
     # added the test (the edit agent has no git).
     test_history: str = ""
-    # Whether and how the failure reproduced on the unfixed code, and whether
-    # code verifies a candidate with that reproduction command.
-    reproduction: str = ""
-    reproduction_output: str = ""
+    # How code verifies a candidate, and whether it does.
+    verification: str = ""
     verified_by_code: bool = False
     # The repository's test conventions, and its own docs in the checkout.
     guide: str = ""
