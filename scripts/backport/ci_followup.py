@@ -266,15 +266,6 @@ def _release_run_failure(
     workflow = repo_entry.ci_followup_release_workflow
     if not workflow:
         return None
-    try:
-        runs = retry_github_call(
-            lambda: list(islice(gh.get_repo(repo_entry.repo).get_workflow(workflow).get_runs(event="schedule"), 1)),
-            retries=2,
-            description=f"find the newest scheduled {workflow} run",
-        )
-    except Exception as exc:  # noqa: BLE001 - the pull request's own CI was still followed up
-        logger.warning("Could not read the scheduled %s runs: %s", workflow, exc)
-        return None
 
     def keep(run: Any, job: FailedJob) -> bool:
         name = release_job_name(job.name, target_branch)
@@ -286,7 +277,19 @@ def _release_run_failure(
             and not job_is_ignored(name, repo_entry.ci_followup_ignored_jobs)
         )
 
-    return most_actionable_failure(gh, repo_entry.repo, runs, keep=keep)
+    # The pull request's own CI was followed up already, and had nothing left:
+    # a run that cannot be read now is read on the next hour's run. Its jobs
+    # are several hundred, over several requests.
+    try:
+        runs = retry_github_call(
+            lambda: list(islice(gh.get_repo(repo_entry.repo).get_workflow(workflow).get_runs(event="schedule"), 1)),
+            retries=2,
+            description=f"find the newest scheduled {workflow} run",
+        )
+        return most_actionable_failure(gh, repo_entry.repo, runs, keep=keep)
+    except Exception as exc:  # noqa: BLE001 - never a reason to fail the follow-up
+        logger.warning("Could not read the scheduled %s run: %s", workflow, exc)
+        return None
 
 
 def plan_request(
