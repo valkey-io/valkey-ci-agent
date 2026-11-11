@@ -83,11 +83,11 @@ of what fails. The bot works out the command that will verify a fix (the
 job's own build and test command, for the failing test only) and tells
 Claude what it is. Some failures have no command the bot can run: a sanitizer
 or valgrind report that names no test, a sentinel or legacy-cluster test, a
-lint. For those the bot only accepts a change that is already merged upstream,
-checks that it builds, and leaves the rest to the PR's own CI. When there is
-nothing upstream to port, as on `unstable` itself, Claude may still propose a
-patch. That patch is reviewed but not run, and the bot's report says so in
-its first line. A backport branch never gets one.
+lint. For those the bot checks that the change builds and leaves the rest to
+the PR's own CI: a change already merged upstream comes first, and where none
+fixes the failure Claude writes a patch. When there is nothing upstream to
+port, as on `unstable` itself, the patch is reviewed but not run, and the
+bot's report says so in its first line.
 
 **Claude diagnoses and edits.** Claude gets the job's whole log, whatever the
 history search found, the verification command, and Valkey's testing
@@ -100,27 +100,29 @@ under each of them, it makes that change and says what is not established. It
 declines only when it can justify no change. Claude works in a scratch copy of the code. It can
 edit files there but cannot commit or push.
 
-On a backport branch Claude may not write a fix of its own. It ports a commit
-that is merged upstream, or adapts one and names it. Claude cannot run git, so
+On a backport branch a change that is merged upstream comes first. Claude
+ports the commit, or adapts it and names it. Claude cannot run git, so
 the bot gives it every commit the branch lacks with the files each changes,
 the diffs of the newest ones to the files the failure names, and the diff of
-a port that did not apply. For an adaptation the bot checks that the named
-commit is merged, is not on the branch yet, and that the patch is that
-commit's change: at least half of the lines it adds are the commit's, or at
-least half of the lines it removes are lines the commit removes. An
-adaptation often writes something else in their place, such as another
-encoding to assert or a wider tolerance. Naming a commit that only touches
-the same file is not enough, and the reviewer reads the named commit's diff
-next to the patch. One other patch is accepted: one that
-changes only files the backport PR itself changes, which repairs what the
-backport brought. A test that is flaky upstream too is fixed upstream first. A
-backport that broke the build is the exception: that is repaired by hand.
+a port that did not apply. A patch is reported as adapting a commit only when
+the bot finds that it does: the named commit is merged, is not on the branch
+yet, and the patch is that commit's change. At least half of the lines it
+adds are the commit's, or at least half of the lines it removes are lines the
+commit removes. An adaptation often writes something else in their place,
+such as another encoding to assert or a wider tolerance. Naming a commit that
+only touches the same file is not enough, and the reviewer reads the named
+commit's diff next to the patch.
+
+Where no upstream commit fixes the failure, such as a test that is flaky on
+`unstable` too, Claude writes the fix on the backport branch. It is verified
+and reviewed like any other patch, and the report says that the default
+branch does not have it, so a maintainer can decide whether it needs the same
+fix.
 
 **Code checks what Claude handed back.** The bot rejects anything that doesn't
 add up: a commit Claude made itself, a fix with no root cause or reasoning, a
 port that isn't a real merged
-commit or is already on the branch, a hand-written fix where only an upstream
-change is accepted, or a suggested patch that is too large.
+commit or is already on the branch, or a suggested patch that is too large.
 
 ## How the fix is tested
 

@@ -23,11 +23,10 @@ from scripts.common.text_utils import compact_text
 
 _POLICY = {
     FixPolicy.BACKPORT: (
-        "This is a backport branch. Port an already-merged upstream fix, or "
-        "make the smallest mechanical adaptation needed on the release "
-        "branch. Do not change product behavior. A change under .github/ is "
-        "allowed only when the CI definition itself is the cause, such as an "
-        "upstream CI fix the release branch lacks."
+        "This is a backport branch: keep the change as small as the failure "
+        "allows, and do not hide a product defect or weaken a test. A change "
+        "under .github/ is allowed only when the CI definition itself is the "
+        "cause, such as an upstream CI fix the release branch lacks."
     ),
     FixPolicy.GENERAL: (
         "Fix the root cause with the smallest coherent source, test or build "
@@ -35,18 +34,14 @@ _POLICY = {
     ),
 }
 
-_UPSTREAM_ONLY = (
-    "Only a change already merged on the default branch is accepted for this "
-    "failure. Choose `port`; or, when the upstream commit does not apply as it "
-    "is, a `patch` that makes the same change adapted to this branch, with "
-    "`adapts_commit` set to that commit's full SHA. If no upstream commit fixes "
-    "this failure, choose `refuse` and say so: a fix the default branch does "
-    "not have, such as one for a flaky test it shares, belongs there first."
-)
-
-_OWN_PATHS = (
-    "One more kind of patch is accepted: one that changes only files this pull "
-    "request itself changes, to repair what the backport brought."
+_UPSTREAM_FIRST = (
+    "A change already merged on the default branch comes first. Choose `port`; "
+    "or, when the upstream commit does not apply as it is, a `patch` that makes "
+    "the same change adapted to this branch, with `adapts_commit` set to that "
+    "commit's full SHA. When no upstream commit fixes this failure, such as a "
+    "flaky test the default branch shares, write the fix here as a `patch` with "
+    "`adapts_commit` empty, and say in `validation` that the default branch "
+    "does not have it and whether it needs the same fix."
 )
 
 _PROMPT = """\
@@ -249,8 +244,7 @@ def run_fix_agent(
             description=task.failure.description or "(none)",
             hint=task.failure.hint or "(none)",
             other_jobs=", ".join(task.failure.other_failed_jobs) or "(none)",
-            policy=_POLICY[task.policy] + (f"\n{_UPSTREAM_ONLY}" if context.upstream_only else "")
-            + (f" {_OWN_PATHS}" if context.own_paths else ""),
+            policy=_POLICY[task.policy] + (f"\n{_UPSTREAM_FIRST}" if context.upstream_first else ""),
             target=capabilities.publication_guidance,
             context=_context_prompt(context, Path(log_dir), allows_port),
             test_guidance=(
@@ -465,9 +459,14 @@ def review_candidate(
             adapted = Path(log_dir) / "adapted-commit.diff"
             adapted.write_text(_adapted_diff(repo_dir, candidate), encoding="utf-8")
             origin = (
-                "This branch takes only changes already merged upstream. The patch says it adapts upstream "
-                f"commit {candidate.adapts}, whose diff to the same files is in {adapted}: reject anything in "
-                "the patch that is not that commit's change, or the least needed to apply it here.\n"
+                f"The patch says it adapts upstream commit {candidate.adapts}, whose diff to the same files is "
+                f"in {adapted}: reject anything in the patch that is not that commit's change, or the least "
+                "needed to apply it here.\n"
+            )
+        elif context.upstream_first and candidate.action is CandidateAction.PATCH:
+            origin = (
+                "This is a release branch, and no commit on the default branch was found to fix the failure: "
+                "the patch is a fix written for this branch. Reject a change larger than the failure needs.\n"
             )
         # What code ran and found, for a verified candidate; else what it planned.
         checked = candidate.verification or context.verification

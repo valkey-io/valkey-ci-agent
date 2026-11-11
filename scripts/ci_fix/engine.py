@@ -16,9 +16,10 @@ that job's own setup and build (``scripts/ci_fix/job.sh``):
    its whole file), and a separate read-only review must approve it.
    Otherwise the result goes back to the agent, up to ``MAX_ROUNDS`` times.
 
-On a backport branch, and for a failure no command here can run, only a
-change already merged upstream is accepted: a port, or a patch that adapts
-one (``FixContext.upstream_only``).
+On a backport branch, and for a failure no command here can run, a change
+already merged upstream comes first: a port, or a patch that adapts one
+(``FixContext.upstream_first``). Where none fixes the failure, the fix is
+written on the branch, and reported as one the default branch does not have.
 """
 
 from __future__ import annotations
@@ -334,8 +335,7 @@ def _establish(
     search found, and the repository's test guide, go to the agent too.
     """
     plan = None
-    upstream_only = False
-    own_paths: tuple[str, ...] = ()
+    upstream_first = False
     described = ""
     if runs_tests:
         plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
@@ -346,18 +346,15 @@ def _establish(
             # test, a lint: nothing here runs it, but the default branch may
             # already hold its fix, which the pull request's own CI checks.
             plan = upstream_plan(job)
-            upstream_only = True
+            upstream_first = True
         elif plan is not None and task.policy is FixPolicy.BACKPORT:
-            # A release branch takes the upstream change, not a fix of its
-            # own that the default branch never gets; but what the backport
-            # itself brought and broke is repaired here.
-            upstream_only = True
-            own_paths = _pull_request_paths(repo_dir, task.failure.base_branch)
+            # A release branch takes the upstream change where there is one.
+            upstream_first = True
     # A job that failed outside any test the bot can run (a validator, an
     # exception between tests), with nothing upstream to port: the fixes
     # people write for these are small and read from the log, so one is
-    # proposed, reviewed, and published as not run. Never on a backport
-    # branch, which takes only what is merged upstream.
+    # proposed, reviewed, and published as not run. Not on a backport
+    # branch: its unrunnable failures take the plan above, which builds.
     reviewed_only = runs_tests and plan is None and task.policy is FixPolicy.GENERAL
     if reviewed_only:
         described = _NOT_RUN
@@ -387,33 +384,17 @@ def _establish(
         test_history=history,
         unported_changes=(
             unported_changes(repo_dir, tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths])))
-            if upstream_only else ""
+            if upstream_first else ""
         ),
-        unported_index=unported_index(repo_dir) if upstream_only else "",
+        unported_index=unported_index(repo_dir) if upstream_first else "",
         verification=described,
         verified_by_code=plan is not None,
-        upstream_only=upstream_only,
-        own_paths=own_paths,
+        upstream_first=upstream_first,
         reviewed_only=reviewed_only,
         guide=guide,
         guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
     return context, plan
-
-
-def _pull_request_paths(repo_dir: str, base_branch: str) -> tuple[str, ...]:
-    """The files the checked-out branch changes relative to ``base_branch``; none when that cannot be told.
-
-    Of the hand-written fixes pushed to backport branches, eleven of thirteen
-    changed a file their pull request never touched: a flake the release
-    branch already had. The other two repaired what the backport brought.
-    """
-    try:
-        fork_point = git_output(repo_dir, "merge-base", f"origin/{base_branch}", "HEAD").strip()
-        return git_paths(repo_dir, "diff", "--no-ext-diff", "--name-only", "-z", fork_point, "HEAD")
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-        logger.info("Could not list what the pull request changes: %s", exc)
-        return ()
 
 
 def _can_port(task: FixTask, repo_dir: str) -> bool:
@@ -507,6 +488,8 @@ def _fix_loop(
             continue
 
         checks = list(established)
+        if context.upstream_first and candidate.action is CandidateAction.PATCH and not candidate.adapts:
+            checks.append(_OWN_FIX)
         if outcome.undeclared:
             checks.append(
                 "The patch also changes " + ", ".join(f"`{path}`" for path in outcome.undeclared)
@@ -601,8 +584,7 @@ def agent_round(
     try:
         declared = set(candidate.changed_paths)
         candidate = _checked_candidate(
-            task, repo_dir, original_head, candidate,
-            upstream_only=context.upstream_only, own_paths=context.own_paths,
+            task, repo_dir, original_head, candidate, upstream_first=context.upstream_first,
         )
     except _Rejected as exc:
         tree = _KEPT_TREE if worktree_changed_paths(repo_dir, strict=True) else _RESET_TREE
@@ -640,12 +622,12 @@ _TREE_CHANGED = (
     "verified, so the tree no longer matches the patch that was checked. Make the fix "
     "itself: nothing the build or a test writes can be part of it."
 )
-_UPSTREAM_ONLY = (
-    "Only a change already merged upstream is accepted here: choose `port`, or a `patch` "
-    "whose `adapts_commit` is the full SHA of the merged default-branch commit it adapts to "
-    "this branch. A patch that changes only files this pull request itself changes is "
-    "accepted too: it repairs what the backport brought. Any other fix belongs on the "
-    "default branch first: choose `refuse` and say so."
+# Of the hand-written fixes people pushed to backport branches, eleven of
+# thirteen were for a flake the release branch already had, in a file the
+# backport never touched.
+_OWN_FIX = (
+    "No change on the default branch was found to fix this failure, so this fix was written "
+    "for this branch: the default branch does not have it."
 )
 _NOT_RUN = "No command here can run the failing check, so this fix was reviewed, not run."
 
@@ -955,15 +937,15 @@ def _timeout(deadline: float) -> int:
 
 def _checked_candidate(
     task: FixTask, repo_dir: str, original_head: str, candidate: FixCandidate, *,
-    upstream_only: bool = False, own_paths: tuple[str, ...] = (),
+    upstream_first: bool = False,
 ) -> FixCandidate:
     """``candidate`` with its patch built from the checkout, or a refusal.
 
     A commit is a refusal: the agent broke the one rule its checkout depends
     on. Anything else wrong with what it handed back raises
     :class:`_Rejected`, which goes back to it like a failing test. With
-    ``upstream_only``, a patch must adapt a merged upstream commit, unless it
-    changes only ``own_paths``, the files the pull request itself changes.
+    ``upstream_first``, a patch's claim to adapt a merged upstream commit is
+    kept only when code finds it does; otherwise the patch is the bot's own.
 
     The patch is what the working tree holds, not what the agent listed: a
     file it changed and did not list is published with the rest and pointed
@@ -1004,8 +986,7 @@ def _checked_candidate(
     except EmptyPatch:
         raise _Rejected("The agent selected a patch but produced no patch content.")
     adapts = ""
-    if upstream_only and not (own_paths and set(changed_paths) <= set(own_paths)):
-        _check_adapts(repo_dir, candidate.adapts, changed_paths, patch)
+    if upstream_first and _adapts(repo_dir, candidate.adapts, changed_paths, patch):
         adapts = candidate.adapts
     patch_limit = capabilities.patch_limit
     if len(patch) > patch_limit:
@@ -1034,34 +1015,29 @@ def _checked_candidate(
 _MIN_ADAPTED_SHARE = 0.5
 
 
-def _check_adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...], patch: str) -> None:
-    """Raise :class:`_Rejected` unless ``patch`` adapts ``commit``, a merged upstream change.
+def _adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...], patch: str) -> bool:
+    """Whether ``patch`` adapts ``commit``, a merged upstream change.
 
     The commit has to pass what a port must (merged on the default branch,
     not on this one), and the patch has to be mostly that commit's change to
     the same files: naming a commit that only touches the file adapts nothing.
     """
     if not is_full_sha(commit):
-        raise _Rejected(_UPSTREAM_ONLY)
+        return False
     try:
         check_port(Path(repo_dir), commit, "HEAD")
         upstream = git_output(
             repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", commit, "--", *changed_paths,
         )
-    except (PushRefused, PushFailed) as exc:
-        raise _Rejected(f"{exc} {_UPSTREAM_ONLY}") from exc
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-        raise _Rejected(f"Commit {commit[:12]} could not be read. {_UPSTREAM_ONLY}") from exc
+    except (PushRefused, PushFailed, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("The patch does not adapt %s: %s", commit[:12], exc)
+        return False
+
     def shared(sign: str) -> float:
         ours = changed_text(patch, sign)
         return len(ours & changed_text(upstream, sign)) / len(ours) if ours else 0.0
 
-    share = max(shared("+"), shared("-"))
-    if share < _MIN_ADAPTED_SHARE:
-        raise _Rejected(
-            f"Only {share:.0%} of the patch's changed lines are {commit[:12]}'s change to the same files, "
-            f"so it does not adapt that commit. {_UPSTREAM_ONLY}"
-        )
+    return max(shared("+"), shared("-")) >= _MIN_ADAPTED_SHARE
 
 
 def changed_text(diff: str, sign: str) -> set[str]:

@@ -195,7 +195,7 @@ class FixCandidate:
     port_commit: str = ""
     validation: str = ""
     # The merged upstream commit a patch adapts to this branch, checked by
-    # code; set only where nothing else is accepted (FixContext.upstream_only).
+    # code; set only where an upstream change comes first (FixContext.upstream_first).
     adapts: str = ""
     # What code established about the candidate (local test runs and the
     # review), for the maintainer report. Never written by the agent.
@@ -221,7 +221,7 @@ class FixContext:
     # added the test (the edit agent has no git).
     test_history: str = ""
     # The default branch's commits to the failure's files that the checkout
-    # lacks, when only one of those may fix it (``upstream_only``).
+    # lacks, when one of those may fix it (``upstream_first``).
     unported_changes: str = ""
     # Every commit the default branch has and the working commit lacks, with
     # the files it changes: the fix may be in a file the failure does not name.
@@ -229,14 +229,10 @@ class FixContext:
     # How code verifies a candidate, and whether it does.
     verification: str = ""
     verified_by_code: bool = False
-    # Only a change already merged upstream is accepted: a port, or a patch
-    # that adapts one. So on a backport branch, and for a failure no command
-    # here can run.
-    upstream_only: bool = False
-    # On a backport branch: the files the pull request itself changes. A
-    # patch confined to them repairs what the backport brought, and needs no
-    # upstream commit.
-    own_paths: tuple[str, ...] = ()
+    # A change already merged upstream comes first: a port, or a patch that
+    # adapts one; a fix of the branch's own only where none fixes the failure.
+    # So on a backport branch, and for a failure no command here can run.
+    upstream_first: bool = False
     # Nothing here can run the failing check and no upstream change can be
     # ported, so a fix is reviewed and published as not run.
     reviewed_only: bool = False

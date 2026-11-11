@@ -133,7 +133,7 @@ def test_suggestion_uses_confined_profile_and_backport_policy(tmp_path, monkeypa
     )
 
     assert seen["profile"] == "ci_fix_suggest"
-    assert "Port an already-merged upstream fix" in seen["prompt"]
+    assert "This is a backport branch" in seen["prompt"]
     assert "Prepare a patch for a PR comment only" in seen["prompt"]
     assert '"action": "patch|refuse"' in seen["prompt"]
     assert "- `port`:" not in seen["prompt"]
@@ -270,7 +270,7 @@ def test_a_fix_that_will_not_be_run_says_what_is_and_is_not_established(tmp_path
     assert "### Verification\nNo command here can run the failing check" in seen["prompt"]
 
 
-def test_where_only_an_upstream_change_is_accepted_the_agent_is_told_and_its_claim_is_read(
+def test_where_an_upstream_change_comes_first_the_agent_is_told_and_its_claim_is_read(
     tmp_path, monkeypatch,
 ) -> None:
     from scripts.ci_fix.models import FixContext
@@ -279,15 +279,32 @@ def test_where_only_an_upstream_change_is_accepted_the_agent_is_told_and_its_cla
     monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
         {"action": "patch", "summary": "adapted", "changed_paths": ["a.c"], "adapts_commit": "D" * 40}))
 
-    context = FixContext(upstream_only=True, unported_changes="# `src/a.c`\n\n- `abc` 2026-11-04 Free the hint\n",
+    context = FixContext(upstream_first=True, unported_changes="# `src/a.c`\n\n- `abc` 2026-11-04 Free the hint\n",
                          unported_index="- `abc` 2026-11-04 Free the hint | src/a.c\n")
     candidate = agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=context)
 
-    assert "Only a change already merged on the default branch is accepted" in seen["prompt"]
+    assert "A change already merged on the default branch comes first" in seen["prompt"]
+    # Where none fixes the failure, the fix is written on the branch, not refused.
+    assert "write the fix here as a `patch`" in seen["prompt"] and "belongs there first" not in seen["prompt"]
     assert "### Upstream changes this branch lacks" in seen["prompt"] and "upstream-changes.md" in seen["prompt"]
     # And every commit it lacks, by the files it changes: the fix may be in a file the log does not name.
     assert "### Every upstream commit this branch lacks" in seen["prompt"] and "upstream-commits.md" in seen["prompt"]
     assert candidate.adapts == "d" * 40
+
+
+def test_the_review_is_told_when_a_release_branchs_patch_is_not_an_upstream_change(tmp_path, monkeypatch) -> None:
+    from scripts.ci_fix.models import FixCandidate, FixContext
+
+    seen = {}
+    monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
+        {"approved": True, "reasoning": "fine"}))
+    own = FixCandidate(action=CandidateAction.PATCH, patch="diff", failing_check="t", root_cause="race")
+
+    agent_mod.review_candidate(own, str(tmp_path), "log", context=FixContext(upstream_first=True))
+    assert "the patch is a fix written for this branch" in seen["prompt"]
+
+    agent_mod.review_candidate(own, str(tmp_path), "log", context=FixContext())
+    assert "written for this branch" not in seen["prompt"]
 
 
 def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) -> None:
