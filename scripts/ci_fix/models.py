@@ -203,8 +203,10 @@ class FixCandidate:
     # Other detector issues whose test the patch changed, without showing
     # that it fixes them. Never written by the agent.
     also_touches: tuple[int, ...] = ()
-    # Reviewed, never run: nothing the bot has can run the failing check
-    # (FixContext.reviewed_only). Never written by the agent.
+    # Never run: nothing the bot has can run the failing check, so the change
+    # was reviewed, and at most built (FixContext.reviewed_only, only_built).
+    # A patch like that is posted for a person to apply, never pushed. Never
+    # written by the agent.
     not_run: bool = False
 
 
@@ -236,6 +238,9 @@ class FixContext:
     # Nothing here can run the failing check and no upstream change can be
     # ported, so a fix is reviewed and published as not run.
     reviewed_only: bool = False
+    # Nothing here can run the failing check, but an upstream change may fix
+    # it: a candidate is built and reviewed, not run.
+    only_built: bool = False
     # The repository's test conventions, and its own docs in the checkout.
     guide: str = ""
     guide_paths: tuple[str, ...] = ()

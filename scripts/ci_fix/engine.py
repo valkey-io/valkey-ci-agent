@@ -18,8 +18,10 @@ that job's own setup and build (``scripts/ci_fix/job.sh``):
 
 On a backport branch, and for a failure no command here can run, a change
 already merged upstream comes first: a port, or a patch that adapts one
-(``FixContext.upstream_first``). Where none fixes the failure, the fix is
-written on the branch, and reported as one the default branch does not have.
+(``FixContext.upstream_first``). Where none fixes the failure, a fix to the
+test or the test harness is written on the branch, and reported as one the
+default branch does not have; product source changes there only by a commit
+merged upstream.
 """
 
 from __future__ import annotations
@@ -335,7 +337,7 @@ def _establish(
     search found, and the repository's test guide, go to the agent too.
     """
     plan = None
-    upstream_first = False
+    upstream_first = only_built = False
     described = ""
     if runs_tests:
         plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
@@ -346,7 +348,7 @@ def _establish(
             # test, a lint: nothing here runs it, but the default branch may
             # already hold its fix, which the pull request's own CI checks.
             plan = upstream_plan(job)
-            upstream_first = True
+            upstream_first = only_built = True
         elif plan is not None and task.policy is FixPolicy.BACKPORT:
             # A release branch takes the upstream change where there is one.
             upstream_first = True
@@ -391,6 +393,7 @@ def _establish(
         verified_by_code=plan is not None,
         upstream_first=upstream_first,
         reviewed_only=reviewed_only,
+        only_built=only_built,
         guide=guide,
         guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
@@ -536,7 +539,8 @@ def _fix_loop(
             logger.info("CI-fix round %d: %s", attempt, failed.splitlines()[0])
             continue
         return replace(
-            candidate, verification="\n".join(checks), also_touches=touches, not_run=context.reviewed_only,
+            candidate, verification="\n".join(checks), also_touches=touches,
+            not_run=context.reviewed_only or context.only_built,
         )
     return _refusal(
         f"No candidate passed its test and review in {MAX_ROUNDS} attempts. Last: {last}",
@@ -628,6 +632,13 @@ _TREE_CHANGED = (
 _OWN_FIX = (
     "No change on the default branch was found to fix this failure, so this fix was written "
     "for this branch: the default branch does not have it."
+)
+_PRODUCT_NEEDS_UPSTREAM = (
+    "On a release branch, product source changes only by a commit merged upstream, and the patch "
+    "changes {paths} without being one: choose `port`, or set `adapts_commit` to the merged "
+    "default-branch commit the patch adapts, which it must mostly be. Without one, fix the test or "
+    "the test harness if that is the correct fix; otherwise choose `refuse` and say what the "
+    "default branch needs."
 )
 _NOT_RUN = "No command here can run the failing check, so this fix was reviewed, not run."
 
@@ -945,7 +956,8 @@ def _checked_candidate(
     on. Anything else wrong with what it handed back raises
     :class:`_Rejected`, which goes back to it like a failing test. With
     ``upstream_first``, a patch's claim to adapt a merged upstream commit is
-    kept only when code finds it does; otherwise the patch is the bot's own.
+    kept only when code finds it does; otherwise the patch is the bot's own,
+    which on a backport branch may change tests and the harness only.
 
     The patch is what the working tree holds, not what the agent listed: a
     file it changed and did not list is published with the rest and pointed
@@ -988,6 +1000,9 @@ def _checked_candidate(
     adapts = ""
     if upstream_first and _adapts(repo_dir, candidate.adapts, changed_paths, patch):
         adapts = candidate.adapts
+    product = tuple(path for path in changed_paths if not is_test_path(path))
+    if upstream_first and task.policy is FixPolicy.BACKPORT and product and not adapts:
+        raise _Rejected(_PRODUCT_NEEDS_UPSTREAM.format(paths=", ".join(f"`{path}`" for path in product)))
     patch_limit = capabilities.patch_limit
     if len(patch) > patch_limit:
         raise _Rejected(
@@ -1038,6 +1053,11 @@ def _adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...], patch: s
         return len(ours & changed_text(upstream, sign)) / len(ours) if ours else 0.0
 
     return max(shared("+"), shared("-")) >= _MIN_ADAPTED_SHARE
+
+
+def is_test_path(path: str) -> bool:
+    """Whether ``path`` is test code or the test harness, not product source (Valkey: ``tests/``, ``src/unit/``)."""
+    return any(part in ("tests", "test", "unit") for part in Path(path).parts[:-1])
 
 
 def changed_text(diff: str, sign: str) -> set[str]:

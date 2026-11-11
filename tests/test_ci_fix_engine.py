@@ -1024,7 +1024,8 @@ def test_a_backport_branch_takes_a_fix_of_its_own_where_none_is_upstream(tmp_pat
     source, head_sha = _source_repo(tmp_path)
     _upstream_commit(source, head_sha)
     _install_clone(monkeypatch, source)
-    agent = _adapting_agent("")
+    (source / "tests").mkdir()
+    agent = _adapting_agent("", "tests/value.tcl")
 
     candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
 
@@ -1061,6 +1062,59 @@ def test_an_adaptation_may_write_other_lines_where_its_commit_writes_its_own(tmp
     assert candidate.action is CandidateAction.PATCH and candidate.adapts == commit
 
 
+@pytest.mark.parametrize(("path", "accepted"), [
+    ("tests/unit/value.tcl", True), ("tests/support/server.tcl", True), ("src/unit/test_value.cpp", True),
+    ("src/server.c", False), ("deps/libvalkey/src/net.c", False), ("Makefile", False),
+])
+def test_a_backport_branchs_own_fix_may_change_tests_and_the_harness_only(tmp_path, monkeypatch, path, accepted):
+    """Product source changes on a release branch only by a commit merged upstream.
+
+    Two replayed fixes rewrote how the server masks a signal around fork() on 8.0 and 7.2, with no
+    upstream commit behind them and nothing here able to run the valgrind job that failed.
+    """
+    source, head_sha = _source_repo(tmp_path)
+    _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+
+    def agent(task, repo_dir, job_log, *, feedback="", **_kwargs):  # noqa: ARG001
+        agent.feedback.append(feedback)
+        target = Path(repo_dir) / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("a fix of the branch's own\n", encoding="utf-8")
+        return FixCandidate(action=CandidateAction.PATCH, failing_check="value check", root_cause="a race",
+                            reasoning="fix it here", changed_paths=(path,))
+
+    agent.feedback = []
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
+
+    if accepted:
+        assert candidate.action is CandidateAction.PATCH and agent.feedback == [""]
+    else:
+        assert candidate.action is CandidateAction.REFUSE
+        assert f"changes `{path}` without being one" in agent.feedback[1]
+        assert "fix the test or the test harness" in agent.feedback[1]
+
+
+def test_a_backport_branch_takes_product_source_from_an_upstream_commit(tmp_path, monkeypatch):
+    source, head_sha = _source_repo(tmp_path)
+    (source / "src").mkdir()
+    (source / "src" / "server.c").write_text("before\n", encoding="utf-8")
+    git(source, "add", "src/server.c")
+    git(source, "commit", "-qm", "Add the server")
+    head_sha = git(source, "rev-parse", "HEAD")
+    git(source, "checkout", "-q", "-b", "upstream")
+    (source / "src" / "server.c").write_text("fixed\n", encoding="utf-8")
+    git(source, "commit", "-qam", "Fix the server")
+    commit = git(source, "rev-parse", "HEAD")
+    git(source, "checkout", "-q", "--detach", head_sha)
+    _install_clone(monkeypatch, source)
+    agent = _adapting_agent(commit, "src/server.c")
+
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
+
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == commit
+
+
 @pytest.mark.parametrize(("adapts", "path", "text"), [
     # Every hand-written fix pushed to a backport branch changed a file that unported upstream commits
     # change too: naming one of them adapts nothing unless the patch is its change.
@@ -1070,10 +1124,9 @@ def test_an_adaptation_may_write_other_lines_where_its_commit_writes_its_own(tmp
     ("head", "value.txt", "fixed\n"),  # already on this branch
     ("b" * 40, "value.txt", "fixed\n"),  # not merged upstream
 ])
-def test_a_patch_is_reported_as_adapting_a_commit_only_when_it_is_that_commits_change(
+def test_a_patch_to_product_source_must_be_the_upstream_commit_it_names(
     tmp_path, monkeypatch, adapts, path, text,
 ):
-    """Otherwise it is published as what it is: a fix of the branch's own."""
     source, head_sha = _source_repo(tmp_path)
     commit = _upstream_commit(source, head_sha)
     _install_clone(monkeypatch, source)
@@ -1081,7 +1134,21 @@ def test_a_patch_is_reported_as_adapting_a_commit_only_when_it_is_that_commits_c
 
     candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
 
-    assert candidate.action is CandidateAction.PATCH and candidate.adapts == ""
+    assert candidate.action is CandidateAction.REFUSE
+    assert f"changes `{path}` without being one" in agent.feedback[1]
+
+
+def test_a_test_fix_that_adapts_nothing_is_published_as_the_branchs_own(tmp_path, monkeypatch):
+    """A claim to adapt a commit is kept only when the patch is that commit's change."""
+    source, head_sha = _source_repo(tmp_path)
+    commit = _upstream_commit(source, head_sha)  # which changes value.txt, not the test
+    _install_clone(monkeypatch, source)
+    (source / "tests").mkdir()
+    agent = _adapting_agent(commit, "tests/value.tcl")
+
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
+
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == "" and agent.feedback == [""]
     assert "the default branch does not have it" in candidate.verification
 
 
@@ -1124,10 +1191,10 @@ def test_a_failure_no_command_can_run_takes_an_upstream_change_first_and_is_only
     assert commands == ['make -j"$(getconf _NPROCESSORS_ONLN)"']
     assert "builds." in candidate.verification
 
-    # A fix written here is built and reviewed too, and reported as not upstream and not run.
+    # A fix written here is built and reviewed too, and marked as not run: it is posted, not pushed.
     own = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=_adapting_agent(""),
                                  test_func=lambda *_args: TestRun(True, ""))
-    assert own.action is CandidateAction.PATCH and own.adapts == ""
+    assert own.action is CandidateAction.PATCH and own.adapts == "" and own.not_run
     assert "the default branch does not have it" in own.verification
     assert "code only checks that the change builds" in own.verification
 

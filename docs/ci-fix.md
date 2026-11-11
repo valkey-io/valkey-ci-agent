@@ -83,11 +83,15 @@ of what fails. The bot works out the command that will verify a fix (the
 job's own build and test command, for the failing test only) and tells
 Claude what it is. Some failures have no command the bot can run: a sanitizer
 or valgrind report that names no test, a sentinel or legacy-cluster test, a
-lint. For those the bot checks that the change builds and leaves the rest to
-the PR's own CI: a change already merged upstream comes first, and where none
-fixes the failure Claude writes a patch. When there is nothing upstream to
-port, as on `unstable` itself, the patch is reviewed but not run, and the
-bot's report says so in its first line.
+lint. For those the bot checks that the change builds: a change already
+merged upstream comes first, and where none fixes the failure Claude writes a
+patch. When there is nothing upstream to port, as on `unstable` itself, the
+patch is reviewed but not run.
+
+The bot never pushes a patch it wrote and could not run. It posts the patch
+in a comment, says that it was not run, and leaves it for a person to apply.
+A port of a commit merged upstream is still pushed when it only builds here:
+it ran where it was merged, and the PR's own CI runs the check.
 
 **Claude diagnoses and edits.** Claude gets the job's whole log, whatever the
 history search found, the verification command, and Valkey's testing
@@ -114,10 +118,19 @@ only touches the same file is not enough, and the reviewer reads the named
 commit's diff next to the patch.
 
 Where no upstream commit fixes the failure, such as a test that is flaky on
-`unstable` too, Claude writes the fix on the backport branch. It is verified
-and reviewed like any other patch, and the report says that the default
-branch does not have it, so a maintainer can decide whether it needs the same
-fix.
+`unstable` too, Claude writes the fix on the backport branch, in the test or
+the test harness only. It is verified and reviewed like any other patch, and
+the report says that the default branch does not have it, so a maintainer can
+decide whether it needs the same fix. Product source (anything outside the
+tests) changes on a backport branch only by a port or an adaptation of a
+merged upstream commit: a patch that changes it without being one is sent
+back, and if the fix has to be there Claude declines and says what the
+default branch needs.
+
+On every branch Claude is told to look for the test or harness fix first and
+to change product source only when the failure cannot be fixed correctly
+anywhere else. Of eleven fixes people merged for failures the bot replayed,
+eight changed only tests or the harness.
 
 **Code checks what Claude handed back.** The bot rejects anything that doesn't
 add up: a commit Claude made itself, a fix with no root cause or reasoning, a

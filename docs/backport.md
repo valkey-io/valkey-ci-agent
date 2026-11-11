@@ -131,6 +131,9 @@ change that is already merged on `unstable`: it ports the commit, or adapts
 it when it doesn't apply as it is. Where no upstream commit fixes the
 failure, such as a test that is flaky on `unstable` too, it writes the fix on
 the backport branch, and its comment says that `unstable` does not have it.
+Such a fix may change tests and the test harness only: server code changes on
+a backport branch only by a commit merged on `unstable`. A fix the bot could
+not run is posted as a patch in a comment, never pushed.
 
 ## Suggesting backports
 

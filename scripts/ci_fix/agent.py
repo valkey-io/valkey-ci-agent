@@ -21,16 +21,26 @@ from scripts.common.ai_output import extract_json_object
 from scripts.common.proc import git_output
 from scripts.common.text_utils import compact_text
 
+# Of eleven fixes people merged for failures the bot replayed, eight changed
+# only tests or the test harness, two changed product source, and one patched
+# a vendored dependency and was turned down.
+_PREFER_TESTS = (
+    "Prefer a fix in the test or the test harness. Change product source only "
+    "when the failure cannot be fixed correctly anywhere else, and then say why "
+    "no test change would be right."
+)
+
 _POLICY = {
     FixPolicy.BACKPORT: (
         "This is a backport branch: keep the change as small as the failure "
-        "allows, and do not hide a product defect or weaken a test. A change "
-        "under .github/ is allowed only when the CI definition itself is the "
-        "cause, such as an upstream CI fix the release branch lacks."
+        f"allows, and do not hide a product defect or weaken a test. {_PREFER_TESTS} "
+        "A change under .github/ is allowed only when the CI definition itself "
+        "is the cause, such as an upstream CI fix the release branch lacks."
     ),
     FixPolicy.GENERAL: (
         "Fix the root cause with the smallest coherent source, test or build "
-        "change; never a workflow change. Do not hide a product defect or weaken a test."
+        f"change; never a workflow change. {_PREFER_TESTS} Do not hide a product "
+        "defect or weaken a test."
     ),
 }
 
@@ -41,7 +51,11 @@ _UPSTREAM_FIRST = (
     "commit's full SHA. When no upstream commit fixes this failure, such as a "
     "flaky test the default branch shares, write the fix here as a `patch` with "
     "`adapts_commit` empty, and say in `validation` that the default branch "
-    "does not have it and whether it needs the same fix."
+    "does not have it and whether it needs the same fix. On a release branch "
+    "that patch may change tests and the test harness only: product source "
+    "changes there only by a port or an adaptation of a merged upstream commit. "
+    "If the fix has to be in product source and upstream has none, choose "
+    "`refuse` and say what the default branch needs."
 )
 
 _PROMPT = """\
