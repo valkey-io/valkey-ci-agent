@@ -56,6 +56,10 @@ class AgentProfile:
     # profile with Bash in an untrusted checkout, which must not reach the
     # job's environment.
     isolated: bool = False
+    # Keep the session (the CLI's event stream) with the evidence, not only
+    # its hash: for sessions over public code and logs, where what the agent
+    # read and concluded is otherwise gone once the job's log is.
+    keeps_session: bool = False
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,10 @@ class AgentRunResult:
     finished_at: str
 
 
+# Over fourteen failures whose fix is known, Fable 5.2 sessions ran 25
+# seconds to 10 minutes at xhigh, about as long as at high.
+_CI_FIX_EFFORT = "xhigh"
+
 AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
     "conflict_resolve_edit_only": AgentProfile(
         name="conflict_resolve_edit_only",
@@ -89,7 +97,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="test_adaptation_edit_only",
         allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
         timeout=1800,
-        effort="max",
+        effort="xhigh",
         max_turns=160,
         writes_allowed=True,
         output_schema="edited-files",
@@ -99,7 +107,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="validation_repair_edit_only",
         allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
         timeout=1800,
-        effort="max",
+        effort="xhigh",
         max_turns=160,
         writes_allowed=True,
         output_schema="edited-files",
@@ -109,7 +117,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="fuzzer_analysis_readonly",
         allowed_tools="Read,Grep,Glob",
         timeout=1800,
-        effort="max",
+        effort="xhigh",
         max_turns=200,
         writes_allowed=False,
         output_schema="text",
@@ -118,19 +126,20 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="ci_fix_edit",
         allowed_tools="Read,Edit,MultiEdit,Write,Grep",
         timeout=None,
-        effort="xhigh",
+        effort=_CI_FIX_EFFORT,
         max_turns=None,
         writes_allowed=True,
         output_schema="candidate-json",
         disallowed_tools="Bash,Glob",
         confined=True,
         isolated=True,
+        keeps_session=True,
     ),
     "ci_fix_review": AgentProfile(
         name="ci_fix_review",
         allowed_tools="Read,Grep",
         timeout=None,
-        effort="xhigh",
+        effort=_CI_FIX_EFFORT,
         max_turns=None,
         output_schema="review-json",
         disallowed_tools="Bash,Glob,Edit,MultiEdit,Write",
@@ -138,12 +147,13 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         # It reads a tree the isolated account just ran commands in; a link
         # left there must not reach this process's environment.
         isolated=True,
+        keeps_session=True,
     ),
     "ci_fix_suggest": AgentProfile(
         name="ci_fix_suggest",
         allowed_tools="Read,Edit,MultiEdit,Write,Grep",
         timeout=None,
-        effort="xhigh",
+        effort=_CI_FIX_EFFORT,
         max_turns=None,
         writes_allowed=True,
         output_schema="candidate-json",
@@ -151,12 +161,13 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         confined=True,
         # A contributor or fork PR's checkout may hold links out of it.
         isolated=True,
+        keeps_session=True,
     ),
     "release_notes_review_edit_only": AgentProfile(
         name="release_notes_review_edit_only",
         allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
         timeout=600,
-        effort="max",
+        effort="xhigh",
         max_turns=120,
         writes_allowed=True,
         output_schema="edited-files",
@@ -248,6 +259,8 @@ def _write_evidence(
             f"{result.started_at.replace(':', '').replace('+', 'Z')}-{result.profile}-{result.prompt_sha256[:12]}.json"
         )
         path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+        if profile.keeps_session:
+            path.with_suffix(".stream.jsonl").write_text(result.stdout, encoding="utf-8")
     except OSError as exc:
         logger.warning(
             "Could not write agent evidence for profile %s to %s: %s",

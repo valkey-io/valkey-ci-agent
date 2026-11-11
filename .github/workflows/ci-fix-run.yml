@@ -11,8 +11,8 @@ name: CI Fix Run
 # scripts/ci_fix/ci_job.py). The fix is prepared inside that very job: on its
 # runner, in its container if it has one (fix-in-container), after its own
 # checkouts, setup and build (the plan's setup.sh). Then, instead of its tests,
-# the agent reproduces the failure, fixes it and verifies the fix with the
-# job's own build and test commands (scripts/ci_fix/job.sh). A job that cannot
+# the agent fixes the failure and code verifies the fix with the job's own
+# build and test commands (scripts/ci_fix/job.sh). A job that cannot
 # host the fix is replaced by the same steps on the bot's own runner
 # (fix-local). The fix jobs hold no GitHub token; plan and publish do the
 # GitHub work, each with its own App token.

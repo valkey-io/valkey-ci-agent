@@ -78,4 +78,4 @@ runs:
     - name: Install Claude Code
       if: ${{ inputs['install-claude'] == 'true' }}
       shell: bash
-      run: npm install -g @anthropic-ai/claude-code@2.1.175
+      run: npm install -g @anthropic-ai/claude-code@2.1.300

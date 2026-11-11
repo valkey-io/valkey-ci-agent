@@ -450,15 +450,11 @@ def _validate_issue_target(gh: Any, task: FixTask) -> str:
         raise TargetRevalidationFailed(
             f"Issue #{issue_number} links could not be revalidated ({exc})."
         ) from exc
-    body = str(getattr(issue, "body", "") or "")
-    occurrence = parse_detector_occurrence(body)
-    if occurrence is None:
+    # A newer occurrence is the same test failing again while its fix was
+    # prepared: the fix is for the test, and is still published
+    # (scripts/ci_fix/issues.py records it for the newer run too).
+    if parse_detector_occurrence(str(getattr(issue, "body", "") or "")) is None:
         return f"Issue #{issue_number} no longer contains a detector occurrence."
-    if occurrence != task.failure.run_id:
-        return (
-            f"Issue #{issue_number} now points at run {occurrence}, "
-            "not the occurrence that was analyzed."
-        )
     return ""
 
 
@@ -506,11 +502,7 @@ def _draft_body(task: FixTask, candidate: FixCandidate | None) -> str:
     failure = task.failure
     lines = []
     if failure.issue_number:
-        # One file often holds several open failures, so a patch can fix more
-        # than the issue it was asked about. Each extra issue was verified on
-        # its own test; the ones that were not are only mentioned.
-        closes = [failure.issue_number, *(candidate.also_fixes if candidate else ())]
-        lines += [" ".join(f"Fixes #{number}" for number in closes), ""]
+        lines += [f"Fixes #{failure.issue_number}", ""]
     description = prose(failure.description, 2_000) if failure.description else (
         f"`{failure.job_name}` failed in a {_source_label(failure)} run."
     )

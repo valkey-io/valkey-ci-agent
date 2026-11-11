@@ -37,7 +37,7 @@ def test_without_the_jobs_commands_plain_make_and_runtest_loop_only_the_failing_
     plan = plan_for(checkout, (TEST,), scheduled=True)
 
     assert plan.command(20) == (
-        'make -j"$(nproc)" && ./runtest --dump-logs --accurate --single unit/type/incr '
+        'make -j"$(getconf _NPROCESSORS_ONLN)" && ./runtest --dump-logs --accurate --single unit/type/incr '
         "--only 'INCREX BYFLOAT overflow preserves existing TTL' --fastfail --loops 20 --timeout 600"
     )
     assert "plain make and runtest" in plan.notes[-1]
@@ -83,8 +83,8 @@ def test_a_c_unit_test_is_repeated_by_name_the_way_the_job_ran_it(checkout):
     plan = plan_for(checkout, (UNIT_TEST, TEST), scheduled=True, job=job)
 
     assert plan.command(20) == (
-        "make -j\"$(nproc)\" all-with-unit-tests SERVER_CFLAGS='-Werror' && "
-        '{ test -x ./src/unit/valkey-unit-gtests || make -j"$(nproc)" all-with-unit-tests; } && '
+        "make -j\"$(getconf _NPROCESSORS_ONLN)\" all-with-unit-tests SERVER_CFLAGS='-Werror' && "
+        '{ test -x ./src/unit/valkey-unit-gtests || make -j"$(getconf _NPROCESSORS_ONLN)" all-with-unit-tests; } && '
         "(cd src/unit && python3 ../../deps/gtest-parallel/gtest_parallel.py ./valkey-unit-gtests "
         "--timeout_per_test 300 --repeat=20 --gtest_filter=Crc64Test.TestCrc64 -- --accurate)"
     )
@@ -111,8 +111,8 @@ def test_the_jobs_unit_test_arguments_and_make_variables_are_kept_apart(checkout
 
     # The job's build names no unit tests, but makes them: nothing is rebuilt as 64-bit.
     assert plan.build == (
-        "make -j\"$(nproc)\" 32bit SERVER_CFLAGS='-Werror' && { test -x ./src/unit/valkey-unit-gtests || "
-        "make -j\"$(nproc)\" all-with-unit-tests 'GTEST_LIBS=/usr/lib32/libgtest.a /usr/lib32/libgmock.a'; }"
+        "make -j\"$(getconf _NPROCESSORS_ONLN)\" 32bit SERVER_CFLAGS='-Werror' && { test -x ./src/unit/valkey-unit-gtests || "
+        "make -j\"$(getconf _NPROCESSORS_ONLN)\" all-with-unit-tests 'GTEST_LIBS=/usr/lib32/libgtest.a /usr/lib32/libgmock.a'; }"
     )
     assert plan.test.endswith("-- --large-memory --seed 7)")
     without = plan_for(checkout, (UNIT_TEST,), scheduled=True, job=JobCommands(build="make", runtest="./runtest"))
@@ -147,7 +147,7 @@ def test_without_gtest_parallel_the_binary_repeats_in_one_process_and_no_gtest_m
 
     plan = plan_for(checkout, (UNIT_TEST,), scheduled=False, job=JobCommands(build="make", runtest="./runtest"))
 
-    assert plan.build == 'make -j"$(nproc)" && { test -x ./src/unit/valkey-unit-gtests || make -j"$(nproc)" all-with-unit-tests; }'
+    assert plan.build == 'make -j"$(getconf _NPROCESSORS_ONLN)" && { test -x ./src/unit/valkey-unit-gtests || make -j"$(getconf _NPROCESSORS_ONLN)" all-with-unit-tests; }'
     assert plan.test == "./src/unit/valkey-unit-gtests --gtest_filter=Crc64Test.TestCrc64 --gtest_repeat=\0loops\0"
     assert any("no gtest-parallel" in note for note in plan.notes)
 
@@ -298,7 +298,7 @@ def test_in_the_job_its_own_build_and_runtest_run_the_failing_test(checkout):
 
     # One line: every report quotes the command, and a code span holds no newline.
     assert plan.build == (
-        "export CC='clang' && make -j\"$(nproc)\" all-with-unit-tests SANITIZER=address USE_LIBBACKTRACE=yes"
+        "export CC='clang' && make -j\"$(getconf _NPROCESSORS_ONLN)\" all-with-unit-tests SANITIZER=address USE_LIBBACKTRACE=yes"
     )
     assert plan.test.replace(LOOPS, "20") == (
         "./runtest --accurate --verbose --dump-logs --tls --single unit/type/incr "
@@ -318,7 +318,7 @@ def test_a_jobs_multi_line_build_becomes_one_command(checkout):
 
     assert plan.build == (
         "apt-get update && apt-get install -y make gcc-13 && update-alternatives --install x"
-        " && make -j\"$(nproc)\" CC=gcc"
+        " && make -j\"$(getconf _NPROCESSORS_ONLN)\" CC=gcc"
     )
     assert "\n" not in plan.command(3)
 
@@ -350,7 +350,7 @@ def test_in_a_valgrind_job_its_own_options_are_kept(checkout):
 def test_a_build_break_is_checked_by_the_jobs_build_alone_and_once(result, failed):
     plan = build_plan(JobCommands(build="export CC=gcc\nmake MALLOC=libc", runtest="./runtest"))
 
-    assert plan.command(10) == 'export CC=gcc && make -j"$(nproc)" MALLOC=libc'  # no runtest, no loops
+    assert plan.command(10) == 'export CC=gcc && make -j"$(getconf _NPROCESSORS_ONLN)" MALLOC=libc'  # no runtest, no loops
     assert plan.loops == 1 and plan.failed(result) is failed
     assert plan.ran(TestRun(passed=True, output="")) and not plan.tests
 
@@ -469,3 +469,22 @@ def test_a_fallback_counts_only_the_named_tests_own_failure(checkout):
         assert fallback.attributed and not fallback.failed(sibling)
     own = TestRun(passed=False, output="", report=f"[err]: first named test in {plan.fallback.tests[0].file}")
     assert plan.fallback.failed(own)
+
+
+def test_a_report_quotes_the_isolated_run_without_the_script_that_writes_its_file(tmp_path):
+    """An isolated run once put a thirty-line Tcl script into the report, a bullet a line."""
+    (tmp_path / "runtest").write_text("#!/bin/sh\n", encoding="utf-8")
+    test_file = tmp_path / "tests" / "integration" / "replication.tcl"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text('test "a test with a long name" {}\n', encoding="utf-8")
+    plan = plan_for(str(tmp_path), (FailedTest("a test with a long name", "tests/integration/replication.tcl"),),
+                    scheduled=False)
+
+    isolated = plan.fallback
+    assert "info complete" in isolated.command(40)  # what runs writes the file
+    quoted = isolated.quoted(40)
+    assert "\n" not in quoted and "info complete" not in quoted
+    assert quoted.startswith('make -j"$(getconf _NPROCESSORS_ONLN)" && ./runtest ')
+    assert "--single integration/replication.ci-fix-isolated" in quoted and "--loops 40" in quoted
+    # A plan that needs no script is quoted as it runs.
+    assert plan.quoted(40) == plan.command(40)

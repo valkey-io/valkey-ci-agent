@@ -86,7 +86,7 @@ def test_run_claude_code_streams_json_and_uses_bedrock_env(monkeypatch, caplog):
     assert captured["kwargs"]["env"]["CLAUDE_CODE_USE_BEDROCK"] == "1"
     assert (
         captured["kwargs"]["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"]
-        == "us.anthropic.claude-fable-5"
+        == "us.anthropic.claude-fable-5-2"
     )
     assert (
         captured["kwargs"]["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"]
@@ -210,7 +210,7 @@ def test_run_claude_code_honors_model_env_overrides(monkeypatch):
     monkeypatch.setenv("CI_AGENT_CLAUDE_MODEL", "custom-opus")
     monkeypatch.setenv(
         "CI_AGENT_CLAUDE_BEDROCK_FABLE_MODEL",
-        "global.anthropic.claude-fable-5",
+        "global.anthropic.claude-fable-5-2",
     )
     monkeypatch.setenv(
         "CI_AGENT_CLAUDE_BEDROCK_OPUS_MODEL",
@@ -223,7 +223,7 @@ def test_run_claude_code_honors_model_env_overrides(monkeypatch):
     assert (stdout, stderr, rc) == ('{"type":"result","result":"ok"}\n', "", 0)
     assert captured["cmd"][captured["cmd"].index("--model") + 1] == "custom-opus"
     assert captured["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"] == (
-        "global.anthropic.claude-fable-5"
+        "global.anthropic.claude-fable-5-2"
     )
     assert captured["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == (
         "global.anthropic.claude-opus-4-7"

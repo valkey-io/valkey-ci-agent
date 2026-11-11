@@ -164,6 +164,21 @@ def parse_result_line(line: str) -> ResultLine | None:
     return ResultLine(status, *(test or ("", "")))
 
 
+# The sentinel and legacy cluster harnesses report a test as
+# ``09:24:21> <name>: FAILED: <why>`` (tests/instances.tcl), naming no file.
+_INSTANCE_FAILURE_RE = re.compile(r"^\d\d:\d\d:\d\d> (?P<name>.+?): FAILED\b")
+
+
+def failed_instance_tests_in_log(log: str) -> list[str]:
+    """The names of the sentinel and legacy-cluster tests a log shows failing, in order."""
+    found: list[str] = []
+    for raw in (log or "").splitlines():
+        match = _INSTANCE_FAILURE_RE.match(strip_log_prefix(raw))
+        if match and match.group("name") not in found:
+            found.append(match.group("name"))
+    return found
+
+
 def failed_tests_in_log(log: str) -> list[tuple[str, str]]:
     """``(test name, file)`` for each test a log shows failing, in order.
 

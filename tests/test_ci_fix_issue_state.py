@@ -24,48 +24,32 @@ def test_parse_detector_occurrence_rejects_missing_or_malformed_markers() -> Non
     )
 
 
+def _event(event: str = "cross-referenced", state: str = "open", title: str = "", body: str = "") -> SimpleNamespace:
+    source = SimpleNamespace(pull_request=object(), state=state, title=title, body=body)
+    return SimpleNamespace(event=event, source=SimpleNamespace(issue=source))
+
+
 @pytest.mark.parametrize(
     ("event", "expected"),
     [
-        (
-            SimpleNamespace(
-                event="cross-referenced",
-                source=SimpleNamespace(
-                    issue=SimpleNamespace(
-                        pull_request=object(),
-                        state="open",
-                    )
-                ),
-            ),
-            True,
-        ),
-        (
-            SimpleNamespace(
-                event="cross-referenced",
-                source=SimpleNamespace(
-                    issue=SimpleNamespace(
-                        pull_request=object(),
-                        state="closed",
-                    )
-                ),
-            ),
-            False,
-        ),
-        (
-            SimpleNamespace(
-                event="mentioned",
-                source=SimpleNamespace(
-                    issue=SimpleNamespace(
-                        pull_request=object(),
-                        state="open",
-                    )
-                ),
-            ),
-            False,
-        ),
+        (_event(body="Fixes #7"), True),
+        (_event(body="This closes: valkey-io/valkey#7."), True),
+        (_event(title="Resolve https://github.com/o/r/issues/7"), True),
+        # One keyword, several issues: valkey #5333 says "Fixes #5301 #5305", #5271 "Addresses #5224".
+        (_event(body="Fixes #5301 #7"), True),
+        (_event(body="Fixes #1, #2 and #7."), True),
+        (_event(body="Addresses #7. A regression test covers it."), True),
+        (_event(body="Fixes #7", state="closed"), False),
+        (_event(body="Fixes #4289.\n\nRelated failures: #7, #4435."), False),
+        (_event(body="Fixes #4289\nRelated failures: #7"), False),
+        (_event(body="Fixes #7", event="mentioned"), False),
+        # A pull request that only cites the issue, or closes another, is not working on it.
+        (_event(body="Seen while looking at #7."), False),
+        (_event(body="Fixes #70"), False),
+        (_event(body=None), False),
     ],
 )
-def test_has_open_linked_pr_checks_cross_referenced_open_pulls(
+def test_has_open_linked_pr_needs_an_open_pull_that_closes_the_issue(
     event: SimpleNamespace,
     expected: bool,
 ) -> None:

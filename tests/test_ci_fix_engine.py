@@ -33,17 +33,19 @@ from tests.git_helpers import git
 def _approving_review_and_no_tests(monkeypatch):
     """Keep edit-loop tests focused on the edit loop.
 
-    Tests of the "cannot be checked" refusal restore it themselves.
-    The real review and test runner start agents and processes; these tests use
-    their own scripts directly instead.
+    Every failure gets a plan whose build and test pass, unless a test plans
+    its own. The real review and test runner start agents and processes;
+    these tests use their own scripts directly instead.
     """
     monkeypatch.setattr(engine_mod, "review_candidate", lambda *a, **k: (True, "looks right"))
     monkeypatch.setattr(engine_mod, "isolated_user", lambda: "")
-    monkeypatch.setattr(engine_mod, "_unverifiable_refusal", lambda *_args: None)
+    monkeypatch.setattr(
+        engine_mod, "plan_for", lambda repo_dir, tests, **_kwargs: VerifyPlan(build="true", test="true", tests=tests),
+    )
 
 
 _LOG = "exact failed job log"
-_REAL_UNVERIFIABLE_REFUSAL = engine_mod._unverifiable_refusal
+_REAL_PLAN_FOR = engine_mod.plan_for
 
 
 def test_a_c_unit_tests_file_is_located_in_the_checkout(tmp_path):
@@ -55,6 +57,18 @@ def test_a_c_unit_tests_file_is_located_in_the_checkout(tmp_path):
     assert engine_mod.locate_unit_tests(str(tmp_path), tests) == (
         FailedTest("Crc64Test.TestCrc64", "src/unit/test_crc64.cpp"), tests[1], tests[2],
     )
+
+
+def test_a_sentinel_test_is_searched_for_by_name_though_nothing_runs_it(tmp_path):
+    """Its name finds the upstream fix (#5274); with no file, no plan runs it and no history is read."""
+    log = "09:24:21> SENTINEL SIMULATE-FAILURE valkey-cli hint: FAILED: caught an error in the test\n"
+    tests = engine_mod.failed_tests(_task("a" * 40), log)
+
+    assert tests == (FailedTest("SENTINEL SIMULATE-FAILURE valkey-cli hint", ""),)
+    assert _REAL_PLAN_FOR(str(tmp_path), tests, scheduled=False) is None
+    # A runtest failure in the same log is the one to fix.
+    both = "[err]: INCR fails in tests/unit/type/incr.tcl\n" + log
+    assert engine_mod.failed_tests(_task("a" * 40), both) == (FailedTest("INCR fails", "tests/unit/type/incr.tcl"),)
 
 
 def _source_repo(tmp_path: Path) -> tuple[Path, str]:
@@ -222,26 +236,24 @@ def test_prepare_fix_sends_a_mixed_port_and_edits_back(tmp_path, monkeypatch) ->
 
 
 def test_a_mistake_in_what_the_agent_hands_back_goes_back_to_it(tmp_path, monkeypatch) -> None:
-    """A path it forgot to declare is for the agent to correct, not a final refusal."""
+    """A fix with no root cause is for the agent to complete, not a final refusal."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
-    declared = iter([(), ("value.txt",)])
+    causes = iter(["", "cause"])
     feedback = []
 
     def agent(task, repo_dir, job_log, **kwargs):
         feedback.append(kwargs["feedback"])
         (Path(repo_dir) / "value.txt").write_text("fixed\n", encoding="utf-8")
-        return FixCandidate(
-            action=CandidateAction.PATCH, failing_check="tests", root_cause="cause", reasoning="fix",
-            changed_paths=next(declared),
-        )
+        # The failing check it left out is the job's; only what a maintainer needs is asked for again.
+        return FixCandidate(action=CandidateAction.PATCH, root_cause=next(causes), reasoning="fix")
 
     candidate = engine_mod.prepare_fix(
         _task(head_sha), _LOG, agent_func=agent, review_func=lambda *a, **k: (True, "fixes it"),
     )
 
-    assert candidate.action is CandidateAction.PATCH
-    assert "did not declare its changed paths" in feedback[1]
+    assert candidate.action is CandidateAction.PATCH and candidate.failing_check == "tests"
+    assert "did not provide a root cause and a change rationale" in feedback[1]
 
 
 def _upstream_commit(source: Path, head_sha: str, content: str = "fixed\n") -> str:
@@ -316,12 +328,12 @@ def test_other_issues_are_checked_with_a_ports_change_still_in_the_tree(tmp_path
     _install_clone(monkeypatch, source)
     seen = []
 
-    def other_issues_fixed(_task, candidate, repo_dir, *_args, **_kwargs):
+    def other_issues_touched(_task, candidate, repo_dir, *_args, **_kwargs):
         tree = subprocess.run(["git", "-C", repo_dir, "diff", "HEAD"], capture_output=True, text=True).stdout
         seen.append(("+fixed" in candidate.patch, "+fixed" in tree))
-        return (), ()
+        return ()
 
-    monkeypatch.setattr(engine_mod, "other_issues_fixed", other_issues_fixed)
+    monkeypatch.setattr(engine_mod, "other_issues_touched", other_issues_touched)
     engine_mod.prepare_fix(
         _task(head_sha), _LOG, agent_func=_port_agent(commit), review_func=lambda *a, **k: (True, "ok"),
     )
@@ -354,7 +366,7 @@ def test_a_port_is_tested_and_the_checkout_restored(tmp_path, monkeypatch) -> No
 
     def agent(task, repo_dir, job_log, **_kwargs):
         agent.trees.append((Path(repo_dir) / "value.txt").read_text())
-        return replace(_port_agent(commit)(task, repo_dir, job_log), test_command="check")
+        return _port_agent(commit)(task, repo_dir, job_log)
 
     agent.trees = []
     monkeypatch.setattr(engine_mod, "_verify", lambda candidate, repo_dir, *a: seen.append(
@@ -436,9 +448,11 @@ def test_prepare_fix_rejects_an_action_disabled_by_target_capabilities(
     assert "patch action is not supported" in candidate.summary
 
 
-def test_prepare_fix_refuses_undeclared_incidental_paths(tmp_path, monkeypatch) -> None:
+def test_a_file_the_agent_changed_and_did_not_list_is_pointed_out_not_refused(tmp_path, monkeypatch) -> None:
+    """The tree is the patch. A list that does not match it used to cost a whole round, of up to two hours."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    reviewed = []
 
     def agent(task, repo_dir, job_log, **_kwargs):
         (Path(repo_dir) / "value.txt").write_text("fixed\n", encoding="utf-8")
@@ -452,13 +466,15 @@ def test_prepare_fix_refuses_undeclared_incidental_paths(tmp_path, monkeypatch) 
         )
 
     candidate = engine_mod.prepare_fix(
-        _task(head_sha),
-        _LOG,
-        agent_func=agent,
+        _task(head_sha), _LOG, agent_func=agent,
+        review_func=lambda candidate, *a, **k: reviewed.append(candidate.verification) or (True, "both belong"),
     )
 
-    assert candidate.action is CandidateAction.REFUSE
-    assert "did not match the paths declared" in candidate.summary
+    assert candidate.action is CandidateAction.PATCH
+    assert candidate.changed_paths == ("generated.txt", "value.txt") and "+incidental" in candidate.patch
+    # The reviewer, and the report, are told which file was not listed.
+    note = "The patch also changes `generated.txt`, which its author did not list"
+    assert note in reviewed[0] and note in candidate.verification
 
 
 def test_prepare_fix_bounds_a_large_job_log_but_keeps_its_tail(
@@ -514,7 +530,7 @@ def test_draft_issue_uses_current_target_sha_with_exact_old_run_evidence(
 
 # --- the feedback loop: test without and with the patch, review, retry -------------
 
-def _value_agent(*values, command="test \"$(cat value.txt)\" = right", failure_type=None):
+def _value_agent(*values, failure_type=None):
     """An agent writing each of ``values`` in turn, recording the feedback it got."""
     from scripts.ci_fix.models import FailureType
 
@@ -526,7 +542,7 @@ def _value_agent(*values, command="test \"$(cat value.txt)\" = right", failure_t
         (Path(repo_dir) / "value.txt").write_text(f"{next(rounds)}\n", encoding="utf-8")
         return FixCandidate(
             action=CandidateAction.PATCH, failing_check="value check", root_cause="stale value",
-            reasoning="set the right value", changed_paths=("value.txt",), test_command=command,
+            reasoning="set the right value", changed_paths=("value.txt",),
             failure_type=failure_type or FailureType.DETERMINISTIC,
         )
 
@@ -537,6 +553,7 @@ def _value_agent(*values, command="test \"$(cat value.txt)\" = right", failure_t
 def _prepare(tmp_path, monkeypatch, agent, *, kind=TargetKind.UPDATE_PR, review=None, test=None):
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    _with_plan(monkeypatch)
     return engine_mod.prepare_fix(
         _task(head_sha, kind=kind), _LOG, agent_func=agent,
         review_func=review or (lambda *a, **k: (True, "fixes the stale value")),
@@ -549,7 +566,9 @@ def test_a_fix_whose_test_passes_with_it_is_accepted(tmp_path, monkeypatch):
     candidate = _prepare(tmp_path, monkeypatch, agent)
     assert candidate.action is CandidateAction.PATCH
     assert agent.feedback == [""]
-    assert 'With the fix, `test "$(cat value.txt)" = right` passed 2 time(s)' in candidate.verification
+    assert "passed 40 loop(s)" in candidate.verification
+    # CI's failure is the evidence; the report does not claim more than the run showed.
+    assert "The failure was not reproduced before the fix" in candidate.verification
     assert "Review: fixes the stale value" in candidate.verification
 
 
@@ -557,16 +576,19 @@ def test_a_fix_whose_test_still_fails_goes_back_with_the_output(tmp_path, monkey
     agent = _value_agent("almost", "right")
     candidate = _prepare(tmp_path, monkeypatch, agent)
     assert candidate.action is CandidateAction.PATCH
-    assert "With your change" in agent.feedback[1] and "failed on run 1 of 2" in agent.feedback[1]
+    assert "With your change" in agent.feedback[1] and "loops=1` could not run the tests" in agent.feedback[1]
     assert "Accepted on attempt 2 of 3." in candidate.verification
     assert "+right" in candidate.patch and "almost" not in candidate.patch
 
 
-def test_a_fix_whose_test_fails_with_it_goes_back(tmp_path, monkeypatch):
+def test_the_next_round_is_told_what_the_last_one_concluded(tmp_path, monkeypatch):
+    """Each session starts without the last one's reading of the code."""
     agent = _value_agent("almost", "right")
     candidate = _prepare(tmp_path, monkeypatch, agent)
     assert candidate.action is CandidateAction.PATCH
-    assert "failed on run 1 of 2" in agent.feedback[1]
+    assert "Your previous session concluded" in agent.feedback[1]
+    assert "- Root cause: stale value\n- Change: set the right value" in agent.feedback[1]
+    assert agent.feedback[1].endswith("The working tree still holds your previous edits; revise them.")
 
 
 def test_a_rejected_review_goes_back_to_the_agent(tmp_path, monkeypatch):
@@ -578,64 +600,12 @@ def test_a_rejected_review_goes_back_to_the_agent(tmp_path, monkeypatch):
     assert agent.feedback[1].endswith("The working tree still holds your previous edits; revise them.")
 
 
-def test_a_flaky_fix_must_pass_ten_times(tmp_path, monkeypatch):
-    from scripts.ci_fix.models import FailureType
-
-    runs = []
-
-    def test(repo_dir, command, timeout):
-        runs.append((Path(repo_dir) / "value.txt").read_text())
-        return engine_mod.run_test_command(repo_dir, command, timeout)
-
-    candidate = _prepare(tmp_path, monkeypatch, _value_agent("right", failure_type=FailureType.FLAKY), test=test)
-    assert candidate.action is CandidateAction.PATCH
-    assert runs == ["right\n"] * engine_mod.FLAKY_TEST_RUNS
-    assert f"passed {engine_mod.FLAKY_TEST_RUNS} time(s)" in candidate.verification
-
-
 def test_a_suggestion_is_reviewed_but_its_code_is_never_run(tmp_path, monkeypatch):
     test = []
     candidate = _prepare(tmp_path, monkeypatch, _value_agent("right"), kind=TargetKind.SUGGEST,
                          test=lambda *a: test.append(a) or TestRun(True, ""))
     assert candidate.action is CandidateAction.PATCH
     assert test == []
-
-
-def _agent_command_check(monkeypatch, patched, *, tests=()):
-    """``_test_feedback`` with every run of the patched code giving ``patched``."""
-    candidate = FixCandidate(action=CandidateAction.PATCH, test_command="./runtest --single unit/value", patch="p")
-    checks = []
-    feedback = engine_mod._test_feedback(
-        candidate, "/repo", lambda *_args: patched, time.monotonic() + 600, checks, tests,
-    )
-    return feedback, checks
-
-
-def test_an_agent_command_killed_for_time_is_a_failed_attempt(monkeypatch):
-    with pytest.raises(RuntimeError, match="did not finish"):
-        _agent_command_check(monkeypatch, TestRun(False, "timed out after 60s", timed_out=True))
-
-
-def test_an_agent_command_must_run_the_failing_test_with_the_patch(monkeypatch):
-    test = FailedTest("value is right", "tests/unit/value.tcl")
-    renamed = TestRun(True, "", "[ok]: value is renamed (1 ms)")
-    feedback, checks = _agent_command_check(monkeypatch, renamed, tests=(test,))
-    assert "without running the failing test" in feedback and checks == []
-
-    ran = TestRun(True, "", "[ok]: value is right (1 ms)")
-    feedback, checks = _agent_command_check(monkeypatch, ran, tests=(test,))
-    assert feedback == "" and checks
-
-
-def test_an_agent_command_is_judged_by_its_exit_status_without_named_tests(monkeypatch):
-    """A gtest or other command, with no runtest test to look for: its exit status is the result."""
-    feedback, checks = _agent_command_check(monkeypatch, TestRun(True, "[  PASSED  ] 1 test"))
-    assert feedback == "" and checks
-
-
-def test_without_a_test_command_the_report_says_so(tmp_path, monkeypatch):
-    candidate = _prepare(tmp_path, monkeypatch, _value_agent("right", command=""))
-    assert "No test command could run this check" in candidate.verification
 
 
 def test_no_new_round_starts_without_time_to_finish_it(tmp_path, monkeypatch):
@@ -676,16 +646,48 @@ def _with_plan(monkeypatch, seen=None):
     monkeypatch.setattr(engine_mod, "plan_for", plan_for)
 
 
-def test_without_a_verification_plan_no_fix_is_attempted(tmp_path, monkeypatch):
-    """A fix the bot publishes as tested must run; review alone is not a check."""
-    monkeypatch.setattr(engine_mod, "_unverifiable_refusal", _REAL_UNVERIFIABLE_REFUSAL)
+def test_a_failure_nothing_can_run_gets_a_fix_that_is_reviewed_and_said_not_to_be_run(tmp_path, monkeypatch):
+    """A job that failed outside any test, with nothing upstream to port (#5285, #5306, #5217).
+
+    People fixed each with a few lines read from the log. The bot may propose
+    one, but never as tested: it is reviewed, and published as not run.
+    """
+    source, head_sha = _source_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", lambda *_args, **_kwargs: None)
+    agent, reviewed, timeouts = _value_agent("right"), [], []
+
+    def recording_agent(*args, timeout, **kwargs):
+        timeouts.append(timeout)
+        return agent(*args, **kwargs)
+
+    def review(candidate, *_args, **_kwargs):
+        reviewed.append(candidate.verification)
+        return True, "reads right"
+
+    candidate = engine_mod.prepare_fix(
+        _task(head_sha), _LOG, agent_func=recording_agent, review_func=review,
+        test_func=lambda *_args: pytest.fail("nothing is run"),
+    )
+
+    assert candidate.action is CandidateAction.PATCH and candidate.not_run
+    assert engine_mod._NOT_RUN in candidate.verification and engine_mod._NOT_RUN in reviewed[0]
+    assert "passed" not in candidate.verification and "Review: reads right" in candidate.verification
+    # The review still gets its time after the agent.
+    assert timeouts[0] <= engine_mod.PREPARE_BUDGET_S - engine_mod._REVIEW_RESERVE_S
+
+
+def test_a_backport_branch_never_gets_a_fix_that_was_not_run(tmp_path, monkeypatch):
+    """There only an upstream change is accepted, and with nothing to port there is no fix."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     monkeypatch.setattr(engine_mod, "plan_for", lambda *_args, **_kwargs: None)
 
-    candidate = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=lambda *a, **k: pytest.fail("no edit"))
+    candidate = engine_mod.prepare_fix(
+        _backport(_task(head_sha)), _LOG, agent_func=lambda *a, **k: pytest.fail("no edit"),
+    )
 
-    assert candidate.action is CandidateAction.REFUSE
+    assert candidate.action is CandidateAction.REFUSE and not candidate.not_run
     assert "could not be checked" in candidate.summary
 
 
@@ -696,8 +698,9 @@ def _runs_value_check(results):
         report = (
             "[ok]: value is right (1 ms)" if outcome.passed else "[err]: value is right in tests/unit/value.tcl"
         )
-        loops = command.split("loops=", 1)[-1].split()[0]
-        results.append(((Path(repo_dir) / "value.txt").read_text().splitlines()[0], loops))
+        if "loops=" in command:  # not the build, which runs first and alone
+            loops = command.split("loops=", 1)[-1].split()[0]
+            results.append(((Path(repo_dir) / "value.txt").read_text().splitlines()[0], loops))
         return TestRun(outcome.passed, outcome.output, report)
 
     return run
@@ -709,7 +712,7 @@ def test_the_fix_is_verified_with_the_jobs_command(tmp_path, monkeypatch):
     _install_clone(monkeypatch, source)
     seen, runs = {}, []
     _with_plan(monkeypatch, seen)
-    agent = _value_agent("right", command="")
+    agent = _value_agent("right")
     contexts = []
 
     def recording_agent(*args, **kwargs):
@@ -725,7 +728,7 @@ def test_the_fix_is_verified_with_the_jobs_command(tmp_path, monkeypatch):
 
     assert candidate.action is CandidateAction.PATCH
     assert seen["tests"] == (FailedTest("value is right", "tests/unit/value.tcl"),)
-    assert runs == [("right", "40")]  # only with the fix
+    assert runs == [("right", "1"), ("right", "40")]  # only with the fix: once, then looped
     assert contexts[0].verification.startswith("Code checks your change with")
     assert contexts[0].verified_by_code
     assert "passed 40 loop(s)" in candidate.verification
@@ -743,10 +746,14 @@ def test_a_detector_issue_for_a_c_unit_test_is_verified_with_gtest(tmp_path, mon
     git(source, "commit", "-m", "unit test")
     head_sha = git(source, "rev-parse", "HEAD")
     _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
     runs, contexts = [], []
 
     def gtest_runner(repo_dir, command, timeout):
         """A unit-test binary whose verdict is value.txt's content."""
+        if "gtest_parallel.py" not in command:
+            assert command.startswith("make ")  # the build, which runs first and alone
+            return TestRun(True, "")
         assert "gtest_parallel.py ./valkey-unit-gtests --timeout_per_test 300 --repeat=" in command
         assert "--gtest_filter=Crc64Test.TestCrc64)" in command  # a PR's run: no --accurate
         value = (Path(repo_dir) / "value.txt").read_text().splitlines()[0]
@@ -755,7 +762,7 @@ def test_a_detector_issue_for_a_c_unit_test_is_verified_with_gtest(tmp_path, mon
             return TestRun(True, "", "[1/1] Crc64Test.TestCrc64 (1 ms)")
         return TestRun(False, "", "src/unit/test_crc64.cpp:29: Failure\n[  FAILED  ] Crc64Test.TestCrc64 (0 ms)")
 
-    agent = _value_agent("right", command="")
+    agent = _value_agent("right")
 
     def recording_agent(*args, **kwargs):
         contexts.append(kwargs["context"])
@@ -769,7 +776,7 @@ def test_a_detector_issue_for_a_c_unit_test_is_verified_with_gtest(tmp_path, mon
     candidate = engine_mod.prepare_fix(task, _LOG, agent_func=recording_agent, test_func=gtest_runner)
 
     assert candidate.action is CandidateAction.PATCH
-    assert runs == [("right", "40")]
+    assert runs == [("right", "1"), ("right", "40")]
     assert "--repeat=40 --gtest_filter=Crc64Test.TestCrc64)`" in contexts[0].verification
     assert "passed 40 loop(s)" in candidate.verification
 
@@ -784,19 +791,19 @@ def test_a_flaky_fix_is_verified_with_a_flakes_loops(tmp_path, monkeypatch):
     task = _task(head_sha)
     task = replace(task, failure=replace(task.failure, failed_tests=(FailedTest("value is right", "tests/unit/value.tcl"),)))
     candidate = engine_mod.prepare_fix(
-        task, _LOG_WITH_FAILURE, agent_func=_value_agent("right", command="", failure_type=FailureType.FLAKY),
+        task, _LOG_WITH_FAILURE, agent_func=_value_agent("right", failure_type=FailureType.FLAKY),
         test_func=_runs_value_check(runs),
     )
 
     assert candidate.action is CandidateAction.PATCH
-    assert runs == [("right", "40")]
+    assert runs == [("right", "1"), ("right", "40")]
 
 
 def test_a_fix_that_does_not_stop_the_failure_goes_back(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     _with_plan(monkeypatch)
-    agent = _value_agent("almost", "right", command="")
+    agent = _value_agent("almost", "right")
 
     candidate = engine_mod.prepare_fix(
         _task(head_sha), _LOG_WITH_FAILURE, agent_func=agent,
@@ -804,7 +811,7 @@ def test_a_fix_that_does_not_stop_the_failure_goes_back(tmp_path, monkeypatch):
     )
 
     assert candidate.action is CandidateAction.PATCH
-    assert "the failing test still fails within 40 loop(s)" in agent.feedback[1]
+    assert "the failing test still fails within 1 loop(s)" in agent.feedback[1]
 
 
 def test_existing_fixes_and_the_test_guide_reach_the_agent_and_the_report(tmp_path, monkeypatch):
@@ -850,11 +857,12 @@ def test_a_fix_that_skips_the_failing_test_is_sent_back(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     _with_plan(monkeypatch)
+    built, ran = TestRun(True, ""), TestRun(True, "", "[ok]: value is right (1 ms)")
     calls = iter([
-        TestRun(True, "", ""),  # with the fix: nothing ran
-        TestRun(True, "", "[ok]: value is right (1 ms)"),
+        built, TestRun(True, "", ""),  # with the fix: nothing ran
+        built, ran, ran,
     ])
-    agent = _value_agent("skip it", "right", command="")
+    agent = _value_agent("skip it", "right")
 
     candidate = engine_mod.prepare_fix(
         _task(head_sha), _LOG_WITH_FAILURE, agent_func=agent,
@@ -869,18 +877,19 @@ def test_a_harness_error_with_the_fix_is_not_reported_as_the_same_failure(tmp_pa
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     _with_plan(monkeypatch)
+    built, ran = TestRun(True, ""), TestRun(True, "", "[ok]: value is right (1 ms)")
     calls = iter([
-        TestRun(False, "", "[exception]: Executing test client: broken pipe"),
-        TestRun(True, "", "[ok]: value is right (1 ms)"),
+        built, TestRun(False, "", "[exception]: Executing test client: broken pipe"),
+        built, ran, ran,
     ])
-    agent = _value_agent("broken", "right", command="")
+    agent = _value_agent("broken", "right")
 
     engine_mod.prepare_fix(
         _task(head_sha), _LOG_WITH_FAILURE, agent_func=agent,
         test_func=lambda *a: next(calls),
     )
 
-    assert "could not build or run the tests" in agent.feedback[1]
+    assert "could not run the tests" in agent.feedback[1]
     assert "still fails" not in agent.feedback[1]
 
 
@@ -898,6 +907,7 @@ def test_switching_from_a_patch_to_a_port_discards_the_patch(tmp_path, monkeypat
     candidate = engine_mod.prepare_fix(
         _task(head_sha), _LOG, agent_func=agent,
         review_func=lambda *a, **k: next(verdicts),
+        test_func=lambda repo_dir, command, timeout: TestRun("almost" not in (Path(repo_dir) / "value.txt").read_text(), ""),
     )
 
     assert candidate.action is CandidateAction.PORT
@@ -960,6 +970,169 @@ def test_the_agent_leaves_time_to_verify_and_review(tmp_path, monkeypatch):
     engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
 
     assert timeouts[0] <= engine_mod.PREPARE_BUDGET_S - engine_mod._VERIFY_RESERVE_S
+    # Nor may one session use the whole budget: a candidate that fails its test gets another round.
+    assert timeouts[0] == engine_mod._MAX_AGENT_ROUND_S
+    assert engine_mod.PREPARE_BUDGET_S - engine_mod._MAX_AGENT_ROUND_S - engine_mod._VERIFY_RESERVE_S \
+        >= engine_mod._MIN_ROUND_S
+
+
+def test_the_review_reads_what_the_checks_found(tmp_path, monkeypatch):
+    reviewed = []
+
+    def review(candidate, *_args, **_kwargs):
+        reviewed.append(candidate.verification)
+        return True, "ok"
+
+    _prepare(tmp_path, monkeypatch, _value_agent("right"), review=review)
+
+    assert "passed 40 loop(s)" in reviewed[0] and "was not reproduced before the fix" in reviewed[0]
+
+
+# --- where only a change already merged upstream is accepted ------------------
+
+def _backport(task: FixTask) -> FixTask:
+    return replace(task, policy=FixPolicy.BACKPORT)
+
+
+def _adapting_agent(adapts: str, path: str = "value.txt", text: str = "fixed\nkept for this branch\n"):
+    """An agent whose patch is the upstream commit's line ("fixed") and one of its own, unless ``text`` says otherwise."""
+    def agent(task, repo_dir, job_log, *, feedback="", context=None, **_kwargs):  # noqa: ARG001
+        agent.feedback.append(feedback)
+        agent.contexts.append(context)
+        (Path(repo_dir) / path).write_text(text, encoding="utf-8")
+        return FixCandidate(
+            action=CandidateAction.PATCH, failing_check="value check", root_cause="the branch lacks the fix",
+            reasoning="adapt the upstream fix", changed_paths=(path,), adapts=adapts,
+        )
+
+    agent.feedback, agent.contexts = [], []
+    return agent
+
+
+def test_a_backport_branch_takes_no_fix_of_its_own(tmp_path, monkeypatch):
+    """A release branch's flake is the default branch's too: 16 of 17 pushed fixes were hand-written."""
+    source, head_sha = _source_repo(tmp_path)
+    _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+    agent = _adapting_agent("")
+
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
+
+    assert agent.contexts[0].upstream_only
+    assert candidate.action is CandidateAction.REFUSE
+    assert "Only a change already merged upstream is accepted here" in candidate.summary
+    assert "choose `refuse` and say so" in agent.feedback[1]
+
+
+def test_a_backport_branch_takes_a_patch_that_adapts_a_merged_upstream_commit(tmp_path, monkeypatch):
+    source, head_sha = _source_repo(tmp_path)
+    commit = _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=_adapting_agent(commit))
+
+    assert candidate.action is CandidateAction.PATCH
+    assert candidate.adapts == commit and "+kept for this branch" in candidate.patch
+
+
+@pytest.mark.parametrize(("adapts", "path", "text", "reason"), [
+    # Every hand-written fix pushed to a backport branch changed a file that unported upstream commits
+    # change too: naming one of them adapts nothing unless the patch is its change.
+    ("upstream", "value.txt", "a fix of its own\nwith a longer wait\n", "Only 0% of the patch's changed lines"),
+    ("upstream", "value.txt", "fixed\nand two lines\nof its own\n", "Only 33% of the patch's changed lines"),
+    ("upstream", "other.txt", "fixed\n", "Only 0% of the patch's changed lines"),  # the commit changes value.txt
+    ("head", "value.txt", "fixed\n", "already present on the target head"),
+    ("b" * 40, "value.txt", "fixed\n", "not merged into origin/main"),
+])
+def test_a_patch_must_adapt_the_upstream_commit_it_names(tmp_path, monkeypatch, adapts, path, text, reason):
+    source, head_sha = _source_repo(tmp_path)
+    commit = _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+    agent = _adapting_agent({"upstream": commit, "head": head_sha}.get(adapts, adapts), path, text)
+
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
+
+    assert candidate.action is CandidateAction.REFUSE
+    assert reason in agent.feedback[1]
+
+
+def test_a_backport_branch_repairs_what_its_own_pull_request_brought(tmp_path, monkeypatch):
+    """A patch confined to files the pull request changes needs no upstream commit.
+
+    Eleven of the thirteen hand-written fixes pushed to backport branches changed a file their
+    pull request never touched; the other two repaired what the backport brought.
+    """
+    source, base_sha = _source_repo(tmp_path)
+    (source / "brought.txt").write_text("by the backport\n", encoding="utf-8")
+    git(source, "add", "brought.txt")
+    git(source, "commit", "-qm", "Backport a change")
+    head_sha = git(source, "rev-parse", "HEAD")
+    monkeypatch.setattr(engine_mod, "default_branch_ref", lambda _repo: "origin/main")
+
+    def clone(repo_full_name, destination, sha, *, pull_number=0):  # noqa: ARG001
+        shutil.copytree(source, destination)
+        git(destination, "checkout", "-q", "--detach", sha)
+        # origin/main is the release branch the pull request is into, where it forked.
+        git(destination, "update-ref", "refs/remotes/origin/main", base_sha)
+        return True
+
+    monkeypatch.setattr(engine_mod, "shallow_clone_at_sha", clone)
+
+    own = _adapting_agent("", "brought.txt")
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=own)
+    assert own.contexts[0].upstream_only and own.contexts[0].own_paths == ("brought.txt",)
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == ""
+
+    # A file the pull request never touched is the release branch's own trouble.
+    elsewhere = _adapting_agent("", "value.txt")
+    refused = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=elsewhere)
+    assert refused.action is CandidateAction.REFUSE
+    assert "changes only files this pull request itself changes" in elsewhere.feedback[1]
+
+
+def test_a_backport_that_broke_the_build_may_be_repaired_by_hand(tmp_path, monkeypatch):
+    """#5128's backport used bool without <stdbool.h>: the fix adapts the backport, and no upstream commit is it."""
+    source, head_sha = _source_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
+    agent = _adapting_agent("")
+
+    candidate = engine_mod.prepare_fix(
+        _backport(_task(head_sha)), "make: *** [Makefile:6: all] Error 2", agent_func=agent,
+        job=JobCommands(build="true", runtest="./runtest"),
+    )
+
+    assert not agent.contexts[0].upstream_only
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == ""
+
+
+def test_a_failure_no_command_can_run_is_fixed_only_by_an_upstream_change(tmp_path, monkeypatch):
+    """A sanitizer leak or a sentinel test: nothing here runs it, but its fix may be upstream (#5274)."""
+    source, head_sha = _source_repo(tmp_path)
+    commit = _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", lambda *_args, **_kwargs: None)
+    contexts, commands = [], []
+
+    def agent(task, repo_dir, job_log, *, context=None, **kwargs):
+        contexts.append(context)
+        return _port_agent(commit)(task, repo_dir, job_log, **kwargs)
+
+    candidate = engine_mod.prepare_fix(
+        _task(head_sha), _LOG, agent_func=agent,
+        test_func=lambda _repo, command, _timeout: commands.append(command) or TestRun(True, ""),
+    )
+
+    assert contexts[0].upstream_only
+    assert "No command here can run the failing check" in contexts[0].verification
+    assert candidate.action is CandidateAction.PORT and candidate.port_commit == commit
+    assert commands == ['make -j"$(getconf _NPROCESSORS_ONLN)"']
+    assert "builds." in candidate.verification
+
+    # A fix written here would be published on review alone.
+    refused = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=_adapting_agent(""),
+                                     test_func=lambda *_args: TestRun(True, ""))
+    assert refused.action is CandidateAction.REFUSE
 
 
 def test_a_failure_with_nothing_to_search_for_does_not_claim_a_search(tmp_path, monkeypatch):
@@ -999,6 +1172,7 @@ def test_a_port_not_merged_on_the_default_branch_goes_back_before_testing(tmp_pa
 def test_a_later_round_whose_agent_fails_is_a_failed_attempt_not_a_refusal(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    _with_plan(monkeypatch)
     first = _value_agent("almost")
 
     def agent(task, repo_dir, job_log, **kwargs):
@@ -1017,6 +1191,7 @@ def test_an_agent_that_runs_out_its_session_refuses_without_a_retry(tmp_path, mo
     """A second session reads what the first read and times out the same way (#5224)."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    _with_plan(monkeypatch)
     first = _value_agent("almost")
     calls = []
 
@@ -1103,7 +1278,7 @@ def test_a_detector_issue_verifies_only_its_own_test(tmp_path, monkeypatch):
     task = _task(head_sha)
     task = replace(task, failure=replace(task.failure, failed_tests=(own,), issue_number=7))
 
-    engine_mod.prepare_fix(task, log, agent_func=_value_agent("right", command=""),
+    engine_mod.prepare_fix(task, log, agent_func=_value_agent("right"),
                            test_func=_runs_value_check([]))
 
     assert seen["tests"] == (own,)
@@ -1117,7 +1292,7 @@ def test_a_verification_that_runs_out_of_time_is_a_failed_attempt(tmp_path, monk
         TestRun(False, "timed out after 60s", timed_out=True),
         TestRun(True, "", "[ok]: value is right (1 ms)"),
     ])
-    agent = _value_agent("right", "right", command="")
+    agent = _value_agent("right", "right")
 
     # Nothing is known about the change: a failed attempt, retried, not feedback.
     with pytest.raises(RuntimeError, match="did not finish in the time left"):
@@ -1179,6 +1354,7 @@ def _prepare_with_others(tmp_path, monkeypatch, others):
 
     source, head_sha = _two_test_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
     task = replace(
         _task(head_sha, kind=TargetKind.DRAFT_PR),
         other_issues=tuple(OtherIssue(number=n, test=FailedTest(t, "tests/unit/t.tcl")) for n, t in others),
@@ -1195,14 +1371,14 @@ def _prepare_with_others(tmp_path, monkeypatch, others):
 def test_another_issue_whose_test_passes_with_the_patch_is_touched_not_claimed(tmp_path, monkeypatch):
     candidate = _prepare_with_others(tmp_path, monkeypatch, [(11, "B")])
     assert candidate.action is CandidateAction.PATCH
-    assert (candidate.also_fixes, candidate.also_touches) == ((), (11,))
+    assert candidate.also_touches == (11,)
     assert "The patch changes `B`, issue `#11`'s test, which passed 40 loop(s) with it." in candidate.verification
 
 
 def test_an_issue_whose_test_does_not_pass_with_the_patch_is_only_mentioned(tmp_path, monkeypatch):
     # C is not in the file, so its test never runs.
     candidate = _prepare_with_others(tmp_path, monkeypatch, [(12, "C")])
-    assert (candidate.also_fixes, candidate.also_touches) == ((), (12,))
+    assert candidate.also_touches == (12,)
     assert "The patch changes `C`, issue `#12`'s test, which did not pass with it." in candidate.verification
     # Unlinked: a bare #12 would let this PR keep #12 from a fix of its own.
     assert "#12" not in candidate.verification.replace("`#12`", "")
@@ -1213,6 +1389,7 @@ def test_an_issue_in_another_file_is_not_considered(tmp_path, monkeypatch):
 
     source, head_sha = _two_test_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
     task = replace(
         _task(head_sha, kind=TargetKind.DRAFT_PR),
         other_issues=(OtherIssue(number=13, test=FailedTest("Z", "tests/unit/other.tcl")),),
@@ -1222,7 +1399,7 @@ def test_an_issue_in_another_file_is_not_considered(tmp_path, monkeypatch):
         task, _LOG, agent_func=_fix_both_agent(),
         review_func=lambda *a, **k: (True, "ok"), test_func=_only_tests_pass,
     )
-    assert (candidate.also_fixes, candidate.also_touches) == ((), ())
+    assert candidate.also_touches == ()
 
 
 # --- inside the failed job: its checkout ----------------------------------------
@@ -1271,12 +1448,13 @@ def test_a_build_break_no_test_names_is_fixed_and_verified_by_the_jobs_build(tmp
     """#5077: the job failed in make. The job's build is the check."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
     build = 'test "$(cat value.txt)" = right || { echo "value.c:1:5: error: unknown type name bool"; exit 2; }'
     seen = []
 
     def agent(task, repo_dir, job_log, **kwargs):
         seen.append(kwargs["context"])
-        return _value_agent("right", command="")(task, repo_dir, job_log, **kwargs)
+        return _value_agent("right")(task, repo_dir, job_log, **kwargs)
 
     candidate = engine_mod.prepare_fix(
         _task(head_sha), "make: *** [Makefile:6: all] Error 2", agent_func=agent,
@@ -1284,22 +1462,31 @@ def test_a_build_break_no_test_names_is_fixed_and_verified_by_the_jobs_build(tmp
     )
 
     assert candidate.action is CandidateAction.PATCH
-    assert f"`{build}` (1 loop(s))" in seen[0].verification
-    assert f"`{build}` passed 1 loop(s)" in candidate.verification
+    assert f"`{build}`: the build must pass." in seen[0].verification
+    assert f"With the fix, `{build}` builds." in candidate.verification
 
 
 def test_a_job_that_did_not_break_in_make_gets_no_build_plan(tmp_path, monkeypatch):
     """A reply-schema validator failure names no test either, but its build passed (#5306)."""
-    monkeypatch.setattr(engine_mod, "_unverifiable_refusal", _REAL_UNVERIFIABLE_REFUSAL)
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
+
+    contexts = []
+
+    def agent(task, repo_dir, job_log, *, context=None, **_kwargs):  # noqa: ARG001
+        contexts.append(context)
+        return FixCandidate(action=CandidateAction.REFUSE, summary="The validator is not a code fix.")
 
     candidate = engine_mod.prepare_fix(
         _task(head_sha), "make[1]: [Makefile:849: distclean] Error 2 (ignored)\nJSON schema validation error",
-        agent_func=lambda *a, **k: pytest.fail("no edit"), job=JobCommands(build="false", runtest="./runtest"),
+        agent_func=agent, job=JobCommands(build="false", runtest="./runtest"),
+        test_func=lambda *_args: pytest.fail("the job's build is not the check"),
     )
 
-    assert candidate.action is CandidateAction.REFUSE and "could not be checked" in candidate.summary
+    # No build plan: the fix would be reviewed, not run, and the agent may still decline.
+    assert contexts[0].reviewed_only and not contexts[0].verified_by_code
+    assert candidate.action is CandidateAction.REFUSE and not candidate.not_run
 
 
 def _chain():
@@ -1312,7 +1499,8 @@ def _chain():
 def test_a_test_that_fails_under_only_is_verified_in_its_own_block(tmp_path):
     """#5073: with --only the setup is skipped and the test always fails; in its block it passes."""
     seen, checks = [], []
-    results = {"only": TestRun(False, "", "[err]: t in tests/unit/a.tcl"),
+    results = {"make": TestRun(True, ""),
+               "only": TestRun(False, "", "[err]: t in tests/unit/a.tcl"),
                "isolated": TestRun(True, "", "[ok]: t (1 ms)")}
 
     def run(_repo, command, _timeout):
@@ -1322,8 +1510,81 @@ def test_a_test_that_fails_under_only_is_verified_in_its_own_block(tmp_path):
 
     feedback = engine_mod._verify_with_plan(_chain(), str(tmp_path), run, time.monotonic() + 600, checks)
 
-    assert feedback == "" and seen == ["only", "isolated"]
+    # The build, each plan once until one passes, then that one looped.
+    assert feedback == "" and seen == ["make", "only", "isolated", "isolated"]
     assert "`make && isolated` passed 40 loop(s)" in checks[0]
+
+
+def test_a_test_that_passes_once_and_fails_in_its_loops_is_not_passed_by_a_fallback(tmp_path):
+    """A fallback is for a test that cannot run alone, not for one that still fails now and then."""
+    seen = []
+
+    def run(_repo, command, _timeout):
+        seen.append(command)
+        if command == "make" or "--loops 1" in command:
+            return TestRun(True, "", "[ok]: t (1 ms)")
+        return TestRun(False, "boom", "[err]: t in tests/unit/a.tcl")
+
+    test = FailedTest("t", "tests/unit/a.tcl")
+    whole = VerifyPlan(build="make", test="whole", tests=(test,), single_run=True, attributed=True)
+    plan = VerifyPlan(build="make", test=f"only --loops {LOOPS}", tests=(test,), fallback=whole)
+
+    feedback = engine_mod._verify_with_plan(plan, str(tmp_path), run, time.monotonic() + 7200, [])
+
+    assert seen == ["make", "make && only --loops 1", "make && only --loops 40"]
+    assert "still fails within 40 loop(s): `make && only --loops 40`" in feedback
+
+
+def test_a_slow_test_gets_the_loops_that_fit(tmp_path):
+    """One 79s loop cannot run 40 times in the time kept for verification (run 42480180080)."""
+    seen, checks = [], []
+
+    def run(_repo, command, _timeout):
+        seen.append(command)
+        return TestRun(True, "", "[ok]: t (1 ms)", seconds=79.0)
+
+    plan = VerifyPlan(build="make", test=f"only --loops {LOOPS}", tests=(FailedTest("t", "tests/unit/a.tcl"),))
+
+    assert engine_mod._verify_with_plan(plan, str(tmp_path), run, time.monotonic() + 7200, checks) == ""
+    assert seen[-1] == "make && only --loops 34"
+    assert "passed 34 loop(s)" in checks[0] and checks[1] == "One loop takes 79s, so 34 loop(s) ran, not 40."
+
+    # With no time for a second run, the one that passed is the check.
+    seen.clear(), checks.clear()
+    assert engine_mod._verify_with_plan(plan, str(tmp_path), run, time.monotonic() + 100, checks) == ""
+    assert seen == ["make", "make && only --loops 1"] and "passed 1 loop(s)" in checks[0]
+
+
+def test_a_change_that_does_not_build_is_told_so(tmp_path):
+    seen = []
+
+    def run(_repo, command, _timeout):
+        seen.append(command)
+        return TestRun(False, "value.c:1:5: error: unknown type name bool")
+
+    plan = VerifyPlan(build="make", test="only", tests=(FailedTest("t", "tests/unit/a.tcl"),))
+    feedback = engine_mod._verify_with_plan(plan, str(tmp_path), run, time.monotonic() + 600, [])
+
+    assert seen == ["make"]
+    assert "`make` does not build" in feedback and "unknown type name bool" in feedback
+
+
+def test_a_fix_under_deps_makes_the_build_rebuild_them(tmp_path):
+    """#5330: a fix in deps/libvalkey was verified against the library built without it."""
+    (tmp_path / "src").mkdir()
+    settings = tmp_path / "src" / ".make-settings"
+    git(tmp_path, "init")
+    plan = VerifyPlan(build="true", test="true", build_only=True)
+    run = lambda *_args: TestRun(True, "")  # noqa: E731
+
+    settings.write_text("PREV_FINAL_CFLAGS=-O2\n", encoding="utf-8")
+    in_src = FixCandidate(action=CandidateAction.PATCH, patch="--- a/src/a.c\n+++ b/src/a.c\n@@ -1 +1 @@\n-a\n+b\n")
+    engine_mod._verify(in_src, str(tmp_path), plan, run, time.monotonic() + 600, [])
+    assert settings.exists()
+
+    in_deps = replace(in_src, patch=in_src.patch.replace("src/a.c", "deps/libvalkey/src/net.c"))
+    engine_mod._verify(in_deps, str(tmp_path), plan, run, time.monotonic() + 600, [])
+    assert not settings.exists()
 
 
 def test_a_patch_that_fails_every_way_gets_the_last_runs_feedback(tmp_path):
@@ -1331,11 +1592,11 @@ def test_a_patch_that_fails_every_way_gets_the_last_runs_feedback(tmp_path):
 
     def run(_repo, command, _timeout):
         seen.append(command.split(" && ")[-1].split()[0])
-        return TestRun(False, "boom", "[err]: t in tests/unit/a.tcl")
+        return TestRun(True, "") if command == "make" else TestRun(False, "boom", "[err]: t in tests/unit/a.tcl")
 
     feedback = engine_mod._verify_with_plan(_chain(), str(tmp_path), run, time.monotonic() + 600, [])
 
-    assert seen == ["only", "isolated", "whole"]
+    assert seen == ["make", "only", "isolated", "whole"]
     assert "still fails within 1 loop(s): `make && whole`" in feedback
 
 
@@ -1404,8 +1665,8 @@ def test_a_test_whose_name_is_built_at_run_time_counts_as_touched_by_any_change_
     assert engine_mod._changes_test(str(tmp_path), _changed(source, after), FailedTest("incr operation", "tests/unit/t.tcl"))
 
 
-def test_a_test_command_that_rewrites_the_patched_file_does_not_get_its_patch_published(tmp_path, monkeypatch):
-    """The tree is the candidate: a command that edits it during verification changes the candidate."""
+def test_a_test_that_rewrites_the_patched_file_does_not_get_its_patch_published(tmp_path, monkeypatch):
+    """The tree is the candidate: a build or test that edits it during verification changes the candidate."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     feedback_seen = []
@@ -1415,7 +1676,7 @@ def test_a_test_command_that_rewrites_the_patched_file_does_not_get_its_patch_pu
         (Path(repo_dir) / "value.txt").write_text("bad\n", encoding="utf-8")
         return FixCandidate(
             action=CandidateAction.PATCH, failing_check="value", root_cause="wrong value",
-            reasoning="set it", changed_paths=("value.txt",), test_command="check",
+            reasoning="set it", changed_paths=("value.txt",),
         )
 
     def test(repo_dir, command, timeout):  # noqa: ARG001

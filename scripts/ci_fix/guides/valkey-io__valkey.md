@@ -45,7 +45,7 @@ The verification section of your briefing names the exact command the bot
 checks your change with, with the job's own build; prefer it. In general:
 
 ```sh
-make -j"$(nproc)"
+make -j"$(getconf _NPROCESSORS_ONLN)"
 ./runtest --single unit/type/incr --only 'exact test name' --loops 20 --fastfail --dump-logs
 ```
 
@@ -58,7 +58,7 @@ block runs inline, so loop a file with `run_solo` with `--clients 1`. Add
 A C unit test is a Google Test in `src/unit/test_*.cpp`, not a Tcl test:
 
 ```sh
-make -j"$(nproc)" all-with-unit-tests
+make -j"$(getconf _NPROCESSORS_ONLN)" all-with-unit-tests
 ./src/unit/valkey-unit-gtests --gtest_filter='Suite.Test' --gtest_repeat=20
 ```
 

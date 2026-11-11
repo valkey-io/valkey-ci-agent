@@ -233,22 +233,56 @@ def test_the_agent_is_told_what_code_established_and_shown_ports_first(tmp_path,
     assert "### Verification\nCode checks your change with `./runtest ...`" in prompt
     assert "CI job log is your evidence" in prompt
     assert "`tests/README.md`" in prompt
-    # Code verifies with its own command, so no model command is accepted.
-    assert "only code-owned checks are\naccepted as verification" in prompt
+    # Code verifies with its own command, and the test is never bent to it.
+    assert "only that counts: do not claim to have run anything" in prompt
+    assert "never change a test so that it can run alone" in prompt
+    assert "test_command" not in prompt and "Only a change already merged" not in prompt
     assert prompt.index("- `port`:") < prompt.index("- `patch`:")
     assert seen["files"]["prior-fixes.md"] == "# detail with the diff"
     assert seen["files"]["test-guide.md"] == "# Fixing a failing Valkey test"
 
 
-def test_without_a_verification_plan_the_agent_must_not_invent_a_test_command(tmp_path, monkeypatch) -> None:
+def test_without_a_verification_plan_the_agent_must_not_claim_a_test_run(tmp_path, monkeypatch) -> None:
     seen = {}
     monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
         {"action": "refuse", "summary": "no"}))
 
     agent_mod.run_fix_agent(_task(), str(tmp_path), "log")
 
-    assert "Leave `test_command`\nempty" in seen["prompt"]
+    assert "do not claim to have\nrun anything" in seen["prompt"]
     assert "What code established" not in seen["prompt"]
+
+
+def test_a_fix_that_will_not_be_run_is_proposed_only_where_the_cause_is_established(tmp_path, monkeypatch) -> None:
+    from scripts.ci_fix.models import FixContext
+
+    seen = {}
+    monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
+        {"action": "refuse", "summary": "no"}))
+
+    agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=FixContext(
+        reviewed_only=True, verification="No command here can run the failing check, so this fix was reviewed, not run."))
+
+    assert "your patch will be\nreviewed and published as not run" in seen["prompt"]
+    assert "only where the log and the code establish the cause; otherwise refuse" in seen["prompt"]
+    assert "### Verification\nNo command here can run the failing check" in seen["prompt"]
+
+
+def test_where_only_an_upstream_change_is_accepted_the_agent_is_told_and_its_claim_is_read(
+    tmp_path, monkeypatch,
+) -> None:
+    from scripts.ci_fix.models import FixContext
+
+    seen = {}
+    monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
+        {"action": "patch", "summary": "adapted", "changed_paths": ["a.c"], "adapts_commit": "D" * 40}))
+
+    context = FixContext(upstream_only=True, unported_changes="# `src/a.c`\n\n- `abc` 2026-11-04 Free the hint\n")
+    candidate = agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=context)
+
+    assert "Only a change already merged on the default branch is accepted" in seen["prompt"]
+    assert "### Upstream changes this branch lacks" in seen["prompt"] and "upstream-changes.md" in seen["prompt"]
+    assert candidate.adapts == "d" * 40
 
 
 def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) -> None:
@@ -259,15 +293,27 @@ def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) 
         {"approved": True, "reasoning": "fine"}))
     candidate = FixCandidate(action=CandidateAction.PORT, port_commit="c" * 40, patch="diff", failing_check="t",
                              root_cause="race")
+    context = FixContext(verification="Code checks your change with `make`.", guide="# guide")
 
-    approved, _ = agent_mod.review_candidate(
-        candidate, str(tmp_path), "log",
-        context=FixContext(verification="Code checks your change with `make`.", guide="# guide"),
-    )
+    approved, _ = agent_mod.review_candidate(candidate, str(tmp_path), "log", context=context)
 
     assert approved
     assert f"ports upstream commit {'c' * 40}" in seen["prompt"]
-    assert "Verification, by code: Code checks your change with `make`." in seen["prompt"]
+    assert "What code checked:\nCode checks your change with `make`." in seen["prompt"]
+    assert "It is a claim: check it against the log" in seen["prompt"]
+    # A port is merged upstream, where it was reviewed: its design is not judged again. The first
+    # run on a new model turned down the one merged fix for a flake because it widened an assertion.
+    assert "do not judge its design again" in seen["prompt"]
+    assert "a looser threshold unless" not in seen["prompt"] and "is a rejection" not in seen["prompt"]
+
+    # A fix written here is judged on its merits, against the repository's conventions; and a
+    # verified candidate's review reads what the checks found, and what a patch says it adapts.
+    adapted = FixCandidate(action=CandidateAction.PATCH, adapts="d" * 40, patch="diff",
+                           verification="With the fix, `make` builds.")
+    agent_mod.review_candidate(adapted, str(tmp_path), "log", context=context)
+    assert "What code checked:\nWith the fix, `make` builds." in seen["prompt"]
+    assert f"adapts upstream commit {'d' * 40}" in seen["prompt"]
+    assert "a looser threshold unless" in seen["prompt"] and "do not judge its design again" not in seen["prompt"]
     assert "a skip tag instead of a fix, is a rejection" in seen["prompt"]
 
 

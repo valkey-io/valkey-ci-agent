@@ -258,7 +258,6 @@ def test_an_issue_fix_published_as_a_comment_pushes_nothing(monkeypatch: pytest.
 @pytest.mark.parametrize(("issue", "why"), [
     (_issue(state="closed"), "no longer open"),
     (_issue(assignees=[SimpleNamespace(login="alice")]), "now assigned"),
-    (_issue(body="<!-- valkey-ci-agent:test-failure:last-key:101 -->"), "now points at run 101"),
 ])
 def test_a_comment_is_not_posted_on_an_issue_that_changed_during_the_fix(issue, why) -> None:
     task = _task(TargetKind.DRAFT_PR, issue=9)
@@ -474,10 +473,6 @@ def test_wrong_base_existing_occurrence_pr_is_not_reused(
     [
         (_issue(state="closed"), "no longer open"),
         (_issue(assignees=[SimpleNamespace(login="alice")]), "now assigned"),
-        (
-            _issue(body="<!-- valkey-ci-agent:test-failure:last-key:101 -->"),
-            "now points at run 101",
-        ),
         (_issue(body="detector marker removed"), "no longer contains"),
     ],
 )
@@ -585,7 +580,7 @@ def test_a_daily_draft_closes_its_issue():
     assert body.startswith("Fixes #9\n\n") and "[See the run](https://github.com/o/r/actions/runs/1)" in body
 
 
-def test_a_draft_closes_only_the_extra_issues_whose_tests_were_verified():
+def test_a_draft_closes_only_its_own_issue_and_mentions_the_ones_it_touched():
     from dataclasses import replace
 
     from scripts.ci_fix.models import Failure, FixPolicy, FixTarget, FixTask, TargetKind
@@ -593,12 +588,22 @@ def test_a_draft_closes_only_the_extra_issues_whose_tests_were_verified():
 
     failure = Failure("o/r", 1, "a" * 40, 2, "job", base_branch="unstable", issue_number=9, source=Source.DAILY)
     target = FixTarget(TargetKind.DRAFT_PR, "o/r", branch="agent/ci-fix/x")
-    candidate = replace(_candidate(), also_fixes=(10, 11), also_touches=(12,))
+    candidate = replace(_candidate(), also_touches=(12,))
 
     body = publish_mod._draft_body(FixTask(failure, target, FixPolicy.GENERAL), candidate)
 
-    assert "Fixes #9 Fixes #10 Fixes #11" in body
+    assert "Fixes #9\n" in body
     assert "Fixes #12" not in body
     assert "It also changes the test of issue `#12`, without showing that it fixes it." in body
     # In code, so GitHub does not link it: a linked open PR would keep #12 from its own fix.
     assert "#12" not in body.replace("`#12`", "")
+
+
+def test_a_fix_is_still_published_when_its_test_failed_again_while_it_was_prepared() -> None:
+    """The fix is for the test, not for the run that showed it failing: a newer run discards nothing."""
+    task = _task(TargetKind.DRAFT_PR, issue=9)
+    gh, _repo = _gh(issue=_issue(body="<!-- valkey-ci-agent:test-failure:last-key:101 -->"))
+
+    result = publish_candidate(gh, task, _candidate(), git_env={}, issue_publication=IssuePublication.COMMENT)
+
+    assert result.kind is ResultKind.SUGGESTED
