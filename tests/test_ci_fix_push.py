@@ -459,6 +459,19 @@ def test_only_ci_fix_and_backport_namespaces_are_writable(branch: str) -> None:
         )
 
 
+def test_a_clipped_subject_does_not_end_on_a_dangling_word() -> None:
+    """A fix pushed to 7.2 was titled "Fix diskless all replicas drop during rdb pipe in"."""
+    candidate = FixCandidate(
+        action=CandidateAction.PATCH,
+        failing_check="diskless all replicas drop during rdb pipe in tests/integration/replication.tcl "
+                      "(job test-alpine-libc-malloc)",
+    )
+
+    subject = commit_message(candidate).splitlines()[0]
+
+    assert subject == "Fix diskless all replicas drop during rdb pipe"
+
+
 def test_commit_message_is_concise_and_wraps_the_explanation() -> None:
     candidate = FixCandidate(
         action=CandidateAction.PATCH,

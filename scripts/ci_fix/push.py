@@ -444,12 +444,18 @@ def commit_message(candidate: FixCandidate) -> str:
     return f"{subject}\n\n{body}\n" if body else subject
 
 
+_DANGLING = frozenset({"", "a", "an", "and", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "with"})
+
+
 def fit_subject(subject: str) -> str:
     """Fit a Git commit or PR subject to the conventional 72 characters."""
     subject = " ".join(subject.split()).strip(" .")
     if len(subject) <= 72:
         return subject
-    clipped = subject[:72].rstrip()
-    if " " in clipped:
-        clipped = clipped.rsplit(" ", 1)[0]
-    return clipped.rstrip(" .")
+    words = subject[:72].rstrip().split(" ")
+    if len(words) > 1:
+        words.pop()  # likely cut mid-word
+    # "Fix x during y in" reads as a mistake: do not end on a word that only leads to the next.
+    while len(words) > 1 and words[-1].lower().strip("(`") in _DANGLING:
+        words.pop()
+    return " ".join(words).rstrip(" .(")
