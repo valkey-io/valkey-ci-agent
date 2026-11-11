@@ -312,6 +312,10 @@ class FixPlan:
     comment_id: int = 0
     # FOLLOW-UP: successful-result markers and identities for silent attempts.
     markers: tuple[str, ...] = ()
+    # Set by the publish job when the fix job failed before the engine started
+    # (a runner that could not install or build): such an attempt says nothing
+    # about the failure, so no front door counts it.
+    never_started: bool = False
 
 
 @dataclass(frozen=True)
@@ -320,3 +324,6 @@ class FixOutcome:
 
     candidate: Optional[FixCandidate] = None
     error: str = ""
+    # The engine ran. An outcome written for it by the job's own steps, or
+    # none at all, is a job that failed before it could.
+    started: bool = False

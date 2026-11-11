@@ -223,7 +223,19 @@ def test_the_fix_job_prepares_from_the_plan_alone_with_the_jobs_own_commands(mon
     outcome = run.fix(tmp_path, tmp_path / "out", repo_dir="/job")
 
     assert seen == {"task": _pr_plan().task, "log": "the log", "repo_dir": "/job", "job": commands}
-    assert load(tmp_path / "out" / run.OUTCOME_FILE, FixOutcome) == outcome == FixOutcome(candidate=_CANDIDATE)
+    assert load(tmp_path / "out" / run.OUTCOME_FILE, FixOutcome) == outcome
+    assert outcome == FixOutcome(candidate=_CANDIDATE, started=True)
+
+
+def test_a_fix_job_stopped_mid_fix_leaves_an_attempt_that_started(monkeypatch, tmp_path):
+    save(tmp_path / run.PLAN_FILE, _pr_plan())
+    monkeypatch.setattr(run, "prepare_fix", MagicMock(side_effect=KeyboardInterrupt))
+
+    with pytest.raises(KeyboardInterrupt):
+        run.fix(tmp_path, tmp_path / "out")
+
+    left = load(tmp_path / "out" / run.OUTCOME_FILE, FixOutcome)
+    assert left.started and left.candidate is None and "stopped before the fix finished" in left.error
 
 
 def test_a_failure_before_the_fix_engine_is_recorded(tmp_path):
@@ -335,6 +347,28 @@ def test_a_fix_that_crashed_or_never_finished_is_reported_as_failed(front_door, 
     assert missing.kind is ResultKind.FAILED and "https://run" in missing.summary
 
 
+def test_only_an_attempt_whose_engine_never_started_is_marked_on_its_plan(
+    front_door, monkeypatch, tmp_path,
+):
+    """A runner that could not install or build says nothing about the failure: the plan records that."""
+    outputs = tmp_path / "outputs"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(outputs))
+    save(tmp_path / run.PLAN_FILE, _pr_plan())
+    monkeypatch.setattr(run, "prepare_fix", MagicMock(side_effect=RuntimeError("agent died")))
+    run.fix(tmp_path, tmp_path / "crashed")
+    run.record_failure(tmp_path / "setup", "the failed job's setup and build replay failed")
+
+    _publish(tmp_path, tmp_path / "crashed")
+    assert not load(tmp_path / run.PLAN_FILE, FixPlan).never_started and not outputs.exists()
+
+    for never_started in ("setup", "nothing"):
+        save(tmp_path / run.PLAN_FILE, _pr_plan())
+        _publish(tmp_path, tmp_path / never_started)
+        assert load(tmp_path / run.PLAN_FILE, FixPlan) == replace(_pr_plan(), never_started=True)
+    assert outputs.read_text(encoding="utf-8") == "never_started=true\n" * 2
+    assert all(result.kind is ResultKind.FAILED for result in front_door.reported)
+
+
 def test_a_result_that_cannot_be_read_is_reported_as_failed(front_door, tmp_path):
     save(tmp_path / run.PLAN_FILE, _pr_plan())
     (tmp_path / "out").mkdir()
@@ -344,6 +378,7 @@ def test_a_result_that_cannot_be_read_is_reported_as_failed(front_door, tmp_path
 
     (unreadable,) = front_door.reported
     assert unreadable.kind is ResultKind.FAILED and "could not be read" in unreadable.summary
+    assert not load(tmp_path / run.PLAN_FILE, FixPlan).never_started
 
 
 def _issue_plan() -> FixPlan:

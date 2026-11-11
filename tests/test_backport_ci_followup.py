@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -425,7 +426,7 @@ def test_attempt_budget_counts_only_terminal_comments_on_current_head(
     pr = _pr(
         comments=tuple(
             _marker(run=index, job=index)
-            for index in range(1, 4)
+            for index in range(1, 8)
         ),
     )
     target, reason, gh = _select(monkeypatch, pr=pr)
@@ -436,9 +437,9 @@ def test_attempt_budget_counts_only_terminal_comments_on_current_head(
 
 
 def test_refusals_retire_their_jobs_without_spending_the_heads_attempts(monkeypatch) -> None:
-    """A refusal changed nothing on the branch, so it is not one of the head's three attempts."""
+    """A refusal changed nothing on the branch, so it is not one of the head's seven attempts."""
     refused = tuple(_marker(run=index, job=index, outcome="refused") for index in range(30, 33))
-    pushed = (_marker(run=40, job=40, outcome="pushed"), _marker(run=41, job=41))
+    pushed = tuple(_marker(run=index, job=index, outcome="pushed") for index in range(40, 46))
     target, reason, _gh = _select(monkeypatch, pr=_pr(comments=refused + pushed))
 
     assert reason == "actionable" and target is not None
@@ -576,6 +577,20 @@ def test_failed_attempts_post_nothing_and_their_plans_bound_the_retries(monkeypa
     assert target is None and reason == "no-unhandled-actionable-failures"
 
 
+def test_an_attempt_that_failed_before_the_engine_started_has_a_budget_of_its_own(monkeypatch) -> None:
+    """A runner outage fails every run it lasts: none says anything about the job, but it is not retried forever."""
+    pr = _pr()
+    failed = _plan(monkeypatch, _target(pr))
+    outage = replace(failed, never_started=True)
+
+    # Neither a failure of its job, which two would retire, nor one of the head's attempts.
+    target, reason, _gh = _select(monkeypatch, pr=pr, prior_plans=(outage,) * 6 + (failed,))
+    assert reason == "actionable" and target is not None
+
+    target, reason, _gh = _select(monkeypatch, pr=pr, prior_plans=(outage,) * 7)
+    assert target is None and reason == "attempt-budget-exhausted"
+
+
 def test_a_plan_whose_attempt_was_commented_is_not_counted_again(monkeypatch) -> None:
     """A fix or refusal is already on the PR: its plan is not also a failed attempt."""
     pr = _pr()
@@ -602,7 +617,10 @@ def test_a_job_that_keeps_failing_is_retried_a_bounded_number_of_times(monkeypat
 
 
 def test_failed_attempts_count_against_the_heads_budget(monkeypatch) -> None:
-    failed = tuple(_marker(run=index, job=index, outcome="failed") for index in range(50, 53))
+    failed = tuple(_marker(run=index, job=index, outcome="failed") for index in range(50, 57))
+    _target, reason, _gh = _select(monkeypatch, pr=_pr(comments=failed[:6]))
+    assert reason != "attempt-budget-exhausted"
+
     _target, reason, _gh = _select(monkeypatch, pr=_pr(comments=failed))
     assert reason == "attempt-budget-exhausted"
 

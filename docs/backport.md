@@ -113,8 +113,11 @@ PR's CI runs again. The bot never rewrites the branch and doesn't add a DCO
 sign-off to these commits, so a maintainer certifies the change when they
 merge it.
 
-A few rules keep this from going in circles. The agent makes at most three
-attempts on any one commit. A job it tried and failed to fix gets one more
+A few rules keep this from going in circles. The agent makes at most seven
+attempts on any one commit. A run that fails before the agent starts, because
+the runner could not install or build what the job needs, is not one of them
+and does not count against the job: it is tried again the next hour, up to
+seven times. A job it tried and failed to fix gets one more
 try; a job it declined to fix is left for a human, and one it declined twice
 is left alone on later commits too. Jobs that only report on
 other jobs, such as Daily CI's result aggregators and the coverage upload, are
