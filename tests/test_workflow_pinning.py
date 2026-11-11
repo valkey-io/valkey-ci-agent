@@ -690,5 +690,5 @@ def test_a_rerun_of_a_fix_replaces_its_artifacts():
         step for job in _run_jobs().values() for step in job.get("steps") or []
         if "actions/upload-artifact@" in step.get("uses", "")
     ]
-    assert len(uploads) == 4
+    assert len(uploads) == 5
     assert all(step["with"].get("overwrite") is True for step in uploads)

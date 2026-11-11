@@ -62,7 +62,12 @@ _MARKER_RE = re.compile(
 # On a refusal's marker when the fixer itself declined the job, rather than a
 # prepared fix being refused at publication (the head moved, the PR closed).
 _DECLINED = "declined"
-_MAX_ATTEMPTS_PER_HEAD = 3
+_MAX_ATTEMPTS_PER_HEAD = 7
+# An attempt whose fix job failed before the engine started (a runner that
+# could not install or build) says nothing about the job and is not one of
+# those. It has this bound of its own, so that a runner or a setup that stays
+# broken is not retried every hour for as long as the head stands.
+_MAX_UNSTARTED_PER_HEAD = 7
 # A job the fixer declined this many times on one PR is left alone on later
 # heads too: a new head rarely changes why it could not be fixed, and each
 # time costs a session and a comment on the PR.
@@ -85,6 +90,7 @@ class _HandledFailures:
     job_ids: frozenset[int]
     job_keys: frozenset[str]
     attempt_count: int
+    unstarted_count: int
 
 
 def find_followup_target(
@@ -187,7 +193,7 @@ def _followup_for_pr(
         bot_login,
         prior_plans=prior_plans,
     )
-    if handled.attempt_count >= _MAX_ATTEMPTS_PER_HEAD:
+    if handled.attempt_count >= _MAX_ATTEMPTS_PER_HEAD or handled.unstarted_count >= _MAX_UNSTARTED_PER_HEAD:
         return None, "attempt-budget-exhausted"
 
     current_runs = newest_runs_for_head(
@@ -359,7 +365,9 @@ def _handled_failures(
     after ``MAX_FAILED_ATTEMPTS`` of them, since it says nothing about the job.
     A fix or a refusal is commented on the PR; a failure is not, and is found
     in ``prior_plans``, the plans of this branch's earlier runs: a plan whose
-    attempt left no comment is a failed one. A job the fixer declined
+    attempt left no comment is a failed one. One whose fix job failed before
+    the engine started (a runner outage) is neither an attempt nor a failure
+    of its job: it is counted on its own. A job the fixer declined
     ``_MAX_REFUSALS_PER_JOB`` times on any of the PR's heads is retired on
     this one too.
     """
@@ -369,6 +377,7 @@ def _handled_failures(
     failed_keys: Counter[str] = Counter()
     refused_keys: Counter[str] = Counter()
     attempt_count = 0
+    unstarted_count = 0
     commented: set[tuple[str | Any, ...]] = set()
     comments = retry_github_call(
         lambda: list(pr.get_issue_comments()),
@@ -415,6 +424,9 @@ def _handled_failures(
         )
         if not matches or any(match.group("run", "attempt", "job") in commented for match in matches):
             continue
+        if plan.never_started:
+            unstarted_count += 1
+            continue
         attempt_count += 1
         for match in matches:
             job, key = int(match.group("job")), match.group("key")
@@ -428,6 +440,7 @@ def _handled_failures(
         job_ids=frozenset(job_ids),
         job_keys=frozenset(job_keys),
         attempt_count=attempt_count,
+        unstarted_count=unstarted_count,
     )
 
 

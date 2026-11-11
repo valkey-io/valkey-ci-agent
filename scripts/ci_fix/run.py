@@ -184,13 +184,15 @@ def fix(plan_dir: Path, out: Path, *, repo_dir: str = "") -> FixOutcome:
     In the job, it is built and tested with the job's own commands.
     """
     fix_plan = load(plan_dir / PLAN_FILE, FixPlan)
+    # What a job that is stopped mid-fix leaves behind: an attempt that started.
+    save(out / OUTCOME_FILE, FixOutcome(error="the fix job stopped before the fix finished", started=True))
     try:
         job = load(plan_dir / JOB_FILE, JobSpec).commands if (plan_dir / JOB_FILE).exists() else None
         candidate = prepare_fix(fix_plan.task, fix_plan.job_log, repo_dir=repo_dir, job=job)
-        outcome = FixOutcome(candidate=candidate)
+        outcome = FixOutcome(candidate=candidate, started=True)
     except Exception as exc:  # noqa: BLE001 - the publish job reports every outcome
         logger.exception("CI-fix failed")
-        outcome = FixOutcome(error=str(exc) or type(exc).__name__)
+        outcome = FixOutcome(error=str(exc) or type(exc).__name__, started=True)
     save(out / OUTCOME_FILE, outcome)
     return outcome
 
@@ -217,9 +219,13 @@ def publish_and_report(
     except FileNotFoundError:
         outcome = FixOutcome(error=f"the fix job ended without a result (see {run_url})")
     except (OSError, ValueError, TypeError, KeyError) as exc:
-        outcome = FixOutcome(error=f"the fix job's result could not be read ({exc}; see {run_url})")
+        outcome = FixOutcome(error=f"the fix job's result could not be read ({exc}; see {run_url})", started=True)
     reporter = _FRONT_DOORS[fix_plan.front_door][1]
     if outcome.candidate is None:
+        if not outcome.started:
+            # The workflow uploads the plan again, for the runs that count this one's attempts.
+            save(plan_dir / PLAN_FILE, replace(fix_plan, never_started=True))
+            _write_outputs({"never_started": "true"})
         result = FixResult(
             kind=ResultKind.FAILED, summary=f"The CI-fix attempt failed: {outcome.error}", task=fix_plan.task,
         )

@@ -453,6 +453,7 @@ jobs:
           permission-metadata: read
 
       - name: Publish the fix and report it
+        id: publish
         shell: bash
         env:
           TARGET_TOKEN: ${{ steps.ci-token.outputs.token || steps.target-token.outputs.token }}
@@ -462,3 +463,15 @@ jobs:
         run: |
           set -euo pipefail
           python -m scripts.ci_fix.run publish --plan ci-fix-plan --outcome ci-fix-result
+
+      # The plan is the ledger of failed attempts. One whose fix job failed
+      # before the engine started is marked so, and is not counted.
+      - name: Record an attempt that never started
+        if: always() && steps.publish.outputs.never_started == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-fix-plan-${{ inputs.key }}
+          path: ci-fix-plan/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
