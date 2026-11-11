@@ -107,7 +107,8 @@ def test_run_fix_agent_uses_exact_log_and_one_edit_session(tmp_path, monkeypatch
     assert "Job: unit tests (job id 456)" in seen["prompt"]
     assert "Other failed jobs, out of scope: lint" in seen["prompt"]
     assert "Normal target-repository CI is authoritative" in seen["prompt"]
-    assert "rather than keep surveying the" in seen["prompt"]
+    assert "Choose `refuse` only when you can justify no\nchange" in seen["prompt"]
+    assert "one change is\ncorrect under each of them" in seen["prompt"]
     assert "Do not commit or push" in seen["prompt"]
     assert candidate.action is CandidateAction.PATCH
     assert candidate.failure_type is FailureType.DETERMINISTIC
@@ -161,7 +162,7 @@ def test_a_port_commit_is_normalized(tmp_path, monkeypatch) -> None:
     assert candidate.port_commit == commit.lower()
 
 
-def test_infrastructure_classification_cannot_produce_a_patch(tmp_path, monkeypatch) -> None:
+def test_an_infrastructure_label_does_not_discard_the_agents_patch(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         agent_mod,
         "run_agent",
@@ -170,16 +171,17 @@ def test_infrastructure_classification_cannot_produce_a_patch(tmp_path, monkeypa
                 "action": "patch",
                 "summary": "",
                 "failure_type": "infrastructure",
-                "validation": "ignored",
+                "validation": "kept",
             }
         ),
     )
 
     candidate = agent_mod.run_fix_agent(_task(), str(tmp_path), "runner disappeared")
 
-    assert candidate.action is CandidateAction.REFUSE
+    # The action is the agent's decision; the label is only reported.
+    assert candidate.action is CandidateAction.PATCH
     assert candidate.failure_type is FailureType.INFRASTRUCTURE
-    assert candidate.validation == ""
+    assert candidate.validation == "kept"
 
 
 def test_agent_failure_or_ambiguous_output_fails_closed(tmp_path, monkeypatch) -> None:
@@ -253,7 +255,7 @@ def test_without_a_verification_plan_the_agent_must_not_claim_a_test_run(tmp_pat
     assert "What code established" not in seen["prompt"]
 
 
-def test_a_fix_that_will_not_be_run_is_proposed_only_where_the_cause_is_established(tmp_path, monkeypatch) -> None:
+def test_a_fix_that_will_not_be_run_says_what_is_and_is_not_established(tmp_path, monkeypatch) -> None:
     from scripts.ci_fix.models import FixContext
 
     seen = {}
@@ -264,7 +266,7 @@ def test_a_fix_that_will_not_be_run_is_proposed_only_where_the_cause_is_establis
         reviewed_only=True, verification="No command here can run the failing check, so this fix was reviewed, not run."))
 
     assert "your patch will be\nreviewed and published as not run" in seen["prompt"]
-    assert "only where the log and the code establish the cause; otherwise refuse" in seen["prompt"]
+    assert "say plainly what the log and the code establish\nand what they do not" in seen["prompt"]
     assert "### Verification\nNo command here can run the failing check" in seen["prompt"]
 
 
@@ -309,8 +311,14 @@ def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) 
     # A fix written here is judged on its merits, against the repository's conventions; and a
     # verified candidate's review reads what the checks found, and what a patch says it adapts.
     adapted = FixCandidate(action=CandidateAction.PATCH, adapts="d" * 40, patch="diff",
-                           verification="With the fix, `make` builds.")
+                           verification="With the fix, `make` builds.",
+                           reasoning="waits for the save", validation="the log does not show the timer")
     agent_mod.review_candidate(adapted, str(tmp_path), "log", context=context)
+    # The reviewer reads why the author chose the change and what it ruled out, is not to reject
+    # for a failure that was never reproduced (none is), and says what it would approve instead.
+    assert "Why this change: waits for the save" in seen["prompt"]
+    assert "The author's notes: the log does not show the timer" in seen["prompt"]
+    assert "no reason to reject" in seen["prompt"] and "say what change you\nwould approve" in seen["prompt"]
     assert "What code checked:\nWith the fix, `make` builds." in seen["prompt"]
     assert f"adapts upstream commit {'d' * 40}" in seen["prompt"]
     assert "a looser threshold unless" in seen["prompt"] and "do not judge its design again" not in seen["prompt"]

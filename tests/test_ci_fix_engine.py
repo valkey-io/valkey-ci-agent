@@ -239,21 +239,20 @@ def test_a_mistake_in_what_the_agent_hands_back_goes_back_to_it(tmp_path, monkey
     """A fix with no root cause is for the agent to complete, not a final refusal."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
-    causes = iter(["", "cause"])
     feedback = []
 
     def agent(task, repo_dir, job_log, **kwargs):
         feedback.append(kwargs["feedback"])
         (Path(repo_dir) / "value.txt").write_text("fixed\n", encoding="utf-8")
-        # The failing check it left out is the job's; only what a maintainer needs is asked for again.
-        return FixCandidate(action=CandidateAction.PATCH, root_cause=next(causes), reasoning="fix")
+        # The failing check it left out is the job's, and a field it left empty does not cost a round.
+        return FixCandidate(action=CandidateAction.PATCH, root_cause="", reasoning="fix")
 
     candidate = engine_mod.prepare_fix(
         _task(head_sha), _LOG, agent_func=agent, review_func=lambda *a, **k: (True, "fixes it"),
     )
 
     assert candidate.action is CandidateAction.PATCH and candidate.failing_check == "tests"
-    assert "did not provide a root cause and a change rationale" in feedback[1]
+    assert feedback == [""]
 
 
 def _upstream_commit(source: Path, head_sha: str, content: str = "fixed\n") -> str:
@@ -477,30 +476,24 @@ def test_a_file_the_agent_changed_and_did_not_list_is_pointed_out_not_refused(tm
     assert note in reviewed[0] and note in candidate.verification
 
 
-def test_prepare_fix_bounds_a_large_job_log_but_keeps_its_tail(
+def test_prepare_fix_gives_the_agent_the_whole_job_log(
     tmp_path,
     monkeypatch,
 ) -> None:
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
-    monkeypatch.setattr(engine_mod, "MAX_JOB_LOG_CHARS", 100)
-    monkeypatch.setattr(engine_mod, "JOB_LOG_HEAD_CHARS", 20)
     seen = {}
+    log = "start-" + "x" * 1_000_000 + "-final-error"
 
     def agent(task, repo_dir, job_log, **_kwargs):
         seen["log"] = job_log
         return FixCandidate(action=CandidateAction.REFUSE, summary="no fix")
 
-    candidate = engine_mod.prepare_fix(
-        _task(head_sha),
-        "start-" + "x" * 200 + "-final-error",
-        agent_func=agent,
-    )
+    candidate = engine_mod.prepare_fix(_task(head_sha), log, agent_func=agent)
 
     assert candidate.action is CandidateAction.REFUSE
-    assert seen["log"].startswith("start-")
-    assert "truncated" in seen["log"]
-    assert seen["log"].endswith("-final-error")
+    # The failing test's own output is often in the middle of a long log.
+    assert seen["log"] == log
 
 
 def test_draft_issue_uses_current_target_sha_with_exact_old_run_evidence(
@@ -567,8 +560,6 @@ def test_a_fix_whose_test_passes_with_it_is_accepted(tmp_path, monkeypatch):
     assert candidate.action is CandidateAction.PATCH
     assert agent.feedback == [""]
     assert "passed 40 loop(s)" in candidate.verification
-    # CI's failure is the evidence; the report does not claim more than the run showed.
-    assert "The failure was not reproduced before the fix" in candidate.verification
     assert "Review: fixes the stale value" in candidate.verification
 
 
@@ -985,7 +976,7 @@ def test_the_review_reads_what_the_checks_found(tmp_path, monkeypatch):
 
     _prepare(tmp_path, monkeypatch, _value_agent("right"), review=review)
 
-    assert "passed 40 loop(s)" in reviewed[0] and "was not reproduced before the fix" in reviewed[0]
+    assert "passed 40 loop(s)" in reviewed[0]
 
 
 # --- where only a change already merged upstream is accepted ------------------

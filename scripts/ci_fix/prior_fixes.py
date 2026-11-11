@@ -30,9 +30,8 @@ from scripts.common.proc import default_branch_ref, git_output, is_ancestor
 logger = logging.getLogger(__name__)
 
 MAX_CANDIDATES = 5
-# Diffs shown to the agent, and how much of each.
-MAX_DIFFS = 3
-_DIFF_CHARS = 8_000
+# How much of each diff the agent is shown.
+_DIFF_CHARS = 40_000
 _LOG_LIMIT = "200"
 # A shorter test name matches too many unrelated commit messages.
 _MIN_NAME_CHARS = 10
@@ -176,8 +175,10 @@ def _wrapped_prefix(name: str) -> str:
 
 # A source file a log names with a line number, as gcc (``replication.c:120:5:
 # error``, run inside ``src/``), sanitizers (an absolute path) and valgrind
-# (``(replication.c:120)``) print it.
-_LOG_PATH_RE = re.compile(r"([\w./-]*[\w-]\.(?:c|h|cc|cpp|tcl)):\d+")
+# (``(replication.c:120)``) print it. A path starts where its run of path
+# characters does: tried from every character of a long run (a 32 KB value
+# in a failed assertion), the search is quadratic in a log given whole.
+_LOG_PATH_RE = re.compile(r"(?<![\w./-])([\w./-]*[\w-]\.(?:c|h|cc|cpp|tcl)):\d+")
 _REPO_ROOTS = ("src/", "tests/", "deps/", "modules/", "utils/")
 _MAX_LOG_PATHS = 5
 
@@ -272,11 +273,9 @@ def render_prior_fixes(repo_dir: str, fixes: tuple[PriorFix, ...]) -> str:
             where = "on the default branch, NOT on the working commit (a port candidate)"
         lines.append(f"- `{fix.sha}` {fix.date} {fix.subject}")
         lines.append(f"  - {where}; {'; '.join(fix.reasons)}")
-    shown = 0
     for fix in fixes:
-        if fix.on_target or shown >= MAX_DIFFS:
+        if fix.on_target:
             continue
-        shown += 1
         try:
             diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--stat", "--patch", fix.sha)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:

@@ -89,13 +89,15 @@ nothing upstream to port, as on `unstable` itself, Claude may still propose a
 patch. That patch is reviewed but not run, and the bot's report says so in
 its first line. A backport branch never gets one.
 
-**Claude diagnoses and edits.** Claude gets the job's log, whatever the
+**Claude diagnoses and edits.** Claude gets the job's whole log, whatever the
 history search found, the verification command, and Valkey's testing
 conventions: the bot's own guide in `scripts/ci_fix/guides/valkey-io__valkey.md`
 plus the repository's `tests/README.md` and contributor docs. It then does one
 of three things: ports an existing fix (preferred when one fits), writes a
-small patch, or declines. Declining is a legitimate answer, since some
-failures need a person. Claude works in a scratch copy of the code. It can
+small patch, or declines. It is told to aim for the fix a maintainer would
+write. Where the evidence leaves a few possible causes and one change is right
+under each of them, it makes that change and says what is not established. It
+declines only when it can justify no change. Claude works in a scratch copy of the code. It can
 edit files there but cannot commit or push.
 
 On a backport branch Claude may not write a fix of its own. It ports a commit
@@ -134,9 +136,9 @@ in a loop: 40 times, or 4 under valgrind, or as many as fit in 45 minutes
 when one loop is slow. The test has to run and pass every loop. A whole-file
 run is not looped.
 
-The bot does not first reproduce the failure, so a passing loop shows that
-the test passes with the fix, not that it failed without it. The bot's
-report says so.
+The bot does not first reproduce the failure: the failed job is the evidence
+that it fails, and a flaky test rarely fails on demand. A passing loop shows
+that the test passes with the fix, not that it failed without it.
 
 Finally a second Claude session, which can read the code but not change it,
 reviews the fix with the same conventions and the test results in front of
@@ -145,10 +147,11 @@ log rather than take it as given, and to reject a longer timeout or a looser
 threshold that comes without a reason, and any change made so that a test can
 run alone. A port is reviewed differently: its commit is already merged
 upstream, where maintainers reviewed it, so the reviewer only checks that it
-addresses this failure and brings nothing else. If the tests fail or the
-reviewer objects, the output or the
-reviewer's reasoning goes back to Claude, along with what its last session
-concluded, and it revises its fix for the next round. If the build or the
+addresses this failure and brings nothing else. A reviewer that rejects a fix
+says what change it would approve. If the tests fail or the reviewer objects,
+the output or the reviewer's reasoning goes back to Claude, along with what
+its last session concluded, and it makes the fix that points to in the next
+round. If the build or the
 tests change any tracked file while the fix is being tested, the fix that was
 tested is no longer the fix in the tree, so that also goes back for another
 round.
