@@ -117,6 +117,12 @@ such as another encoding to assert or a wider tolerance. Naming a commit that
 only touches the same file is not enough, and the reviewer reads the named
 commit's diff next to the patch.
 
+One failure often shows up on several release branches, so Claude is also
+given what the bot's pull requests into the other release branches changed in
+the files the failure names, with diffs. When one of those commits fixes the
+same failure, it makes the same change here, so the branches do not each
+carry a different fix. A commit that was reverted is left out.
+
 Where no upstream commit fixes the failure, such as a test that is flaky on
 `unstable` too, Claude writes the fix on the backport branch, in the test or
 the test harness only. It is verified and reviewed like any other patch, and
