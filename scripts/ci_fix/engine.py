@@ -362,6 +362,7 @@ def _establish(
     """
     plan = None
     upstream_only = False
+    own_paths: tuple[str, ...] = ()
     described = ""
     if runs_tests:
         plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
@@ -375,8 +376,10 @@ def _establish(
             upstream_only = True
         elif plan is not None and task.policy is FixPolicy.BACKPORT:
             # A release branch takes the upstream change, not a fix of its
-            # own that the default branch never gets.
+            # own that the default branch never gets; but what the backport
+            # itself brought and broke is repaired here.
             upstream_only = True
+            own_paths = _pull_request_paths(repo_dir, task.failure.base_branch)
     # A job that failed outside any test the bot can run (a validator, an
     # exception between tests), with nothing upstream to port: the fixes
     # people write for these are small and read from the log, so one is
@@ -416,11 +419,27 @@ def _establish(
         verification=described,
         verified_by_code=plan is not None,
         upstream_only=upstream_only,
+        own_paths=own_paths,
         reviewed_only=reviewed_only,
         guide=guide,
         guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
     return context, plan
+
+
+def _pull_request_paths(repo_dir: str, base_branch: str) -> tuple[str, ...]:
+    """The files the checked-out branch changes relative to ``base_branch``; none when that cannot be told.
+
+    Of the hand-written fixes pushed to backport branches, eleven of thirteen
+    changed a file their pull request never touched: a flake the release
+    branch already had. The other two repaired what the backport brought.
+    """
+    try:
+        fork_point = git_output(repo_dir, "merge-base", f"origin/{base_branch}", "HEAD").strip()
+        return git_paths(repo_dir, "diff", "--no-ext-diff", "--name-only", "-z", fork_point, "HEAD")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("Could not list what the pull request changes: %s", exc)
+        return ()
 
 
 def _can_port(task: FixTask, repo_dir: str) -> bool:
@@ -514,6 +533,11 @@ def _fix_loop(
             continue
 
         checks = list(established)
+        if outcome.undeclared:
+            checks.append(
+                "The patch also changes " + ", ".join(f"`{path}`" for path in outcome.undeclared)
+                + ", which its author did not list: check that it belongs to the fix."
+            )
         reviewed = replace(candidate, patch=outcome.applied)
         # What the tree holds now is what the candidate is: the build and the
         # test commands run as the account that owns the tree, and could
@@ -573,6 +597,9 @@ class RoundOutcome:
     candidate: FixCandidate
     applied: str = ""
     feedback: str = ""
+    # Files the patch changes that the agent did not list: published with
+    # the rest, and pointed out to the reviewer and in the report.
+    undeclared: tuple[str, ...] = ()
 
 
 def agent_round(
@@ -598,8 +625,10 @@ def agent_round(
         # on to porting instead.
         restore(repo_dir)
     try:
+        declared = set(candidate.changed_paths)
         candidate = _checked_candidate(
-            task, repo_dir, original_head, candidate, upstream_only=context.upstream_only,
+            task, repo_dir, original_head, candidate,
+            upstream_only=context.upstream_only, own_paths=context.own_paths,
         )
     except _Rejected as exc:
         tree = _KEPT_TREE if worktree_changed_paths(repo_dir, strict=True) else _RESET_TREE
@@ -614,7 +643,9 @@ def agent_round(
                 f"{exc} Adapt it as a `patch` if it is the right fix, or choose another action."
                 f"\n\n{_RESET_TREE}"
             ))
-    return RoundOutcome(candidate, applied=candidate.patch)
+    return RoundOutcome(
+        candidate, applied=candidate.patch, undeclared=tuple(sorted(set(candidate.changed_paths) - declared)),
+    )
 
 
 _KEPT_TREE = "The working tree still holds your previous edits; revise them."
@@ -627,8 +658,9 @@ _TREE_CHANGED = (
 _UPSTREAM_ONLY = (
     "Only a change already merged upstream is accepted here: choose `port`, or a `patch` "
     "whose `adapts_commit` is the full SHA of the merged default-branch commit it adapts to "
-    "this branch. A fix with no upstream counterpart belongs on the default branch first: "
-    "choose `refuse` and say so."
+    "this branch. A patch that changes only files this pull request itself changes is "
+    "accepted too: it repairs what the backport brought. Any other fix belongs on the "
+    "default branch first: choose `refuse` and say so."
 )
 _NOT_RUN = "No command here can run the failing check, so this fix was reviewed, not run."
 _NOT_REPRODUCED = (
@@ -944,14 +976,20 @@ def _timeout(deadline: float) -> int:
 
 
 def _checked_candidate(
-    task: FixTask, repo_dir: str, original_head: str, candidate: FixCandidate, *, upstream_only: bool = False,
+    task: FixTask, repo_dir: str, original_head: str, candidate: FixCandidate, *,
+    upstream_only: bool = False, own_paths: tuple[str, ...] = (),
 ) -> FixCandidate:
     """``candidate`` with its patch built from the checkout, or a refusal.
 
     A commit is a refusal: the agent broke the one rule its checkout depends
     on. Anything else wrong with what it handed back raises
     :class:`_Rejected`, which goes back to it like a failing test. With
-    ``upstream_only``, a patch must adapt a merged upstream commit.
+    ``upstream_only``, a patch must adapt a merged upstream commit, unless it
+    changes only ``own_paths``, the files the pull request itself changes.
+
+    The patch is what the working tree holds, not what the agent listed: a
+    file it changed and did not list is published with the rest and pointed
+    out to the reviewer, rather than costing a round.
     """
     current_head = git_output(repo_dir, "rev-parse", "HEAD").strip()
     if current_head != original_head:
@@ -960,9 +998,11 @@ def _checked_candidate(
         )
 
     changed_paths = worktree_changed_paths(repo_dir, strict=True)
-    declared_paths = tuple(sorted(candidate.changed_paths))
     if candidate.action is CandidateAction.REFUSE:
         return replace(candidate, patch="", changed_paths=(), port_commit="", adapts="", validation="")
+    if not candidate.failing_check:
+        # The job is what failed, whatever else the agent left out.
+        candidate = replace(candidate, failing_check=task.failure.job_name)
 
     capabilities = target_capabilities(task.target.kind)
     if not capabilities.allows(candidate.action):
@@ -983,23 +1023,16 @@ def _checked_candidate(
 
     if not changed_paths:
         raise _Rejected("The agent selected a patch but made no working-tree changes.")
-    if not declared_paths:
-        raise _Rejected(
-            "The agent selected a patch but did not declare its changed paths."
-        )
-    if declared_paths != tuple(sorted(changed_paths)):
-        raise _Rejected(
-            "The working tree did not match the paths declared by the agent "
-            f"(declared {declared_paths!r}, found {tuple(sorted(changed_paths))!r})."
-        )
     if not _has_complete_diagnosis(candidate):
         raise _Rejected(_INCOMPLETE_DIAGNOSIS)
     try:
         patch = build_approved_patch(repo_dir, changed_paths, strict=True)
     except EmptyPatch:
         raise _Rejected("The agent selected a patch but produced no patch content.")
-    if upstream_only:
+    adapts = ""
+    if upstream_only and not (own_paths and set(changed_paths) <= set(own_paths)):
         _check_adapts(repo_dir, candidate.adapts, changed_paths, patch)
+        adapts = candidate.adapts
     patch_limit = capabilities.patch_limit
     if len(patch) > patch_limit:
         raise _Rejected(
@@ -1012,7 +1045,7 @@ def _checked_candidate(
         changed_paths=changed_paths,
         port_commit="",
         # Only a checked claim is kept, and reported.
-        adapts=candidate.adapts if upstream_only else "",
+        adapts=adapts,
     )
 
 
@@ -1155,12 +1188,10 @@ def _refusal(summary: str, verification: str = "") -> FixCandidate:
 
 
 def _has_complete_diagnosis(candidate: FixCandidate) -> bool:
-    return all((candidate.failing_check, candidate.root_cause, candidate.reasoning))
+    return bool(candidate.root_cause and candidate.reasoning)
 
 
-_INCOMPLETE_DIAGNOSIS = (
-    "The agent did not provide a complete failing check, root cause, and change rationale."
-)
+_INCOMPLETE_DIAGNOSIS = "The agent did not provide a root cause and a change rationale."
 
 
 class _Rejected(Exception):

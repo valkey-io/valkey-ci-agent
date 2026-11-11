@@ -659,6 +659,22 @@ def test_a_fix_published_as_a_comment_is_the_patch_on_the_issue_and_closes_the_o
     issues_mod._suggestion_comment(issue, issues_mod.parse_issue(issue), source="From run 100, job `j`", candidate=not_run)
     assert issue.comments.pop().body.startswith(
         "A tentative fix, reviewed but not run: nothing the bot has can run the failing check. Nothing was pushed")
+    # The test failed again while the fix was prepared: the fix answers the newer run too,
+    # which then gets no attempt, and no second patch, of its own.
+    failure = issues_mod.parse_issue(issue)
+    issues_mod._terminal_comment(issue, failure, repo_full_name="o/r", action="suggested", summary="s",
+                                 job_name="j", candidate=candidate, newer_run=101)
+    again = issue.comments.pop()
+    assert "the test has failed again since, in [run 101]" in again.body
+    assert again.body.rstrip().endswith(
+        "<!-- valkey-ci-agent:ci-fix-result run=100 outcome=suggested -->\n"
+        "<!-- valkey-ci-agent:ci-fix-result run=101 outcome=suggested -->")
+    again.user = SimpleNamespace(login=_BOT)
+    issue.get_comments = lambda: [again]
+    assert issues_mod.fix_reported(issue, replace(failure, run_id=101), repo_full_name="o/r", bot_login=_BOT)
+    # A refusal says nothing about the newer run, which is still worth an attempt.
+    issues_mod._terminal_comment(issue, failure, repo_full_name="o/r", action="refused", summary="s", newer_run=101)
+    assert "run=101" not in issue.comments.pop().body
     # The occurrence is handled: the dispatcher does not start it again.
     comment.user = SimpleNamespace(login=_BOT)
     issue.get_comments = lambda: list(issue.comments)

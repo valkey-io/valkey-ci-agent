@@ -251,26 +251,24 @@ def test_prepare_fix_sends_a_mixed_port_and_edits_back(tmp_path, monkeypatch) ->
 
 
 def test_a_mistake_in_what_the_agent_hands_back_goes_back_to_it(tmp_path, monkeypatch) -> None:
-    """A path it forgot to declare is for the agent to correct, not a final refusal."""
+    """A fix with no root cause is for the agent to complete, not a final refusal."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
-    declared = iter([(), ("value.txt",)])
+    causes = iter(["", "cause"])
     feedback = []
 
     def agent(task, repo_dir, job_log, **kwargs):
         feedback.append(kwargs["feedback"])
         (Path(repo_dir) / "value.txt").write_text("fixed\n", encoding="utf-8")
-        return FixCandidate(
-            action=CandidateAction.PATCH, failing_check="tests", root_cause="cause", reasoning="fix",
-            changed_paths=next(declared),
-        )
+        # The failing check it left out is the job's; only what a maintainer needs is asked for again.
+        return FixCandidate(action=CandidateAction.PATCH, root_cause=next(causes), reasoning="fix")
 
     candidate = engine_mod.prepare_fix(
         _task(head_sha), _LOG, agent_func=agent, review_func=lambda *a, **k: (True, "fixes it"),
     )
 
-    assert candidate.action is CandidateAction.PATCH
-    assert "did not declare its changed paths" in feedback[1]
+    assert candidate.action is CandidateAction.PATCH and candidate.failing_check == "tests"
+    assert "did not provide a root cause and a change rationale" in feedback[1]
 
 
 def _upstream_commit(source: Path, head_sha: str, content: str = "fixed\n") -> str:
@@ -465,9 +463,11 @@ def test_prepare_fix_rejects_an_action_disabled_by_target_capabilities(
     assert "patch action is not supported" in candidate.summary
 
 
-def test_prepare_fix_refuses_undeclared_incidental_paths(tmp_path, monkeypatch) -> None:
+def test_a_file_the_agent_changed_and_did_not_list_is_pointed_out_not_refused(tmp_path, monkeypatch) -> None:
+    """The tree is the patch. A list that does not match it used to cost a whole round, of up to two hours."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
+    reviewed = []
 
     def agent(task, repo_dir, job_log, **_kwargs):
         (Path(repo_dir) / "value.txt").write_text("fixed\n", encoding="utf-8")
@@ -481,13 +481,15 @@ def test_prepare_fix_refuses_undeclared_incidental_paths(tmp_path, monkeypatch) 
         )
 
     candidate = engine_mod.prepare_fix(
-        _task(head_sha),
-        _LOG,
-        agent_func=agent,
+        _task(head_sha), _LOG, agent_func=agent,
+        review_func=lambda candidate, *a, **k: reviewed.append(candidate.verification) or (True, "both belong"),
     )
 
-    assert candidate.action is CandidateAction.REFUSE
-    assert "did not match the paths declared" in candidate.summary
+    assert candidate.action is CandidateAction.PATCH
+    assert candidate.changed_paths == ("generated.txt", "value.txt") and "+incidental" in candidate.patch
+    # The reviewer, and the report, are told which file was not listed.
+    note = "The patch also changes `generated.txt`, which its author did not list"
+    assert note in reviewed[0] and note in candidate.verification
 
 
 def test_prepare_fix_bounds_a_large_job_log_but_keeps_its_tail(
@@ -1091,6 +1093,40 @@ def test_a_patch_must_adapt_the_upstream_commit_it_names(tmp_path, monkeypatch, 
 
     assert candidate.action is CandidateAction.REFUSE
     assert reason in agent.feedback[1]
+
+
+def test_a_backport_branch_repairs_what_its_own_pull_request_brought(tmp_path, monkeypatch):
+    """A patch confined to files the pull request changes needs no upstream commit.
+
+    Eleven of the thirteen hand-written fixes pushed to backport branches changed a file their
+    pull request never touched; the other two repaired what the backport brought.
+    """
+    source, base_sha = _source_repo(tmp_path)
+    (source / "brought.txt").write_text("by the backport\n", encoding="utf-8")
+    git(source, "add", "brought.txt")
+    git(source, "commit", "-qm", "Backport a change")
+    head_sha = git(source, "rev-parse", "HEAD")
+    monkeypatch.setattr(engine_mod, "default_branch_ref", lambda _repo: "origin/main")
+
+    def clone(repo_full_name, destination, sha, *, pull_number=0):  # noqa: ARG001
+        shutil.copytree(source, destination)
+        git(destination, "checkout", "-q", "--detach", sha)
+        # origin/main is the release branch the pull request is into, where it forked.
+        git(destination, "update-ref", "refs/remotes/origin/main", base_sha)
+        return True
+
+    monkeypatch.setattr(engine_mod, "shallow_clone_at_sha", clone)
+
+    own = _adapting_agent("", "brought.txt")
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=own)
+    assert own.contexts[0].upstream_only and own.contexts[0].own_paths == ("brought.txt",)
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == ""
+
+    # A file the pull request never touched is the release branch's own trouble.
+    elsewhere = _adapting_agent("", "value.txt")
+    refused = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=elsewhere)
+    assert refused.action is CandidateAction.REFUSE
+    assert "changes only files this pull request itself changes" in elsewhere.feedback[1]
 
 
 def test_a_backport_that_broke_the_build_may_be_repaired_by_hand(tmp_path, monkeypatch):

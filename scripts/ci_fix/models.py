@@ -234,6 +234,10 @@ class FixContext:
     # that adapts one. So on a backport branch, and for a failure no command
     # here can run.
     upstream_only: bool = False
+    # On a backport branch: the files the pull request itself changes. A
+    # patch confined to them repairs what the backport brought, and needs no
+    # upstream commit.
+    own_paths: tuple[str, ...] = ()
     # Nothing here can run the failing check and no upstream change can be
     # ported, so a fix is reviewed and published as not run.
     reviewed_only: bool = False

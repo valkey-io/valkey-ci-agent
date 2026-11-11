@@ -399,6 +399,7 @@ def _terminal_comment(
     pr_url: str = "",
     checked: str = "",
     candidate: Optional[FixCandidate] = None,
+    newer_run: int = 0,
 ) -> None:
     # A failed attempt says nothing about the test, only about the bot: it
     # stays in the agent repository's run, and its failed run is what the
@@ -409,8 +410,14 @@ def _terminal_comment(
     source = f"From {_run_link(repo_full_name, failure)}"
     if job_name:
         source += f", job `{job_name}`"
+    # The test failed again while this fix was prepared: the fix is for the
+    # test, so it also answers the newer run, which gets no attempt of its own.
+    again = ""
+    if newer_run and newer_run != failure.run_id and action in (ResultKind.SUGGESTED.value, ResultKind.OPENED.value):
+        source += f"; the test has failed again since, in {_run_link(repo_full_name, replace(failure, run_id=newer_run))}"
+        again = "\n" + _RESULT_MARKER.format(run=newer_run, outcome=action)
     if action == ResultKind.SUGGESTED.value:
-        _suggestion_comment(issue, failure, source=source, candidate=candidate)
+        _suggestion_comment(issue, failure, source=source, candidate=candidate, again=again)
         return
     if action == ResultKind.OPENED.value:
         link = f"[#{pr_number}]({pr_url})" if pr_url else f"#{pr_number}"
@@ -426,7 +433,7 @@ def _terminal_comment(
         body += "\n\n<details><summary>What the bot checked</summary>\n\n" + "\n".join(checks) + "\n\n</details>"
     elif checks:
         body += "\n\n**What the bot checked**\n\n" + "\n".join(checks)
-    body += "\n\n" + _RESULT_MARKER.format(run=failure.run_id, outcome=action)
+    body += "\n\n" + _RESULT_MARKER.format(run=failure.run_id, outcome=action) + again
     retry_github_call(
         lambda: issue.create_comment(body),
         retries=2,
@@ -435,7 +442,9 @@ def _terminal_comment(
 
 
 
-def _suggestion_comment(issue: Any, failure: IssueFailure, *, source: str, candidate: Optional[FixCandidate]) -> None:
+def _suggestion_comment(
+    issue: Any, failure: IssueFailure, *, source: str, candidate: Optional[FixCandidate], again: str = "",
+) -> None:
     """The fix as a patch on the issue: nothing pushed, no PR, a maintainer applies it."""
     where = "in that job" if "job `" in source else "for that run"
     how = (
@@ -452,7 +461,7 @@ def _suggestion_comment(issue: Any, failure: IssueFailure, *, source: str, candi
         if candidate.port_commit:
             lines += [f"It ports `{candidate.port_commit[:12]}`.", ""]
         lines += candidate_patch(candidate)
-    lines += [f"{source}.", "", _RESULT_MARKER.format(run=failure.run_id, outcome=ResultKind.SUGGESTED.value)]
+    lines += [f"{source}.", "", _RESULT_MARKER.format(run=failure.run_id, outcome=ResultKind.SUGGESTED.value) + again]
     body = "\n".join(lines)
     retry_github_call(
         lambda: issue.create_comment(body),
@@ -525,6 +534,7 @@ def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:
         pr_url=result.pr_url,
         checked=result.candidate.verification if result.candidate else "",
         candidate=result.candidate,
+        newer_run=parse_detector_occurrence(str(getattr(issue, "body", "") or "")) or 0,
     )
     return _result_dict(
         repo_full_name,

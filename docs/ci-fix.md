@@ -102,12 +102,14 @@ On a backport branch Claude may not write a fix of its own. It ports a commit
 that is merged upstream, or adapts one and names it, and the bot checks that
 the named commit is merged, is not on the branch yet, and that at least half
 of the lines the patch adds are that commit's own. Naming a commit that only
-touches the same file is not enough. A test that is flaky upstream too is fixed upstream first. A
+touches the same file is not enough. One other patch is accepted: one that
+changes only files the backport PR itself changes, which repairs what the
+backport brought. A test that is flaky upstream too is fixed upstream first. A
 backport that broke the build is the exception: that is repaired by hand.
 
 **Code checks what Claude handed back.** The bot rejects anything that doesn't
-add up: a commit Claude made itself, files changed that Claude didn't
-declare, a diagnosis with parts missing, a port that isn't a real merged
+add up: a commit Claude made itself, a fix with no root cause or reasoning, a
+port that isn't a real merged
 commit or is already on the branch, a hand-written fix where only an upstream
 change is accepted, or a suggested patch that is too large.
 
@@ -181,7 +183,8 @@ same job have issues of their own.
 By default the bot posts the tested patch on the issue, together with the root
 cause and what it checked. Nothing is pushed and no PR is opened. A maintainer
 can apply the patch or ignore it, and the issue isn't tried again until the
-test fails again.
+test fails again. If the test fails again while a fix is being prepared, the
+fix is still posted, and it covers that newer failure too.
 
 If `CI_FIX_ISSUES_PUBLISH` is set to `draft-pr`, the bot instead pushes a
 branch named `agent/ci-fix/issue-<issue>-<run>` and opens a draft PR that says

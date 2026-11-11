@@ -42,6 +42,11 @@ _UPSTREAM_ONLY = (
     "not have, such as one for a flaky test it shares, belongs there first."
 )
 
+_OWN_PATHS = (
+    "One more kind of patch is accepted: one that changes only files this pull "
+    "request itself changes, to repair what the backport brought."
+)
+
 _PROMPT = """\
 Fix one exact failed GitHub Actions job in the repository at your current
 working directory.
@@ -223,7 +228,8 @@ def run_fix_agent(
             description=task.failure.description or "(none)",
             hint=task.failure.hint or "(none)",
             other_jobs=", ".join(task.failure.other_failed_jobs) or "(none)",
-            policy=_POLICY[task.policy] + (f"\n{_UPSTREAM_ONLY}" if context.upstream_only else ""),
+            policy=_POLICY[task.policy] + (f"\n{_UPSTREAM_ONLY}" if context.upstream_only else "")
+            + (f" {_OWN_PATHS}" if context.own_paths else ""),
             target=capabilities.publication_guidance,
             context=_context_prompt(context, Path(log_dir), allows_port),
             test_guidance=(
