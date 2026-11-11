@@ -102,6 +102,17 @@ def test_a_patch_is_scored_by_how_much_of_it_is_the_known_fix():
 
     other_way = score_case(_case(), _patch("if (error != 0) return VALKEY_ERR;"), _KNOWN)
     assert other_way.verdict == "differs" and "same file another way" in other_way.detail
+    assert other_way.replaced_percent == 0
+
+    # The same fix worded another way shares no added line, but replaces the line the known fix does
+    # (the bot's fixes for #5217 and #5285 against the ones people merged).
+    reworded = FixOutcome(FixCandidate(
+        CandidateAction.PATCH, changed_paths=("src/net.c",),
+        patch="--- a/x\n+++ b/x\n@@ -1 +1 @@\n-    if (error == EINPROGRESS) {\n+    if (error == EISCONN || error == EINPROGRESS) {\n",
+    ))
+    close = score_case(_case(), reworded, _KNOWN)
+    assert (close.verdict, close.shared_percent, close.replaced_percent) == ("differs", 0, 100)
+    assert "replaces 100% of the lines the known fix replaces" in close.detail
 
     # The fix the bot pushed for #5330's failure changed the test; a person fixed libvalkey.
     elsewhere = score_case(_case(), _patch("assert_match {*Could not connect*} $output", paths=("tests/unit/cli.tcl",)), _KNOWN)

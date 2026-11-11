@@ -16,7 +16,9 @@ that holds a token that could.
 
 A score is ``match`` (the known port, or a patch that is mostly the known
 fix's lines), ``differs`` (another change: a person has to read it, since a
-different fix may be right), ``refused`` or ``failed``.
+different fix may be right, and the same fix written another way shares few
+lines; the score says how many of the known fix's replaced lines it replaces
+too), ``refused`` or ``failed``.
 """
 
 from __future__ import annotations
@@ -100,8 +102,10 @@ class Score:
     detail: str
     expected: str
     got: str = ""
-    # For a patch: the share of its added lines that are the known fix's, and the files both change.
+    # For a patch: the share of its added lines that are the known fix's, the share of the lines
+    # the known fix replaces that it replaces too, and the files both change.
     shared_percent: int = 0
+    replaced_percent: int = 0
     shared_files: tuple[str, ...] = ()
 
 
@@ -209,14 +213,25 @@ def _patch_score(case: Case, candidate: FixCandidate, expected: str, known: tupl
     shared_files = tuple(sorted(set(files) & set(candidate.changed_paths)))
     ours = changed_text(candidate.patch, "+")
     percent = round(100 * len(ours & changed_text(patch, "+")) / len(ours)) if ours else 0
+    # The same fix written another way adds other lines, but replaces the same ones.
+    theirs_removed = changed_text(patch, "-")
+    replaced = (
+        round(100 * len(theirs_removed & changed_text(candidate.patch, "-")) / len(theirs_removed))
+        if theirs_removed else 0
+    )
     got = "patch to " + ", ".join(f"`{path}`" for path in candidate.changed_paths)
     if shared_files and percent >= _MATCH_SHARE:
         verdict, detail = "match", f"{percent}% of the lines it adds are the known fix's."
     elif shared_files:
-        verdict, detail = "differs", f"It changes the same file another way ({percent}% of its added lines are shared)."
+        verdict = "differs"
+        detail = (
+            f"It changes the same file another way: {percent}% of the lines it adds are the known fix's, "
+            f"and it replaces {replaced}% of the lines the known fix replaces."
+        )
     else:
         verdict, detail = "differs", "It changes other files than the known fix does: " + ", ".join(files) + "."
-    return Score(case.id, verdict, detail, expected, got=got, shared_percent=percent, shared_files=shared_files)
+    return Score(case.id, verdict, detail, expected, got=got, shared_percent=percent,
+                 replaced_percent=replaced, shared_files=shared_files)
 
 
 def pull_request_change(gh: Any, case: Case) -> tuple[tuple[str, ...], str]:
