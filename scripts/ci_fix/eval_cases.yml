@@ -98,3 +98,109 @@ cases:
     expect:
       pull: 5287
     gap: The log names no test, and nothing here runs the reply-schema validator.
+
+  - id: sanitizer-leak-7.2
+    about: The same LeakSanitizer report on the 7.2 backport PR, the oldest branch.
+    repo: valkey-io/valkey
+    run_id: 42817431023
+    job_id: 129833969869
+    job: test-sanitizer-address (clang)
+    sha: ee00e76e6c3b48264335b124e755f2c6ab3a300a
+    base_branch: "7.2"
+    pr: 5072
+    backport: true
+    expect:
+      port: c86f6ee511e1a36488feb3b8e62093e69195d332  # (#5274)
+
+  - id: sanitizer-leak-9.0
+    about: The same LeakSanitizer report on the 9.0 backport PR.
+    repo: valkey-io/valkey
+    run_id: 42886254469
+    job_id: 130075246631
+    job: test-sanitizer-address (clang)
+    sha: b3aafc7c1bb6ddfab60623224cd16044a33890c4
+    base_branch: "9.0"
+    pr: 5073
+    backport: true
+    expect:
+      port: c86f6ee511e1a36488feb3b8e62093e69195d332  # (#5274)
+
+  - id: forkless-flushdb-valgrind
+    about: "#5302: FLUSHDB during a forkless sync, under valgrind."
+    repo: valkey-io/valkey
+    run_id: 42726275643
+    job_id: 129532587938
+    job: test-valgrind-no-malloc-usable-size-test (integration-type)
+    sha: d5b4fda740a4d71eb138ff3722442a9f5f546056
+    base_branch: unstable
+    issue: 5302
+    scheduled: true
+    test:
+      name: FLUSHDB during forkless sync replays correctly (primary diskless=no, replica load=disabled)
+      file: tests/integration/replication.tcl
+    expect:
+      pull: 5314
+
+  - id: forkless-write-window
+    about: "#5301: writes after a background iterator ends must still reach the replica, under valgrind."
+    repo: valkey-io/valkey
+    run_id: 42726275643
+    job_id: 129532588146
+    job: test-valgrind-test (integration-type)
+    sha: d5b4fda740a4d71eb138ff3722442a9f5f546056
+    base_branch: unstable
+    issue: 5301
+    scheduled: true
+    test:
+      name: Writes after bg iterator termination still reach the replica
+      file: tests/integration/replication.tcl
+    expect:
+      pull: 5333
+
+  - id: repl-flow-control-macos
+    about: "#4860: the primary link's read count with I/O threads, on macOS."
+    repo: valkey-io/valkey
+    run_id: 42538873922
+    job_id: 128909156621
+    job: test-macos-latest
+    sha: aa7545348b688b469d073a01ce4836ed637577f9
+    base_branch: unstable
+    issue: 4860
+    scheduled: true
+    test:
+      name: Primary link stays on the main thread with I/O threads enabled
+      file: tests/integration/replication-flow-control.tcl
+    expect:
+      pull: 5323
+
+  - id: moduleapi-timer-valgrind
+    about: "#5188: a module's blocked-client time against its timer period, under valgrind."
+    repo: valkey-io/valkey
+    run_id: 41744961340
+    job_id: 126295526156
+    job: test-valgrind-no-malloc-usable-size-misc
+    sha: 9ff39f353cac273a3df8e10070ac9b9dc9ed310b
+    base_branch: unstable
+    issue: 5188
+    scheduled: true
+    test:
+      name: block time is equal to timer period
+      file: tests/unit/moduleapi/blockedclient.tcl
+    expect:
+      pull: 5324
+
+  - id: lz4-dual-channel
+    about: "#5216: a corrupt lz4 dual-channel stream must retry without promoting the replica."
+    repo: valkey-io/valkey
+    run_id: 40978346098
+    job_id: 123811852366
+    job: test-sanitizer-force-defrag
+    sha: 6e3eddf4976d0d02c1ecf6dbf19fdd3eb0f2e84b
+    base_branch: unstable
+    issue: 5216
+    scheduled: true
+    test:
+      name: Corrupt buffered lz4 dual-channel stream retries without promoting the replica
+      file: tests/integration/repl-compression.tcl
+    expect:
+      pull: 5295
