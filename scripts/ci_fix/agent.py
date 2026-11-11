@@ -233,10 +233,9 @@ def _context_prompt(context: FixContext, context_dir: Path, allows_port: bool) -
     if context.guide:
         guide = context_dir / "test-guide.md"
         guide.write_text(context.guide, encoding="utf-8")
-        docs = ", ".join(f"`{path}`" for path in context.guide_paths)
         sections.append(
-            f"### How this repository fixes tests\nRead {guide} before "
-            "editing a test" + (f", and the repository's own {docs}." if docs else ".")
+            f"### How this repository fixes tests\nRead {guide} before you change anything: the bot's "
+            "policy for a fix, then the repository's own guidelines for code and tests."
         )
     if not sections:
         return ""
@@ -545,8 +544,9 @@ def review_candidate(
             guide_path = Path(log_dir) / "test-guide.md"
             guide_path.write_text(context.guide, encoding="utf-8")
             guide = (
-                f"Judge test changes against this repository's conventions in {guide_path}: "
-                "a fixed sleep replacing a race, or a skip tag instead of a fix, is a rejection.\n"
+                f"Judge the change against {guide_path}: the bot's policy for a fix, then the repository's "
+                "own guidelines for code and tests. A fixed sleep replacing a race, or a skip tag instead "
+                "of a fix, is a rejection.\n"
             )
         prompt = _REVIEW_PROMPT.format(
             stance=_REVIEW_A_PORT if ported else _REVIEW_A_PATCH,
