@@ -25,6 +25,19 @@ What follows is the bot's own policy, not a summary of those files.
 - Harness or environment: a port clash, an out-of-disk runner, a missing tool.
   Refuse; that is not a code fix.
 
+Ask whether the server did anything wrong, even briefly. A server that
+accepted a stale message, showed a wrong role or state for a moment, or lost
+or delayed a reply has a product bug even when it recovers on its own, and a
+test wait that outlasts it hides the bug: fix `src/` and leave the test
+exercising that path. It is a test bug only when the server did everything it
+promises and the test assumed more.
+
+Code under `deps/` is vendored from other projects (libvalkey, jemalloc, Lua
+and others), and Valkey takes a change there only as an update from that
+project. Do not patch `deps/`: say which project needs the fix and what the
+fix is. Change Valkey's own code or test only where it is wrong whatever the
+dependency does.
+
 A test that fails once in many runs is still a bug. Find the race in the log
 (`--dump-logs` prints each server's log after a failure) before editing.
 Valgrind and sanitizer builds are many times slower; scale a wait with

@@ -56,6 +56,7 @@ from scripts.ci_fix.prior_fixes import (
     render_prior_fixes,
     summarize_prior_fixes,
     unported_changes,
+    unported_index,
 )
 from scripts.ci_fix.push import PushFailed, PushRefused, check_port, cherry_pick_refusal
 from scripts.ci_fix.verification import (
@@ -388,6 +389,7 @@ def _establish(
             unported_changes(repo_dir, tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths])))
             if upstream_only else ""
         ),
+        unported_index=unported_index(repo_dir) if upstream_only else "",
         verification=described,
         verified_by_code=plan is not None,
         upstream_only=upstream_only,
@@ -613,11 +615,22 @@ def agent_round(
         except PortNotApplied as exc:
             return RoundOutcome(candidate, feedback=(
                 f"{exc} Adapt it as a `patch` if it is the right fix, or choose another action."
-                f"\n\n{_RESET_TREE}"
+                f"{_commit_diff(repo_dir, candidate.port_commit)}\n\n{_RESET_TREE}"
             ))
     return RoundOutcome(
         candidate, applied=candidate.patch, undeclared=tuple(sorted(set(candidate.changed_paths) - declared)),
     )
+
+
+def _commit_diff(repo_dir: str, commit: str) -> str:
+    """``commit``'s diff, for an agent that has to adapt it and cannot run git; "" when it cannot be read."""
+    try:
+        diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", commit)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if len(diff) > _TEST_OUTPUT_CHARS:
+        diff = diff[:_TEST_OUTPUT_CHARS] + "\n[... diff truncated ...]"
+    return f"\n\nIts diff:\n```diff\n{diff.rstrip()}\n```" if diff.strip() else ""
 
 
 _KEPT_TREE = "The working tree still holds your previous edits; revise them."
@@ -1010,10 +1023,14 @@ def _checked_candidate(
     )
 
 
-# How much of an adapting patch must be its upstream commit's own lines. Of
-# the fixes pushed to backport branches, the one real port shared all of its
-# lines with an upstream commit and no hand-written one more than a sixth,
-# though each changed a file that 3 to 175 unported upstream commits change.
+# How much of an adapting patch must be its upstream commit's change: of the
+# lines it adds, or of the lines it removes. Of the fixes pushed to backport
+# branches, the one real port shared all of its added lines with an upstream
+# commit and no hand-written one more than a sixth, though each changed a
+# file that 3 to 175 unported upstream commits change. An adaptation may
+# share few added lines (another encoding to assert, a wider tolerance, its
+# own comment: 12% in one that a reviewer accepted) but it replaces the lines
+# its commit replaces.
 _MIN_ADAPTED_SHARE = 0.5
 
 
@@ -1035,11 +1052,11 @@ def _check_adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...], pa
         raise _Rejected(f"{exc} {_UPSTREAM_ONLY}") from exc
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         raise _Rejected(f"Commit {commit[:12]} could not be read. {_UPSTREAM_ONLY}") from exc
-    # What a change adds is its own; what it removes, any change to those
-    # lines removes too. Only a patch that adds nothing is read by its removals.
-    sign = "+" if changed_text(patch, "+") else "-"
-    ours, theirs = changed_text(patch, sign), changed_text(upstream, sign)
-    share = len(ours & theirs) / len(ours) if ours else 0.0
+    def shared(sign: str) -> float:
+        ours = changed_text(patch, sign)
+        return len(ours & changed_text(upstream, sign)) / len(ours) if ours else 0.0
+
+    share = max(shared("+"), shared("-"))
     if share < _MIN_ADAPTED_SHARE:
         raise _Rejected(
             f"Only {share:.0%} of the patch's changed lines are {commit[:12]}'s change to the same files, "

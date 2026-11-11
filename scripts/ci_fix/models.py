@@ -223,6 +223,9 @@ class FixContext:
     # The default branch's commits to the failure's files that the checkout
     # lacks, when only one of those may fix it (``upstream_only``).
     unported_changes: str = ""
+    # Every commit the default branch has and the working commit lacks, with
+    # the files it changes: the fix may be in a file the failure does not name.
+    unported_index: str = ""
     # How code verifies a candidate, and whether it does.
     verification: str = ""
     verified_by_code: bool = False
