@@ -283,6 +283,22 @@ def _port_agent(*commits):
     return agent
 
 
+def test_a_port_that_does_not_apply_comes_back_with_its_diff(tmp_path, monkeypatch) -> None:
+    """The agent cannot run git: without the diff it cannot adapt the commit it found."""
+    source, base_sha = _source_repo(tmp_path)
+    commit = _upstream_commit(source, base_sha)
+    (source / "value.txt").write_text("changed on this branch\n", encoding="utf-8")
+    git(source, "commit", "-qam", "Diverge")
+    head_sha = git(source, "rev-parse", "HEAD")
+    _install_clone(monkeypatch, source)
+    agent = _port_agent(commit, commit, commit)
+
+    engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
+
+    assert "Adapt it as a `patch` if it is the right fix" in agent.feedback[1]
+    assert "Its diff:" in agent.feedback[1] and "-before\n+fixed" in agent.feedback[1]
+
+
 def test_prepare_fix_refuses_a_port_without_a_full_sha(tmp_path, monkeypatch) -> None:
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
@@ -1026,11 +1042,27 @@ def test_a_backport_branch_takes_a_patch_that_adapts_a_merged_upstream_commit(tm
     assert candidate.adapts == commit and "+kept for this branch" in candidate.patch
 
 
+def test_an_adaptation_may_write_other_lines_where_its_commit_writes_its_own(tmp_path, monkeypatch):
+    """It replaces what the commit replaces: one that a reviewer accepted shared 12% of its added lines.
+
+    Upstream asserted a listpack encoding within 16 bytes; the release branch has a hashtable there
+    and three allocations, so its adaptation asserted that within 48, under a comment of its own.
+    """
+    source, head_sha = _source_repo(tmp_path)
+    commit = _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+    agent = _adapting_agent(commit, text="fixed the way this branch needs\n# and says why\n")
+
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
+
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == commit
+
+
 @pytest.mark.parametrize(("adapts", "path", "text", "reason"), [
     # Every hand-written fix pushed to a backport branch changed a file that unported upstream commits
     # change too: naming one of them adapts nothing unless the patch is its change.
-    ("upstream", "value.txt", "a fix of its own\nwith a longer wait\n", "Only 0% of the patch's changed lines"),
-    ("upstream", "value.txt", "fixed\nand two lines\nof its own\n", "Only 33% of the patch's changed lines"),
+    ("upstream", "value.txt", "before\na fix of its own\nwith a longer wait\n", "Only 0% of the patch's changed lines"),
+    ("upstream", "value.txt", "before\nfixed\nand two lines\nof its own\n", "Only 33% of the patch's changed lines"),
     ("upstream", "other.txt", "fixed\n", "Only 0% of the patch's changed lines"),  # the commit changes value.txt
     ("head", "value.txt", "fixed\n", "already present on the target head"),
     ("b" * 40, "value.txt", "fixed\n", "not merged into origin/main"),

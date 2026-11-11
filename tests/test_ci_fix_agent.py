@@ -279,11 +279,14 @@ def test_where_only_an_upstream_change_is_accepted_the_agent_is_told_and_its_cla
     monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
         {"action": "patch", "summary": "adapted", "changed_paths": ["a.c"], "adapts_commit": "D" * 40}))
 
-    context = FixContext(upstream_only=True, unported_changes="# `src/a.c`\n\n- `abc` 2026-11-04 Free the hint\n")
+    context = FixContext(upstream_only=True, unported_changes="# `src/a.c`\n\n- `abc` 2026-11-04 Free the hint\n",
+                         unported_index="- `abc` 2026-11-04 Free the hint | src/a.c\n")
     candidate = agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=context)
 
     assert "Only a change already merged on the default branch is accepted" in seen["prompt"]
     assert "### Upstream changes this branch lacks" in seen["prompt"] and "upstream-changes.md" in seen["prompt"]
+    # And every commit it lacks, by the files it changes: the fix may be in a file the log does not name.
+    assert "### Every upstream commit this branch lacks" in seen["prompt"] and "upstream-commits.md" in seen["prompt"]
     assert candidate.adapts == "d" * 40
 
 

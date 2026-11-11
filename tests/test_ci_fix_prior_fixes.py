@@ -10,6 +10,7 @@ from scripts.ci_fix.prior_fixes import (
     render_prior_fixes,
     summarize_prior_fixes,
     unported_changes,
+    unported_index,
 )
 from tests.git_helpers import commit, git
 
@@ -267,3 +268,23 @@ def test_the_upstream_commits_a_branch_lacks_are_listed_by_file(tmp_path):
     assert unported_changes(str(clone), ()) == ""
     _refresh(clone, "origin/unstable")
     assert unported_changes(str(clone), ("src/valkey-cli.c",)) == ""
+
+
+def test_every_upstream_commit_a_branch_lacks_is_indexed_with_its_files(tmp_path):
+    """The fix for a job that hung in a replication test was in server.c, which its log never named."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, "src/valkey-cli.c", "v1\n", "Add a hint test mode")
+    git(upstream, "branch", "-f", "9.0")
+    older = commit(upstream, "src/server.c", "v2\n", "Use _exit() when a child is killed by SIGUSR1 (#4251)")
+    newer = commit(upstream, "tests/unit/a.tcl", "v3\n", "Deflake a test")
+    _refresh(clone, "origin/9.0")
+
+    index = unported_index(str(clone))
+
+    assert index.splitlines() == [
+        f"- `{newer}` {index.splitlines()[0].split()[2]} Deflake a test | tests/unit/a.tcl",
+        f"- `{older}` {index.splitlines()[1].split()[2]} Use _exit() when a child is killed by SIGUSR1 (#4251) | src/server.c",
+    ]
+    _refresh(clone, "origin/unstable")
+    assert unported_index(str(clone)) == ""
+

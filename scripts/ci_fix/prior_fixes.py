@@ -322,6 +322,37 @@ def unported_changes(repo_dir: str, paths: tuple[str, ...]) -> str:
     return "\n\n".join(sections) + "\n" if sections else ""
 
 
+# How many of the default branch's newest commits are indexed.
+_INDEXED_COMMITS = 5_000
+
+
+def unported_index(repo_dir: str) -> str:
+    """Markdown: the default branch's commits this checkout lacks, newest first, each with the files it changes.
+
+    A failure names the test that failed, not the file its fix is in: the
+    upstream fix for a coverage job that hung in a replication test is in
+    server.c, which the log never mentions. The agent cannot run git, so it
+    searches this for a file or a word.
+    """
+    default_ref = default_branch_ref(repo_dir)
+    if not default_ref:
+        return ""
+    try:
+        output = git_output(
+            repo_dir, "log", "--no-merges", f"--max-count={_INDEXED_COMMITS}", "--name-only",
+            "--format=%x00%H %cs %s", f"HEAD..{default_ref}",
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("Could not index the upstream commits: %s", exc)
+        return ""
+    lines = []
+    for entry in output.split("\x00")[1:]:
+        header, *files = (line for line in entry.splitlines() if line.strip())
+        sha, _, rest = header.partition(" ")
+        lines.append(f"- `{sha}` {rest} | {', '.join(files)}")
+    return "\n".join(lines) + "\n" if lines else ""
+
+
 def summarize_prior_fixes(fixes: tuple[PriorFix, ...]) -> str:
     """One line per candidate, for the prompt and the maintainer report."""
     lines = []

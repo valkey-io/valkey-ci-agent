@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from scripts.ci_fix.models import (
 )
 from scripts.ci_fix.policy import target_capabilities
 from scripts.common.ai_output import extract_json_object
+from scripts.common.proc import git_output
 from scripts.common.text_utils import compact_text
 
 _POLICY = {
@@ -188,6 +190,15 @@ def _context_prompt(context: FixContext, context_dir: Path, allows_port: bool) -
             "The default branch's newest commits to the files this failure names, which the working "
             f"commit does not have, are listed in {unported}, each with its diff to that file. One of them "
             "may be the fix: to port it, name its full SHA."
+        )
+    if context.unported_index:
+        index = context_dir / "upstream-commits.md"
+        index.write_text(context.unported_index, encoding="utf-8")
+        sections.append(
+            "### Every upstream commit this branch lacks\n"
+            f"{index} lists them newest first, one a line, with the files each changes. The fix may be in a "
+            "file the log does not name: search the list for a file or a word, and name a commit's full SHA "
+            "to port it. If it does not apply, you are given its diff to adapt."
         )
     if context.verification:
         section = f"### Verification\n{context.verification}"
@@ -422,6 +433,17 @@ Finish with only this JSON object:
 """
 
 
+def _adapted_diff(repo_dir: str, candidate: FixCandidate) -> str:
+    """The diff of the commit ``candidate`` adapts, to the files it changes; a note when it cannot be read."""
+    try:
+        return git_output(
+            repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", candidate.adapts,
+            "--", *candidate.changed_paths,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        return f"(the commit's diff could not be read: {exc})\n"
+
+
 def review_candidate(
     candidate: FixCandidate,
     repo_dir: str,
@@ -440,10 +462,12 @@ def review_candidate(
             if candidate.action is CandidateAction.PORT else ""
         )
         if candidate.adapts:
+            adapted = Path(log_dir) / "adapted-commit.diff"
+            adapted.write_text(_adapted_diff(repo_dir, candidate), encoding="utf-8")
             origin = (
                 "This branch takes only changes already merged upstream. The patch says it adapts upstream "
-                f"commit {candidate.adapts}: reject anything in it that is not that commit's change, or the "
-                "least needed to apply it here.\n"
+                f"commit {candidate.adapts}, whose diff to the same files is in {adapted}: reject anything in "
+                "the patch that is not that commit's change, or the least needed to apply it here.\n"
             )
         # What code ran and found, for a verified candidate; else what it planned.
         checked = candidate.verification or context.verification

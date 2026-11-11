@@ -101,10 +101,17 @@ declines only when it can justify no change. Claude works in a scratch copy of t
 edit files there but cannot commit or push.
 
 On a backport branch Claude may not write a fix of its own. It ports a commit
-that is merged upstream, or adapts one and names it, and the bot checks that
-the named commit is merged, is not on the branch yet, and that at least half
-of the lines the patch adds are that commit's own. Naming a commit that only
-touches the same file is not enough. One other patch is accepted: one that
+that is merged upstream, or adapts one and names it. Claude cannot run git, so
+the bot gives it every commit the branch lacks with the files each changes,
+the diffs of the newest ones to the files the failure names, and the diff of
+a port that did not apply. For an adaptation the bot checks that the named
+commit is merged, is not on the branch yet, and that the patch is that
+commit's change: at least half of the lines it adds are the commit's, or at
+least half of the lines it removes are lines the commit removes. An
+adaptation often writes something else in their place, such as another
+encoding to assert or a wider tolerance. Naming a commit that only touches
+the same file is not enough, and the reviewer reads the named commit's diff
+next to the patch. One other patch is accepted: one that
 changes only files the backport PR itself changes, which repairs what the
 backport brought. A test that is flaky upstream too is fixed upstream first. A
 backport that broke the build is the exception: that is repaired by hand.
