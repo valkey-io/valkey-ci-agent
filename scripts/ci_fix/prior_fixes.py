@@ -296,23 +296,29 @@ def unported_changes(repo_dir: str, paths: tuple[str, ...]) -> str:
     For a failure only an upstream change may fix. The search above ranks
     commits by what their message says; the fix for a failure that names no
     test (a sanitizer report) says nothing it can match, but its subject
-    tells the agent, which cannot run git, what it is.
+    tells the agent, which cannot run git, what it is. Each commit's diff to
+    the path follows the list: a subject alone left the agent unable to tell
+    whether a commit that sounded right was the fix.
     """
     default_ref = default_branch_ref(repo_dir)
     if not default_ref or not paths:
         return ""
     sections: list[str] = []
     for path in dict.fromkeys(paths):
-        lines = []
+        lines, diffs = [], []
         try:
             for sha in _log(repo_dir, f"HEAD..{default_ref}", f"--max-count={_UNPORTED_COMMITS}", "--", path):
                 subject, date = _subject_and_date(repo_dir, sha)
                 lines.append(f"- `{sha}` {date} {subject}")
+                diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha, "--", path)
+                if len(diff) > _DIFF_CHARS:
+                    diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+                diffs += ["", f"## `{sha[:12]}` {subject}", "", "```diff", diff.rstrip("\n"), "```"]
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
             logger.info("Could not list upstream changes to %s: %s", path, exc)
             continue
         if lines:
-            sections.append("\n".join([f"# `{path}`", "", *lines]))
+            sections.append("\n".join([f"# `{path}`", "", *lines, *diffs]))
     return "\n\n".join(sections) + "\n" if sections else ""
 
 

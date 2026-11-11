@@ -260,6 +260,9 @@ def test_the_upstream_commits_a_branch_lacks_are_listed_by_file(tmp_path):
     assert listed.startswith("# `src/valkey-cli.c`\n\n")
     assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [leak_fix]
     assert "Free valkey-cli test hint before exiting (#5274)" in listed
+    # With its diff to that file: the agent cannot run git, and a subject does not show what a commit changes.
+    assert f"## `{leak_fix[:12]}` Free valkey-cli test hint" in listed and "-v1\n+v2" in listed
+    assert "unrelated" not in listed
     # Nothing to port on the default branch itself, or with no file named.
     assert unported_changes(str(clone), ()) == ""
     _refresh(clone, "origin/unstable")

@@ -186,8 +186,8 @@ def _context_prompt(context: FixContext, context_dir: Path, allows_port: bool) -
         sections.append(
             "### Upstream changes this branch lacks\n"
             "The default branch's newest commits to the files this failure names, which the working "
-            f"commit does not have, are listed in {unported}. One of them may be the fix: to port it, "
-            "name its full SHA."
+            f"commit does not have, are listed in {unported}, each with its diff to that file. One of them "
+            "may be the fix: to port it, name its full SHA."
         )
     if context.verification:
         section = f"### Verification\n{context.verification}"
