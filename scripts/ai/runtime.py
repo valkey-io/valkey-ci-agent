@@ -78,10 +78,10 @@ class AgentRunResult:
     finished_at: str
 
 
-# At xhigh the fix agent thought for up to ten minutes between two file
-# reads, and its sessions ran 16 to 72 minutes: the agent, not verification
-# (2 to 9 minutes), is where a fix's time goes.
-_CI_FIX_EFFORT = "high"
+# On Fable 5.2 at high, sessions over fourteen replayed failures ran 30
+# seconds to 7 minutes and thirteen produced a fix. xhigh is not measured on
+# 5.2 yet; on Fable 5 it ran 16 to 72 minutes a session.
+_CI_FIX_EFFORT = "xhigh"
 
 AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
     "conflict_resolve_edit_only": AgentProfile(
@@ -98,7 +98,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="test_adaptation_edit_only",
         allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
         timeout=1800,
-        effort="max",
+        effort="xhigh",
         max_turns=160,
         writes_allowed=True,
         output_schema="edited-files",
@@ -108,7 +108,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="validation_repair_edit_only",
         allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
         timeout=1800,
-        effort="max",
+        effort="xhigh",
         max_turns=160,
         writes_allowed=True,
         output_schema="edited-files",
@@ -118,7 +118,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="fuzzer_analysis_readonly",
         allowed_tools="Read,Grep,Glob",
         timeout=1800,
-        effort="max",
+        effort="xhigh",
         max_turns=200,
         writes_allowed=False,
         output_schema="text",
@@ -168,7 +168,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="release_notes_review_edit_only",
         allowed_tools="Read,Edit,MultiEdit,Grep,Glob",
         timeout=600,
-        effort="max",
+        effort="xhigh",
         max_turns=120,
         writes_allowed=True,
         output_schema="edited-files",

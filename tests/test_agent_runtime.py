@@ -87,12 +87,12 @@ def test_ci_fix_profiles_match_their_publication_targets() -> None:
     assert "Bash" not in edit.allowed_tools
     # Bounded by the engine's deadline alone: no session timeout or turn cap.
     assert edit.timeout is None and edit.max_turns is None
-    assert edit.effort == "high"
+    assert edit.effort == "xhigh"
     assert suggest.writes_allowed is True
     assert suggest.confined is True
     assert suggest.disallowed_tools == "Bash,Glob"
     assert suggest.timeout is None and suggest.max_turns is None
-    assert suggest.effort == "high"
+    assert suggest.effort == "xhigh"
 
 
 def test_a_caller_cannot_extend_an_agent_profiles_timeout(monkeypatch) -> None:
@@ -112,7 +112,7 @@ def test_a_caller_cannot_extend_an_agent_profiles_timeout(monkeypatch) -> None:
     agent_runtime.run_agent("ci_fix_edit", "fix it", timeout=9999)
     assert captured["timeout"] == 9999
     assert captured["max_turns"] is None
-    assert captured["effort"] == "high"
+    assert captured["effort"] == "xhigh"
 
 
 def test_release_notes_review_profile_is_edit_only() -> None:
