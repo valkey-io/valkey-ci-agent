@@ -41,7 +41,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
-from scripts.ci_fix.agent import AgentTimeout, review_candidate, run_fix_agent
+from scripts.ci_fix.agent import (
+    API_ERROR_PAUSE_S,
+    AgentTimeout,
+    ModelUnavailable,
+    review_candidate,
+    run_fix_agent,
+)
 from scripts.ci_fix.models import (
     CandidateAction,
     FailedTest,
@@ -464,10 +470,22 @@ def _fix_loop(
         agent_timeout = remaining - reserve
         agent_timeout = min(agent_timeout, _MAX_AGENT_ROUND_S)
         try:
-            outcome = agent_round(
-                task, repo_dir, original_head, job_log, context, feedback,
-                attempt=attempt, timeout=max(60, agent_timeout), agent_func=agent_func,
-            )
+            try:
+                outcome = agent_round(
+                    task, repo_dir, original_head, job_log, context, feedback,
+                    attempt=attempt, timeout=max(60, agent_timeout), agent_func=agent_func,
+                )
+            except ModelUnavailable as exc:
+                # The session judged nothing, and may have died mid-edit: run it
+                # once more, on the tree as the working commit has it.
+                logger.warning("CI-fix round %d: %s; running the session once more", attempt, exc)
+                restore(repo_dir)
+                time.sleep(API_ERROR_PAUSE_S)
+                agent_timeout = min(int(deadline - time.monotonic()) - reserve, _MAX_AGENT_ROUND_S)
+                outcome = agent_round(
+                    task, repo_dir, original_head, job_log, context, feedback.replace(_KEPT_TREE, _RESET_TREE),
+                    attempt=attempt, timeout=max(60, agent_timeout), agent_func=agent_func,
+                )
         except AgentTimeout:
             # A session that used its whole budget investigating found no
             # evidence-backed fix; a fresh one repeats the same reading.

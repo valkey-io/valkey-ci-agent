@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +24,8 @@ from scripts.ci_fix.policy import target_capabilities
 from scripts.common.ai_output import extract_json_object
 from scripts.common.proc import git_output
 from scripts.common.text_utils import compact_text
+
+logger = logging.getLogger(__name__)
 
 # Of eleven fixes people merged for failures the bot replayed, eight changed
 # only tests or the test harness, two changed product source, and one patched
@@ -229,6 +235,38 @@ class AgentTimeout(RuntimeError):
     """The edit agent used its whole session without choosing an action."""
 
 
+class ModelUnavailable(RuntimeError):
+    """A session ended on a model API error, after the CLI's own retries: it judged nothing."""
+
+
+# Before a session that died on a model API error is run again.
+API_ERROR_PAUSE_S = 60
+_API_ERROR_RE = re.compile(r"API Error(?:: (\d{3}))?")
+
+
+def api_error(stdout: str) -> str:
+    """The model API error a session's last result reports, when running it again may work; else "".
+
+    Three of twenty-one concurrent sessions ended on "API Error: 503 Bedrock
+    is unable to process your request", five to fourteen minutes in. A 4xx
+    other than a rate limit is the request's own fault and would fail again.
+    """
+    for line in reversed(stdout.strip().splitlines()[-20:]):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not (isinstance(event, dict) and event.get("type") == "result"):
+            continue
+        text = str(event.get("result") or "").strip()
+        match = _API_ERROR_RE.match(text)
+        if match is None:
+            return ""
+        status = int(match.group(1) or 0)
+        return "" if 400 <= status < 500 and status != 429 else compact_text(text, 200)
+    return ""
+
+
 def run_fix_agent(
     task: FixTask,
     repo_dir: str,
@@ -278,6 +316,9 @@ def run_fix_agent(
             timeout=timeout,
         )
     if result.returncode != 0:
+        unavailable = api_error(result.stdout)
+        if unavailable:
+            raise ModelUnavailable(f"the fix agent's session ended on a model API error ({unavailable})")
         error = AgentTimeout if result.stderr.startswith("timeout") else RuntimeError
         raise error(
             f"CI-fix agent failed with exit code {result.returncode}: "
@@ -495,19 +536,22 @@ def review_candidate(
                 f"Judge test changes against this repository's conventions in {guide_path}: "
                 "a fixed sleep replacing a race, or a skip tag instead of a fix, is a rejection.\n"
             )
-        result = run_agent(
-            "ci_fix_review",
-            _REVIEW_PROMPT.format(
-                stance=_REVIEW_A_PORT if ported else _REVIEW_A_PATCH,
-                log_path=log_path, failing_check=candidate.failing_check,
-                root_cause=candidate.root_cause or "(not given)", reasoning=candidate.reasoning or "(not given)",
-                notes=candidate.validation or "(none)", patch=candidate.patch,
-                origin=origin, verification=verification, guide=guide,
-            ),
-            cwd=repo_dir,
-            timeout=timeout,
-            extra_dirs=(log_dir,),
+        prompt = _REVIEW_PROMPT.format(
+            stance=_REVIEW_A_PORT if ported else _REVIEW_A_PATCH,
+            log_path=log_path, failing_check=candidate.failing_check,
+            root_cause=candidate.root_cause or "(not given)", reasoning=candidate.reasoning or "(not given)",
+            notes=candidate.validation or "(none)", patch=candidate.patch,
+            origin=origin, verification=verification, guide=guide,
         )
+        started = time.monotonic()
+        result = run_agent("ci_fix_review", prompt, cwd=repo_dir, timeout=timeout, extra_dirs=(log_dir,))
+        unavailable = api_error(result.stdout) if result.returncode != 0 else ""
+        if unavailable:
+            # The review changes nothing, and the candidate it was judging has already passed its test.
+            logger.warning("The review ended on a model API error (%s): running it once more", unavailable)
+            time.sleep(API_ERROR_PAUSE_S)
+            left = None if timeout is None else max(60, timeout - int(time.monotonic() - started))
+            result = run_agent("ci_fix_review", prompt, cwd=repo_dir, timeout=left, extra_dirs=(log_dir,))
     # A review that crashed, timed out, or gave no verdict judged nothing: the
     # attempt failed, and is retried, rather than the patch being rejected.
     if result.returncode != 0:

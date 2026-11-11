@@ -1233,6 +1233,42 @@ def test_a_port_not_merged_on_the_default_branch_goes_back_before_testing(tmp_pa
     assert "reset to the working commit" in agent.feedback[1]
 
 
+def test_a_session_that_died_on_a_model_api_error_is_run_once_more_on_a_clean_tree(tmp_path, monkeypatch):
+    """The CLI gave up on the API mid-session: that is no verdict, and whatever it had edited is not the fix."""
+    from scripts.ci_fix.agent import ModelUnavailable
+
+    slept, seen = [], []
+    monkeypatch.setattr(engine_mod.time, "sleep", slept.append)
+
+    def agent(task, repo_dir, job_log, **_kwargs):  # noqa: ARG001
+        value = Path(repo_dir) / "value.txt"
+        seen.append(value.read_text(encoding="utf-8"))
+        if len(seen) == 1:
+            value.write_text("half an edit\n", encoding="utf-8")
+            raise ModelUnavailable("the fix agent's session ended on a model API error (API Error: 503)")
+        value.write_text("right\n", encoding="utf-8")
+        return FixCandidate(action=CandidateAction.PATCH, failing_check="value check", root_cause="stale value",
+                            reasoning="set the right value", changed_paths=("value.txt",))
+
+    candidate = _prepare(tmp_path, monkeypatch, agent)
+
+    assert seen == ["before\n", "before\n"] and slept == [60]
+    assert candidate.action is CandidateAction.PATCH and "+right" in candidate.patch
+    assert "half an edit" not in candidate.patch
+
+
+def test_a_session_that_dies_on_a_model_api_error_twice_is_a_failed_attempt(tmp_path, monkeypatch):
+    from scripts.ci_fix.agent import ModelUnavailable
+
+    monkeypatch.setattr(engine_mod.time, "sleep", lambda _seconds: None)
+    agent = MagicMock(side_effect=ModelUnavailable("API Error: 503"))
+
+    with pytest.raises(ModelUnavailable):
+        _prepare(tmp_path, monkeypatch, agent)
+
+    assert agent.call_count == 2
+
+
 def test_a_later_round_whose_agent_fails_is_a_failed_attempt_not_a_refusal(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)

@@ -178,7 +178,9 @@ tests change any tracked file while the fix is being tested, the fix that was
 tested is no longer the fix in the tree, so that also goes back for another
 round.
 
-A fix that doesn't pass within three rounds is declined. If the bot runs out
+A fix that doesn't pass within three rounds is declined. A Claude session
+that ends on a model API error judged nothing, so it is run once more, on a
+clean tree. If the bot runs out
 of time or crashes, that isn't treated as declining: the CI follow-up and
 detector issues get one more attempt at the same failure, and nothing is
 posted about the failed attempt.
