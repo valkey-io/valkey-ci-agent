@@ -183,6 +183,32 @@ def test_bot_pr_is_revalidated_immediately_before_push(
     assert seen["allow_ci_changes"] is True
 
 
+@pytest.mark.parametrize("kind", [TargetKind.UPDATE_PR, TargetKind.DRAFT_PR])
+def test_a_patch_that_was_not_run_is_posted_not_pushed(monkeypatch: pytest.MonkeyPatch, kind) -> None:
+    """Nothing the bot wrote and could not run reaches a branch: a person applies it."""
+    monkeypatch.setattr(publish_mod, "push_candidate", lambda *_a, **_k: pytest.fail("nothing may be pushed"))
+    task = _task(kind, issue=9 if kind is TargetKind.DRAFT_PR else 0)
+    gh, _repo = _gh(issue=_issue()) if kind is TargetKind.DRAFT_PR else _gh()
+    unrun = replace(_candidate(), not_run=True)
+
+    result = publish_candidate(gh, task, unrun, git_env={})  # a draft PR was asked for, where it is an issue's
+
+    assert result.kind is ResultKind.SUGGESTED and result.candidate is unrun
+
+    big = replace(unrun, patch="x" * 50_000)
+    refused = publish_candidate(gh, task, big, git_env={})
+    assert refused.kind is ResultKind.REFUSED and "more than a comment holds" in refused.summary
+
+
+def test_a_port_that_was_only_built_is_still_pushed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It ran where it was merged, and the pull request's own CI runs it here."""
+    monkeypatch.setattr(publish_mod, "push_candidate", lambda *_a, **_k: _NEW)
+    gh, _repo = _gh()
+    port = replace(_candidate(CandidateAction.PORT), not_run=True)
+
+    assert publish_candidate(gh, _task(TargetKind.UPDATE_PR), port, git_env={}).kind is ResultKind.PUSHED
+
+
 def test_a_bot_ci_fix_branch_never_takes_a_ci_change(monkeypatch: pytest.MonkeyPatch) -> None:
     task = _task(TargetKind.UPDATE_PR)
     task = replace(task, target=replace(task.target, branch="agent/ci-fix/x"), policy=FixPolicy.GENERAL)

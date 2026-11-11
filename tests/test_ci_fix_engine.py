@@ -995,7 +995,7 @@ def test_the_review_reads_what_the_checks_found(tmp_path, monkeypatch):
     assert "passed 40 loop(s)" in reviewed[0]
 
 
-# --- where only a change already merged upstream is accepted ------------------
+# --- where a change already merged upstream comes first ------------------------
 
 def _backport(task: FixTask) -> FixTask:
     return replace(task, policy=FixPolicy.BACKPORT)
@@ -1016,19 +1016,22 @@ def _adapting_agent(adapts: str, path: str = "value.txt", text: str = "fixed\nke
     return agent
 
 
-def test_a_backport_branch_takes_no_fix_of_its_own(tmp_path, monkeypatch):
-    """A release branch's flake is the default branch's too: 16 of 17 pushed fixes were hand-written."""
+def test_a_backport_branch_takes_a_fix_of_its_own_where_none_is_upstream(tmp_path, monkeypatch):
+    """A release branch's flake is fixed where it fails: 16 of 17 fixes people pushed there were hand-written.
+
+    The report says the default branch does not have the fix.
+    """
     source, head_sha = _source_repo(tmp_path)
     _upstream_commit(source, head_sha)
     _install_clone(monkeypatch, source)
-    agent = _adapting_agent("")
+    (source / "tests").mkdir()
+    agent = _adapting_agent("", "tests/value.tcl")
 
     candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
 
-    assert agent.contexts[0].upstream_only
-    assert candidate.action is CandidateAction.REFUSE
-    assert "Only a change already merged upstream is accepted here" in candidate.summary
-    assert "choose `refuse` and say so" in agent.feedback[1]
+    assert agent.contexts[0].upstream_first and agent.feedback == [""]
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == ""
+    assert "the default branch does not have it" in candidate.verification
 
 
 def test_a_backport_branch_takes_a_patch_that_adapts_a_merged_upstream_commit(tmp_path, monkeypatch):
@@ -1040,6 +1043,7 @@ def test_a_backport_branch_takes_a_patch_that_adapts_a_merged_upstream_commit(tm
 
     assert candidate.action is CandidateAction.PATCH
     assert candidate.adapts == commit and "+kept for this branch" in candidate.patch
+    assert "the default branch does not have it" not in candidate.verification
 
 
 def test_an_adaptation_may_write_other_lines_where_its_commit_writes_its_own(tmp_path, monkeypatch):
@@ -1058,16 +1062,71 @@ def test_an_adaptation_may_write_other_lines_where_its_commit_writes_its_own(tmp
     assert candidate.action is CandidateAction.PATCH and candidate.adapts == commit
 
 
-@pytest.mark.parametrize(("adapts", "path", "text", "reason"), [
+@pytest.mark.parametrize(("path", "accepted"), [
+    ("tests/unit/value.tcl", True), ("tests/support/server.tcl", True), ("src/unit/test_value.cpp", True),
+    ("src/server.c", False), ("deps/libvalkey/src/net.c", False), ("Makefile", False),
+])
+def test_a_backport_branchs_own_fix_may_change_tests_and_the_harness_only(tmp_path, monkeypatch, path, accepted):
+    """Product source changes on a release branch only by a commit merged upstream.
+
+    Two replayed fixes rewrote how the server masks a signal around fork() on 8.0 and 7.2, with no
+    upstream commit behind them and nothing here able to run the valgrind job that failed.
+    """
+    source, head_sha = _source_repo(tmp_path)
+    _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+
+    def agent(task, repo_dir, job_log, *, feedback="", **_kwargs):  # noqa: ARG001
+        agent.feedback.append(feedback)
+        target = Path(repo_dir) / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("a fix of the branch's own\n", encoding="utf-8")
+        return FixCandidate(action=CandidateAction.PATCH, failing_check="value check", root_cause="a race",
+                            reasoning="fix it here", changed_paths=(path,))
+
+    agent.feedback = []
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
+
+    if accepted:
+        assert candidate.action is CandidateAction.PATCH and agent.feedback == [""]
+    else:
+        assert candidate.action is CandidateAction.REFUSE
+        assert f"changes `{path}` without being one" in agent.feedback[1]
+        assert "fix the test or the test harness" in agent.feedback[1]
+
+
+def test_a_backport_branch_takes_product_source_from_an_upstream_commit(tmp_path, monkeypatch):
+    source, head_sha = _source_repo(tmp_path)
+    (source / "src").mkdir()
+    (source / "src" / "server.c").write_text("before\n", encoding="utf-8")
+    git(source, "add", "src/server.c")
+    git(source, "commit", "-qm", "Add the server")
+    head_sha = git(source, "rev-parse", "HEAD")
+    git(source, "checkout", "-q", "-b", "upstream")
+    (source / "src" / "server.c").write_text("fixed\n", encoding="utf-8")
+    git(source, "commit", "-qam", "Fix the server")
+    commit = git(source, "rev-parse", "HEAD")
+    git(source, "checkout", "-q", "--detach", head_sha)
+    _install_clone(monkeypatch, source)
+    agent = _adapting_agent(commit, "src/server.c")
+
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
+
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == commit
+
+
+@pytest.mark.parametrize(("adapts", "path", "text"), [
     # Every hand-written fix pushed to a backport branch changed a file that unported upstream commits
     # change too: naming one of them adapts nothing unless the patch is its change.
-    ("upstream", "value.txt", "before\na fix of its own\nwith a longer wait\n", "Only 0% of the patch's changed lines"),
-    ("upstream", "value.txt", "before\nfixed\nand two lines\nof its own\n", "Only 33% of the patch's changed lines"),
-    ("upstream", "other.txt", "fixed\n", "Only 0% of the patch's changed lines"),  # the commit changes value.txt
-    ("head", "value.txt", "fixed\n", "already present on the target head"),
-    ("b" * 40, "value.txt", "fixed\n", "not merged into origin/main"),
+    ("upstream", "value.txt", "before\na fix of its own\nwith a longer wait\n"),
+    ("upstream", "value.txt", "before\nfixed\nand two lines\nof its own\n"),  # a third of it is the commit's
+    ("upstream", "other.txt", "fixed\n"),  # the commit changes value.txt
+    ("head", "value.txt", "fixed\n"),  # already on this branch
+    ("b" * 40, "value.txt", "fixed\n"),  # not merged upstream
 ])
-def test_a_patch_must_adapt_the_upstream_commit_it_names(tmp_path, monkeypatch, adapts, path, text, reason):
+def test_a_patch_to_product_source_must_be_the_upstream_commit_it_names(
+    tmp_path, monkeypatch, adapts, path, text,
+):
     source, head_sha = _source_repo(tmp_path)
     commit = _upstream_commit(source, head_sha)
     _install_clone(monkeypatch, source)
@@ -1076,41 +1135,21 @@ def test_a_patch_must_adapt_the_upstream_commit_it_names(tmp_path, monkeypatch, 
     candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
 
     assert candidate.action is CandidateAction.REFUSE
-    assert reason in agent.feedback[1]
+    assert f"changes `{path}` without being one" in agent.feedback[1]
 
 
-def test_a_backport_branch_repairs_what_its_own_pull_request_brought(tmp_path, monkeypatch):
-    """A patch confined to files the pull request changes needs no upstream commit.
+def test_a_test_fix_that_adapts_nothing_is_published_as_the_branchs_own(tmp_path, monkeypatch):
+    """A claim to adapt a commit is kept only when the patch is that commit's change."""
+    source, head_sha = _source_repo(tmp_path)
+    commit = _upstream_commit(source, head_sha)  # which changes value.txt, not the test
+    _install_clone(monkeypatch, source)
+    (source / "tests").mkdir()
+    agent = _adapting_agent(commit, "tests/value.tcl")
 
-    Eleven of the thirteen hand-written fixes pushed to backport branches changed a file their
-    pull request never touched; the other two repaired what the backport brought.
-    """
-    source, base_sha = _source_repo(tmp_path)
-    (source / "brought.txt").write_text("by the backport\n", encoding="utf-8")
-    git(source, "add", "brought.txt")
-    git(source, "commit", "-qm", "Backport a change")
-    head_sha = git(source, "rev-parse", "HEAD")
-    monkeypatch.setattr(engine_mod, "default_branch_ref", lambda _repo: "origin/main")
+    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
 
-    def clone(repo_full_name, destination, sha, *, pull_number=0):  # noqa: ARG001
-        shutil.copytree(source, destination)
-        git(destination, "checkout", "-q", "--detach", sha)
-        # origin/main is the release branch the pull request is into, where it forked.
-        git(destination, "update-ref", "refs/remotes/origin/main", base_sha)
-        return True
-
-    monkeypatch.setattr(engine_mod, "shallow_clone_at_sha", clone)
-
-    own = _adapting_agent("", "brought.txt")
-    candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=own)
-    assert own.contexts[0].upstream_only and own.contexts[0].own_paths == ("brought.txt",)
-    assert candidate.action is CandidateAction.PATCH and candidate.adapts == ""
-
-    # A file the pull request never touched is the release branch's own trouble.
-    elsewhere = _adapting_agent("", "value.txt")
-    refused = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=elsewhere)
-    assert refused.action is CandidateAction.REFUSE
-    assert "changes only files this pull request itself changes" in elsewhere.feedback[1]
+    assert candidate.action is CandidateAction.PATCH and candidate.adapts == "" and agent.feedback == [""]
+    assert "the default branch does not have it" in candidate.verification
 
 
 def test_a_backport_that_broke_the_build_may_be_repaired_by_hand(tmp_path, monkeypatch):
@@ -1125,11 +1164,11 @@ def test_a_backport_that_broke_the_build_may_be_repaired_by_hand(tmp_path, monke
         job=JobCommands(build="true", runtest="./runtest"),
     )
 
-    assert not agent.contexts[0].upstream_only
+    assert not agent.contexts[0].upstream_first
     assert candidate.action is CandidateAction.PATCH and candidate.adapts == ""
 
 
-def test_a_failure_no_command_can_run_is_fixed_only_by_an_upstream_change(tmp_path, monkeypatch):
+def test_a_failure_no_command_can_run_takes_an_upstream_change_first_and_is_only_built(tmp_path, monkeypatch):
     """A sanitizer leak or a sentinel test: nothing here runs it, but its fix may be upstream (#5274)."""
     source, head_sha = _source_repo(tmp_path)
     commit = _upstream_commit(source, head_sha)
@@ -1146,16 +1185,18 @@ def test_a_failure_no_command_can_run_is_fixed_only_by_an_upstream_change(tmp_pa
         test_func=lambda _repo, command, _timeout: commands.append(command) or TestRun(True, ""),
     )
 
-    assert contexts[0].upstream_only
+    assert contexts[0].upstream_first
     assert "No command here can run the failing check" in contexts[0].verification
     assert candidate.action is CandidateAction.PORT and candidate.port_commit == commit
     assert commands == ['make -j"$(getconf _NPROCESSORS_ONLN)"']
     assert "builds." in candidate.verification
 
-    # A fix written here would be published on review alone.
-    refused = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=_adapting_agent(""),
-                                     test_func=lambda *_args: TestRun(True, ""))
-    assert refused.action is CandidateAction.REFUSE
+    # A fix written here is built and reviewed too, and marked as not run: it is posted, not pushed.
+    own = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=_adapting_agent(""),
+                                 test_func=lambda *_args: TestRun(True, ""))
+    assert own.action is CandidateAction.PATCH and own.adapts == "" and own.not_run
+    assert "the default branch does not have it" in own.verification
+    assert "code only checks that the change builds" in own.verification
 
 
 def test_a_failure_with_nothing_to_search_for_does_not_claim_a_search(tmp_path, monkeypatch):
@@ -1190,6 +1231,42 @@ def test_a_port_not_merged_on_the_default_branch_goes_back_before_testing(tmp_pa
     assert candidate.port_commit == commit
     assert "it is not merged into origin/main" in agent.feedback[1]
     assert "reset to the working commit" in agent.feedback[1]
+
+
+def test_a_session_that_died_on_a_model_api_error_is_run_once_more_on_a_clean_tree(tmp_path, monkeypatch):
+    """The CLI gave up on the API mid-session: that is no verdict, and whatever it had edited is not the fix."""
+    from scripts.ci_fix.agent import ModelUnavailable
+
+    slept, seen = [], []
+    monkeypatch.setattr(engine_mod.time, "sleep", slept.append)
+
+    def agent(task, repo_dir, job_log, **_kwargs):  # noqa: ARG001
+        value = Path(repo_dir) / "value.txt"
+        seen.append(value.read_text(encoding="utf-8"))
+        if len(seen) == 1:
+            value.write_text("half an edit\n", encoding="utf-8")
+            raise ModelUnavailable("the fix agent's session ended on a model API error (API Error: 503)")
+        value.write_text("right\n", encoding="utf-8")
+        return FixCandidate(action=CandidateAction.PATCH, failing_check="value check", root_cause="stale value",
+                            reasoning="set the right value", changed_paths=("value.txt",))
+
+    candidate = _prepare(tmp_path, monkeypatch, agent)
+
+    assert seen == ["before\n", "before\n"] and slept == [60]
+    assert candidate.action is CandidateAction.PATCH and "+right" in candidate.patch
+    assert "half an edit" not in candidate.patch
+
+
+def test_a_session_that_dies_on_a_model_api_error_twice_is_a_failed_attempt(tmp_path, monkeypatch):
+    from scripts.ci_fix.agent import ModelUnavailable
+
+    monkeypatch.setattr(engine_mod.time, "sleep", lambda _seconds: None)
+    agent = MagicMock(side_effect=ModelUnavailable("API Error: 503"))
+
+    with pytest.raises(ModelUnavailable):
+        _prepare(tmp_path, monkeypatch, agent)
+
+    assert agent.call_count == 2
 
 
 def test_a_later_round_whose_agent_fails_is_a_failed_attempt_not_a_refusal(tmp_path, monkeypatch):

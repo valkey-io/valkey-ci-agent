@@ -133,7 +133,7 @@ def test_suggestion_uses_confined_profile_and_backport_policy(tmp_path, monkeypa
     )
 
     assert seen["profile"] == "ci_fix_suggest"
-    assert "Port an already-merged upstream fix" in seen["prompt"]
+    assert "This is a backport branch" in seen["prompt"]
     assert "Prepare a patch for a PR comment only" in seen["prompt"]
     assert '"action": "patch|refuse"' in seen["prompt"]
     assert "- `port`:" not in seen["prompt"]
@@ -270,7 +270,7 @@ def test_a_fix_that_will_not_be_run_says_what_is_and_is_not_established(tmp_path
     assert "### Verification\nNo command here can run the failing check" in seen["prompt"]
 
 
-def test_where_only_an_upstream_change_is_accepted_the_agent_is_told_and_its_claim_is_read(
+def test_where_an_upstream_change_comes_first_the_agent_is_told_and_its_claim_is_read(
     tmp_path, monkeypatch,
 ) -> None:
     from scripts.ci_fix.models import FixContext
@@ -279,15 +279,78 @@ def test_where_only_an_upstream_change_is_accepted_the_agent_is_told_and_its_cla
     monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
         {"action": "patch", "summary": "adapted", "changed_paths": ["a.c"], "adapts_commit": "D" * 40}))
 
-    context = FixContext(upstream_only=True, unported_changes="# `src/a.c`\n\n- `abc` 2026-11-04 Free the hint\n",
+    context = FixContext(upstream_first=True, unported_changes="# `src/a.c`\n\n- `abc` 2026-11-04 Free the hint\n",
                          unported_index="- `abc` 2026-11-04 Free the hint | src/a.c\n")
     candidate = agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=context)
 
-    assert "Only a change already merged on the default branch is accepted" in seen["prompt"]
+    assert "A change already merged on the default branch comes first" in seen["prompt"]
+    # Where none fixes the failure, the fix is written on the branch, not refused.
+    assert "write the fix here as a `patch`" in seen["prompt"] and "belongs there first" not in seen["prompt"]
     assert "### Upstream changes this branch lacks" in seen["prompt"] and "upstream-changes.md" in seen["prompt"]
     # And every commit it lacks, by the files it changes: the fix may be in a file the log does not name.
     assert "### Every upstream commit this branch lacks" in seen["prompt"] and "upstream-commits.md" in seen["prompt"]
     assert candidate.adapts == "d" * 40
+
+
+def test_the_review_is_told_when_a_release_branchs_patch_is_not_an_upstream_change(tmp_path, monkeypatch) -> None:
+    from scripts.ci_fix.models import FixCandidate, FixContext
+
+    seen = {}
+    monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
+        {"approved": True, "reasoning": "fine"}))
+    own = FixCandidate(action=CandidateAction.PATCH, patch="diff", failing_check="t", root_cause="race")
+
+    agent_mod.review_candidate(own, str(tmp_path), "log", context=FixContext(upstream_first=True))
+    assert "the patch is a fix written for this branch" in seen["prompt"]
+
+    agent_mod.review_candidate(own, str(tmp_path), "log", context=FixContext())
+    assert "written for this branch" not in seen["prompt"]
+def _stream(result: str, *, returncode: int = 1) -> SimpleNamespace:
+    """A session's stream as the CLI prints it: events, then the result."""
+    events = [{"type": "assistant", "message": {}}, {"type": "result", "subtype": "success", "result": result}]
+    return SimpleNamespace(stdout="\n".join(json.dumps(event) for event in events), stderr="", returncode=returncode)
+
+
+_UNAVAILABLE = "API Error: 503 Bedrock is unable to process your request. This is a server-side issue."
+
+
+@pytest.mark.parametrize(("result", "again"), [
+    (_UNAVAILABLE, True),
+    ("API Error: 429 Too many requests", True),
+    ("API Error: Connection error.", True),
+    ("API Error: 400 The prompt is too long", False),  # the request's own fault: it would fail again
+    ('{"action": "refuse"}', False),
+])
+def test_only_a_model_api_error_worth_another_try_is_one(result, again) -> None:
+    assert bool(agent_mod.api_error(_stream(result).stdout)) is again
+
+
+def test_a_fix_session_that_ended_on_a_model_api_error_says_so(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(agent_mod, "run_agent", lambda *_args, **_kwargs: _stream(_UNAVAILABLE))
+
+    with pytest.raises(agent_mod.ModelUnavailable, match="API Error: 503"):
+        agent_mod.run_fix_agent(_task(), str(tmp_path), "log")
+
+
+def test_a_review_that_ended_on_a_model_api_error_is_run_once_more(tmp_path, monkeypatch) -> None:
+    """The candidate has already passed its test: a 503 is no reason to throw the attempt away."""
+    from scripts.ci_fix.models import FixCandidate
+
+    sessions = iter([_stream(_UNAVAILABLE), _result({"approved": True, "reasoning": "fine"})])
+    prompts, slept = [], []
+    monkeypatch.setattr(agent_mod, "run_agent", lambda _profile, prompt, **_kw: prompts.append(prompt) or next(sessions))
+    monkeypatch.setattr(agent_mod.time, "sleep", slept.append)
+    candidate = FixCandidate(action=CandidateAction.PATCH, patch="diff", failing_check="t", root_cause="race")
+
+    approved, reasoning = agent_mod.review_candidate(candidate, str(tmp_path), "log", timeout=600)
+
+    assert approved and reasoning == "fine"
+    assert len(prompts) == 2 and prompts[0] == prompts[1] and slept == [60]
+
+    # Twice is a failed attempt, as any review that judged nothing is.
+    monkeypatch.setattr(agent_mod, "run_agent", lambda *_args, **_kwargs: _stream(_UNAVAILABLE))
+    with pytest.raises(RuntimeError, match="the review agent failed"):
+        agent_mod.review_candidate(candidate, str(tmp_path), "log")
 
 
 def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) -> None:

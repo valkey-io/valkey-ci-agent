@@ -79,6 +79,20 @@ def publish_candidate(
 
     if target.kind is TargetKind.SUGGEST:
         return _publish_suggestion(gh, task, candidate)
+    if candidate.not_run and candidate.action is CandidateAction.PATCH:
+        # A patch the bot wrote and could not run is never pushed: it is
+        # posted, for a person to apply. A port ran where it was merged.
+        if target.kind is TargetKind.DRAFT_PR:
+            return _publish_issue_comment(gh, task, candidate)
+        limit = target_capabilities(TargetKind.SUGGEST).patch_limit
+        if len(candidate.patch) > limit:
+            return _refused(
+                task,
+                candidate,
+                f"The fix could not be run here, so it was not pushed, and its {len(candidate.patch):,}-character "
+                f"patch is more than a comment holds ({limit:,}).",
+            )
+        return _publish_suggestion(gh, task, candidate)
     if target.kind is TargetKind.UPDATE_PR:
         return _publish_update(gh, task, candidate, git_env=git_env)
     if issue_publication is IssuePublication.COMMENT:
@@ -121,7 +135,10 @@ def _publish_suggestion(gh: Any, task: FixTask, candidate: FixCandidate) -> FixR
         return _refused(task, candidate, f"Not posting the suggestion: {rejection}.")
     return FixResult(
         kind=ResultKind.SUGGESTED,
-        summary="Prepared a patch for the PR author.",
+        summary=(
+            "Prepared a patch that could not be run here, so it was not pushed."
+            if candidate.not_run else "Prepared a patch for the PR author."
+        ),
         task=task,
         candidate=candidate,
     )

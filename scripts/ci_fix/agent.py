@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,32 +25,43 @@ from scripts.common.ai_output import extract_json_object
 from scripts.common.proc import git_output
 from scripts.common.text_utils import compact_text
 
+logger = logging.getLogger(__name__)
+
+# Of eleven fixes people merged for failures the bot replayed, eight changed
+# only tests or the test harness, two changed product source, and one patched
+# a vendored dependency and was turned down.
+_PREFER_TESTS = (
+    "Prefer a fix in the test or the test harness. Change product source only "
+    "when the failure cannot be fixed correctly anywhere else, and then say why "
+    "no test change would be right."
+)
+
 _POLICY = {
     FixPolicy.BACKPORT: (
-        "This is a backport branch. Port an already-merged upstream fix, or "
-        "make the smallest mechanical adaptation needed on the release "
-        "branch. Do not change product behavior. A change under .github/ is "
-        "allowed only when the CI definition itself is the cause, such as an "
-        "upstream CI fix the release branch lacks."
+        "This is a backport branch: keep the change as small as the failure "
+        f"allows, and do not hide a product defect or weaken a test. {_PREFER_TESTS} "
+        "A change under .github/ is allowed only when the CI definition itself "
+        "is the cause, such as an upstream CI fix the release branch lacks."
     ),
     FixPolicy.GENERAL: (
         "Fix the root cause with the smallest coherent source, test or build "
-        "change; never a workflow change. Do not hide a product defect or weaken a test."
+        f"change; never a workflow change. {_PREFER_TESTS} Do not hide a product "
+        "defect or weaken a test."
     ),
 }
 
-_UPSTREAM_ONLY = (
-    "Only a change already merged on the default branch is accepted for this "
-    "failure. Choose `port`; or, when the upstream commit does not apply as it "
-    "is, a `patch` that makes the same change adapted to this branch, with "
-    "`adapts_commit` set to that commit's full SHA. If no upstream commit fixes "
-    "this failure, choose `refuse` and say so: a fix the default branch does "
-    "not have, such as one for a flaky test it shares, belongs there first."
-)
-
-_OWN_PATHS = (
-    "One more kind of patch is accepted: one that changes only files this pull "
-    "request itself changes, to repair what the backport brought."
+_UPSTREAM_FIRST = (
+    "A change already merged on the default branch comes first. Choose `port`; "
+    "or, when the upstream commit does not apply as it is, a `patch` that makes "
+    "the same change adapted to this branch, with `adapts_commit` set to that "
+    "commit's full SHA. When no upstream commit fixes this failure, such as a "
+    "flaky test the default branch shares, write the fix here as a `patch` with "
+    "`adapts_commit` empty, and say in `validation` that the default branch "
+    "does not have it and whether it needs the same fix. On a release branch "
+    "that patch may change tests and the test harness only: product source "
+    "changes there only by a port or an adaptation of a merged upstream commit. "
+    "If the fix has to be in product source and upstream has none, choose "
+    "`refuse` and say what the default branch needs."
 )
 
 _PROMPT = """\
@@ -220,6 +235,38 @@ class AgentTimeout(RuntimeError):
     """The edit agent used its whole session without choosing an action."""
 
 
+class ModelUnavailable(RuntimeError):
+    """A session ended on a model API error, after the CLI's own retries: it judged nothing."""
+
+
+# Before a session that died on a model API error is run again.
+API_ERROR_PAUSE_S = 60
+_API_ERROR_RE = re.compile(r"API Error(?:: (\d{3}))?")
+
+
+def api_error(stdout: str) -> str:
+    """The model API error a session's last result reports, when running it again may work; else "".
+
+    Three of twenty-one concurrent sessions ended on "API Error: 503 Bedrock
+    is unable to process your request", five to fourteen minutes in. A 4xx
+    other than a rate limit is the request's own fault and would fail again.
+    """
+    for line in reversed(stdout.strip().splitlines()[-20:]):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not (isinstance(event, dict) and event.get("type") == "result"):
+            continue
+        text = str(event.get("result") or "").strip()
+        match = _API_ERROR_RE.match(text)
+        if match is None:
+            return ""
+        status = int(match.group(1) or 0)
+        return "" if 400 <= status < 500 and status != 429 else compact_text(text, 200)
+    return ""
+
+
 def run_fix_agent(
     task: FixTask,
     repo_dir: str,
@@ -249,8 +296,7 @@ def run_fix_agent(
             description=task.failure.description or "(none)",
             hint=task.failure.hint or "(none)",
             other_jobs=", ".join(task.failure.other_failed_jobs) or "(none)",
-            policy=_POLICY[task.policy] + (f"\n{_UPSTREAM_ONLY}" if context.upstream_only else "")
-            + (f" {_OWN_PATHS}" if context.own_paths else ""),
+            policy=_POLICY[task.policy] + (f"\n{_UPSTREAM_FIRST}" if context.upstream_first else ""),
             target=capabilities.publication_guidance,
             context=_context_prompt(context, Path(log_dir), allows_port),
             test_guidance=(
@@ -270,6 +316,9 @@ def run_fix_agent(
             timeout=timeout,
         )
     if result.returncode != 0:
+        unavailable = api_error(result.stdout)
+        if unavailable:
+            raise ModelUnavailable(f"the fix agent's session ended on a model API error ({unavailable})")
         error = AgentTimeout if result.stderr.startswith("timeout") else RuntimeError
         raise error(
             f"CI-fix agent failed with exit code {result.returncode}: "
@@ -465,9 +514,14 @@ def review_candidate(
             adapted = Path(log_dir) / "adapted-commit.diff"
             adapted.write_text(_adapted_diff(repo_dir, candidate), encoding="utf-8")
             origin = (
-                "This branch takes only changes already merged upstream. The patch says it adapts upstream "
-                f"commit {candidate.adapts}, whose diff to the same files is in {adapted}: reject anything in "
-                "the patch that is not that commit's change, or the least needed to apply it here.\n"
+                f"The patch says it adapts upstream commit {candidate.adapts}, whose diff to the same files is "
+                f"in {adapted}: reject anything in the patch that is not that commit's change, or the least "
+                "needed to apply it here.\n"
+            )
+        elif context.upstream_first and candidate.action is CandidateAction.PATCH:
+            origin = (
+                "This is a release branch, and no commit on the default branch was found to fix the failure: "
+                "the patch is a fix written for this branch. Reject a change larger than the failure needs.\n"
             )
         # What code ran and found, for a verified candidate; else what it planned.
         checked = candidate.verification or context.verification
@@ -482,19 +536,22 @@ def review_candidate(
                 f"Judge test changes against this repository's conventions in {guide_path}: "
                 "a fixed sleep replacing a race, or a skip tag instead of a fix, is a rejection.\n"
             )
-        result = run_agent(
-            "ci_fix_review",
-            _REVIEW_PROMPT.format(
-                stance=_REVIEW_A_PORT if ported else _REVIEW_A_PATCH,
-                log_path=log_path, failing_check=candidate.failing_check,
-                root_cause=candidate.root_cause or "(not given)", reasoning=candidate.reasoning or "(not given)",
-                notes=candidate.validation or "(none)", patch=candidate.patch,
-                origin=origin, verification=verification, guide=guide,
-            ),
-            cwd=repo_dir,
-            timeout=timeout,
-            extra_dirs=(log_dir,),
+        prompt = _REVIEW_PROMPT.format(
+            stance=_REVIEW_A_PORT if ported else _REVIEW_A_PATCH,
+            log_path=log_path, failing_check=candidate.failing_check,
+            root_cause=candidate.root_cause or "(not given)", reasoning=candidate.reasoning or "(not given)",
+            notes=candidate.validation or "(none)", patch=candidate.patch,
+            origin=origin, verification=verification, guide=guide,
         )
+        started = time.monotonic()
+        result = run_agent("ci_fix_review", prompt, cwd=repo_dir, timeout=timeout, extra_dirs=(log_dir,))
+        unavailable = api_error(result.stdout) if result.returncode != 0 else ""
+        if unavailable:
+            # The review changes nothing, and the candidate it was judging has already passed its test.
+            logger.warning("The review ended on a model API error (%s): running it once more", unavailable)
+            time.sleep(API_ERROR_PAUSE_S)
+            left = None if timeout is None else max(60, timeout - int(time.monotonic() - started))
+            result = run_agent("ci_fix_review", prompt, cwd=repo_dir, timeout=left, extra_dirs=(log_dir,))
     # A review that crashed, timed out, or gave no verdict judged nothing: the
     # attempt failed, and is retried, rather than the patch being rejected.
     if result.returncode != 0:

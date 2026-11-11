@@ -35,7 +35,9 @@ def render_result(result: FixResult) -> str:
     if result.kind is ResultKind.SUGGESTED:
         body = [
             f"A suggested fix for {job}, prepared against `{result.task.target.expected_sha[:12]}`. "
-            "Nothing was pushed to this branch.",
+            + ("The bot could not run the failing check, so nothing was pushed to this branch."
+               if result.candidate is not None and result.candidate.not_run
+               else "Nothing was pushed to this branch."),
             "",
         ]
         body += _context(result)

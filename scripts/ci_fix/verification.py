@@ -495,14 +495,15 @@ def build_plan(job: JobCommands) -> VerifyPlan:
 def upstream_plan(job: JobCommands | None) -> VerifyPlan:
     """The plan for a failure no command here can run: the build alone.
 
-    For a change already merged upstream only (the engine accepts nothing
-    else with this plan): the default branch's CI ran it there, and the pull
-    request's own CI runs the failing check here.
+    A change already merged upstream ran in the default branch's CI, and the
+    pull request's own CI runs the failing check here. A patch written here
+    has run nowhere, and is not pushed (``scripts/ci_fix/publish.py``).
     """
     return VerifyPlan(
         build=_one_line_build(job.build if job is not None and job.build else "make"), test="", build_only=True,
-        notes=("No command here can run the failing check, so code only checks that the change builds; "
-               "the pull request's own CI runs the check.",),
+        notes=("No command here can run the failing check, so code only checks that the change builds. "
+               "A port of a merged upstream commit is pushed, for the pull request's own CI to run the check; "
+               "a patch written here is posted for a person to apply, not pushed.",),
     )
 
 

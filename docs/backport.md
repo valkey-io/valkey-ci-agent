@@ -125,13 +125,15 @@ listed in `ci_followup_ignored_jobs` and never touched. Checks that come from
 other GitHub Apps, like DCO and Codecov, aren't workflow jobs and are never
 considered.
 
-A backport usually fails because it depends on an earlier change the release
-branch doesn't have, so on a backport branch the fixer only takes changes
-that are already merged on `unstable`: it ports the commit, or adapts it when
-it doesn't apply as it is. It does not write a fix of its own for a test that
-is flaky on `unstable` too; that fix belongs on `unstable` first. The one
-exception is a backport that broke the build, which has no upstream commit to
-port and is repaired where it broke.
+A backport often fails because it depends on an earlier change the release
+branch doesn't have, so on a backport branch the fixer first looks for a
+change that is already merged on `unstable`: it ports the commit, or adapts
+it when it doesn't apply as it is. Where no upstream commit fixes the
+failure, such as a test that is flaky on `unstable` too, it writes the fix on
+the backport branch, and its comment says that `unstable` does not have it.
+Such a fix may change tests and the test harness only: server code changes on
+a backport branch only by a commit merged on `unstable`. A fix the bot could
+not run is posted as a patch in a comment, never pushed.
 
 ## Suggesting backports
 
