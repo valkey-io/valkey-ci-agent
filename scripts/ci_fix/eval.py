@@ -2,17 +2,18 @@
 
 The cases are in ``eval_cases.yml``: one exact failed job each, and the fix a
 person merged or proposed for it. A replay runs the same engine a real fix
-does, and stops before publication:
+does, through ``ci-fix-run.yml``, and stops before publication:
 
-1. ``plan``: build the case's :class:`FixPlan` and download its job log. A
-   case on the default branch is planned as of its failed commit
+1. plan: this module is the ``eval`` front door of ``scripts.ci_fix.run``
+   (:func:`plan_request`). The failed job is resolved from its own workflow
+   file like any other, so the fix is prepared inside that job where it can
+   be. A case on the default branch is planned as of its failed commit
    (``FixTask.as_of_failure``), so the fix that landed later is not found.
-2. the fix itself: ``python -m scripts.ci_fix.run fix``, unchanged.
+2. the fix itself, unchanged.
 3. ``score``: compare the candidate with the known fix.
 
-Nothing is published. An eval plan comes from :attr:`FrontDoor.EVAL`, which
-``scripts.ci_fix.run`` refuses to publish, and ``ci-fix-eval.yml`` has no job
-that holds a token that could.
+Nothing is published. ``scripts.ci_fix.run`` refuses to publish a plan from
+:attr:`FrontDoor.EVAL`, and ``ci-fix-run.yml`` skips its publish job for one.
 
 A score is ``match`` (the known port, or a patch that is mostly the known
 fix's lines), ``differs`` (another change: a person has to read it, since a
@@ -43,22 +44,23 @@ from scripts.ci_fix.models import (
     FixOutcome,
     FixPlan,
     FixPolicy,
+    FixResult,
     FixTarget,
     FixTask,
     FrontDoor,
     TargetKind,
 )
-from scripts.ci_fix.run import OUTCOME_FILE, PLAN_FILE
 from scripts.ci_fix.state import load, save
 from scripts.common.git_clone import is_full_sha
 from scripts.common.github_client import retry_github_call
 from scripts.common.valkey_ci import Source
-from scripts.common.workflow_artifacts import ArtifactClient
 
 logger = logging.getLogger(__name__)
 
 CASES_FILE = Path(__file__).resolve().parent / "eval_cases.yml"
 SCORE_FILE = "score.json"
+# scripts.ci_fix.run's OUTCOME_FILE; that module imports this one.
+_OUTCOME_FILE = "outcome.json"
 _ID_RE = re.compile(r"[a-z0-9][a-z0-9.-]*")
 # A patch is the known fix when at least this share of the lines it adds are
 # that fix's: the bar a patch that adapts an upstream commit has to clear.
@@ -181,6 +183,24 @@ def plan_case(case: Case, job_log: str) -> FixPlan:
     return FixPlan(front_door=FrontDoor.EVAL, task=task, job_log=job_log)
 
 
+def plan_request(gh: Any, artifact_client: Any, request: dict[str, Any], *, bot_login: str = "") -> FixPlan:  # noqa: ARG001
+    """The plan for ``request`` (``{"case": id}``), as the ``eval`` front door of ``scripts.ci_fix.run``."""
+    case_id = str(request.get("case") or "")
+    cases = load_cases()
+    if case_id not in cases:
+        raise ValueError(f"no eval case {case_id!r}; the cases are: {', '.join(cases)}")
+    case = cases[case_id]
+    job_log = str(artifact_client.download_job_log(case.repo, case.job_id) or "")
+    if not job_log.strip():
+        raise ValueError(f"the log of job {case.job_id} is gone: eval case {case.id!r} has aged out")
+    return plan_case(case, job_log)
+
+
+def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:  # noqa: ARG001
+    """A replay reports nowhere: its result is the fix job's outcome, which ``score`` reads."""
+    return {"repo": plan.task.failure.repo_full_name, "action": result.kind.value, "summary": result.summary}
+
+
 def score_case(case: Case, outcome: FixOutcome, known: tuple[tuple[str, ...], str] = ((), "")) -> Score:
     """Compare ``outcome`` with ``case``'s known fix; ``known`` is a known pull request's files and patch."""
     expected = f"port of `{case.expect_port[:12]}`" if case.expect_port else f"pull request #{case.expect_pull}"
@@ -270,11 +290,11 @@ def render_score(case: Case, score: Score, outcome: FixOutcome, known_patch: str
     return "\n".join(lines) + "\n"
 
 
-def _github() -> tuple[Github, str]:
+def _github() -> Github:
     token = os.environ.get("TARGET_TOKEN", "")
     if not token:
         raise SystemExit("TARGET_TOKEN is required: any token that can read the case's repository")
-    return Github(auth=Auth.Token(token)), token
+    return Github(auth=Auth.Token(token))
 
 
 def _case(case_id: str) -> Case:
@@ -288,9 +308,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("list", help="print the cases")
-    plan_ = commands.add_parser("plan", help="write a case's plan, with its job log")
-    plan_.add_argument("--case", required=True)
-    plan_.add_argument("--out", required=True, type=Path)
     score_ = commands.add_parser("score", help="compare a replay's outcome with the known fix")
     score_.add_argument("--case", required=True)
     score_.add_argument("--outcome", required=True, type=Path, help="the directory the fix wrote its outcome to")
@@ -304,16 +321,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     case = _case(args.case)
-    gh, token = _github()
-    if args.command == "plan":
-        job_log = ArtifactClient(gh, token=token).download_job_log(case.repo, case.job_id)
-        if not job_log.strip():
-            raise SystemExit(f"the log of job {case.job_id} is gone: eval case {case.id!r} has aged out")
-        save(args.out / PLAN_FILE, plan_case(case, job_log))
-        return 0
-
+    gh = _github()
     try:
-        outcome = load(args.outcome / OUTCOME_FILE, FixOutcome)
+        outcome = load(args.outcome / _OUTCOME_FILE, FixOutcome)
     except FileNotFoundError:
         outcome = FixOutcome(error="the fix job ended without a result")
     known = pull_request_change(gh, case) if case.expect_pull else ((), "")

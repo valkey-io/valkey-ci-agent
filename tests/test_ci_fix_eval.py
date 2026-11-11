@@ -151,70 +151,89 @@ def test_the_report_shows_both_changes_and_a_known_gap():
     assert "<summary>The bot's patch</summary>" in report and "<summary>The known fix</summary>" in report
 
 
-def _run_cli(monkeypatch, tmp_path, *argv, log="the log", files=()):
-    monkeypatch.setenv("TARGET_TOKEN", "t")
-    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+def _artifacts(log: str = "the log") -> SimpleNamespace:
+    return SimpleNamespace(download_job_log=lambda *_args: log)
+
+
+def test_a_replay_is_planned_by_the_production_planner_and_never_published(tmp_path, monkeypatch):
+    """The eval is a front door of scripts.ci_fix.run: the same plan step, then the same fix jobs."""
     monkeypatch.setattr(eval_mod, "load_cases", lambda: {"c": _case()})
-    monkeypatch.setattr(eval_mod, "Github", lambda **_kwargs: SimpleNamespace(
-        get_repo=lambda _name: SimpleNamespace(get_pull=lambda _n: SimpleNamespace(get_files=lambda: list(files)))))
-    monkeypatch.setattr(eval_mod, "ArtifactClient", lambda *_a, **_k: SimpleNamespace(download_job_log=lambda *_x: log))
-    return eval_mod.main(list(argv))
+    monkeypatch.setattr(run_mod, "job_for", lambda _gh, _task: None)  # this job cannot host its fix
 
+    outputs = run_mod.plan(object(), _artifacts(), FrontDoor.EVAL, {"case": "c"}, bot_login="bot", out=tmp_path)
 
-def test_plan_writes_a_plan_the_fix_job_reads_and_nothing_publishes(tmp_path, monkeypatch):
-    assert _run_cli(monkeypatch, tmp_path, "plan", "--case", "c", "--out", str(tmp_path)) == 0
-
+    assert outputs["mode"] == "local"
     plan = load(tmp_path / run_mod.PLAN_FILE, FixPlan)
     assert plan.front_door is FrontDoor.EVAL and plan.job_log == "the log" and plan.task.as_of_failure
-
     # The publish step refuses it before it reads an outcome or touches GitHub.
     with pytest.raises(ValueError, match="never published"):
         run_mod.publish_and_report(object(), tmp_path, tmp_path, git_env={}, run_url="u")
-    with pytest.raises(SystemExit):
-        run_mod.main(["plan", "--front-door", "eval", "--request", "{}", "--out", str(tmp_path)])
 
 
-def test_a_case_whose_log_is_gone_says_it_has_aged_out(tmp_path, monkeypatch):
-    with pytest.raises(SystemExit, match="aged out"):
-        _run_cli(monkeypatch, tmp_path, "plan", "--case", "c", "--out", str(tmp_path), log="")
-    with pytest.raises(SystemExit, match="no eval case 'missing'"):
-        _run_cli(monkeypatch, tmp_path, "plan", "--case", "missing", "--out", str(tmp_path))
+def test_a_case_whose_log_is_gone_says_it_has_aged_out(monkeypatch):
+    monkeypatch.setattr(eval_mod, "load_cases", lambda: {"c": _case()})
+
+    with pytest.raises(ValueError, match="aged out"):
+        eval_mod.plan_request(object(), _artifacts(""), {"case": "c"})
+    with pytest.raises(ValueError, match="no eval case 'missing'"):
+        eval_mod.plan_request(object(), _artifacts(), {"case": "missing"})
+
+
+def test_a_replay_that_could_not_be_planned_reports_nowhere():
+    plan = plan_case(_case(), "log")
+    result = SimpleNamespace(kind=SimpleNamespace(value="failed"), summary="planning failed")
+
+    assert eval_mod.report_result(pytest.fail, plan, result) == {
+        "repo": "o/r", "action": "failed", "summary": "planning failed",
+    }
+
+
+def _score_cli(monkeypatch, *argv, files=()):
+    monkeypatch.setenv("TARGET_TOKEN", "t")
+    monkeypatch.setattr(eval_mod, "load_cases", lambda: {"c": _case()})
+    monkeypatch.setattr(eval_mod, "Github", lambda **_kwargs: SimpleNamespace(
+        get_repo=lambda _name: SimpleNamespace(get_pull=lambda _n: SimpleNamespace(get_files=lambda: list(files)))))
+    return eval_mod.main(["score", "--case", "c", *argv])
 
 
 def test_score_reads_the_fix_jobs_outcome_and_the_known_pull_request(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     save(tmp_path / "result" / run_mod.OUTCOME_FILE, _patch("if (error == EINPROGRESS || error == EISCONN) {"))
     known = [SimpleNamespace(filename="src/net.c", patch=_KNOWN[1])]
     summary = tmp_path / "summary.md"
 
-    _run_cli(monkeypatch, tmp_path, "score", "--case", "c", "--outcome", str(tmp_path / "result"),
-             "--out", str(tmp_path / "score"), files=known)
+    _score_cli(monkeypatch, "--outcome", str(tmp_path / "result"), "--out", str(tmp_path / "score"), files=known)
     assert load(tmp_path / "score" / eval_mod.SCORE_FILE, eval_mod.Score).verdict == "match"
     assert "**match**" in capsys.readouterr().out
 
     # A fix job that crashed left no outcome: that is a score, and it reaches the run's summary.
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
-    monkeypatch.setattr(eval_mod, "load_cases", lambda: {"c": _case()})
-    eval_mod.main(["score", "--case", "c", "--outcome", str(tmp_path / "nothing"), "--out", str(tmp_path / "score")])
+    _score_cli(monkeypatch, "--outcome", str(tmp_path / "nothing"), "--out", str(tmp_path / "score"))
     assert load(tmp_path / "score" / eval_mod.SCORE_FILE, eval_mod.Score).verdict == "failed"
     assert "**failed**" in summary.read_text(encoding="utf-8")
 
 
-def test_the_eval_workflow_can_write_nowhere():
-    """No job holds a token that can write to the target, and the fix job holds no GitHub token at all."""
+def test_the_eval_runs_the_production_fix_and_can_write_nowhere():
+    """It calls ci-fix-run.yml, so a replay is prepared inside the failed job like a real fix.
+
+    Three things keep it from publishing: the App's secrets are not passed, the shared run plans a
+    replay with the workflow's own read-only token and skips its publish job, and run.py refuses.
+    """
     text = Path(".github/workflows/ci-fix-eval.yml").read_text(encoding="utf-8")
     workflow = yaml.load(text, Loader=yaml.BaseLoader)
 
     assert set(workflow["on"]) == {"workflow_dispatch"} and workflow["permissions"] == {}
-    assert set(workflow["jobs"]) == {"plan", "fix", "score"}
-    # No App token, and not the shared fix run, which ends in a publish job.
-    assert "create-github-app-token" not in text and "uses: ./.github/workflows/" not in text
-    for name, job in workflow["jobs"].items():
-        assert all(access == "read" or (name, scope) == ("fix", "id-token") for scope, access in job["permissions"].items())
-    fix = yaml.safe_dump(workflow["jobs"]["fix"])
-    assert "TOKEN" not in fix and "github.token" not in fix and "secrets.AWS_ROLE_ARN" in fix
-    assert "scripts.ci_fix.run publish" not in text
+    assert set(workflow["jobs"]) == {"fix", "score"}
+    fix = workflow["jobs"]["fix"]
+    assert fix["uses"] == "./.github/workflows/ci-fix-run.yml" and fix["with"]["front_door"] == "eval"
+    assert fix["secrets"] == {"AWS_ROLE_ARN": "${{ secrets.AWS_ROLE_ARN }}"}
+    assert fix["permissions"] == {"actions": "read", "contents": "read", "id-token": "write"}
+    assert workflow["jobs"]["score"]["permissions"] == {"contents": "read"}
+    assert "create-github-app-token" not in text and "scripts.ci_fix.run publish" not in text
 
-    # Its fix job is the production one, step for step.
-    production = yaml.load(Path(".github/workflows/ci-fix-run.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-    names = lambda job: [step.get("name") for step in job["steps"]]  # noqa: E731
-    assert names(workflow["jobs"]["fix"]) == names(production["jobs"]["fix-local"])
+    shared = yaml.load(Path(".github/workflows/ci-fix-run.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    assert "inputs.front_door != 'eval'" in shared["jobs"]["publish"]["if"]
+    token = next(step for step in shared["jobs"]["plan"]["steps"] if step.get("id") == "target-token")
+    assert token["if"] == "inputs.front_door != 'eval'"
+    # A real fix still plans and publishes with the App: only its secrets stopped being required of a replay.
+    assert shared["on"]["workflow_call"]["secrets"]["AWS_ROLE_ARN"] == {"required": "true"}

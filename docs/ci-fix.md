@@ -280,10 +280,19 @@ gh workflow run ci-fix-issue-dispatch.yml --repo valkey-io/valkey-ci-agent --fie
 
 `scripts/ci_fix/eval_cases.yml` lists failures whose fix is known: the
 upstream commit a backport branch should have taken, or the pull request a
-person wrote. The **CI Fix Eval** workflow replays one of them through the
-same engine and compares what the bot prepares with that fix. Nothing is
-published: the workflow has no publish job and no token that could write to
-Valkey, and the publish step refuses an eval plan.
+person wrote. The **CI Fix Eval** workflow replays one of them and compares
+what the bot prepares with that fix.
+
+A replay runs through `ci-fix-run.yml` exactly as a real fix does. The failed
+job is read from Valkey's own workflow file, and the fix is prepared inside a
+copy of that job: on its macOS or Ubuntu runner, in its container, with its
+own setup, build and test commands. Nothing of Valkey's CI is copied into
+this repository. A job that can't host the fix falls back to the bot's runner,
+as it does for a real fix.
+
+Nothing is published. The eval doesn't pass the App's secrets, `ci-fix-run.yml`
+plans a replay with the workflow's own read-only token and skips its publish
+job, and the publish step refuses an eval plan.
 
 ```bash
 gh workflow run ci-fix-eval.yml --repo valkey-io/valkey-ci-agent --field case=sanitizer-leak-8.1
@@ -292,22 +301,17 @@ gh workflow run ci-fix-eval.yml --repo valkey-io/valkey-ci-agent --field case=sa
 The run's summary gives a verdict and both changes to read. `match` means the
 bot took the known commit, or wrote a patch that is mostly the known fix's
 lines. `differs` means it changed something else, which a person has to read,
-because a different fix can be right. `refused` and `failed` are what they
-say. A case's `gap` says what the bot lacks for it, such as a failure
-nothing here can run, whose fix is reviewed but not run.
+because a different fix can be right; the summary says how many of the lines
+the known fix replaces the bot's patch replaces too. `refused` and `failed`
+are what they say. A case's `gap` says what the bot lacks for it, such as a
+failure nothing here can run, whose fix is reviewed but not run.
 
 A case on `unstable` is replayed as of the commit that failed, so the fix
-that landed afterwards isn't there for the bot to find. The fix runs on the
-bot's own runner, not inside the failed job, so a case that only fails on
-another platform is judged on what the bot writes, not on its verification.
-A case lasts as long as GitHub keeps its job log, which is 90 days.
+that landed afterwards isn't there for the bot to find. A case lasts as long
+as GitHub keeps its job log, which is 90 days.
 
-The workflow needs `AWS_ROLE_ARN`, and a token that can read the case's
-repository in `CI_FIX_EVAL_TOKEN`, because GitHub serves job logs only to a
-signed-in caller. Each run is one model session of up to a few hours.
-Where the role grants a session shorter than five hours, set the repository
-variable `CI_FIX_AWS_SESSION_SECONDS` to what it grants, and the fix fits its
-time budget inside that.
+The workflow needs `AWS_ROLE_ARN`, with a role that grants a five-hour
+session. Each run is one model session of up to a few hours.
 
 To add a case, copy one in `eval_cases.yml` and fill in the run, the failed
 job's id and name, the commit that failed, and the known fix.

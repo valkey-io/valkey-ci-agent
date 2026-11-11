@@ -32,6 +32,7 @@ from typing import Any, Callable
 from github import Auth, Github, GithubException
 
 from scripts.backport import ci_followup
+from scripts.ci_fix import eval as replay
 from scripts.ci_fix import issues
 from scripts.ci_fix import main as pr_command
 from scripts.ci_fix.ci_job import JobSpec, Unsupported, resolve, setup_script, workflow_source
@@ -73,6 +74,8 @@ _FRONT_DOORS: dict[FrontDoor, tuple[Planner, Reporter]] = {
     FrontDoor.ISSUE: (issues.plan_request, issues.report_result),
     FrontDoor.PR: (pr_command.plan_request, pr_command.report_result),
     FrontDoor.FOLLOW_UP: (ci_followup.plan_request, ci_followup.report_result),
+    # Planned and prepared like the others; never published (publish_and_report).
+    FrontDoor.EVAL: (replay.plan_request, replay.report_result),
 }
 
 
@@ -212,9 +215,9 @@ def publish_and_report(
 ) -> dict[str, Any]:
     """Publish the fix job's candidate, or the reason there is none, and report it."""
     fix_plan = load(plan_dir / PLAN_FILE, FixPlan)
-    if fix_plan.front_door not in _FRONT_DOORS:
+    if fix_plan.front_door is FrontDoor.EVAL:
         # A replayed failure (scripts/ci_fix/eval.py) is scored, never published.
-        raise ValueError(f"a plan from the {fix_plan.front_door.value} front door is never published")
+        raise ValueError("a replayed failure is never published")
     try:
         outcome = load(outcome_dir / OUTCOME_FILE, FixOutcome)
     except FileNotFoundError:

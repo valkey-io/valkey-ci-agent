@@ -100,9 +100,6 @@ TEST_TIMEOUT_S = 30 * 60
 # budget runs low.
 AWS_SESSION_S = 5 * 60 * 60
 PREPARE_BUDGET_S = 4 * 60 * 60 + 30 * 60
-# The session a job actually got, when its role grants less than
-# ``AWS_SESSION_S`` (ci-fix-eval.yml sets it from a repository variable).
-SESSION_ENV = "CI_FIX_AWS_SESSION_SECONDS"
 _MIN_ROUND_S = 8 * 60
 # Of each round's time, what the agent may not use: the candidate's
 # verification (looped tests, possibly under valgrind) and review come after it.
@@ -171,7 +168,7 @@ def prepare_fix(
     job_log = bounded_job_log(job_log)
 
     with checkout(task, repo_dir) as (repo_dir, original_head):
-        deadline = time.monotonic() + prepare_budget()
+        deadline = time.monotonic() + PREPARE_BUDGET_S
         runs_tests = task.target.kind is not TargetKind.SUGGEST
         run_test = test_func or run_test_command
         tests = locate_unit_tests(repo_dir, failed_tests(task, job_log))
@@ -188,14 +185,6 @@ def prepare_fix(
             agent_func=agent_func, review=review_func or review_candidate,
             run_test=run_test if runs_tests and plan is not None else None, deadline=deadline, job=job, tests=tests,
         )
-
-
-def prepare_budget() -> int:
-    """The seconds a preparation may take: inside the model's AWS session, by the usual margin."""
-    session = os.environ.get(SESSION_ENV, "").strip()
-    if not session.isdigit():
-        return PREPARE_BUDGET_S
-    return min(PREPARE_BUDGET_S, int(session) - (AWS_SESSION_S - PREPARE_BUDGET_S))
 
 
 def _unverifiable_refusal(context: FixContext, plan: VerifyPlan | None) -> FixCandidate | None:
@@ -222,6 +211,8 @@ def checkout(task: FixTask, repo_dir: str = "") -> Iterator[tuple[str, str]]:
         head = git_output(repo_dir, "rev-parse", "HEAD").strip()
         if head.lower() != checkout_sha.lower():
             raise RuntimeError(f"the job checked out {head[:12]} instead of {checkout_sha[:12]}")
+        if task.as_of_failure:
+            _hold_default_branch(repo_dir)
         _keep_existing(repo_dir)
         yield repo_dir, head
         return

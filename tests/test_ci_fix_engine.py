@@ -130,21 +130,6 @@ def test_the_budget_fits_the_aws_session_and_leaves_a_round_after_verification()
     assert engine_mod.PREPARE_BUDGET_S - engine_mod._VERIFY_RESERVE_S >= engine_mod._MIN_ROUND_S
 
 
-def test_a_shorter_aws_session_shortens_the_budget_by_the_same_margin(monkeypatch) -> None:
-    """A role that grants three hours, not five: the preparation still ends inside the session."""
-    margin = engine_mod.AWS_SESSION_S - engine_mod.PREPARE_BUDGET_S
-    monkeypatch.delenv(engine_mod.SESSION_ENV, raising=False)
-    assert engine_mod.prepare_budget() == engine_mod.PREPARE_BUDGET_S
-
-    monkeypatch.setenv(engine_mod.SESSION_ENV, "10800")
-    assert engine_mod.prepare_budget() == 10800 - margin
-    # Never more than the usual budget, and an unset repository variable (an empty value) changes nothing.
-    monkeypatch.setenv(engine_mod.SESSION_ENV, "43200")
-    assert engine_mod.prepare_budget() == engine_mod.PREPARE_BUDGET_S
-    monkeypatch.setenv(engine_mod.SESSION_ENV, "")
-    assert engine_mod.prepare_budget() == engine_mod.PREPARE_BUDGET_S
-
-
 def test_prepare_fix_binds_exact_job_and_builds_binary_patch(tmp_path, monkeypatch) -> None:
     source, head_sha = _source_repo(tmp_path)
     clone_calls = _install_clone(monkeypatch, source)
@@ -1025,6 +1010,15 @@ def test_a_replayed_failure_does_not_find_the_fix_that_landed_after_it(tmp_path,
     # A real fix sees the default branch as it is.
     engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
     assert seen["default"] == commit
+
+    # Inside the failed job's own checkout as well, where a replay runs when the job can host it.
+    job = tmp_path / "job"
+    git(tmp_path, "clone", "-q", str(source), str(job))
+    git(job, "checkout", "-q", "--detach", head_sha)
+    git(job, "update-ref", "refs/remotes/origin/main", commit)
+    git(job, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    engine_mod.prepare_fix(task, _LOG, agent_func=agent, repo_dir=str(job))
+    assert seen["default"] == head_sha
 
 
 # --- where only a change already merged upstream is accepted ------------------
