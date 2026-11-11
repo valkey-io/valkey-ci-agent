@@ -455,12 +455,15 @@ def resolve_conflicts_with_claude(
     retry_files_list = "\n".join(
         f"- `{cf.path}`: {err}" for cf, err in needs_retry
     )
+    # A new session, which knows nothing of the first: the task again, then
+    # where it stands.
     retry_prompt = (
-        "Your previous resolution(s) failed validation:\n\n"
+        f"{prompt}\n\n"
+        "## Where this stands\n\n"
+        "An earlier session worked on this cherry-pick, and its edits are in the "
+        "working tree: keep them. These files still failed validation:\n\n"
         f"{retry_files_list}\n\n"
-        "Fix only the listed conflict files. Keep any already-made edits "
-        "inside the allowed cherry-pick file set. Do NOT edit any other files. "
-        "Do NOT run `git add` or `git commit`."
+        "Finish those files, under the constraints above."
     )
     retry_result = run_agent("conflict_resolve_edit_only", retry_prompt, cwd=repo_dir)
     retry_summary = _agent_result_text(retry_result.stdout)

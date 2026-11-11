@@ -3734,6 +3734,43 @@ def test_validation_repair_prompt_is_narrowly_scoped():
     assert "Read tool" in prompt
 
 
+def test_the_repair_agent_is_shown_what_the_backport_changed(tmp_path):
+    """It has no shell: the commits the branch brought and their diff are a file it reads."""
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "8.1")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    (tmp_path / "a.c").write_text("int old;\n", encoding="utf-8")
+    git("add", "a.c")
+    git("commit", "-q", "-m", "base")
+    git("branch", "base")
+    (tmp_path / "a.c").write_text("int fixed;\n", encoding="utf-8")
+    git("commit", "-q", "-am", "Fix the thing (#42)")
+    seen = {}
+
+    def fake_run_agent(_profile, prompt, *, cwd):  # noqa: ARG001
+        path = next(word for word in prompt.split() if word.endswith(".diff"))
+        seen.update(prompt=prompt, path=path, changes=Path(path).read_text(encoding="utf-8"))
+        return SimpleNamespace(returncode=0, stderr="")
+
+    repair_validation_failure_with_claude(
+        str(tmp_path), "8.1", ["make"], [], "compiler error", base_ref="base",
+        run_git=lambda *_args, **_kwargs: None,
+        run_agent_func=fake_run_agent,
+        validate_func=lambda *_args, **_kwargs: (True, "ok"),
+        changed_paths_func=lambda *_args: ("a.c",),
+        changed_paths_since_base_func=lambda *_args, **_kwargs: ("a.c",),
+        has_staged_changes_func=lambda *_args: True,
+    )
+
+    assert "Fix the thing (#42)" in seen["changes"]
+    assert "-int old;" in seen["changes"] and "+int fixed;" in seen["changes"]
+    assert "You cannot run git" in seen["prompt"]
+    assert not Path(seen["path"]).exists()  # removed with the attempt
+
+
 def test_repair_validation_failure_invokes_edit_only_agent(monkeypatch):
     agent_calls: list[tuple[str, str, str]] = []
     git_calls: list[tuple[str, ...]] = []

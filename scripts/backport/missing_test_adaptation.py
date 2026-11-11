@@ -121,20 +121,22 @@ def adapt_target_missing_tests_with_claude(
             run_process=run_process,
         )
     ) - excluded
-    prompt = build_test_adaptation_prompt(
-        repo_dir,
-        candidate,
-        missing_test_sources,
-        language=language,
-        test_path_patterns=test_path_patterns,
-        excluded_test_paths=excluded,
-        run_process=run_process,
-    )
 
     try:
         with tempfile.TemporaryDirectory(
             prefix="valkey-test-adaptation-",
         ) as temp_dir:
+            prompt = build_test_adaptation_prompt(
+                repo_dir,
+                candidate,
+                missing_test_sources,
+                language=language,
+                test_path_patterns=test_path_patterns,
+                excluded_test_paths=excluded,
+                run_process=run_process,
+                # Beside the sandbox, not in it: nothing there is part of the adaptation.
+                context_dir=Path(temp_dir, "upstream"),
+            )
             sandbox_dir = Path(temp_dir, "repo")
             copy_worktree_for_adaptation(repo_dir, sandbox_dir)
             for path in sorted(excluded):
@@ -308,12 +310,13 @@ def build_test_adaptation_prompt(
     test_path_patterns: tuple[str, ...] | list[str] | None = None,
     excluded_test_paths: Iterable[str] = (),
     run_process: RunProcess = subprocess.run,
+    context_dir: Path | None = None,
 ) -> str:
     excluded = set(excluded_test_paths)
     source_sections = "\n\n".join(
         f"### Missing upstream test or harness file: {path}\n"
-        f"```\n{content[:MAX_TEST_CONTEXT_CHARS]}\n```"
-        for path, content in sorted(missing_test_sources.items())
+        f"```\n{_shown(content, index, path, context_dir)}\n```"
+        for index, (path, content) in enumerate(sorted(missing_test_sources.items()))
     )
     existing_tests = "\n".join(
         f"- {path}"
@@ -351,6 +354,27 @@ def build_test_adaptation_prompt(
         f"- If equivalent branch-native coverage is not practical, make no file "
         f"changes and explain that in your final result.\n\n"
         f"Do not wrap output in markdown. Edit files directly when safe."
+    )
+
+
+def _shown(content: str, index: int, path: str, context_dir: Path | None) -> str:
+    """``content`` as the prompt shows it: whole, or its start and where the whole text is.
+
+    The start alone was the first 12,000 characters, with nothing to say that
+    a longer test file went on: the agent was asked for equivalent coverage of
+    tests it never saw.
+    """
+    if len(content) <= MAX_TEST_CONTEXT_CHARS:
+        return content
+    shown = content[:MAX_TEST_CONTEXT_CHARS]
+    if context_dir is None:
+        return f"{shown}\n[... cut here: {len(content) - len(shown):,} more characters are not shown ...]"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    whole = context_dir / f"{index:02d}-{Path(path).name}"
+    whole.write_text(content, encoding="utf-8")
+    return (
+        f"{shown}\n[... cut here: this is the first {len(shown):,} of {len(content):,} characters. "
+        f"Read the whole text at {whole} before you decide what coverage to add ...]"
     )
 
 

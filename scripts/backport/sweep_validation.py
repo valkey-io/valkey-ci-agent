@@ -308,6 +308,7 @@ def repair_validation_failure_with_claude(
     changed_paths_func: ChangedPaths = worktree_changed_paths,
     changed_paths_since_base_func: ChangedPathsSinceBase = changed_paths_since_base,
     has_staged_changes_func: HasStagedChanges = has_staged_changes,
+    backport_changes_func: Callable[[str, str], str] | None = None,
 ) -> ValidationOutcome:
     """Give Claude Code one scoped attempt at the validation failure.
 
@@ -346,14 +347,20 @@ def repair_validation_failure_with_claude(
 
     owns_log_path = validation_log_path is None
     log_path = validation_log_path or create_validation_log_path()
+    changes_path = ""
     try:
         if owns_log_path:
             Path(log_path).write_text(validation_output, encoding="utf-8")
+        changes = (backport_changes_func or backport_changes)(repo_dir, comparison_ref)
+        if changes:
+            changes_path = create_validation_log_path(suffix=".diff")
+            Path(changes_path).write_text(changes, encoding="utf-8")
 
         prompt = build_validation_repair_prompt(
             target_branch,
             changed_paths,
             log_path,
+            changes_path,
         )
         logger.info(
             "Calling Claude Code to repair validation failure on %s "
@@ -532,6 +539,28 @@ def repair_validation_failure_with_claude(
     finally:
         if owns_log_path:
             remove_validation_log_path(log_path)
+        remove_validation_log_path(changes_path)
+
+
+def backport_changes(repo_dir: str, base_ref: str) -> str:
+    """The commits the backport branch has over ``base_ref``, and their diff; "" when they cannot be read.
+
+    For the repair agent, which has no shell: it is asked to keep what the
+    source pull requests meant, and can see neither which they were nor what
+    they changed.
+    """
+    try:
+        commits = git_output(repo_dir, "log", "--no-merges", "--format=%h %s", f"{base_ref}..HEAD")
+        diff = git_output(repo_dir, "diff", "--no-ext-diff", "--no-textconv", base_ref, "HEAD")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("Could not read what the backport changes over %s: %s", base_ref, exc)
+        return ""
+    if not diff.strip():
+        return ""
+    return (
+        f"# Commits this branch has over {base_ref}, newest first\n\n{commits.rstrip()}\n\n"
+        f"# Their combined diff\n\n{diff}"
+    )
 
 
 def adapt_added_tests_for_target(
@@ -1008,10 +1037,10 @@ def validation_output_with_diagnosis(
     )
 
 
-def create_validation_log_path() -> str:
+def create_validation_log_path(suffix: str = ".log") -> str:
     log_fd, log_path = tempfile.mkstemp(
         prefix="backport-validation-",
-        suffix=".log",
+        suffix=suffix,
     )
     os.close(log_fd)
     return log_path
@@ -1030,8 +1059,18 @@ def build_validation_repair_prompt(
     target_branch: str,
     changed_paths: tuple[str, ...],
     validation_log_path: str,
+    changes_path: str = "",
 ) -> str:
     path_list = "\n".join(f"- {path}" for path in changed_paths)
+    changes = (
+        "What the backport changed is at:\n"
+        f"  {changes_path}\n\n"
+        "It lists the commits this branch has over the release branch, each "
+        "with the source PR number in its subject, and their combined diff. "
+        "You cannot run git: read that file to see what each source PR meant "
+        "to change before you adapt it.\n\n"
+        if changes_path else ""
+    )
     return (
         "You are repairing a failed automated backport validation run.\n\n"
         f"Target branch: {target_branch}\n\n"
@@ -1041,6 +1080,7 @@ def build_validation_repair_prompt(
         "stage or commit changes, or run commands.\n\n"
         "Backport branch changed files:\n"
         f"{path_list}\n\n"
+        f"{changes}"
         "Full validation output is at:\n"
         f"  {validation_log_path}\n\n"
         "Read that file with the Read tool, and use Grep/Glob if needed to "
