@@ -16,7 +16,7 @@ _OLD_REQUIREMENTS_INSTALL_RE = re.compile(rf"{_PIP_INSTALL_RE} (?:-r requirement
 _DIRECT_AGENT_SETUP_RE = re.compile(
     rf"actions/setup-python@|{_PIP_INSTALL_RE} \.|{_PIP_INSTALL_RE} -e|npm install -g @anthropic-ai/claude-code"
 )
-_EXPECTED_CLAUDE_CODE_VERSION = "2.1.175"
+_EXPECTED_CLAUDE_CODE_VERSION = "2.1.300"
 _TRUSTED_REUSABLE_WORKFLOW_REFS = {
     # Qualification is an organization-owned workflow, not a third-party
     # action. It intentionally follows the automation repository's protected
