@@ -222,7 +222,20 @@ def checkout(task: FixTask, repo_dir: str = "") -> Iterator[tuple[str, str]]:
         original_head = git_output(str(clone), "rev-parse", "HEAD").strip()
         if original_head.lower() != checkout_sha.lower():
             raise RuntimeError(f"clone resolved {original_head[:12]} instead of {checkout_sha[:12]}")
+        if task.as_of_failure:
+            _hold_default_branch(str(clone))
         yield str(clone), original_head
+
+
+def _hold_default_branch(repo_dir: str) -> None:
+    """Point the clone's default branch at the checked-out commit.
+
+    A replayed failure's fix has landed since: with the default branch where
+    it is now, the history search would find that fix and offer it as a port.
+    """
+    default_ref = default_branch_ref(repo_dir)
+    if default_ref:
+        run_git(repo_dir, "update-ref", f"refs/remotes/{default_ref}", "HEAD")
 
 
 # What a job's checkout held before the agent started: its ignored files
@@ -1002,8 +1015,8 @@ def _check_adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...], pa
         raise _Rejected(f"Commit {commit[:12]} could not be read. {_UPSTREAM_ONLY}") from exc
     # What a change adds is its own; what it removes, any change to those
     # lines removes too. Only a patch that adds nothing is read by its removals.
-    sign = "+" if _changed_text(patch, "+") else "-"
-    ours, theirs = _changed_text(patch, sign), _changed_text(upstream, sign)
+    sign = "+" if changed_text(patch, "+") else "-"
+    ours, theirs = changed_text(patch, sign), changed_text(upstream, sign)
     share = len(ours & theirs) / len(ours) if ours else 0.0
     if share < _MIN_ADAPTED_SHARE:
         raise _Rejected(
@@ -1012,7 +1025,7 @@ def _check_adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...], pa
         )
 
 
-def _changed_text(diff: str, sign: str) -> set[str]:
+def changed_text(diff: str, sign: str) -> set[str]:
     """The lines a diff adds (``+``) or removes (``-``), without their indentation; a lone brace or blank says nothing."""
     return {
         text for text in (line[1:].strip() for line in diff.splitlines()

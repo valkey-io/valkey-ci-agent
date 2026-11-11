@@ -412,7 +412,8 @@ def test_the_candidate_is_published_as_its_target_says(front_door, monkeypatch, 
 
 
 def test_every_front_door_plans_publishes_and_reports():
-    assert set(run._FRONT_DOORS) == set(FrontDoor)
+    # But for a replayed failure, which is scored and never published (scripts/ci_fix/eval.py).
+    assert set(run._FRONT_DOORS) == set(FrontDoor) - {FrontDoor.EVAL}
 
 
 @pytest.mark.parametrize(("action", "exit_code"), [("failed", 1), ("refused", 0)])

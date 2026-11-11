@@ -1,0 +1,181 @@
+name: CI Fix Eval
+run-name: "CI fix eval ${{ inputs.case }}"
+
+# Replays one failure whose fix is known (scripts/ci_fix/eval_cases.yml) and
+# compares what the CI fix bot prepares with that fix (scripts/ci_fix/eval.py).
+#
+#   plan -> fix -> score
+#
+# Nothing is published, by construction: no job here holds a token that can
+# write to the target repository, there is no publish job, and
+# scripts/ci_fix/run.py refuses to publish an eval plan. The fix is the same
+# engine a real fix runs, on the bot's own runner (ci-fix-run.yml's
+# fix-local): the same isolated account, the same steps, and no GitHub token.
+#
+# One run is one case, and one case is a model session of up to hours: start
+# the cases you want, one run each.
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: "A case id from scripts/ci_fix/eval_cases.yml"
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  plan:
+    name: "Plan the replay (${{ inputs.case }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+
+      - name: Plan the case and download its job log
+        shell: bash
+        env:
+          # Reads the case's public job log, which GitHub serves only to a
+          # signed-in caller: any token that can read the target repository.
+          TARGET_TOKEN: ${{ secrets.CI_FIX_EVAL_TOKEN || github.token }}
+          CASE: ${{ inputs.case }}
+        run: python -m scripts.ci_fix.eval plan --case "${CASE}" --out ci-fix-plan
+
+      - name: Upload the plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-fix-eval-plan
+          path: ci-fix-plan/
+          retention-days: 30
+          overwrite: true
+
+  # ci-fix-run.yml's fix-local, step for step.
+  fix:
+    name: "Fix on the bot's runner"
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: 'CI fix: download the plan'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ci-fix-eval-plan
+          path: ${{ runner.temp }}/ci-fix-plan
+      - name: Install Valkey build and test dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            build-essential pkg-config libssl-dev tcl8.6 tclx tcl-tls valgrind
+      - name: 'CI fix: check out the agent'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .ci-fix-agent
+          persist-credentials: false
+      - name: 'CI fix: set up the agent'
+        uses: ./.ci-fix-agent/.github/actions/setup-agent
+        with:
+          path: .ci-fix-agent
+          install-claude: 'true'
+      - name: 'CI fix: stage the isolated checkout'
+        shell: bash
+        run: bash .ci-fix-agent/scripts/ci_fix/job.sh stage
+      - name: 'CI fix: configure AWS credentials'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ci-fix-eval-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 18000
+      - name: 'CI fix: prepare the fix in this job'
+        shell: bash
+        env:
+          CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
+        run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
+      - name: 'CI fix: ensure the fix has a result'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ensure-result
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh ensure-result
+          fi
+      - name: 'CI fix: clean up the isolated checkout'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" cleanup
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh cleanup
+          fi
+      - name: 'CI fix: upload the result'
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-fix-eval-result
+          path: ${{ runner.temp }}/ci-fix-out/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+  score:
+    name: "Score the replay (${{ inputs.case }})"
+    needs: [plan, fix]
+    # A fix that failed or refused is a result too.
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+
+      - name: Download the fix
+        # A fix job that crashed uploaded nothing; the score says so.
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ci-fix-eval-result
+          path: ci-fix-result
+
+      - name: Compare the candidate with the known fix
+        shell: bash
+        env:
+          # Reads the known fix's pull request. Nothing is written anywhere.
+          TARGET_TOKEN: ${{ secrets.CI_FIX_EVAL_TOKEN || github.token }}
+          CASE: ${{ inputs.case }}
+        run: python -m scripts.ci_fix.eval score --case "${CASE}" --outcome ci-fix-result --out ci-fix-score
+
+      - name: Upload the score
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-fix-eval-score
+          path: ci-fix-score/
+          retention-days: 30
+          overwrite: true

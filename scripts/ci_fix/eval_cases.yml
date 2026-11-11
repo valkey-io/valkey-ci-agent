@@ -1,0 +1,100 @@
+# Failures whose fix is known, replayed by scripts/ci_fix/eval.py to see what
+# the CI fix bot prepares for them. Nothing is published.
+#
+# Each case is one exact failed job. `expect` names its fix: `port` is the
+# upstream commit a backport branch should take; `pull` is the pull request a
+# person wrote (merged or still open). `gap` says why the bot is not expected
+# to manage a case yet: it stays here so that the day it does shows.
+#
+# A case on the default branch is replayed as of its failed commit, so the fix
+# that landed later is not there to find. A backport case sees the default
+# branch as it is now, which is where its port comes from.
+#
+# A case lasts as long as GitHub keeps its job log (90 days); `plan` says so
+# when one has aged out.
+cases:
+  - id: sanitizer-leak-8.1
+    about: LeakSanitizer report in the sentinel valkey-cli hint test, on the 8.1 backport PR.
+    repo: valkey-io/valkey
+    run_id: 42788083633
+    job_id: 129734399755
+    job: test-sanitizer-address (clang)
+    sha: 533a67f8dc2a060b9f53a3975ad6a08238e2ad45
+    base_branch: "8.1"
+    pr: 5075
+    backport: true
+    expect:
+      port: c86f6ee511e1a36488feb3b8e62093e69195d332  # Free valkey-cli test hint before exiting (#5274)
+
+  - id: hashexpire-9.0
+    about: A hash-field expiry test that fails with libc malloc, on the 9.0 backport PR.
+    repo: valkey-io/valkey
+    run_id: 42795329838
+    job_id: 129758961802
+    job: test-ubuntu-libc-malloc
+    sha: f0f4ab83b7a8e0d22d26f13d36b9b7657b066488
+    base_branch: "9.0"
+    pr: 5073
+    backport: true
+    expect:
+      port: caf5f2bfc20dd5371d87202ee338b348593e2a1b  # (#4785), which the bot did port here
+
+  - id: pause-busy-script
+    about: "#5224: a busy script ending while the replica's postponed primary is paused, with I/O threads."
+    repo: valkey-io/valkey
+    run_id: 42726275643
+    job_id: 129532588086
+    job: test-ubuntu-tls-io-threads
+    sha: d5b4fda740a4d71eb138ff3722442a9f5f546056
+    base_branch: unstable
+    issue: 5224
+    scheduled: true
+    test:
+      name: Busy script ending while the replica's postponed primary is paused
+      file: tests/unit/pause.tcl
+    expect:
+      pull: 5271  # a fix in src/, where the bot pushed a test-side wait instead
+
+  - id: del-node-macos
+    about: "#5330: valkey-cli --cluster del-node of an unreachable node, on macOS."
+    repo: valkey-io/valkey
+    run_id: 42726275643
+    job_id: 129532587982
+    job: test-macos-latest
+    sha: d5b4fda740a4d71eb138ff3722442a9f5f546056
+    base_branch: unstable
+    issue: 5330
+    scheduled: true
+    test:
+      name: "del-node: Delete unreachable node without slots"
+      file: tests/unit/cluster/cli.tcl
+    expect:
+      pull: 5331
+
+  - id: tcl85-stride
+    about: "#5285: a test used lsort -stride, which macOS's Tcl 8.5 does not have."
+    repo: valkey-io/valkey
+    run_id: 41744961340
+    job_id: 126295526487
+    job: test-macos-latest
+    sha: 9ff39f353cac273a3df8e10070ac9b9dc9ed310b
+    base_branch: unstable
+    issue: 5285
+    scheduled: true
+    expect:
+      pull: 5276
+    gap: The log names no test, so no command checks a fix; and only macOS's Tcl fails it.
+
+  - id: reply-schema
+    about: "#5306: the reply-schema validator rejected CONFIG SET's reply."
+    repo: valkey-io/valkey
+    run_id: 41939533851
+    job_id: 126956469385
+    job: reply-schemas-validator
+    sha: c86f6ee511e1a36488feb3b8e62093e69195d332
+    base_branch: unstable
+    issue: 5306
+    scheduled: true
+    expect:
+      pull: 5287
+    gap: The log names no test, and nothing here runs the reply-schema validator.
