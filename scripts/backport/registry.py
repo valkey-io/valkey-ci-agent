@@ -52,6 +52,10 @@ class RepoEntry:
     repair_validation_failures: bool = False
     automatic_ci_followup: bool = False
     ci_followup_ignored_jobs: tuple[str, ...] = ()
+    # The scheduled workflow that runs the tests of every release branch
+    # (Valkey's weekly.yml), or "": its failures on a branch are followed up
+    # on that branch's open sweep PR.
+    ci_followup_release_workflow: str = ""
     backport_label: str = "backport"
     llm_conflict_label: str = "ai-resolved-conflicts"
     max_conflicting_files: int = 100
@@ -209,6 +213,14 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
                 "must be a non-empty string"
             )
 
+    ci_followup_release_workflow = raw.get("ci_followup_release_workflow", "")
+    if not isinstance(ci_followup_release_workflow, str) or (
+        ci_followup_release_workflow and not re.fullmatch(r"[\w.-]+\.ya?ml", ci_followup_release_workflow)
+    ):
+        raise ValueError(
+            f"repos[{index}].ci_followup_release_workflow must be a workflow file name, such as weekly.yml"
+        )
+
     backport_label = raw.get("backport_label", "backport")
     if not isinstance(backport_label, str) or not backport_label.strip():
         raise ValueError(f"repos[{index}].backport_label must be a non-empty string")
@@ -244,6 +256,7 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
         repair_validation_failures=repair_validation_failures,
         automatic_ci_followup=automatic_ci_followup,
         ci_followup_ignored_jobs=tuple(str(item) for item in ci_followup_ignored_jobs),
+        ci_followup_release_workflow=ci_followup_release_workflow,
         backport_label=backport_label,
         llm_conflict_label=llm_conflict_label,
         max_conflicting_files=max_conflicting_files,

@@ -52,6 +52,9 @@ repos:
       - "consolidate-test-failures*"
       - "notify-about-job-results*"
       - "code-coverage*"
+    # weekly.yml runs daily.yml's jobs on every release branch: a branch's
+    # failures there are fixed on its open sweep PR, like the PR's own.
+    ci_followup_release_workflow: weekly.yml
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
     max_conflicting_files: 100
