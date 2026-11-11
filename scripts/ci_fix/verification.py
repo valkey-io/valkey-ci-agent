@@ -83,12 +83,21 @@ class VerifyPlan:
     # Other tests run too (a fallback), so only the named tests' own results
     # count: a valgrind or sanitizer report cannot be told apart from theirs.
     attributed: bool = False
+    # The test command as a report quotes it, when the one that runs is not
+    # for reading (the isolated plan writes its file with an inline script).
+    shown: str = ""
 
     def command(self, loops: int) -> str:
         """The build and test command, the test looped ``loops`` times."""
         if self.build_only:
             return self.build
         return f"{self.build} && {self.test.replace(LOOPS, str(loops))}"
+
+    def quoted(self, loops: int) -> str:
+        """``command`` as a report or the agent's feedback quotes it."""
+        if self.build_only or not self.shown:
+            return self.command(loops)
+        return f"{self.build} && {self.shown.replace(LOOPS, str(loops))}"
 
     @property
     def loops(self) -> int:
@@ -440,6 +449,7 @@ def _isolated_plan(
         tests=tuple(replace(test, file=copy) for test in tests),
         fallback=_whole_file_plan(repo_dir, tests, base, options, build, notes),
         attributed=True,
+        shown=run,
     )
 
 

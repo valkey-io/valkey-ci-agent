@@ -860,20 +860,18 @@ def _verify_with_plan(
         return ""
     current = plan
     while True:
-        command = current.command(1)
-        first = _run(run_test, repo_dir, command, deadline)
+        first = _run(run_test, repo_dir, current.command(1), deadline)
         if first.passed and current.ran(first):
             break
         if current.fallback is None:
-            return _not_passing(current, command, 1, first)
+            return _not_passing(current, current.quoted(1), 1, first)
         current = current.fallback
     loops = _loops_that_fit(current, first.seconds, deadline)
     if loops > 1:
-        command = current.command(loops)
-        looped = _run(run_test, repo_dir, command, deadline)
+        looped = _run(run_test, repo_dir, current.command(loops), deadline)
         if not (looped.passed and current.ran(looped)):
-            return _not_passing(current, command, loops, looped)
-    checks.append(f"With the fix, `{command}` passed {loops} loop(s).")
+            return _not_passing(current, current.quoted(loops), loops, looped)
+    checks.append(f"With the fix, `{current.quoted(loops)}` passed {loops} loop(s).")
     if loops < current.loops:
         checks.append(f"One loop takes {first.seconds:.0f}s, so {loops} loop(s) ran, not {current.loops}.")
     checks.append(_NOT_REPRODUCED)

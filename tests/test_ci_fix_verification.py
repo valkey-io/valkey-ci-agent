@@ -469,3 +469,22 @@ def test_a_fallback_counts_only_the_named_tests_own_failure(checkout):
         assert fallback.attributed and not fallback.failed(sibling)
     own = TestRun(passed=False, output="", report=f"[err]: first named test in {plan.fallback.tests[0].file}")
     assert plan.fallback.failed(own)
+
+
+def test_a_report_quotes_the_isolated_run_without_the_script_that_writes_its_file(tmp_path):
+    """The eval's first isolated run put a thirty-line Tcl script into the report, a bullet a line."""
+    (tmp_path / "runtest").write_text("#!/bin/sh\n", encoding="utf-8")
+    test_file = tmp_path / "tests" / "integration" / "replication.tcl"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text('test "a test with a long name" {}\n', encoding="utf-8")
+    plan = plan_for(str(tmp_path), (FailedTest("a test with a long name", "tests/integration/replication.tcl"),),
+                    scheduled=False)
+
+    isolated = plan.fallback
+    assert "info complete" in isolated.command(40)  # what runs writes the file
+    quoted = isolated.quoted(40)
+    assert "\n" not in quoted and "info complete" not in quoted
+    assert quoted.startswith('make -j"$(getconf _NPROCESSORS_ONLN)" && ./runtest ')
+    assert "--single integration/replication.ci-fix-isolated" in quoted and "--loops 40" in quoted
+    # A plan that needs no script is quoted as it runs.
+    assert plan.quoted(40) == plan.command(40)
