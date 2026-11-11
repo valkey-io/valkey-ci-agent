@@ -720,6 +720,24 @@ def test_a_weekly_run_that_is_running_or_passed_has_nothing_to_fix(monkeypatch, 
     assert target is None and reason == "no-unhandled-actionable-failures"
 
 
+def test_a_weekly_run_that_cannot_be_read_does_not_fail_the_follow_up(monkeypatch) -> None:
+    """Its jobs are several hundred, over several requests: GitHub ended one early, and the run failed."""
+    monkeypatch.setattr(ci_followup, "find_existing_pr", lambda *_args: _pr())
+    gh = _gh([_run(conclusion="success")], _pr())
+    gh.get_repo.return_value.get_workflow.return_value.get_runs.return_value = [_weekly_run()]
+
+    def jobs_for_run(_gh, _repo, _run_id, **_kwargs):
+        raise ConnectionError("Response ended prematurely")
+
+    monkeypatch.setattr(github_runs, "failed_jobs_for_run", jobs_for_run)
+
+    target, reason = find_followup_target(
+        gh, repo_entry=_weekly_entry(), target_branch="9.0", bot_login=_BOT,
+    )
+
+    assert target is None and reason == "no-unhandled-actionable-failures"
+
+
 def test_weekly_failures_are_followed_up_only_where_the_registry_names_the_workflow(monkeypatch) -> None:
     target, reason, gh = _select(
         monkeypatch, runs=[_run(conclusion="success")], release_run=_weekly_run(), release_jobs=_WEEKLY,
