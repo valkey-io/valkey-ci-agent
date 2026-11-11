@@ -136,6 +136,10 @@ class Failure:
     source: Optional[Source] = None
     # The failed run's workflow file, without ``.yml`` (``ci``, ``daily``).
     workflow: str = ""
+    # The commit whose workflow file defined the failed job, when it is not
+    # the commit the fix is prepared on: a run of every release branch runs
+    # the default branch's jobs on each of them.
+    workflow_sha: str = ""
 
     @property
     def scheduled(self) -> bool:

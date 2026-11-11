@@ -341,6 +341,9 @@ def plan_request(
         # A run of every release branch runs the scheduled workflow's jobs, as scheduled.
         source=Source.DAILY if target.release_run else None,
         workflow=workflow_file(target.run),
+        # Those jobs are the ones of the commit the run was started on, the
+        # default branch's: a release branch's own workflow may lack them.
+        workflow_sha=str(getattr(target.run, "head_sha", "") or "") if target.release_run else "",
     )
     task = FixTask(
         failure=failure,

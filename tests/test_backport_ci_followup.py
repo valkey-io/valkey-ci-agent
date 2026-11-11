@@ -678,6 +678,8 @@ def test_the_plan_for_a_weekly_failure_replays_the_scheduled_job_on_the_sweep_he
     # The job as daily.yml names it, run as scheduled, on the head the fix is pushed to.
     assert task.failure.job_name == "test-ubuntu-tls" and task.failure.job_id == 73
     assert task.failure.scheduled and task.failure.workflow == "weekly"
+    # Weekly's jobs are the default branch's daily.yml, at the commit the run was started on.
+    assert task.failure.workflow_sha == "f" * 40
     assert task.failure.run_id == 500 and task.failure.head_sha == _HEAD and task.failure.pr_number == 4226
     assert "scheduled run of release branch `9.0`" in task.failure.description
     assert task.policy is FixPolicy.BACKPORT and task.target.kind is TargetKind.UPDATE_PR
