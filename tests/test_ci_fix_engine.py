@@ -1034,6 +1034,25 @@ def test_a_backport_branch_takes_a_fix_of_its_own_where_none_is_upstream(tmp_pat
     assert "the default branch does not have it" in candidate.verification
 
 
+def test_a_backport_fix_is_shown_what_the_other_release_branches_changed(tmp_path, monkeypatch):
+    source, head_sha = _source_repo(tmp_path)
+    _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+    asked = []
+    monkeypatch.setattr(engine_mod, "sibling_branch_changes",
+                        lambda _repo, paths, **kwargs: asked.append((paths, kwargs)) or "# Release branch `9.1`\n")
+    task = _backport(_task(head_sha))
+    task = replace(task, target=replace(task.target, branch="agent/backport/sweep/main"))
+    backport, general = _adapting_agent(""), _adapting_agent("")
+
+    engine_mod.prepare_fix(task, _LOG, agent_func=backport)
+    engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=general)
+
+    assert backport.contexts[0].sibling_changes == "# Release branch `9.1`\n"
+    assert asked[0][1] == {"own_branch": "agent/backport/sweep/main", "base_branch": "main"} and len(asked) == 1
+    assert general.contexts[0].sibling_changes == ""
+
+
 def test_a_backport_branch_takes_a_patch_that_adapts_a_merged_upstream_commit(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     commit = _upstream_commit(source, head_sha)

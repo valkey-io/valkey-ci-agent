@@ -8,6 +8,7 @@ from scripts.ci_fix.prior_fixes import (
     failing_test_history,
     find_prior_fixes,
     render_prior_fixes,
+    sibling_branch_changes,
     summarize_prior_fixes,
     unported_changes,
     unported_index,
@@ -268,6 +269,37 @@ def test_the_upstream_commits_a_branch_lacks_are_listed_by_file(tmp_path):
     assert unported_changes(str(clone), ()) == ""
     _refresh(clone, "origin/unstable")
     assert unported_changes(str(clone), ("src/valkey-cli.c",)) == ""
+
+
+def test_the_other_release_branches_fixes_to_a_file_are_listed_with_their_diffs(tmp_path):
+    """One cluster test was fixed three ways on three release branches: each fix was written without the others."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    git(upstream, "branch", "9.1")
+    for release in ("9.0", "9.1"):
+        git(upstream, "branch", f"agent/backport/sweep/{release}", release)
+    git(upstream, "checkout", "-q", "agent/backport/sweep/9.1")
+    fix = commit(upstream, TEST_FILE, "test v1\nwait for the replica\n", "Fix the replication test: wait for the replica")
+    commit(upstream, "src/server.c", "a backport\n", "Backport something else (#1)")
+    loosened = commit(upstream, TEST_FILE, "test v1\nwait for the replica\nlooser\n", "Loosen the check")
+    git(upstream, "revert", "--no-edit", loosened)
+    git(upstream, "checkout", "-q", "agent/backport/sweep/9.0")
+    commit(upstream, TEST_FILE, "test v1\nits own\n", "This branch's own commit")
+    _refresh(clone, "origin/agent/backport/sweep/9.0")
+
+    listed = sibling_branch_changes(
+        str(clone), (TEST_FILE,), own_branch="agent/backport/sweep/9.0", base_branch="9.0",
+    )
+
+    assert "# Release branch `9.1` (`agent/backport/sweep/9.1`)" in listed
+    assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
+    assert f"## `{fix[:12]}` on `9.1`: Fix the replication test" in listed and "+wait for the replica" in listed
+    # Not a commit that was reverted, nor its revert; not another file's; not this branch's own.
+    assert "Loosen the check" not in listed and "Backport something else" not in listed
+    assert "This branch's own commit" not in listed
+
+    # Only a branch named after the release branch it is into has siblings.
+    assert sibling_branch_changes(str(clone), (TEST_FILE,), own_branch="agent/ci-fix/issue-9", base_branch="9.0") == ""
+    assert sibling_branch_changes(str(clone), (), own_branch="agent/backport/sweep/9.0", base_branch="9.0") == ""
 
 
 def test_every_upstream_commit_a_branch_lacks_is_indexed_with_its_files(tmp_path):

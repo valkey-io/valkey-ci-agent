@@ -215,6 +215,18 @@ def _context_prompt(context: FixContext, context_dir: Path, allows_port: bool) -
             "file the log does not name: search the list for a file or a word, and name a commit's full SHA "
             "to port it. If it does not apply, you are given its diff to adapt."
         )
+    if context.sibling_changes:
+        siblings = context_dir / "other-release-branches.md"
+        siblings.write_text(context.sibling_changes, encoding="utf-8")
+        sections.append(
+            "### What the other release branches changed here\n"
+            f"{siblings} lists what the bot's pull requests into the other release branches changed in the "
+            "files this failure names, each with its diff. One failure should get the same fix on every "
+            "release branch. When one of those commits fixes this failure, make the same change here, "
+            "adapted only where this branch's code differs; when it is itself a port of an upstream commit, "
+            "port that commit. Every rule above still holds for it. Say in `validation` which commit you "
+            "followed, or why none of them fits."
+        )
     if context.verification:
         section = f"### Verification\n{context.verification}"
         sections.append(section)

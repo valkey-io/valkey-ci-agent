@@ -63,6 +63,7 @@ from scripts.ci_fix.prior_fixes import (
     find_prior_fixes,
     paths_in_log,
     render_prior_fixes,
+    sibling_branch_changes,
     summarize_prior_fixes,
     unported_changes,
     unported_index,
@@ -395,6 +396,13 @@ def _establish(
             if upstream_first else ""
         ),
         unported_index=unported_index(repo_dir) if upstream_first else "",
+        sibling_changes=(
+            sibling_branch_changes(
+                repo_dir, tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths])),
+                own_branch=task.target.branch, base_branch=task.failure.base_branch,
+            )
+            if upstream_first and task.policy is FixPolicy.BACKPORT else ""
+        ),
         verification=described,
         verified_by_code=plan is not None,
         upstream_first=upstream_first,

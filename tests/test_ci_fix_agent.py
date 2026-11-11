@@ -289,6 +289,13 @@ def test_where_an_upstream_change_comes_first_the_agent_is_told_and_its_claim_is
     assert "### Upstream changes this branch lacks" in seen["prompt"] and "upstream-changes.md" in seen["prompt"]
     # And every commit it lacks, by the files it changes: the fix may be in a file the log does not name.
     assert "### Every upstream commit this branch lacks" in seen["prompt"] and "upstream-commits.md" in seen["prompt"]
+    assert "other-release-branches.md" not in seen["prompt"]
+
+    # What the other release branches' pull requests changed in the same files: one failure, one fix.
+    sibling = FixContext(upstream_first=True, sibling_changes="# Release branch `9.1`\n")
+    agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=sibling)
+    assert "other-release-branches.md" in seen["prompt"]
+    assert "the same fix on every release branch" in seen["prompt"]
     assert candidate.adapts == "d" * 40
 
 

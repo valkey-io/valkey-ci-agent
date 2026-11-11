@@ -353,6 +353,63 @@ def unported_index(repo_dir: str) -> str:
     return "\n".join(lines) + "\n" if lines else ""
 
 
+# How many commits per sibling branch the agent is shown.
+_SIBLING_COMMITS = 10
+_REVERTS_RE = re.compile(r"This reverts commit ([0-9a-f]{40})")
+
+
+def sibling_branch_changes(repo_dir: str, paths: tuple[str, ...], *, own_branch: str, base_branch: str) -> str:
+    """Markdown: what the bot's pull requests into the other release branches changed in ``paths``, with diffs.
+
+    One failure shows up on several release branches, and each fix was
+    written without sight of the others. Of twenty fixes pushed to six sweep
+    PRs, one cluster test got a wait on 9.1, a packet filter on 9.0 and a new
+    debug command on 8.1, and one macOS failure was rewritten five ways. The
+    agent cannot run git, so the sibling branches' commits are given to it.
+
+    ``own_branch`` is the branch the fix is pushed to
+    (``agent/backport/sweep/8.1`` into ``8.1``); its siblings are the other
+    branches under the same prefix, each compared with the release branch it
+    is named after. A commit that was reverted, and its revert, are left out.
+    """
+    suffix = f"/{base_branch}"
+    if not paths or not base_branch or not own_branch.endswith(suffix):
+        return ""
+    prefix = own_branch.removesuffix(suffix)
+    try:
+        refs = git_output(
+            repo_dir, "for-each-ref", "--format=%(refname:short)", f"refs/remotes/origin/{prefix}/",
+        ).split()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("Could not list the sibling branches of %s: %s", own_branch, exc)
+        return ""
+    sections: list[str] = []
+    for ref in sorted(refs):
+        release = ref.removeprefix(f"origin/{prefix}/")
+        if release == base_branch:
+            continue
+        revision_range = f"origin/{release}..{ref}"
+        try:
+            undone = set(_REVERTS_RE.findall(git_output(repo_dir, "log", "--format=%B", revision_range)))
+            lines, diffs = [], []
+            for sha in _log(repo_dir, revision_range, f"--max-count={_SIBLING_COMMITS}", "--", *paths):
+                body = git_output(repo_dir, "show", "-s", "--format=%B", sha)
+                if sha in undone or _REVERTS_RE.search(body):
+                    continue
+                subject, date = _subject_and_date(repo_dir, sha)
+                lines.append(f"- `{sha[:12]}` {date} {subject}")
+                diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha, "--", *paths)
+                if len(diff) > _DIFF_CHARS:
+                    diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+                diffs += ["", f"## `{sha[:12]}` on `{release}`: {subject}", "", "```diff", diff.rstrip("\n"), "```"]
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.info("Could not read what %s changes: %s", ref, exc)
+            continue
+        if lines:
+            sections.append("\n".join([f"# Release branch `{release}` (`{ref.removeprefix('origin/')}`)", "", *lines, *diffs]))
+    return "\n\n".join(sections) + "\n" if sections else ""
+
+
 def summarize_prior_fixes(fixes: tuple[PriorFix, ...]) -> str:
     """One line per candidate, for the prompt and the maintainer report."""
     lines = []

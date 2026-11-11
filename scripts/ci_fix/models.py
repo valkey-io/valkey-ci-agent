@@ -232,6 +232,9 @@ class FixContext:
     # Every commit the default branch has and the working commit lacks, with
     # the files it changes: the fix may be in a file the failure does not name.
     unported_index: str = ""
+    # What the bot's pull requests into the other release branches changed in
+    # the failure's files: one failure is fixed the same way on every branch.
+    sibling_changes: str = ""
     # How code verifies a candidate, and whether it does.
     verification: str = ""
     verified_by_code: bool = False
