@@ -248,9 +248,9 @@ class FixContext:
     # Nothing here can run the failing check, but an upstream change may fix
     # it: a candidate is built and reviewed, not run.
     only_built: bool = False
-    # The repository's test conventions, and its own docs in the checkout.
+    # The bot's guide for the repository, ending with the repository's own
+    # guidelines as its default branch has them.
     guide: str = ""
-    guide_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

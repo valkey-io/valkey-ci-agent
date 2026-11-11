@@ -1034,6 +1034,48 @@ def test_a_backport_branch_takes_a_fix_of_its_own_where_none_is_upstream(tmp_pat
     assert "the default branch does not have it" in candidate.verification
 
 
+def test_the_guide_ends_with_the_repositorys_own_guidelines_from_its_default_branch(tmp_path, monkeypatch):
+    """Naming their paths was not enough: 2% of sessions opened tests/README.md, 95% read the guide handed to them.
+
+    And a release branch cut before a guideline was written does not have it.
+    """
+    source, head_sha = _source_repo(tmp_path)
+    git(source, "checkout", "-q", "-b", "upstream")
+    for path, text in (("AGENTS.md", "Keep changes minimal and easy to backport.\n"),
+                       ("tests/README.md", "the default branch's test readme\n")):
+        (source / path).parent.mkdir(parents=True, exist_ok=True)
+        (source / path).write_text(text, encoding="utf-8")
+        git(source, "add", path)
+    git(source, "commit", "-qm", "Write the guidelines")
+    git(source, "checkout", "-q", head_sha)
+    # The release branch has an older test readme of its own, and no AGENTS.md.
+    (source / "tests").mkdir(exist_ok=True)
+    (source / "tests" / "README.md").write_text("the release branch's older readme\n", encoding="utf-8")
+    git(source, "add", "tests/README.md")
+    git(source, "commit", "-qm", "An older readme")
+    release_head = git(source, "rev-parse", "HEAD")
+    _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "guide_for", lambda _repo: "# The bot's policy\n")
+    agent = _adapting_agent("", "tests/value.tcl")
+
+    engine_mod.prepare_fix(_backport(_task(release_head)), _LOG, agent_func=agent)
+
+    guide = agent.contexts[0].guide
+    assert guide.startswith("# The bot's policy\n") and "# The repository's own guidelines" in guide
+    assert "## The repository's `AGENTS.md`\n\nKeep changes minimal and easy to backport." in guide
+    assert "the default branch's test readme" in guide and "the release branch's older readme" not in guide
+    # One the default branch does not have either is left out.
+    assert "DEVELOPMENT_GUIDE.md" not in guide
+
+
+def test_without_a_default_branch_to_read_the_checkouts_own_guidelines_stand_in(tmp_path, monkeypatch):
+    (tmp_path / "AGENTS.md").write_text("from the checkout\n", encoding="utf-8")
+    monkeypatch.setattr(engine_mod, "default_branch_ref", lambda _repo: "")
+
+    assert "## The repository's `AGENTS.md`\n\nfrom the checkout" in engine_mod.repository_guidelines(str(tmp_path))
+    assert engine_mod.repository_guidelines(str(tmp_path / "nowhere")) == ""
+
+
 def test_a_backport_fix_is_shown_what_the_other_release_branches_changed(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     _upstream_commit(source, head_sha)

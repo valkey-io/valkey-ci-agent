@@ -1,19 +1,17 @@
 # Fixing a failing Valkey test
 
-Valkey documents its own tests. Read, in your checkout, whichever of these
-exist before you change a test; they are the authority on helpers, tags and
-conventions, and they match the branch you are on:
+Valkey's own guidelines for code and tests are at the end of this file, as the
+default branch has them (`AGENTS.md`, `DEVELOPMENT_GUIDE.md`, `tests/README.md`
+and `src/unit/README.md`). Read them: they are the authority on style and
+conventions.
 
-- `tests/README.md`
-- `.github/instructions/integration-tests.instructions.md`
-- `AGENTS.md`, `DEVELOPMENT_GUIDE.md`, `CONTRIBUTING.md`
-- `tests/support/util.tcl`, `tests/support/test.tcl` and
-  `tests/test_helper.tcl` for what a `wait_for_*` or `verify_*` helper
-  actually does, and whether this branch has it: helpers and runtest options
-  differ between release lines, so use only what this branch's `tests/`
-  defines.
+Before you use a `wait_for_*` or `verify_*` helper or a runtest option, read
+`tests/support/util.tcl`, `tests/support/test.tcl` and `tests/test_helper.tcl`
+in your checkout for what it actually does, and whether this branch has it.
+Helpers and options differ between release lines, so use only what this
+branch's `tests/` defines.
 
-What follows is the bot's own policy, not a summary of those files.
+What follows first is the bot's own policy, not a summary of those files.
 
 ## First decide what failed
 

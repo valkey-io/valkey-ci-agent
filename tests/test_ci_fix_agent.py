@@ -224,7 +224,6 @@ def test_the_agent_is_told_what_code_established_and_shown_ports_first(tmp_path,
         verification="Code checks your change with `./runtest ...` (40 loop(s)).",
         verified_by_code=True,
         guide="# Fixing a failing Valkey test",
-        guide_paths=("tests/README.md",),
     )
 
     agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=context)
@@ -234,7 +233,8 @@ def test_the_agent_is_told_what_code_established_and_shown_ports_first(tmp_path,
     assert "choose `port` with its full SHA rather than writing a new fix" in prompt
     assert "### Verification\nCode checks your change with `./runtest ...`" in prompt
     assert "CI job log is your evidence" in prompt
-    assert "`tests/README.md`" in prompt
+    assert "test-guide.md before you change anything" in prompt
+    assert "the repository's own guidelines for code and tests" in prompt
     # Code verifies with its own command, and the test is never bent to it.
     assert "only that counts: do not claim to have run anything" in prompt
     assert "never change a test so that it can run alone" in prompt

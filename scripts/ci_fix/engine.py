@@ -129,12 +129,15 @@ _MAX_TESTS = 3
 # Where a repository's test conventions for the agent live, and the
 # repository's own docs that the agent should read when present.
 _GUIDES_DIR = Path(__file__).resolve().parent / "guides"
+# The repository's own guidelines, given to the agent and the reviewer at the
+# end of the bot's guide. Not CONTRIBUTING.md, which is about process (the
+# DCO, design documents), nor .github/instructions/, which summarizes
+# DEVELOPMENT_GUIDE.md for another review tool.
 _REPO_DOCS = (
-    "tests/README.md",
-    ".github/instructions/integration-tests.instructions.md",
     "AGENTS.md",
     "DEVELOPMENT_GUIDE.md",
-    "CONTRIBUTING.md",
+    "tests/README.md",
+    "src/unit/README.md",
 )
 
 AgentFunc = Callable[..., FixCandidate]
@@ -386,6 +389,8 @@ def _establish(
     if fixes:
         logger.info("Existing-fix candidates: %s", "; ".join(f"{f.sha[:12]} {f.subject}" for f in fixes))
     guide = guide_for(task.failure.repo_full_name)
+    if guide:
+        guide += repository_guidelines(repo_dir)
     context = FixContext(
         prior_fixes=summarize_prior_fixes(fixes),
         prior_fixes_detail=render_prior_fixes(repo_dir, fixes),
@@ -409,7 +414,6 @@ def _establish(
         reviewed_only=reviewed_only,
         only_built=only_built,
         guide=guide,
-        guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
     return context, plan
 
@@ -438,6 +442,44 @@ def _ignore_generated_copies(repo_dir: str) -> None:
                                + ISOLATED_COPY_PATTERN + "\n", encoding="utf-8")
     except OSError as exc:
         logger.warning("Could not ignore generated test copies in %s: %s", repo_dir, exc)
+
+
+def repository_guidelines(repo_dir: str) -> str:
+    """The repository's own guidelines as its default branch has them, to end the bot's guide with.
+
+    Naming their paths was not enough: of 93 fix sessions, 95% read the
+    guide they were handed and 2% opened ``tests/README.md``. And they are
+    taken from the default branch, not the checkout: a release branch cut
+    before a guideline was written does not have it (Valkey's 9.0 and older
+    have neither ``AGENTS.md`` nor ``DEVELOPMENT_GUIDE.md``), and a pull
+    request cannot rewrite what its own fix is judged by. The checkout's copy
+    stands in only where the default branch cannot be read.
+    """
+    default_ref = default_branch_ref(repo_dir)
+    sections: list[str] = []
+    for path in _REPO_DOCS:
+        text = ""
+        if default_ref:
+            try:
+                text = git_output(repo_dir, "show", f"{default_ref}:{path}")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                text = ""
+        if not text.strip():
+            try:
+                text = (Path(repo_dir) / path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        if text.strip():
+            sections.append(f"## The repository's `{path}`\n\n{text.strip()}\n")
+    if not sections:
+        return ""
+    return (
+        "\n\n---\n\n# The repository's own guidelines\n\n"
+        "As the default branch has them. They are the authority on style and conventions. What the "
+        "policy above lets you change still decides what you may change, and a release branch may "
+        "lack a helper or an option they mention: use only what this branch has.\n\n"
+        + "\n".join(sections)
+    )
 
 
 def guide_for(repo_full_name: str) -> str:

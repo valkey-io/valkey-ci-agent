@@ -95,8 +95,12 @@ it ran where it was merged, and the PR's own CI runs the check.
 
 **Claude diagnoses and edits.** Claude gets the job's whole log, whatever the
 history search found, the verification command, and Valkey's testing
-conventions: the bot's own guide in `scripts/ci_fix/guides/valkey-io__valkey.md`
-plus the repository's `tests/README.md` and contributor docs. It then does one
+conventions: the bot's own guide in `scripts/ci_fix/guides/valkey-io__valkey.md`,
+which ends with Valkey's own guidelines (`AGENTS.md`, `DEVELOPMENT_GUIDE.md`,
+`tests/README.md` and `src/unit/README.md`). Those are taken from the default
+branch, so an older release branch gets the current ones and a pull request
+cannot change the rules its fix is judged by. The reviewer reads the same
+file. It then does one
 of three things: ports an existing fix (preferred when one fits), writes a
 small patch, or declines. It is told to aim for the fix a maintainer would
 write. Where the evidence leaves a few possible causes and one change is right
