@@ -20,7 +20,7 @@ from scripts.common.proc import filter_env
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CLAUDE_MODEL = "fable"
-_DEFAULT_BEDROCK_FABLE_MODEL = "us.anthropic.claude-fable-5"
+_DEFAULT_BEDROCK_FABLE_MODEL = "us.anthropic.claude-fable-5-2"
 _DEFAULT_BEDROCK_OPUS_MODEL = "us.anthropic.claude-opus-4-8"
 _CLAUDE_MODEL_ENV = "CI_AGENT_CLAUDE_MODEL"
 _BEDROCK_FABLE_MODEL_ENV = "CI_AGENT_CLAUDE_BEDROCK_FABLE_MODEL"

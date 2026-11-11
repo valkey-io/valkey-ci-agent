@@ -313,10 +313,6 @@ as GitHub keeps its job log, which is 90 days.
 The workflow needs `AWS_ROLE_ARN`, with a role that grants a five-hour
 session. Each run is one model session of up to a few hours.
 
-To compare models, give the run a `model`: an alias, or a Bedrock inference
-profile id such as `us.anthropic.claude-fable-5-2`. Only that run uses it;
-the default for every other agent is unchanged.
-
 To add a case, copy one in `eval_cases.yml` and fill in the run, the failed
 job's id and name, the commit that failed, and the known fix.
 

@@ -40,10 +40,6 @@ on:
       target_repo:
         type: string
         default: valkey
-      model:
-        description: "The model for this fix, instead of CI_AGENT_CLAUDE_MODEL: an alias, or a Bedrock inference profile id"
-        type: string
-        default: ""
     secrets:
       # The App plans and publishes a real fix; a replayed one needs neither.
       VALKEYRIE_BOT_APP_ID:
@@ -194,7 +190,7 @@ jobs:
       - name: 'CI fix: prepare the fix in this job'
         shell: bash
         env:
-          CI_AGENT_CLAUDE_MODEL: ${{ inputs.model || vars.CI_AGENT_CLAUDE_MODEL }}
+          CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
         run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
       - name: 'CI fix: ensure the fix has a result'
         if: always()
@@ -290,7 +286,7 @@ jobs:
       - name: 'CI fix: prepare the fix in this job'
         shell: bash
         env:
-          CI_AGENT_CLAUDE_MODEL: ${{ inputs.model || vars.CI_AGENT_CLAUDE_MODEL }}
+          CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
         run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
       - name: 'CI fix: ensure the fix has a result'
         if: always()
@@ -367,7 +363,7 @@ jobs:
       - name: 'CI fix: prepare the fix in this job'
         shell: bash
         env:
-          CI_AGENT_CLAUDE_MODEL: ${{ inputs.model || vars.CI_AGENT_CLAUDE_MODEL }}
+          CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
         run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
       - name: 'CI fix: ensure the fix has a result'
         if: always()

@@ -30,10 +30,10 @@ These repository variables adjust its behaviour:
 
 ### The model
 
-By default the agent uses Claude Fable 5 through the
-`us.anthropic.claude-fable-5` Bedrock inference profile. The AWS account needs
+By default the agent uses Claude Fable 5.2 through the
+`us.anthropic.claude-fable-5-2` Bedrock inference profile. The AWS account needs
 access to that profile, and its Bedrock data retention must be set to
-`provider_data_share`, because Fable 5 isn't available with zero data
+`provider_data_share`, because Fable 5.2 isn't available with zero data
 retention. If you need to, set `CI_AGENT_CLAUDE_MODEL=opus` to fall back to
 Claude Opus 4.8. The workflows install Claude Code CLI version 2.1.175.
 
