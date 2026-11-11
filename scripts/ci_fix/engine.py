@@ -84,7 +84,7 @@ from scripts.common.proc import (
     worktree_changed_paths,
 )
 from scripts.common.text_utils import strip_ansi
-from scripts.common.valkey_ci import FAILURE_MARKERS, failed_tests_in_log
+from scripts.common.valkey_ci import FAILURE_MARKERS, failed_instance_tests_in_log, failed_tests_in_log
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +293,10 @@ def failed_tests(task: FixTask, job_log: str) -> tuple[FailedTest, ...]:
             test for test in (FailedTest.from_report(name, file) for name, file in failed_tests_in_log(job_log))
             if test not in tests
         ]
+    if not tests:
+        # A sentinel or legacy-cluster test names no file and no command here
+        # runs it, but its name still finds the upstream change that fixes it.
+        tests = [FailedTest(name, "") for name in failed_instance_tests_in_log(job_log)]
     # A log or issue names the file; one that leaves tests/ is not a test.
     return tuple(test for test in tests if ".." not in Path(test.file).parts)[:_MAX_TESTS]
 
@@ -372,7 +376,7 @@ def _establish(
         prior_fixes_searched=found is not None,
         test_history=history,
         unported_changes=(
-            unported_changes(repo_dir, tuple(dict.fromkeys([*(test.file for test in tests), *paths])))
+            unported_changes(repo_dir, tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths])))
             if upstream_only else ""
         ),
         verification=described,
@@ -949,12 +953,12 @@ def _checked_candidate(
         )
     if not _has_complete_diagnosis(candidate):
         raise _Rejected(_INCOMPLETE_DIAGNOSIS)
-    if upstream_only:
-        _check_adapts(repo_dir, candidate.adapts, changed_paths)
     try:
         patch = build_approved_patch(repo_dir, changed_paths, strict=True)
     except EmptyPatch:
         raise _Rejected("The agent selected a patch but produced no patch content.")
+    if upstream_only:
+        _check_adapts(repo_dir, candidate.adapts, changed_paths, patch)
     patch_limit = capabilities.patch_limit
     if len(patch) > patch_limit:
         raise _Rejected(
@@ -971,26 +975,50 @@ def _checked_candidate(
     )
 
 
-def _check_adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...]) -> None:
-    """Raise :class:`_Rejected` unless the patch adapts ``commit``, a merged upstream change.
+# How much of an adapting patch must be its upstream commit's own lines. Of
+# the fixes pushed to backport branches, the one real port shared all of its
+# lines with an upstream commit and no hand-written one more than a sixth,
+# though each changed a file that 3 to 175 unported upstream commits change.
+_MIN_ADAPTED_SHARE = 0.5
+
+
+def _check_adapts(repo_dir: str, commit: str, changed_paths: tuple[str, ...], patch: str) -> None:
+    """Raise :class:`_Rejected` unless ``patch`` adapts ``commit``, a merged upstream change.
 
     The commit has to pass what a port must (merged on the default branch,
-    not on this one), and change one of the files the patch does: a patch
-    that shares no file with it adapts something else.
+    not on this one), and the patch has to be mostly that commit's change to
+    the same files: naming a commit that only touches the file adapts nothing.
     """
     if not is_full_sha(commit):
         raise _Rejected(_UPSTREAM_ONLY)
     try:
         check_port(Path(repo_dir), commit, "HEAD")
-        touched = git_paths(repo_dir, "show", "--no-ext-diff", "--name-only", "--format=", "-z", commit)
+        upstream = git_output(
+            repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", commit, "--", *changed_paths,
+        )
     except (PushRefused, PushFailed) as exc:
         raise _Rejected(f"{exc} {_UPSTREAM_ONLY}") from exc
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         raise _Rejected(f"Commit {commit[:12]} could not be read. {_UPSTREAM_ONLY}") from exc
-    if not set(touched) & set(changed_paths):
+    # What a change adds is its own; what it removes, any change to those
+    # lines removes too. Only a patch that adds nothing is read by its removals.
+    sign = "+" if _changed_text(patch, "+") else "-"
+    ours, theirs = _changed_text(patch, sign), _changed_text(upstream, sign)
+    share = len(ours & theirs) / len(ours) if ours else 0.0
+    if share < _MIN_ADAPTED_SHARE:
         raise _Rejected(
-            f"The patch changes none of the files {commit[:12]} changes, so it does not adapt it. {_UPSTREAM_ONLY}"
+            f"Only {share:.0%} of the patch's changed lines are {commit[:12]}'s change to the same files, "
+            f"so it does not adapt that commit. {_UPSTREAM_ONLY}"
         )
+
+
+def _changed_text(diff: str, sign: str) -> set[str]:
+    """The lines a diff adds (``+``) or removes (``-``), without their indentation; a lone brace or blank says nothing."""
+    return {
+        text for text in (line[1:].strip() for line in diff.splitlines()
+                          if line.startswith(sign) and not line.startswith(sign * 3))
+        if len(text) > 3
+    }
 
 
 def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S) -> TestRun:

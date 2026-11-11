@@ -77,3 +77,21 @@ def test_runtest_result_lines_parse(line, expected):
     result = parse_result_line(line)
     assert (result.status, result.name, result.file) == expected
     assert parse_result_line("make: *** [all] Error 2") is None
+
+
+def test_sentinel_and_legacy_cluster_failures_are_read_by_name() -> None:
+    """Their harness names no file: ``09:24:21> <name>: FAILED: <why>`` (valkey job 129734399755)."""
+    from scripts.common.valkey_ci import failed_instance_tests_in_log
+
+    log = (
+        "2026-11-10T09:24:21.1104887Z 09:24:21> SENTINEL SIMULATE-FAILURE command metadata: OK\n"
+        "2026-11-10T09:24:21.1514151Z 09:24:21> SENTINEL SIMULATE-FAILURE valkey-cli hint: FAILED: caught an error in the test \n"
+        "2026-11-10T09:24:21.1514999Z ==75987==ERROR: LeakSanitizer: detected memory leaks\n"
+        "2026-11-10T09:24:22.0000000Z 09:24:22> SENTINEL SIMULATE-FAILURE valkey-cli hint: FAILED: caught an error in the test \n"
+        "2026-11-10T09:25:05.1444444Z 09:25:05> Cluster should eventually be up again: FAILED: timeout\n"
+    )
+
+    assert failed_instance_tests_in_log(log) == [
+        "SENTINEL SIMULATE-FAILURE valkey-cli hint", "Cluster should eventually be up again",
+    ]
+    assert failed_instance_tests_in_log("[err]: INCR fails in tests/unit/type/incr.tcl\n") == []

@@ -98,8 +98,9 @@ edit files there but cannot commit or push.
 
 On a backport branch Claude may not write a fix of its own. It ports a commit
 that is merged upstream, or adapts one and names it, and the bot checks that
-the named commit is merged, is not on the branch yet, and changes a file the
-patch changes. A test that is flaky upstream too is fixed upstream first. A
+the named commit is merged, is not on the branch yet, and that at least half
+of the lines the patch adds are that commit's own. Naming a commit that only
+touches the same file is not enough. A test that is flaky upstream too is fixed upstream first. A
 backport that broke the build is the exception: that is repaired by hand.
 
 **Code checks what Claude handed back.** The bot rejects anything that doesn't
@@ -161,7 +162,8 @@ Setting the repository variable `CI_FIX_ISSUES_AUTO_DISPATCH` to `false`
 turns the dispatcher off.
 
 An issue is eligible when it is open, unassigned and no open PR says it
-closes it (`Fixes #1234`; a PR that only mentions the issue doesn't count),
+closes or addresses it (`Fixes #1234`, also as one of a list; a PR that only
+mentions the issue doesn't count),
 and when the bot hasn't already posted a fix, declined, or failed twice for
 the failure it currently records. A newer failure makes the issue
 eligible again. At most two of these fixes run at once, which

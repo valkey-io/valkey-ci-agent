@@ -21,16 +21,24 @@ def parse_detector_occurrence(body: str) -> int | None:
     return int(marker.group("run"))
 
 
-# GitHub's closing keywords, then a reference to the issue: "Fixes #12",
-# "closes: valkey-io/valkey#12", "resolves https://github.com/o/r/issues/12".
-_CLOSING_REFERENCE = r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+\S*?(?:#|/issues/){number}(?!\d)"
+# A closing keyword, then the issue among the references that follow it on
+# the line: "Fixes #12", "closes: valkey-io/valkey#12", "Fixes #11 #12",
+# "resolves https://github.com/o/r/issues/11, #12". GitHub itself closes only
+# the first of a list, but its author is working on all of them; so is one
+# who writes "Addresses #12".
+_REFERENCE = r"\S*(?:#|/issues/)"
+_CLOSING_REFERENCE = (
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|address(?:e[sd])?):?[ \t]+"
+    rf"(?:{_REFERENCE}\d+[ \t,]*(?:and[ \t]+)?)*?{_REFERENCE}{{number}}(?!\d)"
+)
 
 
 def has_open_linked_pr(issue: Any) -> bool:
     """Return whether an open pull request says it closes ``issue``.
 
-    A pull request that only mentions the issue is not working on it: an
-    unrelated one that cites the failure must not keep the issue from a fix.
+    A pull request that only mentions the issue ("Related failures: #12") is
+    not working on it: one that cites the failure must not keep the issue
+    from a fix.
     """
     timeline = retry_github_call(
         lambda: list(issue.get_timeline()),

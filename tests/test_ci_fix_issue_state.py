@@ -35,7 +35,13 @@ def _event(event: str = "cross-referenced", state: str = "open", title: str = ""
         (_event(body="Fixes #7"), True),
         (_event(body="This closes: valkey-io/valkey#7."), True),
         (_event(title="Resolve https://github.com/o/r/issues/7"), True),
+        # One keyword, several issues: valkey #5333 says "Fixes #5301 #5305", #5271 "Addresses #5224".
+        (_event(body="Fixes #5301 #7"), True),
+        (_event(body="Fixes #1, #2 and #7."), True),
+        (_event(body="Addresses #7. A regression test covers it."), True),
         (_event(body="Fixes #7", state="closed"), False),
+        (_event(body="Fixes #4289.\n\nRelated failures: #7, #4435."), False),
+        (_event(body="Fixes #4289\nRelated failures: #7"), False),
         (_event(body="Fixes #7", event="mentioned"), False),
         # A pull request that only cites the issue, or closes another, is not working on it.
         (_event(body="Seen while looking at #7."), False),

@@ -59,6 +59,18 @@ def test_a_c_unit_tests_file_is_located_in_the_checkout(tmp_path):
     )
 
 
+def test_a_sentinel_test_is_searched_for_by_name_though_nothing_runs_it(tmp_path):
+    """Its name finds the upstream fix (#5274); with no file, no plan runs it and no history is read."""
+    log = "09:24:21> SENTINEL SIMULATE-FAILURE valkey-cli hint: FAILED: caught an error in the test\n"
+    tests = engine_mod.failed_tests(_task("a" * 40), log)
+
+    assert tests == (FailedTest("SENTINEL SIMULATE-FAILURE valkey-cli hint", ""),)
+    assert _REAL_PLAN_FOR(str(tmp_path), tests, scheduled=False) is None
+    # A runtest failure in the same log is the one to fix.
+    both = "[err]: INCR fails in tests/unit/type/incr.tcl\n" + log
+    assert engine_mod.failed_tests(_task("a" * 40), both) == (FailedTest("INCR fails", "tests/unit/type/incr.tcl"),)
+
+
 def _source_repo(tmp_path: Path) -> tuple[Path, str]:
     repo = tmp_path / "source"
     repo.mkdir()
@@ -947,11 +959,12 @@ def _backport(task: FixTask) -> FixTask:
     return replace(task, policy=FixPolicy.BACKPORT)
 
 
-def _adapting_agent(adapts: str, path: str = "value.txt"):
+def _adapting_agent(adapts: str, path: str = "value.txt", text: str = "fixed\nkept for this branch\n"):
+    """An agent whose patch is the upstream commit's line ("fixed") and one of its own, unless ``text`` says otherwise."""
     def agent(task, repo_dir, job_log, *, feedback="", context=None, **_kwargs):  # noqa: ARG001
         agent.feedback.append(feedback)
         agent.contexts.append(context)
-        (Path(repo_dir) / path).write_text("adapted\n", encoding="utf-8")
+        (Path(repo_dir) / path).write_text(text, encoding="utf-8")
         return FixCandidate(
             action=CandidateAction.PATCH, failing_check="value check", root_cause="the branch lacks the fix",
             reasoning="adapt the upstream fix", changed_paths=(path,), adapts=adapts,
@@ -984,19 +997,23 @@ def test_a_backport_branch_takes_a_patch_that_adapts_a_merged_upstream_commit(tm
     candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=_adapting_agent(commit))
 
     assert candidate.action is CandidateAction.PATCH
-    assert candidate.adapts == commit and "+adapted" in candidate.patch
+    assert candidate.adapts == commit and "+kept for this branch" in candidate.patch
 
 
-@pytest.mark.parametrize(("adapts", "path", "reason"), [
-    ("upstream", "other.txt", "changes none of the files"),  # the commit changes value.txt
-    ("head", "value.txt", "already present on the target head"),
-    ("b" * 40, "value.txt", "not merged into origin/main"),
+@pytest.mark.parametrize(("adapts", "path", "text", "reason"), [
+    # Every hand-written fix pushed to a backport branch changed a file that unported upstream commits
+    # change too: naming one of them adapts nothing unless the patch is its change.
+    ("upstream", "value.txt", "a fix of its own\nwith a longer wait\n", "Only 0% of the patch's changed lines"),
+    ("upstream", "value.txt", "fixed\nand two lines\nof its own\n", "Only 33% of the patch's changed lines"),
+    ("upstream", "other.txt", "fixed\n", "Only 0% of the patch's changed lines"),  # the commit changes value.txt
+    ("head", "value.txt", "fixed\n", "already present on the target head"),
+    ("b" * 40, "value.txt", "fixed\n", "not merged into origin/main"),
 ])
-def test_a_patch_must_adapt_the_upstream_commit_it_names(tmp_path, monkeypatch, adapts, path, reason):
+def test_a_patch_must_adapt_the_upstream_commit_it_names(tmp_path, monkeypatch, adapts, path, text, reason):
     source, head_sha = _source_repo(tmp_path)
     commit = _upstream_commit(source, head_sha)
     _install_clone(monkeypatch, source)
-    agent = _adapting_agent({"upstream": commit, "head": head_sha}.get(adapts, adapts), path)
+    agent = _adapting_agent({"upstream": commit, "head": head_sha}.get(adapts, adapts), path, text)
 
     candidate = engine_mod.prepare_fix(_backport(_task(head_sha)), _LOG, agent_func=agent)
 
