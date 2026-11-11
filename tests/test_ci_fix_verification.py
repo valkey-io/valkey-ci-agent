@@ -472,7 +472,7 @@ def test_a_fallback_counts_only_the_named_tests_own_failure(checkout):
 
 
 def test_a_report_quotes_the_isolated_run_without_the_script_that_writes_its_file(tmp_path):
-    """The eval's first isolated run put a thirty-line Tcl script into the report, a bullet a line."""
+    """An isolated run once put a thirty-line Tcl script into the report, a bullet a line."""
     (tmp_path / "runtest").write_text("#!/bin/sh\n", encoding="utf-8")
     test_file = tmp_path / "tests" / "integration" / "replication.tcl"
     test_file.parent.mkdir(parents=True)

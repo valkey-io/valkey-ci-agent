@@ -178,10 +178,6 @@ class FixTask:
     # Other open detector issues whose test this patch may also fix. Each is
     # verified on its own before the draft PR claims to fix it.
     other_issues: tuple[OtherIssue, ...] = ()
-    # Prepare the fix as of the failed commit: the checkout's default branch
-    # is held at it, so nothing merged since is there to find. Only a replayed
-    # failure sets it (scripts/ci_fix/eval.py), whose fix has since landed.
-    as_of_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -298,7 +294,6 @@ class FrontDoor(str, Enum):
     ISSUE = "issue"  # a Test Failure Detector issue (scripts/ci_fix/issues.py)
     PR = "pr"  # a maintainer's command on a PR (scripts/ci_fix/main.py)
     FOLLOW_UP = "follow-up"  # a bot-owned PR's red head (scripts/backport/ci_followup.py)
-    EVAL = "eval"  # a replayed failure whose fix is known (scripts/ci_fix/eval.py): never published
 
 
 @dataclass(frozen=True)

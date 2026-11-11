@@ -353,8 +353,7 @@ def test_every_fix_front_door_runs_the_shared_fix():
             for name in ("VALKEYRIE_BOT_APP_ID", "VALKEYRIE_BOT_PRIVATE_KEY", "AWS_ROLE_ARN")
         }, filename
         doors.add(job["with"]["front_door"])
-    # A replayed failure runs it too, without the App's secrets (ci-fix-eval.yml, tests/test_ci_fix_eval.py).
-    assert doors == {door.value for door in FrontDoor} - {FrontDoor.EVAL.value}
+    assert doors == {door.value for door in FrontDoor}
 
 
 def test_only_the_plan_and_publish_jobs_hold_a_github_token():

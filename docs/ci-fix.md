@@ -279,46 +279,6 @@ any:
 gh workflow run ci-fix-issue-dispatch.yml --repo valkey-io/valkey-ci-agent --field dry_run=true
 ```
 
-## Checking the bot against known fixes
-
-`scripts/ci_fix/eval_cases.yml` lists failures whose fix is known: the
-upstream commit a backport branch should have taken, or the pull request a
-person wrote. The **CI Fix Eval** workflow replays one of them and compares
-what the bot prepares with that fix.
-
-A replay runs through `ci-fix-run.yml` exactly as a real fix does. The failed
-job is read from Valkey's own workflow file, and the fix is prepared inside a
-copy of that job: on its macOS or Ubuntu runner, in its container, with its
-own setup, build and test commands. Nothing of Valkey's CI is copied into
-this repository. A job that can't host the fix falls back to the bot's runner,
-as it does for a real fix.
-
-Nothing is published. The eval doesn't pass the App's secrets, `ci-fix-run.yml`
-plans a replay with the workflow's own read-only token and skips its publish
-job, and the publish step refuses an eval plan.
-
-```bash
-gh workflow run ci-fix-eval.yml --repo valkey-io/valkey-ci-agent --field case=sanitizer-leak-8.1
-```
-
-The run's summary gives a verdict and both changes to read. `match` means the
-bot took the known commit, or wrote a patch that is mostly the known fix's
-lines. `differs` means it changed something else, which a person has to read,
-because a different fix can be right; the summary says how many of the lines
-the known fix replaces the bot's patch replaces too. `refused` and `failed`
-are what they say. A case's `gap` says what the bot lacks for it, such as a
-failure nothing here can run, whose fix is reviewed but not run.
-
-A case on `unstable` is replayed as of the commit that failed, so the fix
-that landed afterwards isn't there for the bot to find. A case lasts as long
-as GitHub keeps its job log, which is 90 days.
-
-The workflow needs `AWS_ROLE_ARN`, with a role that grants a five-hour
-session. Each run is one model session of up to a few hours.
-
-To add a case, copy one in `eval_cases.yml` and fill in the run, the failed
-job's id and name, the commit that failed, and the known fix.
-
 ## Configuration
 
 The bot uses the shared secrets described in [setup.md](setup.md). Its

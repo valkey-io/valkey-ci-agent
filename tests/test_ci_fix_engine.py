@@ -988,39 +988,6 @@ def test_the_review_reads_what_the_checks_found(tmp_path, monkeypatch):
     assert "passed 40 loop(s)" in reviewed[0] and "was not reproduced before the fix" in reviewed[0]
 
 
-def test_a_replayed_failure_does_not_find_the_fix_that_landed_after_it(tmp_path, monkeypatch):
-    """The eval prepares a fix as of the failed commit: the default branch is held there."""
-    source, head_sha = _source_repo(tmp_path)
-    commit = _upstream_commit(source, head_sha)  # the fix a person merged later
-    _install_clone(monkeypatch, source)
-    seen = {}
-
-    def agent(task, repo_dir, job_log, *, context=None, **_kwargs):  # noqa: ARG001
-        seen["default"] = git(Path(repo_dir), "rev-parse", "origin/main")
-        seen["context"] = context
-        return FixCandidate(action=CandidateAction.PORT, failing_check="t", root_cause="r", reasoning="port it",
-                            port_commit=commit)
-
-    task = replace(_task(head_sha), as_of_failure=True)
-    candidate = engine_mod.prepare_fix(task, _LOG, agent_func=agent)
-
-    assert seen["default"] == head_sha and not seen["context"].upstream_only
-    # Nor can it be named: to this checkout it was never merged.
-    assert candidate.action is CandidateAction.REFUSE and "not merged into origin/main" in candidate.summary
-    # A real fix sees the default branch as it is.
-    engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
-    assert seen["default"] == commit
-
-    # Inside the failed job's own checkout as well, where a replay runs when the job can host it.
-    job = tmp_path / "job"
-    git(tmp_path, "clone", "-q", str(source), str(job))
-    git(job, "checkout", "-q", "--detach", head_sha)
-    git(job, "update-ref", "refs/remotes/origin/main", commit)
-    git(job, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-    engine_mod.prepare_fix(task, _LOG, agent_func=agent, repo_dir=str(job))
-    assert seen["default"] == head_sha
-
-
 # --- where only a change already merged upstream is accepted ------------------
 
 def _backport(task: FixTask) -> FixTask:

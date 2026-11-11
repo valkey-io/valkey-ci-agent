@@ -78,9 +78,8 @@ class AgentRunResult:
     finished_at: str
 
 
-# On Fable 5.2 at high, sessions over fourteen replayed failures ran 30
-# seconds to 7 minutes and thirteen produced a fix. xhigh is not measured on
-# 5.2 yet; on Fable 5 it ran 16 to 72 minutes a session.
+# Over fourteen failures whose fix is known, Fable 5.2 sessions ran 25
+# seconds to 10 minutes at xhigh, about as long as at high.
 _CI_FIX_EFFORT = "xhigh"
 
 AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
