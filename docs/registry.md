@@ -32,6 +32,7 @@ repos:
     repair_validation_failures: true
     automatic_ci_followup: true
     ci_followup_ignored_jobs: ["*dco*", "code-coverage*"]
+    ci_followup_release_workflow: weekly.yml
     branches:
       - branch: "8.1"
         project_number: 14
@@ -98,6 +99,13 @@ the bot should fix. For Valkey these are Daily CI's two result aggregators and
 the coverage upload. The patterns only match GitHub Actions jobs. Checks from
 other GitHub Apps, such as DCO and Codecov, are never considered in the first
 place, so patterns for them are only a precaution.
+
+`ci_followup_release_workflow` names a scheduled workflow that runs the tests
+of every release branch, as Valkey's `weekly.yml` does by calling `daily.yml`
+once a branch. When it is set, a release branch's failures in the newest such
+run are [followed up on that branch's sweep
+PR](backport.md#when-a-backport-prs-own-ci-fails). Leave it out to follow up
+only the PRs' own CI.
 
 ## Smaller settings
 

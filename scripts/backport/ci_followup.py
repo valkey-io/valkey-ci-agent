@@ -5,6 +5,11 @@ bot-owned sweep PR for one registered release branch, waits for its current
 head's CI to finish, chooses one unhandled actionable job, and plans its fix,
 which runs like every other (:mod:`scripts.ci_fix.run`).
 
+When the sweep PR's own CI has nothing left to fix, the release branch's
+failures in the newest scheduled run of every release branch (Valkey's
+weekly.yml) are fixed on the sweep PR the same way: its backports are what
+the branch will be.
+
 The engine owns diagnosis, editing, and publication. The target PR's normal CI
 remains the final verifier, matching the existing backport workflow model.
 Published fixes and reasoned refusals are commented on the target PR. Failed
@@ -48,6 +53,7 @@ from scripts.ci_fix.models import (
 )
 from scripts.ci_fix.policy import is_backport_branch, is_writable_branch
 from scripts.common.github_client import retry_github_call
+from scripts.common.valkey_ci import Source
 from scripts.common.workflow_jobs import job_is_ignored
 
 logger = logging.getLogger(__name__)
@@ -83,12 +89,19 @@ class FollowupTarget:
     head_sha: str
     head_branch: str
     job: FailedJob
+    # The failure is the release branch's own, in the scheduled run that
+    # tests every release branch, not one of the pull request's CI.
+    release_run: bool = False
 
 
 @dataclass(frozen=True)
 class _HandledFailures:
     job_ids: frozenset[int]
     job_keys: frozenset[str]
+    # Jobs a fix or a refusal was reported for on any head of the PR. A
+    # release branch's run is not run again when the head moves, so its job
+    # is done with once, not once a head.
+    reported_job_ids: frozenset[int]
     attempt_count: int
     unstarted_count: int
 
@@ -218,10 +231,62 @@ def _followup_for_pr(
         and _job_key(run, job.name) not in handled.job_keys
         and not job_is_ignored(job.name, repo_entry.ci_followup_ignored_jobs),
     )
+    release_run = False
+    if picked is None and head_branch == f"{_BRANCH_PREFIX}/{target_branch}":
+        # The pull request's own CI has nothing left to fix: the release
+        # branch's failures are fixed on its sweep PR too.
+        picked = _release_run_failure(gh, repo_entry, target_branch, handled)
+        release_run = picked is not None
     if picked is None:
         return None, "no-unhandled-actionable-failures"
     run, job, _failed = picked
-    return FollowupTarget(pr=pr, run=run, head_sha=head_sha, head_branch=head_branch, job=job), "actionable"
+    return FollowupTarget(
+        pr=pr, run=run, head_sha=head_sha, head_branch=head_branch, job=job, release_run=release_run,
+    ), "actionable"
+
+
+def release_job_name(job_name: str, branch: str) -> str:
+    """The job's own name when ``job_name`` is ``branch``'s in a run of every release branch, else "".
+
+    Valkey's weekly.yml calls daily.yml once a branch, so its jobs are named
+    ``run-daily-for-release-branches (8.0) / test-ubuntu-jemalloc``.
+    """
+    caller, separator, name = job_name.partition(" / ")
+    return name.strip() if separator and caller.rstrip().endswith(f"({branch})") else ""
+
+
+def _release_run_failure(
+    gh: Any, repo_entry: RepoEntry, target_branch: str, handled: _HandledFailures,
+) -> tuple[Any, FailedJob, list[FailedJob]] | None:
+    """One unhandled failure of ``target_branch`` in the newest scheduled run of every release branch.
+
+    Only the newest run: one still running says nothing yet, and the one
+    before it tested the branch a week earlier.
+    """
+    workflow = repo_entry.ci_followup_release_workflow
+    if not workflow:
+        return None
+    try:
+        runs = retry_github_call(
+            lambda: list(islice(gh.get_repo(repo_entry.repo).get_workflow(workflow).get_runs(event="schedule"), 1)),
+            retries=2,
+            description=f"find the newest scheduled {workflow} run",
+        )
+    except Exception as exc:  # noqa: BLE001 - the pull request's own CI was still followed up
+        logger.warning("Could not read the scheduled %s runs: %s", workflow, exc)
+        return None
+
+    def keep(run: Any, job: FailedJob) -> bool:
+        name = release_job_name(job.name, target_branch)
+        return (
+            bool(name and job.id)
+            and job.id not in handled.job_ids
+            and job.id not in handled.reported_job_ids
+            and _job_key(run, job.name) not in handled.job_keys
+            and not job_is_ignored(name, repo_entry.ci_followup_ignored_jobs)
+        )
+
+    return most_actionable_failure(gh, repo_entry.repo, runs, keep=keep)
 
 
 def plan_request(
@@ -253,17 +318,32 @@ def plan_request(
 
     selected_job = target.job
     run_attempt = int(getattr(target.run, "run_attempt", 1) or 1)
+    job_name, described = selected_job.name, f"the failure in job `{selected_job.name}`"
+    if target.release_run:
+        # The job as the scheduled workflow names it, which is how it is
+        # resolved and replayed on this pull request's head.
+        job_name = release_job_name(selected_job.name, target_branch)
+        described = (
+            f"the failure in job `{job_name}` of the scheduled run of release branch `{target_branch}`, "
+            "which this pull request is into. That run tested the release branch, not this pull "
+            "request's head: the fix is prepared and checked on this head."
+        )
     failure = Failure(
         repo_full_name=repo_entry.repo,
         run_id=int(target.run.id),
         run_attempt=run_attempt,
         head_sha=target.head_sha,
         job_id=selected_job.id,
-        job_name=selected_job.name,
+        job_name=job_name,
         base_branch=target_branch,
-        description=f"the failure in job `{selected_job.name}`",
+        description=described,
         pr_number=int(target.pr.number),
+        # A run of every release branch runs the scheduled workflow's jobs, as scheduled.
+        source=Source.DAILY if target.release_run else None,
         workflow=workflow_file(target.run),
+        # Those jobs are the ones of the commit the run was started on, the
+        # default branch's: a release branch's own workflow may lack them.
+        workflow_sha=str(getattr(target.run, "head_sha", "") or "") if target.release_run else "",
     )
     task = FixTask(
         failure=failure,
@@ -289,7 +369,11 @@ def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:
     failure = plan.task.failure
     if result.kind is not ResultKind.FAILED:
         what = "backport" if is_backport_branch(plan.task.target.branch) else "pull request"
-        body = f"Automatic follow-up on this {what}'s CI.\n\n" + render_result(result)
+        lead = (
+            f"Automatic follow-up on the scheduled test run of `{failure.base_branch}`, the branch this "
+            "pull request is into." if failure.scheduled else f"Automatic follow-up on this {what}'s CI."
+        )
+        body = f"{lead}\n\n" + render_result(result)
         declined = result.candidate is not None and result.candidate.action is CandidateAction.REFUSE
         reason = f" reason={_DECLINED}" if declined else ""
         body += "\n\n" + "\n".join(
@@ -373,6 +457,7 @@ def _handled_failures(
     """
     job_ids: set[int] = set()
     job_keys: set[str] = set()
+    reported_job_ids: set[int] = set()
     failed_ids: Counter[int] = Counter()
     failed_keys: Counter[str] = Counter()
     refused_keys: Counter[str] = Counter()
@@ -391,6 +476,10 @@ def _handled_failures(
         if author != bot_login:
             continue
         every_head = tuple(_MARKER_RE.finditer(str(getattr(comment, "body", "") or "")))
+        reported_job_ids.update(
+            int(match.group("job")) for match in every_head
+            if match.group("outcome") != ResultKind.FAILED.value
+        )
         refused_keys.update(
             match.group("key") for match in every_head
             if match.group("key") and match.group("reason") == _DECLINED
@@ -439,6 +528,7 @@ def _handled_failures(
     return _HandledFailures(
         job_ids=frozenset(job_ids),
         job_keys=frozenset(job_keys),
+        reported_job_ids=frozenset(reported_job_ids),
         attempt_count=attempt_count,
         unstarted_count=unstarted_count,
     )

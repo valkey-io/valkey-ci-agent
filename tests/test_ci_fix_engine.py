@@ -1237,8 +1237,9 @@ def test_a_session_that_died_on_a_model_api_error_is_run_once_more_on_a_clean_tr
     """The CLI gave up on the API mid-session: that is no verdict, and whatever it had edited is not the fix."""
     from scripts.ci_fix.agent import ModelUnavailable
 
-    slept, seen = [], []
-    monkeypatch.setattr(engine_mod.time, "sleep", slept.append)
+    seen = []
+    # Not time.sleep itself: the test command's own polling sleeps too.
+    monkeypatch.setattr(engine_mod, "API_ERROR_PAUSE_S", 0)
 
     def agent(task, repo_dir, job_log, **_kwargs):  # noqa: ARG001
         value = Path(repo_dir) / "value.txt"
@@ -1252,7 +1253,7 @@ def test_a_session_that_died_on_a_model_api_error_is_run_once_more_on_a_clean_tr
 
     candidate = _prepare(tmp_path, monkeypatch, agent)
 
-    assert seen == ["before\n", "before\n"] and slept == [60]
+    assert seen == ["before\n", "before\n"]
     assert candidate.action is CandidateAction.PATCH and "+right" in candidate.patch
     assert "half an edit" not in candidate.patch
 
@@ -1260,7 +1261,7 @@ def test_a_session_that_died_on_a_model_api_error_is_run_once_more_on_a_clean_tr
 def test_a_session_that_dies_on_a_model_api_error_twice_is_a_failed_attempt(tmp_path, monkeypatch):
     from scripts.ci_fix.agent import ModelUnavailable
 
-    monkeypatch.setattr(engine_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(engine_mod, "API_ERROR_PAUSE_S", 0)
     agent = MagicMock(side_effect=ModelUnavailable("API Error: 503"))
 
     with pytest.raises(ModelUnavailable):

@@ -158,7 +158,10 @@ def job_for(gh: Any, task: FixTask) -> JobSpec | None:
 
     The setup replays in that tree, so it is that tree's workflow: a detector
     issue's fix is prepared on the branch tip, not the older commit the
-    scheduled run tested. A suggestion is never run, so it needs no job.
+    scheduled run tested. A run of every release branch is the exception: its
+    jobs are the default branch's, which a release branch's own workflow may
+    not have (``Failure.workflow_sha``). A suggestion is never run, so it
+    needs no job.
     """
     failure = task.failure
     workflow = failure.source.value if failure.source else failure.workflow
@@ -170,7 +173,7 @@ def job_for(gh: Any, task: FixTask) -> JobSpec | None:
         ref = f"refs/pull/{failure.pr_number}/merge"
     try:
         sha = checked_out(task)
-        source = workflow_source(gh, failure.repo_full_name, workflow, sha)
+        source = workflow_source(gh, failure.repo_full_name, workflow, failure.workflow_sha or sha)
         return resolve(source, failure.job_name, scheduled=failure.scheduled,
                        repository=failure.repo_full_name, sha=sha, ref=ref)
     except (Unsupported, GithubException) as exc:

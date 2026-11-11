@@ -233,7 +233,10 @@ def test_validation_failure_retries_claude_once(tmp_path: Path) -> None:
         results = resolve_conflicts_with_claude(str(tmp_path), [cf], _pr_context())
 
     assert len(prompts) == 2
-    assert "failed validation" in prompts[1]
+    # The retry is a new session: it is given the whole task again, and then where it stands.
+    assert prompts[1].startswith(prompts[0])
+    assert "An earlier session worked on this cherry-pick" in prompts[1]
+    assert "`tests/unit/cluster.tcl`:" in prompts[1].removeprefix(prompts[0])
     assert len(results) == 1
     assert results[0].resolved_content == "proc f {} { return ok }\n"
 

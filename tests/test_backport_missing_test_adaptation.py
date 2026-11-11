@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from scripts.backport.missing_test_adaptation import (
     adapt_target_missing_tests_with_claude,
+    build_test_adaptation_prompt,
     is_test_path,
 )
 from scripts.backport.models import BackportCandidate
@@ -130,6 +131,35 @@ def test_adaptation_reports_removed_existing_test_without_deleting_it(
         "testing/acl_test.cc"
     )
     assert test_path.read_text(encoding="utf-8") == "TEST(ACL, Existing) {}\n"
+
+
+def test_a_long_upstream_test_is_given_whole_as_a_file_not_cut(tmp_path: Path) -> None:
+    """Its first 12,000 characters were all the agent saw, with nothing to say there was more."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    candidate = BackportCandidate(
+        source_pr_number=42, source_pr_title="test", source_pr_url="https://example.test/pull/42",
+        target_branch="1.2",
+    )
+    long_test = "TEST(New, Start) {}\n" + "// filler\n" * 2_000 + "TEST(New, AtTheEnd) {}\n"
+    sources = {"testing/long_test.cc": long_test, "testing/short_test.cc": "TEST(Short, Works) {}\n"}
+
+    prompt = build_test_adaptation_prompt(
+        str(repo), candidate, sources, language="c++", context_dir=tmp_path / "upstream",
+    )
+
+    whole = tmp_path / "upstream" / "00-long_test.cc"
+    assert whole.read_text(encoding="utf-8") == long_test
+    assert f"Read the whole text at {whole}" in prompt and "TEST(New, AtTheEnd)" not in prompt
+    # A short one is inline, as before, and nothing is written for it.
+    assert "TEST(Short, Works) {}" in prompt
+    assert [path.name for path in (tmp_path / "upstream").iterdir()] == ["00-long_test.cc"]
+
+    # With nowhere to write it, the cut is at least said.
+    assert "more characters are not shown" in build_test_adaptation_prompt(
+        str(repo), candidate, sources, language="c++",
+    )
 
 
 def test_adaptation_hides_cleanly_added_upstream_test_from_editable_sandbox(

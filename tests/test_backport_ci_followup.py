@@ -137,6 +137,8 @@ def _select(
     jobs=None,
     entry=None,
     prior_plans=(),
+    release_run=None,
+    release_jobs=(),
 ):
     pr = pr or _pr()
     runs = runs if runs is not None else [_run()]
@@ -144,6 +146,8 @@ def _select(
         FailedJob("unit tests", id=3),
     ]
     gh = _gh(runs, pr)
+    workflow = gh.get_repo.return_value.get_workflow.return_value
+    workflow.get_runs.return_value = [release_run] if release_run is not None else []
     monkeypatch.setattr(
         ci_followup,
         "find_existing_pr",
@@ -155,6 +159,8 @@ def _select(
     }
 
     def jobs_for_run(_gh, _repo, run_id, *, run_attempt, **_kwargs):
+        if release_run is not None and run_id == release_run.id:
+            return list(release_jobs)
         assert run_attempt == attempts_by_run[run_id]
         return list(jobs)
 
@@ -623,6 +629,120 @@ def test_failed_attempts_count_against_the_heads_budget(monkeypatch) -> None:
 
     _target, reason, _gh = _select(monkeypatch, pr=_pr(comments=failed))
     assert reason == "attempt-budget-exhausted"
+
+
+# --- the release branch's own failures, from the run of every release branch -------
+
+_WEEKLY = (
+    FailedJob("run-daily-for-release-branches (8.0) / test-ubuntu-jemalloc", id=70),
+    FailedJob("run-daily-for-release-branches (9.0) / code-coverage", id=71),
+    FailedJob("run-daily-for-release-branches (9.0) / test-valgrind-misc", id=72),
+    FailedJob("run-daily-for-release-branches (9.0) / test-ubuntu-tls", id=73),
+    FailedJob("determine-release-branches", id=74),
+)
+
+
+def _weekly_run(**fields):
+    run = _run(500, workflow_id=900, head_sha="f" * 40, head_branch="unstable", **fields)
+    run.path, run.event = ".github/workflows/weekly.yml", "schedule"
+    return run
+
+
+def _weekly_entry():
+    return _entry(ci_followup_release_workflow="weekly.yml", ci_followup_ignored_jobs=("code-coverage*",))
+
+
+def _select_weekly(monkeypatch, **kwargs):
+    """The sweep PR's own CI is green unless ``runs`` says otherwise."""
+    kwargs.setdefault("runs", [_run(conclusion="success")])
+    kwargs.setdefault("release_run", _weekly_run())
+    return _select(monkeypatch, entry=_weekly_entry(), release_jobs=_WEEKLY, **kwargs)
+
+
+def test_a_release_branchs_weekly_failure_is_fixed_on_its_sweep_pr(monkeypatch) -> None:
+    """This branch's jobs only, the one most likely to have a fix first, and never a job that only reports."""
+    target, reason, gh = _select_weekly(monkeypatch)
+
+    assert reason == "actionable" and target.release_run
+    assert target.job == FailedJob("run-daily-for-release-branches (9.0) / test-ubuntu-tls", id=73)
+    assert target.run.id == 500 and target.head_sha == _HEAD
+    gh.get_repo.return_value.get_workflow.assert_called_once_with("weekly.yml")
+    gh.get_repo.return_value.get_workflow.return_value.get_runs.assert_called_once_with(event="schedule")
+
+
+def test_the_plan_for_a_weekly_failure_replays_the_scheduled_job_on_the_sweep_head(monkeypatch) -> None:
+    target, _reason, _gh_client = _select_weekly(monkeypatch)
+
+    task = _plan(monkeypatch, target).task
+
+    # The job as daily.yml names it, run as scheduled, on the head the fix is pushed to.
+    assert task.failure.job_name == "test-ubuntu-tls" and task.failure.job_id == 73
+    assert task.failure.scheduled and task.failure.workflow == "weekly"
+    # Weekly's jobs are the default branch's daily.yml, at the commit the run was started on.
+    assert task.failure.workflow_sha == "f" * 40
+    assert task.failure.run_id == 500 and task.failure.head_sha == _HEAD and task.failure.pr_number == 4226
+    assert "scheduled run of release branch `9.0`" in task.failure.description
+    assert task.policy is FixPolicy.BACKPORT and task.target.kind is TargetKind.UPDATE_PR
+    assert task.target.branch == "agent/backport/sweep/9.0" and task.target.expected_sha == _HEAD
+
+
+def test_the_pull_requests_own_failure_comes_before_the_release_branchs(monkeypatch) -> None:
+    target, reason, gh = _select_weekly(monkeypatch, runs=[_run()])
+
+    assert reason == "actionable" and not target.release_run and target.job.id == 3
+    gh.get_repo.return_value.get_workflow.assert_not_called()
+
+
+def test_a_weekly_failure_is_handled_once_however_often_the_head_moves(monkeypatch) -> None:
+    """A fix pushed for it moves the head, and the weekly run is not run again on the new one."""
+    earlier_head = tuple(
+        _marker(head="b" * 40, run=500, job=job, outcome=outcome)
+        for job, outcome in ((73, "pushed"), (72, "refused"))
+    )
+
+    target, reason, _gh_client = _select_weekly(monkeypatch, pr=_pr(comments=earlier_head))
+
+    assert target is None and reason == "no-unhandled-actionable-failures"
+
+    # An attempt that failed reported nothing, and is tried again.
+    failed = (_marker(head="b" * 40, run=500, job=73, outcome="failed"), earlier_head[1])
+    target, reason, _gh_client = _select_weekly(monkeypatch, pr=_pr(comments=failed))
+    assert reason == "actionable" and target.job.id == 73
+
+
+@pytest.mark.parametrize("release_run", [
+    _weekly_run(status="in_progress", conclusion=None),  # says nothing yet; the one before it is a week old
+    _weekly_run(conclusion="success"),
+])
+def test_a_weekly_run_that_is_running_or_passed_has_nothing_to_fix(monkeypatch, release_run) -> None:
+    target, reason, _gh_client = _select_weekly(monkeypatch, release_run=release_run)
+
+    assert target is None and reason == "no-unhandled-actionable-failures"
+
+
+def test_weekly_failures_are_followed_up_only_where_the_registry_names_the_workflow(monkeypatch) -> None:
+    target, reason, gh = _select(
+        monkeypatch, runs=[_run(conclusion="success")], release_run=_weekly_run(), release_jobs=_WEEKLY,
+    )
+
+    assert target is None and reason == "no-unhandled-actionable-failures"
+    gh.get_repo.return_value.get_workflow.assert_not_called()
+
+
+def test_a_weekly_fix_is_reported_as_the_release_branchs_failure(monkeypatch) -> None:
+    target, _reason, _gh_client = _select_weekly(monkeypatch)
+    plan = _plan(monkeypatch, target)
+    posted = []
+    pull = SimpleNamespace(create_issue_comment=posted.append)
+    gh = MagicMock()
+    gh.get_repo.return_value.get_pull.return_value = pull
+    result = FixResult(kind=ResultKind.REFUSED, summary="A port clash on the runner.", task=plan.task,
+                       candidate=FixCandidate(action=CandidateAction.REFUSE, summary="A port clash on the runner."))
+
+    ci_followup.report_result(gh, plan, result)
+
+    assert posted[0].startswith("Automatic follow-up on the scheduled test run of `9.0`")
+    assert "run=500" in posted[0] and "job=73" in posted[0] and "outcome=refused reason=declined" in posted[0]
 
 
 # --- a pushed fix or a draft PR also has CI nobody else watches --------------------

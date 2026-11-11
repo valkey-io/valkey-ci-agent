@@ -104,6 +104,7 @@ class TestLoadRegistry:
         assert entry.repair_validation_failures is False
         assert entry.automatic_ci_followup is False
         assert entry.ci_followup_ignored_jobs == ()
+        assert entry.ci_followup_release_workflow == ""
         assert entry.backport_label == "backport"
         assert entry.llm_conflict_label == "ai-resolved-conflicts"
         assert entry.max_conflicting_files == 100
@@ -130,6 +131,7 @@ class TestLoadRegistry:
             repair_validation_failures=True,
             automatic_ci_followup=True,
             ci_followup_ignored_jobs=["*dco*"],
+            ci_followup_release_workflow="weekly.yml",
             test_path_patterns=["testing/*.cc", "integration/test_*.py"],
             backport_label="bp",
             llm_conflict_label="ai",
@@ -163,6 +165,7 @@ class TestLoadRegistry:
         assert entry.repair_validation_failures is True
         assert entry.automatic_ci_followup is True
         assert entry.ci_followup_ignored_jobs == ("*dco*",)
+        assert entry.ci_followup_release_workflow == "weekly.yml"
         assert entry.test_path_patterns == (
             "testing/*.cc",
             "integration/test_*.py",
@@ -240,6 +243,13 @@ class TestValidation:
         data = _minimal_registry(repos=[repo])
         path = _write_registry(tmp_path, data)
         with pytest.raises(ValueError, match="language"):
+            load_registry(path)
+
+    @pytest.mark.parametrize("value", ["../weekly.yml", "weekly", 5])
+    def test_release_workflow_must_be_a_workflow_file_name(self, tmp_path, value):
+        data = _minimal_registry(repos=[_minimal_repo(ci_followup_release_workflow=value)])
+        path = _write_registry(tmp_path, data)
+        with pytest.raises(ValueError, match="ci_followup_release_workflow"):
             load_registry(path)
 
     def test_duplicate_repo(self, tmp_path):

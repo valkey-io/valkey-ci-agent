@@ -89,13 +89,16 @@ A repository can opt in to two kinds of help with
 
 The first is a repair. Claude gets one attempt to fix a backport that failed
 validation. It may only edit the files the backport touched, and it is not
-allowed to delete tests to make the failure go away.
+allowed to delete tests to make the failure go away. Claude has no shell
+there, so it is given the validation log and a file with the commits the
+backport brought and their diff.
 
 The second is for tests that can't run on an older branch at all. Sometimes a
 fix comes with a new test written for a test harness that the release branch
 doesn't have. Rather than quietly dropping the test, Claude ports what the
 test checks into an existing test that the branch does support, and the whole
-backport is validated again. If that can't be done, the backport fails
+backport is validated again. A long upstream test is given to Claude whole,
+as a file. If that can't be done, the backport fails
 instead of going in without its test.
 
 ## When a backport PR's own CI fails
@@ -112,6 +115,15 @@ finished, then picks one failed job it hasn't tried yet and hands it to the
 PR's CI runs again. The bot never rewrites the branch and doesn't add a DCO
 sign-off to these commits, so a maintainer certifies the change when they
 merge it.
+
+Valkey also tests every release branch once a week (`weekly.yml`). When a
+sweep PR's own CI has nothing left to fix, the agent takes that branch's
+failures from the newest weekly run, one an hour, and fixes them on the sweep
+PR under the same rules. The fix is prepared and tested on the sweep PR's
+latest commit, not on the commit the weekly run tested, and the comment says
+which run it came from. A weekly failure is handled once, however often the
+PR's head moves. Without an open sweep PR for the branch there is nowhere to
+push, and nothing is done.
 
 A few rules keep this from going in circles. The agent makes at most seven
 attempts on any one commit. A run that fails before the agent starts, because

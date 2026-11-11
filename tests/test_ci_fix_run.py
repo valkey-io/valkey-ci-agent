@@ -120,6 +120,19 @@ def test_a_scheduled_failure_is_resolved_from_its_scheduled_workflow(front_door,
     assert load(tmp_path / run.JOB_FILE, JobSpec).env == {"CC": "clang"}
 
 
+def test_a_release_branchs_weekly_job_is_resolved_from_the_workflow_that_ran_it(front_door, workflows, tmp_path):
+    """Weekly runs the default branch's daily.yml on each release branch: 8.0's own has no test-ubuntu-tls-io-threads."""
+    plan = _pr_plan("test-sanitizer-address (clang)")
+    failure = replace(plan.task.failure, source=Source.DAILY, workflow="weekly", workflow_sha="f" * 40)
+    front_door.planned = replace(plan, task=replace(plan.task, failure=failure))
+
+    outputs = _plan(tmp_path, front_door.planned)
+
+    assert workflows == [("valkey-io/valkey", "daily", "f" * 40)]
+    # The fix is still prepared on the commit it is pushed to.
+    assert outputs["job"] == "test-sanitizer-address (clang)" and outputs["use_git_ref"] == _HEAD
+
+
 def test_an_issue_fix_replays_the_job_from_the_tip_it_checks_out(front_door, workflows, tmp_path):
     """The scheduled run tested an older commit; its setup must match the tree it runs in."""
     tip = "c" * 40
