@@ -371,14 +371,28 @@ def _default_summary(action: CandidateAction) -> str:
     return "No safe fix was prepared."
 
 
-_REVIEW_PROMPT = """\
-You are reviewing a proposed fix for a failed CI job in the repository at your
-current working directory, which holds the fix. Be skeptical: approve only a
+# A fix written here is judged on its merits. A port is not: its commit is
+# merged on the default branch, whose maintainers reviewed it, and a reviewer
+# that turns it down for its design (a tolerance where it would rather have
+# an exact value) leaves the release branch with no fix at all.
+_REVIEW_A_PATCH = """\
+Be skeptical: approve only a
 change that fixes the root cause the log shows. Reject one that weakens or
 skips a test, hides a product defect, or changes more than the failure needs.
 Reject a longer timeout, more retries or a looser threshold unless the patch's
 author shows why the old value was wrong; and any change whose purpose is to
-let a test run alone or under a particular test selection.
+let a test run alone or under a particular test selection."""
+
+_REVIEW_A_PORT = """\
+The fix is a commit
+already merged on the repository's default branch, where its maintainers
+reviewed it: do not judge its design again. Approve it when it addresses the
+failure the log shows. Reject it only when it addresses something else, or
+brings changes this failure does not need."""
+
+_REVIEW_PROMPT = """\
+You are reviewing a proposed fix for a failed CI job in the repository at your
+current working directory, which holds the fix. {stance}
 
 The exact failed-job log is at:
 {log_path}
@@ -424,8 +438,10 @@ def review_candidate(
         # What code ran and found, for a verified candidate; else what it planned.
         checked = candidate.verification or context.verification
         verification = f"What code checked:\n{checked}\n" if checked else ""
+        ported = candidate.action is CandidateAction.PORT
         guide = ""
-        if context.guide:
+        # The repository's conventions are for a change written here, not for one it already merged.
+        if context.guide and not ported:
             guide_path = Path(log_dir) / "test-guide.md"
             guide_path.write_text(context.guide, encoding="utf-8")
             guide = (
@@ -435,6 +451,7 @@ def review_candidate(
         result = run_agent(
             "ci_fix_review",
             _REVIEW_PROMPT.format(
+                stance=_REVIEW_A_PORT if ported else _REVIEW_A_PATCH,
                 log_path=log_path, failing_check=candidate.failing_check,
                 root_cause=candidate.root_cause, patch=candidate.patch,
                 origin=origin, verification=verification, guide=guide,

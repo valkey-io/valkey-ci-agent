@@ -300,16 +300,21 @@ def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) 
     assert approved
     assert f"ports upstream commit {'c' * 40}" in seen["prompt"]
     assert "What code checked:\nCode checks your change with `make`." in seen["prompt"]
-    assert "a skip tag instead of a fix, is a rejection" in seen["prompt"]
     assert "It is a claim: check it against the log" in seen["prompt"]
-    assert "a looser threshold unless" in seen["prompt"]
+    # A port is merged upstream, where it was reviewed: its design is not judged again. The first
+    # run on a new model turned down the one merged fix for a flake because it widened an assertion.
+    assert "do not judge its design again" in seen["prompt"]
+    assert "a looser threshold unless" not in seen["prompt"] and "is a rejection" not in seen["prompt"]
 
-    # A verified candidate's review reads what the checks found, and what a patch says it adapts.
+    # A fix written here is judged on its merits, against the repository's conventions; and a
+    # verified candidate's review reads what the checks found, and what a patch says it adapts.
     adapted = FixCandidate(action=CandidateAction.PATCH, adapts="d" * 40, patch="diff",
                            verification="With the fix, `make` builds.")
     agent_mod.review_candidate(adapted, str(tmp_path), "log", context=context)
     assert "What code checked:\nWith the fix, `make` builds." in seen["prompt"]
     assert f"adapts upstream commit {'d' * 40}" in seen["prompt"]
+    assert "a looser threshold unless" in seen["prompt"] and "do not judge its design again" not in seen["prompt"]
+    assert "a skip tag instead of a fix, is a rejection" in seen["prompt"]
 
 
 @pytest.mark.parametrize("result", [

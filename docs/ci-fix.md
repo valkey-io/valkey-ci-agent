@@ -143,7 +143,10 @@ reviews the fix with the same conventions and the test results in front of
 it, and has to approve. It is told to check Claude's diagnosis against the
 log rather than take it as given, and to reject a longer timeout or a looser
 threshold that comes without a reason, and any change made so that a test can
-run alone. If the tests fail or the reviewer objects, the output or the
+run alone. A port is reviewed differently: its commit is already merged
+upstream, where maintainers reviewed it, so the reviewer only checks that it
+addresses this failure and brings nothing else. If the tests fail or the
+reviewer objects, the output or the
 reviewer's reasoning goes back to Claude, along with what its last session
 concluded, and it revises its fix for the next round. If the build or the
 tests change any tracked file while the fix is being tested, the fix that was
