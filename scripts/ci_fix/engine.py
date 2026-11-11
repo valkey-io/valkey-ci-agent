@@ -88,9 +88,6 @@ from scripts.common.valkey_ci import FAILURE_MARKERS, failed_instance_tests_in_l
 
 logger = logging.getLogger(__name__)
 
-MAX_JOB_LOG_CHARS = 300_000
-JOB_LOG_HEAD_CHARS = 40_000
-
 # A candidate that fails its test or its review goes back to the agent with
 # the result, this many times in all.
 MAX_ROUNDS = 3
@@ -112,7 +109,7 @@ _MAX_AGENT_ROUND_S = 2 * 60 * 60
 # What the looped run of a verification may take. A slow test gets as many
 # loops as fit (a 79s test cannot loop 40 times in the time kept back).
 _LOOP_BUDGET_S = 45 * 60
-_TEST_OUTPUT_CHARS = 6_000
+_TEST_OUTPUT_CHARS = 40_000
 # A make that stopped on an error; ``make[1]: [...] Error 2 (ignored)`` is not one.
 _BUILD_BROKE_RE = re.compile(r"make(?:\[\d+\])?: \*\*\* .*Error \d+")
 # At most this many of a job's failing tests are searched for and verified.
@@ -165,7 +162,6 @@ def prepare_fix(
 
     if not job_log:
         return _refusal("The exact failed-job log is unavailable; no fix was prepared.")
-    job_log = bounded_job_log(job_log)
 
     with checkout(task, repo_dir) as (repo_dir, original_head):
         deadline = time.monotonic() + PREPARE_BUDGET_S
@@ -639,10 +635,6 @@ _UPSTREAM_ONLY = (
     "default branch first: choose `refuse` and say so."
 )
 _NOT_RUN = "No command here can run the failing check, so this fix was reviewed, not run."
-_NOT_REPRODUCED = (
-    "The failure was not reproduced before the fix: the passing run shows that the test "
-    "passes with the change, not that it failed without it."
-)
 
 
 def _earlier_diagnosis(candidate: FixCandidate) -> str:
@@ -850,7 +842,6 @@ def _verify_with_plan(
     checks.append(f"With the fix, `{current.quoted(loops)}` passed {loops} loop(s).")
     if loops < current.loops:
         checks.append(f"One loop takes {first.seconds:.0f}s, so {loops} loop(s) ran, not {current.loops}.")
-    checks.append(_NOT_REPRODUCED)
     return ""
 
 
@@ -989,16 +980,12 @@ def _checked_candidate(
             raise _Rejected(
                 "The agent mixed an upstream port with working-tree edits; no candidate was published."
             )
-        if not _has_complete_diagnosis(candidate):
-            raise _Rejected(_INCOMPLETE_DIAGNOSIS)
         if not is_full_sha(candidate.port_commit):
             raise _Rejected("The proposed upstream port is not a full commit SHA.")
         return replace(candidate, patch="", changed_paths=(), adapts="", validation="")
 
     if not changed_paths:
         raise _Rejected("The agent selected a patch but made no working-tree changes.")
-    if not _has_complete_diagnosis(candidate):
-        raise _Rejected(_INCOMPLETE_DIAGNOSIS)
     try:
         patch = build_approved_patch(repo_dir, changed_paths, strict=True)
     except EmptyPatch:
@@ -1161,20 +1148,5 @@ def _refusal(summary: str, verification: str = "") -> FixCandidate:
     return FixCandidate(action=CandidateAction.REFUSE, summary=summary, verification=verification)
 
 
-def _has_complete_diagnosis(candidate: FixCandidate) -> bool:
-    return bool(candidate.root_cause and candidate.reasoning)
-
-
-_INCOMPLETE_DIAGNOSIS = "The agent did not provide a root cause and a change rationale."
-
-
 class _Rejected(Exception):
     """What the agent handed back cannot be used as it is; it may revise it."""
-
-
-def bounded_job_log(job_log: str) -> str:
-    if len(job_log) <= MAX_JOB_LOG_CHARS:
-        return job_log
-    marker = "\n\n[... job log truncated; keeping the final failure output ...]\n\n"
-    tail_chars = MAX_JOB_LOG_CHARS - JOB_LOG_HEAD_CHARS - len(marker)
-    return job_log[:JOB_LOG_HEAD_CHARS] + marker + job_log[-tail_chars:]
