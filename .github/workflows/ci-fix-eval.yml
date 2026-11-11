@@ -1,5 +1,5 @@
 name: CI Fix Eval
-run-name: "CI fix eval ${{ inputs.case }}"
+run-name: "CI fix eval ${{ inputs.case }}${{ inputs.model && format(' ({0})', inputs.model) || '' }}"
 
 # Replays one failure whose fix is known (scripts/ci_fix/eval_cases.yml) and
 # compares what the CI fix bot prepares with that fix (scripts/ci_fix/eval.py).
@@ -22,6 +22,11 @@ on:
         description: "A case id from scripts/ci_fix/eval_cases.yml"
         required: true
         type: string
+      model:
+        description: "A model to try instead of the default: an alias, or a Bedrock inference profile id (us.anthropic.claude-fable-5-2)"
+        required: false
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -39,6 +44,7 @@ jobs:
       front_door: eval
       request: ${{ format('{{"case":{0}}}', toJSON(inputs.case)) }}
       key: eval-${{ inputs.case }}
+      model: ${{ inputs.model }}
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 

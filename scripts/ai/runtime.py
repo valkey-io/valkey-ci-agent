@@ -78,6 +78,11 @@ class AgentRunResult:
     finished_at: str
 
 
+# At xhigh the fix agent thought for up to ten minutes between two file
+# reads, and its sessions ran 16 to 72 minutes: the agent, not verification
+# (2 to 9 minutes), is where a fix's time goes.
+_CI_FIX_EFFORT = "high"
+
 AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
     "conflict_resolve_edit_only": AgentProfile(
         name="conflict_resolve_edit_only",
@@ -122,7 +127,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="ci_fix_edit",
         allowed_tools="Read,Edit,MultiEdit,Write,Grep",
         timeout=None,
-        effort="xhigh",
+        effort=_CI_FIX_EFFORT,
         max_turns=None,
         writes_allowed=True,
         output_schema="candidate-json",
@@ -135,7 +140,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="ci_fix_review",
         allowed_tools="Read,Grep",
         timeout=None,
-        effort="xhigh",
+        effort=_CI_FIX_EFFORT,
         max_turns=None,
         output_schema="review-json",
         disallowed_tools="Bash,Glob,Edit,MultiEdit,Write",
@@ -149,7 +154,7 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         name="ci_fix_suggest",
         allowed_tools="Read,Edit,MultiEdit,Write,Grep",
         timeout=None,
-        effort="xhigh",
+        effort=_CI_FIX_EFFORT,
         max_turns=None,
         writes_allowed=True,
         output_schema="candidate-json",
