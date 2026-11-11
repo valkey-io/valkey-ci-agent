@@ -112,6 +112,10 @@ Do not repeat a change that was shown not to work. What happened, from code
 _NOT_VERIFIED = """Code owns executable verification: do not claim to have
 run anything."""
 
+_REVIEWED_ONLY = """No command can run the failing check, so your patch will be
+reviewed and published as not run: do not claim to have run anything. Propose
+a patch only where the log and the code establish the cause; otherwise refuse."""
+
 _VERIFIED_BY_CODE = """Code verifies a candidate with its own command (above),
 and only that counts: do not claim to have run anything.
 The CI job log is your evidence of what fails and why. When the failing test
@@ -222,7 +226,10 @@ def run_fix_agent(
             policy=_POLICY[task.policy] + (f"\n{_UPSTREAM_ONLY}" if context.upstream_only else ""),
             target=capabilities.publication_guidance,
             context=_context_prompt(context, Path(log_dir), allows_port),
-            test_guidance=_VERIFIED_BY_CODE if context.verified_by_code else _NOT_VERIFIED,
+            test_guidance=(
+                _VERIFIED_BY_CODE if context.verified_by_code
+                else _REVIEWED_ONLY if context.reviewed_only else _NOT_VERIFIED
+            ),
             action_guidance=action_guidance,
             action_values=action_values,
             port_instruction=port_instruction,

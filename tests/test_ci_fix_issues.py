@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -653,6 +654,11 @@ def test_a_fix_published_as_a_comment_is_the_patch_on_the_issue_and_closes_the_o
     assert "```diff\n--- a/tests/x.tcl" in comment.body
     assert comment.body.rstrip().endswith("<!-- valkey-ci-agent:ci-fix-result run=100 outcome=suggested -->")
     assert (result["action"], result["pr"]) == ("suggested", 0)
+    # A fix nothing could run says so before anything else.
+    not_run = replace(candidate, not_run=True, verification="No command here can run the failing check.")
+    issues_mod._suggestion_comment(issue, issues_mod.parse_issue(issue), source="From run 100, job `j`", candidate=not_run)
+    assert issue.comments.pop().body.startswith(
+        "A tentative fix, reviewed but not run: nothing the bot has can run the failing check. Nothing was pushed")
     # The occurrence is handled: the dispatcher does not start it again.
     comment.user = SimpleNamespace(login=_BOT)
     issue.get_comments = lambda: list(issue.comments)

@@ -3,8 +3,8 @@
 #
 # Each case is one exact failed job. `expect` names its fix: `port` is the
 # upstream commit a backport branch should take; `pull` is the pull request a
-# person wrote (merged or still open). `gap` says why the bot is not expected
-# to manage a case yet: it stays here so that the day it does shows.
+# person wrote (merged or still open). `gap` says what the bot lacks for a
+# case, so that its result is read with that in mind.
 #
 # A case on the default branch is replayed as of its failed commit, so the fix
 # that landed later is not there to find. A backport case sees the default
@@ -83,7 +83,7 @@ cases:
     scheduled: true
     expect:
       pull: 5276
-    gap: The log names no test, so no command checks a fix; and only macOS's Tcl fails it.
+    gap: The log names no test, so a fix is reviewed, not run; and only macOS's Tcl fails it.
 
   - id: reply-schema
     about: "#5306: the reply-schema validator rejected CONFIG SET's reply."
@@ -97,7 +97,7 @@ cases:
     scheduled: true
     expect:
       pull: 5287
-    gap: The log names no test, and nothing here runs the reply-schema validator.
+    gap: The log names no test and nothing here runs the reply-schema validator, so a fix is reviewed, not run.
 
   - id: sanitizer-leak-7.2
     about: The same LeakSanitizer report on the 7.2 backport PR, the oldest branch.
@@ -204,3 +204,17 @@ cases:
       file: tests/integration/repl-compression.tcl
     expect:
       pull: 5295
+
+  - id: nodes-conf-mkdir
+    about: "#5217: a cluster test could not create its nodes.conf folder, in a container job."
+    repo: valkey-io/valkey
+    run_id: 40978346098
+    job_id: 123811852718
+    job: test-ubuntu-jemalloc-fortify
+    sha: 6e3eddf4976d0d02c1ecf6dbf19fdd3eb0f2e84b
+    base_branch: unstable
+    issue: 5217
+    scheduled: true
+    expect:
+      pull: 5026
+    gap: The log names no test, so a fix is reviewed, not run.

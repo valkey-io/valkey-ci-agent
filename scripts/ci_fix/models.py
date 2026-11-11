@@ -207,6 +207,9 @@ class FixCandidate:
     # Other detector issues whose test the patch changed, without showing
     # that it fixes them. Never written by the agent.
     also_touches: tuple[int, ...] = ()
+    # Reviewed, never run: nothing the bot has can run the failing check
+    # (FixContext.reviewed_only). Never written by the agent.
+    not_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,6 +234,9 @@ class FixContext:
     # that adapts one. So on a backport branch, and for a failure no command
     # here can run.
     upstream_only: bool = False
+    # Nothing here can run the failing check and no upstream change can be
+    # ported, so a fix is reviewed and published as not run.
+    reviewed_only: bool = False
     # The repository's test conventions, and its own docs in the checkout.
     guide: str = ""
     guide_paths: tuple[str, ...] = ()

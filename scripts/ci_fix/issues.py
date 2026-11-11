@@ -438,8 +438,12 @@ def _terminal_comment(
 def _suggestion_comment(issue: Any, failure: IssueFailure, *, source: str, candidate: Optional[FixCandidate]) -> None:
     """The fix as a patch on the issue: nothing pushed, no PR, a maintainer applies it."""
     where = "in that job" if "job `" in source else "for that run"
+    how = (
+        "reviewed but not run: nothing the bot has can run the failing check"
+        if candidate is not None and candidate.not_run else f"prepared and checked {where}"
+    )
     lines = [
-        f"A tentative fix, prepared and checked {where}. Nothing was pushed and no PR was opened: "
+        f"A tentative fix, {how}. Nothing was pushed and no PR was opened: "
         "a maintainer applies it, or not.",
         "",
     ]

@@ -87,7 +87,7 @@ class Case:
     # The known fix: the upstream commit to port, or the pull request a person wrote.
     expect_port: str = ""
     expect_pull: int = 0
-    # Why the bot is not expected to manage this case yet.
+    # What the bot lacks for this case, for whoever reads its result.
     gap: str = ""
 
 

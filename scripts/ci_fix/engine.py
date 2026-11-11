@@ -107,6 +107,8 @@ _MIN_ROUND_S = 8 * 60
 # Of each round's time, what the agent may not use: the candidate's
 # verification (looped tests, possibly under valgrind) and review come after it.
 _VERIFY_RESERVE_S = 60 * 60
+# The same for a fix that is reviewed but not run.
+_REVIEW_RESERVE_S = 15 * 60
 # One agent session's share of the budget, so that a first round cannot use
 # all of it: a candidate that fails its test still gets a second round.
 _MAX_AGENT_ROUND_S = 2 * 60 * 60
@@ -177,14 +179,14 @@ def prepare_fix(
             task, repo_dir, tests, paths_in_log(repo_dir, job_log),
             runs_tests=runs_tests, job=job, job_log=job_log,
         )
-        if runs_tests:
+        if runs_tests and not context.reviewed_only:
             refusal = _unverifiable_refusal(context, plan)
             if refusal is not None:
                 return refusal
         return _fix_loop(
             task, repo_dir, original_head, job_log, context, plan,
             agent_func=agent_func, review=review_func or review_candidate,
-            run_test=run_test if runs_tests else None, deadline=deadline, job=job, tests=tests,
+            run_test=run_test if runs_tests and plan is not None else None, deadline=deadline, job=job, tests=tests,
         )
 
 
@@ -197,7 +199,7 @@ def prepare_budget() -> int:
 
 
 def _unverifiable_refusal(context: FixContext, plan: VerifyPlan | None) -> FixCandidate | None:
-    """Refuse when no command can run the failing test: the fix would be published on review alone."""
+    """Refuse when no command can run the failing test, where a fix may not be published on review alone."""
     if plan is not None:
         return None
     return _refusal(
@@ -375,6 +377,14 @@ def _establish(
             # A release branch takes the upstream change, not a fix of its
             # own that the default branch never gets.
             upstream_only = True
+    # A job that failed outside any test the bot can run (a validator, an
+    # exception between tests), with nothing upstream to port: the fixes
+    # people write for these are small and read from the log, so one is
+    # proposed, reviewed, and published as not run. Never on a backport
+    # branch, which takes only what is merged upstream.
+    reviewed_only = runs_tests and plan is None and task.policy is FixPolicy.GENERAL
+    if reviewed_only:
+        described = _NOT_RUN
     if plan is not None:
         _ignore_generated_copies(repo_dir)
         loops = plan.loops
@@ -406,6 +416,7 @@ def _establish(
         verification=described,
         verified_by_code=plan is not None,
         upstream_only=upstream_only,
+        reviewed_only=reviewed_only,
         guide=guide,
         guide_paths=tuple(path for path in _REPO_DOCS if guide and (Path(repo_dir) / path).is_file()),
     )
@@ -470,9 +481,10 @@ def _fix_loop(
         # failure: it is a failed attempt, which may be retried, not a refusal.
         if attempt > 1 and remaining < _MIN_ROUND_S:
             raise RuntimeError(f"Ran out of time after {attempt - 1} attempt(s). Last: {last}")
-        # In a short budget the reserve is at most half of what is left.
-        reserve = min(_VERIFY_RESERVE_S, remaining // 2)
-        agent_timeout = remaining - reserve if run_test is not None else remaining
+        # What comes after the agent: verification and review, or review
+        # alone. In a short budget, at most half of what is left.
+        reserve = min(_VERIFY_RESERVE_S if run_test is not None else _REVIEW_RESERVE_S, remaining // 2)
+        agent_timeout = remaining - reserve
         agent_timeout = min(agent_timeout, _MAX_AGENT_ROUND_S)
         try:
             outcome = agent_round(
@@ -542,7 +554,9 @@ def _fix_loop(
             feedback = "\n\n".join(part for part in (failed, _earlier_diagnosis(candidate), tree) if part)
             logger.info("CI-fix round %d: %s", attempt, failed.splitlines()[0])
             continue
-        return replace(candidate, verification="\n".join(checks), also_touches=touches)
+        return replace(
+            candidate, verification="\n".join(checks), also_touches=touches, not_run=context.reviewed_only,
+        )
     return _refusal(
         f"No candidate passed its test and review in {MAX_ROUNDS} attempts. Last: {last}",
         verification="\n".join(established),
@@ -616,6 +630,7 @@ _UPSTREAM_ONLY = (
     "this branch. A fix with no upstream counterpart belongs on the default branch first: "
     "choose `refuse` and say so."
 )
+_NOT_RUN = "No command here can run the failing check, so this fix was reviewed, not run."
 _NOT_REPRODUCED = (
     "The failure was not reproduced before the fix: the passing run shows that the test "
     "passes with the change, not that it failed without it."

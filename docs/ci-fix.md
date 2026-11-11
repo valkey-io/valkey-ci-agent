@@ -85,7 +85,9 @@ Claude what it is. Some failures have no command the bot can run: a sanitizer
 or valgrind report that names no test, a sentinel or legacy-cluster test, a
 lint. For those the bot only accepts a change that is already merged upstream,
 checks that it builds, and leaves the rest to the PR's own CI. When there is
-nothing upstream to port, as on `unstable` itself, it declines.
+nothing upstream to port, as on `unstable` itself, Claude may still propose a
+patch. That patch is reviewed but not run, and the bot's report says so in
+its first line. A backport branch never gets one.
 
 **Claude diagnoses and edits.** Claude gets the job's log, whatever the
 history search found, the verification command, and Valkey's testing
@@ -288,7 +290,8 @@ The run's summary gives a verdict and both changes to read. `match` means the
 bot took the known commit, or wrote a patch that is mostly the known fix's
 lines. `differs` means it changed something else, which a person has to read,
 because a different fix can be right. `refused` and `failed` are what they
-say. A case marked with a `gap` is one the bot isn't expected to manage yet.
+say. A case's `gap` says what the bot lacks for it, such as a failure
+nothing here can run, whose fix is reviewed but not run.
 
 A case on `unstable` is replayed as of the commit that failed, so the fix
 that landed afterwards isn't there for the bot to find. The fix runs on the

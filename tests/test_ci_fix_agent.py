@@ -253,6 +253,21 @@ def test_without_a_verification_plan_the_agent_must_not_claim_a_test_run(tmp_pat
     assert "What code established" not in seen["prompt"]
 
 
+def test_a_fix_that_will_not_be_run_is_proposed_only_where_the_cause_is_established(tmp_path, monkeypatch) -> None:
+    from scripts.ci_fix.models import FixContext
+
+    seen = {}
+    monkeypatch.setattr(agent_mod, "run_agent", lambda profile, prompt, **kw: seen.update(prompt=prompt) or _result(
+        {"action": "refuse", "summary": "no"}))
+
+    agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=FixContext(
+        reviewed_only=True, verification="No command here can run the failing check, so this fix was reviewed, not run."))
+
+    assert "your patch will be\nreviewed and published as not run" in seen["prompt"]
+    assert "only where the log and the code establish the cause; otherwise refuse" in seen["prompt"]
+    assert "### Verification\nNo command here can run the failing check" in seen["prompt"]
+
+
 def test_where_only_an_upstream_change_is_accepted_the_agent_is_told_and_its_claim_is_read(
     tmp_path, monkeypatch,
 ) -> None:

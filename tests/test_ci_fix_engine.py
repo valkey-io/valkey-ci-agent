@@ -659,15 +659,48 @@ def _with_plan(monkeypatch, seen=None):
     monkeypatch.setattr(engine_mod, "plan_for", plan_for)
 
 
-def test_without_a_verification_plan_no_fix_is_attempted(tmp_path, monkeypatch):
-    """A fix the bot publishes as tested must run; review alone is not a check."""
+def test_a_failure_nothing_can_run_gets_a_fix_that_is_reviewed_and_said_not_to_be_run(tmp_path, monkeypatch):
+    """A job that failed outside any test, with nothing upstream to port (#5285, #5306, #5217).
+
+    People fixed each with a few lines read from the log. The bot may propose
+    one, but never as tested: it is reviewed, and published as not run.
+    """
+    source, head_sha = _source_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", lambda *_args, **_kwargs: None)
+    agent, reviewed, timeouts = _value_agent("right"), [], []
+
+    def recording_agent(*args, timeout, **kwargs):
+        timeouts.append(timeout)
+        return agent(*args, **kwargs)
+
+    def review(candidate, *_args, **_kwargs):
+        reviewed.append(candidate.verification)
+        return True, "reads right"
+
+    candidate = engine_mod.prepare_fix(
+        _task(head_sha), _LOG, agent_func=recording_agent, review_func=review,
+        test_func=lambda *_args: pytest.fail("nothing is run"),
+    )
+
+    assert candidate.action is CandidateAction.PATCH and candidate.not_run
+    assert engine_mod._NOT_RUN in candidate.verification and engine_mod._NOT_RUN in reviewed[0]
+    assert "passed" not in candidate.verification and "Review: reads right" in candidate.verification
+    # The review still gets its time after the agent.
+    assert timeouts[0] <= engine_mod.PREPARE_BUDGET_S - engine_mod._REVIEW_RESERVE_S
+
+
+def test_a_backport_branch_never_gets_a_fix_that_was_not_run(tmp_path, monkeypatch):
+    """There only an upstream change is accepted, and with nothing to port there is no fix."""
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)
     monkeypatch.setattr(engine_mod, "plan_for", lambda *_args, **_kwargs: None)
 
-    candidate = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=lambda *a, **k: pytest.fail("no edit"))
+    candidate = engine_mod.prepare_fix(
+        _backport(_task(head_sha)), _LOG, agent_func=lambda *a, **k: pytest.fail("no edit"),
+    )
 
-    assert candidate.action is CandidateAction.REFUSE
+    assert candidate.action is CandidateAction.REFUSE and not candidate.not_run
     assert "could not be checked" in candidate.summary
 
 
@@ -1442,12 +1475,21 @@ def test_a_job_that_did_not_break_in_make_gets_no_build_plan(tmp_path, monkeypat
     _install_clone(monkeypatch, source)
     monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
 
+    contexts = []
+
+    def agent(task, repo_dir, job_log, *, context=None, **_kwargs):  # noqa: ARG001
+        contexts.append(context)
+        return FixCandidate(action=CandidateAction.REFUSE, summary="The validator is not a code fix.")
+
     candidate = engine_mod.prepare_fix(
         _task(head_sha), "make[1]: [Makefile:849: distclean] Error 2 (ignored)\nJSON schema validation error",
-        agent_func=lambda *a, **k: pytest.fail("no edit"), job=JobCommands(build="false", runtest="./runtest"),
+        agent_func=agent, job=JobCommands(build="false", runtest="./runtest"),
+        test_func=lambda *_args: pytest.fail("the job's build is not the check"),
     )
 
-    assert candidate.action is CandidateAction.REFUSE and "could not be checked" in candidate.summary
+    # No build plan: the fix would be reviewed, not run, and the agent may still decline.
+    assert contexts[0].reviewed_only and not contexts[0].verified_by_code
+    assert candidate.action is CandidateAction.REFUSE and not candidate.not_run
 
 
 def _chain():
