@@ -100,6 +100,9 @@ TEST_TIMEOUT_S = 30 * 60
 # budget runs low.
 AWS_SESSION_S = 5 * 60 * 60
 PREPARE_BUDGET_S = 4 * 60 * 60 + 30 * 60
+# The session a job actually got, when its role grants less than
+# ``AWS_SESSION_S`` (ci-fix-eval.yml sets it from a repository variable).
+SESSION_ENV = "CI_FIX_AWS_SESSION_SECONDS"
 _MIN_ROUND_S = 8 * 60
 # Of each round's time, what the agent may not use: the candidate's
 # verification (looped tests, possibly under valgrind) and review come after it.
@@ -166,7 +169,7 @@ def prepare_fix(
     job_log = bounded_job_log(job_log)
 
     with checkout(task, repo_dir) as (repo_dir, original_head):
-        deadline = time.monotonic() + PREPARE_BUDGET_S
+        deadline = time.monotonic() + prepare_budget()
         runs_tests = task.target.kind is not TargetKind.SUGGEST
         run_test = test_func or run_test_command
         tests = locate_unit_tests(repo_dir, failed_tests(task, job_log))
@@ -183,6 +186,14 @@ def prepare_fix(
             agent_func=agent_func, review=review_func or review_candidate,
             run_test=run_test if runs_tests else None, deadline=deadline, job=job, tests=tests,
         )
+
+
+def prepare_budget() -> int:
+    """The seconds a preparation may take: inside the model's AWS session, by the usual margin."""
+    session = os.environ.get(SESSION_ENV, "").strip()
+    if not session.isdigit():
+        return PREPARE_BUDGET_S
+    return min(PREPARE_BUDGET_S, int(session) - (AWS_SESSION_S - PREPARE_BUDGET_S))
 
 
 def _unverifiable_refusal(context: FixContext, plan: VerifyPlan | None) -> FixCandidate | None:
@@ -459,7 +470,9 @@ def _fix_loop(
         # failure: it is a failed attempt, which may be retried, not a refusal.
         if attempt > 1 and remaining < _MIN_ROUND_S:
             raise RuntimeError(f"Ran out of time after {attempt - 1} attempt(s). Last: {last}")
-        agent_timeout = remaining - _VERIFY_RESERVE_S if run_test is not None else remaining
+        # In a short budget the reserve is at most half of what is left.
+        reserve = min(_VERIFY_RESERVE_S, remaining // 2)
+        agent_timeout = remaining - reserve if run_test is not None else remaining
         agent_timeout = min(agent_timeout, _MAX_AGENT_ROUND_S)
         try:
             outcome = agent_round(

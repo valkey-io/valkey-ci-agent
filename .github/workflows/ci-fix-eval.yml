@@ -103,11 +103,14 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: ci-fix-eval-${{ github.run_id }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
-          role-duration-seconds: 18000
+          # A repository whose role grants less than five hours says how much;
+          # the engine fits its time budget inside it.
+          role-duration-seconds: ${{ vars.CI_FIX_AWS_SESSION_SECONDS || 18000 }}
       - name: 'CI fix: prepare the fix in this job'
         shell: bash
         env:
           CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
+          CI_FIX_AWS_SESSION_SECONDS: ${{ vars.CI_FIX_AWS_SESSION_SECONDS }}
         run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
       - name: 'CI fix: ensure the fix has a result'
         if: always()

@@ -299,6 +299,9 @@ A case lasts as long as GitHub keeps its job log, which is 90 days.
 The workflow needs `AWS_ROLE_ARN`, and a token that can read the case's
 repository in `CI_FIX_EVAL_TOKEN`, because GitHub serves job logs only to a
 signed-in caller. Each run is one model session of up to a few hours.
+Where the role grants a session shorter than five hours, set the repository
+variable `CI_FIX_AWS_SESSION_SECONDS` to what it grants, and the fix fits its
+time budget inside that.
 
 To add a case, copy one in `eval_cases.yml` and fill in the run, the failed
 job's id and name, the commit that failed, and the known fix.

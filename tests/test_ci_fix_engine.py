@@ -130,6 +130,21 @@ def test_the_budget_fits_the_aws_session_and_leaves_a_round_after_verification()
     assert engine_mod.PREPARE_BUDGET_S - engine_mod._VERIFY_RESERVE_S >= engine_mod._MIN_ROUND_S
 
 
+def test_a_shorter_aws_session_shortens_the_budget_by_the_same_margin(monkeypatch) -> None:
+    """A role that grants three hours, not five: the preparation still ends inside the session."""
+    margin = engine_mod.AWS_SESSION_S - engine_mod.PREPARE_BUDGET_S
+    monkeypatch.delenv(engine_mod.SESSION_ENV, raising=False)
+    assert engine_mod.prepare_budget() == engine_mod.PREPARE_BUDGET_S
+
+    monkeypatch.setenv(engine_mod.SESSION_ENV, "10800")
+    assert engine_mod.prepare_budget() == 10800 - margin
+    # Never more than the usual budget, and an unset repository variable (an empty value) changes nothing.
+    monkeypatch.setenv(engine_mod.SESSION_ENV, "43200")
+    assert engine_mod.prepare_budget() == engine_mod.PREPARE_BUDGET_S
+    monkeypatch.setenv(engine_mod.SESSION_ENV, "")
+    assert engine_mod.prepare_budget() == engine_mod.PREPARE_BUDGET_S
+
+
 def test_prepare_fix_binds_exact_job_and_builds_binary_patch(tmp_path, monkeypatch) -> None:
     source, head_sha = _source_repo(tmp_path)
     clone_calls = _install_clone(monkeypatch, source)
