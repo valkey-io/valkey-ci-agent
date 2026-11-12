@@ -100,6 +100,8 @@ reading it from the top.
 
 Aim for the fix a maintainer would write, one that removes the cause: waiting
 for the condition a test depends on, say, instead of for a length of time.
+Never make a test or the harness ignore what it reports, or accept an outcome
+it rejected, to make it pass: remove why the report happens.
 When the evidence narrows the cause to a few possibilities and one change is
 correct under each of them, make that change and say in `validation` what the
 evidence does not establish. Choose `refuse` only when you can justify no
@@ -485,7 +487,11 @@ change that fixes the root cause the log shows. Reject one that weakens or
 skips a test, hides a product defect, or changes more than the failure needs.
 Reject a longer timeout, more retries or a looser threshold unless the patch's
 author shows why the old value was wrong; and any change whose purpose is to
-let a test run alone or under a particular test selection. Reject a handler
+let a test run alone or under a particular test selection. Reject a change
+that makes a test or the harness ignore an error, a warning or a finding it
+reports, or accept an outcome it rejected, unless the author shows that every
+outcome it would then accept is correct behaviour: the fix to approve removes
+why the report happens. Reject a handler
 for a state that cannot happen, an exact assertion on state the server is
 still changing, a new helper where an existing one does the job, and
 comments that narrate the fix or its history.

@@ -414,6 +414,7 @@ def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) 
     assert "no reason to reject" in seen["prompt"] and "say what change you\nwould approve" in seen["prompt"]
     assert "What code checked:\nWith the fix, `make` builds." in seen["prompt"]
     assert f"adapts upstream commit {'d' * 40}" in seen["prompt"]
+    assert "ignore an error, a warning or a finding it\nreports" in seen["prompt"]
     assert "a looser threshold unless" in seen["prompt"] and "do not judge its design again" not in seen["prompt"]
     # Written fixes are also held to the test-quality rules in the bot's guide.
     assert "for a state that cannot happen" in seen["prompt"]
