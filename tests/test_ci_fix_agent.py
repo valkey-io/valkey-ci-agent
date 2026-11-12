@@ -109,7 +109,7 @@ def test_run_fix_agent_uses_exact_log_and_one_edit_session(tmp_path, monkeypatch
     assert "Normal target-repository CI is authoritative" in seen["prompt"]
     assert "Choose `refuse` only when you can justify no\nchange" in seen["prompt"]
     assert "one change is\ncorrect under each of them" in seen["prompt"]
-    assert "Do not commit or push" in seen["prompt"]
+    assert "Never commit, push, create a branch, or modify `.git`." in seen["prompt"]
     assert candidate.action is CandidateAction.PATCH
     assert candidate.failure_type is FailureType.DETERMINISTIC
     assert candidate.changed_paths == ("src/parser.c",)
@@ -265,8 +265,9 @@ def test_a_fix_that_will_not_be_run_says_what_is_and_is_not_established(tmp_path
     agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=FixContext(
         reviewed_only=True, verification="No command here can run the failing check, so this fix was reviewed, not run."))
 
-    assert "Unless\nyou name it in `failing_tests` and code can run it" in seen["prompt"]
-    assert "say plainly what the log and the code establish and what they\ndo not" in seen["prompt"]
+    assert "No run will catch a wrong guess" in seen["prompt"]
+    assert "say plainly what the log\nand the code establish and what they do not" in seen["prompt"]
+    assert "do not claim to have run\nanything" in seen["prompt"]
     assert "### Verification\nNo command here can run the failing check" in seen["prompt"]
     assert "If you can, name it in `failing_tests`" in seen["prompt"]
 

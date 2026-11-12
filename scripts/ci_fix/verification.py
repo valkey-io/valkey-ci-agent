@@ -53,12 +53,13 @@ _OK_LINE_RE = re.compile(r"\[ok\]:|\[       OK \]|^\[\d+/\d+\] \S+ \(\d+ ms\)$")
 _TEST_FRAME_RE = re.compile(r"\btest [\"{]")
 _MAX_FAILURE_LINES = 200
 _MAX_OK_LINES = 2_000
-# runtest's no-progress watchdog (default 20 minutes, Daily's valgrind jobs
-# 40). It must fire well inside the verification budget, or a hanging test is
-# killed from outside before runtest can report it as ``[TIMEOUT]``. One test,
-# even under valgrind, makes progress well within it.
-# A test's watchdog in verification: the job's own, up to the cap, else
-# the default (a hang without valgrind shows well before 600s).
+# runtest's no-progress watchdog (``--timeout``) in verification: the job's
+# own, up to the cap, else 600s rather than runtest's 20-minute default (a
+# hang without valgrind shows well before 600s). Daily's valgrind jobs pass
+# 2400: a test under valgrind is slow, not hung. The watchdog must fire inside
+# the verification budget, or a hanging test is killed from outside before
+# runtest can report it as ``[TIMEOUT]``; past the cap, the notes say a
+# ``[TIMEOUT]`` may be verification's own.
 _RUNTEST_TIMEOUT_S = 600
 _MAX_RUNTEST_TIMEOUT_S = 2400
 
@@ -237,9 +238,7 @@ def plan_for(
     if not base:
         # A job with only some of the suites (Daily's valgrind "misc" jobs run only the module API tests).
         return None
-    # runtest keeps the last --timeout. The job's own watchdog is kept (Daily's
-    # valgrind jobs pass 2400: a test under valgrind is slow, not hung) up to
-    # the cap; past it, the notes say a [TIMEOUT] may be verification's own.
+    # runtest keeps the last --timeout.
     job_timeout = _job_timeout(base)
     options = ["--timeout", str(min(job_timeout or _RUNTEST_TIMEOUT_S, _MAX_RUNTEST_TIMEOUT_S))]
     if job_timeout > _MAX_RUNTEST_TIMEOUT_S:

@@ -12,7 +12,7 @@ request's red head (:mod:`scripts.backport.ci_followup`).
    its own setup and build (``scripts/ci_fix/job.sh``), or on the bot's own
    runner. It holds no GitHub token.
 3. ``publish``: the candidate is published as its target says. A published
-   fix is reported on the target PR or issue; failures and refusals remain in
+   fix or a refusal is reported on the target PR or issue; a failure stays in
    this repository's workflow logs and retry state.
 
 The plan, the resolved job and the fix's outcome pass between the jobs as

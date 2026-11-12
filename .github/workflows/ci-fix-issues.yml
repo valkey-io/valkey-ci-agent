@@ -1,8 +1,9 @@
 name: CI Fix Issues
 
 # One run handles one Test Failure Detector issue and, when a fix is
-# accepted, opens or updates a draft PR. The target repository's normal PR CI
-# and human review decide whether it is mergeable; this workflow never merges.
+# accepted, posts it on the issue as a patch, or opens or updates a draft PR
+# when CI_FIX_ISSUES_PUBLISH is draft-pr. A maintainer, or the draft PR's own
+# CI and human review, decide whether it is merged; this workflow never merges.
 # The fix runs like every other (ci-fix-run.yml), inside the Valkey job that
 # failed when it can host it.
 # ci-fix-issue-dispatch.yml finds an issue's active runs by this name, and

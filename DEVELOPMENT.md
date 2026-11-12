@@ -6,8 +6,7 @@ does and how to run it, start from the [README](README.md).
 
 ## What you need
 
-- Python 3.9 or later. CI tests 3.9 and 3.11, and lint and type checks run on
-  3.11, so 3.11 is the safest choice locally.
+- Python 3.11 or later, which CI tests, lints and type checks on.
 - The GitHub CLI, `gh`, to start workflows.
 - A GitHub token, for anything that talks to the GitHub API.
 - AWS credentials with access to Bedrock, for anything that calls Claude.

@@ -27,8 +27,8 @@ class TargetKind(str, Enum):
 class IssuePublication(str, Enum):
     """How a fix for a detector issue is published.
 
-    ``comment`` posts the verified patch on the issue for a maintainer to
-    apply; ``draft-pr`` pushes a branch and opens a draft PR. The
+    ``comment`` posts the patch on the issue for a maintainer to apply;
+    ``draft-pr`` pushes a branch and opens a draft PR. The
     ``CI_FIX_ISSUES_PUBLISH`` repository variable chooses; comment is the
     default while the bot earns its PRs.
     """
@@ -65,8 +65,8 @@ class ResultKind(str, Enum):
 
 
 # A failed attempt (an agent crash, the time running out) says nothing about
-# the failure, so it is tried again, this many times in all, before every
-# front door that retries on its own gives up on it.
+# the failure. A detector issue and a bot-owned PR's follow-up try it again,
+# and give up after this many failed attempts.
 MAX_FAILED_ATTEMPTS = 2
 
 
@@ -254,7 +254,7 @@ class FixContext:
     verified_by_code: bool = False
     # A change already merged upstream comes first: a port, or a patch that
     # adapts one; a fix of the branch's own only where none fixes the failure.
-    # So on a backport branch, and for a failure no command here can run.
+    # Set on a backport branch, and for a failure no command here can run.
     upstream_first: bool = False
     # Nothing here can run the failing check and no upstream change can be
     # ported, so a fix is reviewed and published as not run.

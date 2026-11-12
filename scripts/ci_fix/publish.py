@@ -1,14 +1,16 @@
 """Publish a prepared CI-fix candidate.
 
-Publication is intentionally ordinary:
+A candidate is published in one of these ways:
 
-* update a bot-owned PR branch, or, for a backport sweep PR, the CI-sweep
+* push to a bot-owned PR branch, or, for a backport sweep PR, to the CI-sweep
   PR into it, which it opens when there is none;
-* suggest a patch on a contributor PR; or
-* create a draft fix PR for a detector issue.
+* for a sweep PR's failure that a merged upstream commit fixes, name the
+  upstream PR the sweep should backport;
+* suggest a patch on a contributor PR;
+* post a patch on a detector issue; or
+* open a draft fix PR for a detector issue.
 
-The target repository's normal pull-request CI is the verification authority.
-This module never merges a pull request.
+The PR's own CI decides; this module never merges.
 """
 
 from __future__ import annotations
@@ -47,6 +49,10 @@ from scripts.common.git_clone import is_full_sha
 from scripts.common.github_client import retry_github_call
 
 logger = logging.getLogger(__name__)
+
+# How _validate_issue_target says a PR already links the issue, which
+# reconcile_draft_pr checks for.
+_LINKED_PR = "already has an open linked pull request"
 
 
 class TargetRevalidationFailed(Exception):
@@ -120,11 +126,13 @@ def _publish_issue_comment(gh: Any, task: FixTask, candidate: FixCandidate) -> F
     if len(candidate.patch) > limit:
         # The candidate was prepared under the draft PR's limit; a comment
         # holds less. Said plainly, rather than a comment without its patch.
+        # A patch that was not run is never pushed, so a draft PR is no help.
+        advice = "" if candidate.not_run else " Set CI_FIX_ISSUES_PUBLISH=draft-pr for a fix this size."
         return _refused(
             task,
             candidate,
             f"The fix is a {len(candidate.patch):,}-character patch, more than a comment holds "
-            f"({limit:,}); it was not posted. Set CI_FIX_ISSUES_PUBLISH=draft-pr for a fix this size.",
+            f"({limit:,}); it was not posted.{advice}",
         )
     return FixResult(
         kind=ResultKind.SUGGESTED,
@@ -247,7 +255,7 @@ def _publish_ci_sweep(
     if pull is not None:
         named = f"PR #{int(pull.number)} from {target.fix_branch}"
         if not is_bot_author(str(getattr(getattr(pull, "user", None), "login", "") or "")):
-            return _refused(task, candidate, f"{named} is not the CI agent's.")
+            return _refused(task, candidate, f"{named} is not owned by the CI agent.")
         if str(getattr(getattr(pull, "base", None), "ref", "") or "") != target.branch:
             return _refused(task, candidate, f"{named} is not into {target.branch}.")
 
@@ -461,7 +469,7 @@ def reconcile_draft_pr(
         return _failed(
             task,
             candidate,
-            f"The draft publication target {target.branch} could not be "
+            f"The occurrence branch {target.branch} could not be "
             f"revalidated: {exc}",
             commit_sha=known_commit_sha,
         )
@@ -518,7 +526,7 @@ def reconcile_draft_pr(
     if rejection:
         # The exact PR may have appeared between the first lookup and the
         # issue-timeline check. One final exact lookup resolves that race.
-        if "already has an open linked pull request" in rejection:
+        if _LINKED_PR in rejection:
             reused = _reuse_draft_pr(gh, task, candidate, commit_sha)
             if reused is not None:
                 return reused
@@ -567,7 +575,7 @@ def reconcile_draft_pr(
         return _failed(
             task,
             candidate,
-            f"The fix branch {target.branch} is at {commit_sha[:12]}, but the "
+            f"The occurrence branch {target.branch} is at {commit_sha[:12]}, but the "
             f"draft PR could not be opened: {exc}",
             commit_sha=commit_sha,
         )
@@ -630,7 +638,7 @@ def _validate_pr_target(gh: Any, task: FixTask, *, require_bot: bool) -> str:
 
 
 def _validate_issue_target(gh: Any, task: FixTask) -> str:
-    """Recheck a detector issue immediately before creating its branch.
+    """Recheck a detector issue before its fix is published.
 
     The base branch may have moved since the candidate was prepared: the
     draft PR is opened from the commit it was prepared on, and its own CI
@@ -658,7 +666,7 @@ def _validate_issue_target(gh: Any, task: FixTask) -> str:
         return f"Issue #{issue_number} is now assigned; leaving it to the assignee."
     try:
         if has_open_linked_pr(issue):
-            return f"Issue #{issue_number} already has an open linked pull request."
+            return f"Issue #{issue_number} {_LINKED_PR}."
     except Exception as exc:  # noqa: BLE001 - retry can recover GitHub API failures
         raise TargetRevalidationFailed(
             f"Issue #{issue_number} links could not be revalidated ({exc})."

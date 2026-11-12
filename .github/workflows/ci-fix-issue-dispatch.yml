@@ -3,7 +3,7 @@ name: CI Fix Issue Dispatch
 # Starts ci-fix-issues.yml once per open Daily Test Failure Detector issue
 # worth an attempt, keeping at most max_runs of those runs active at once
 # (scripts/ci_fix/issue_dispatch.py). It only reads valkey-io/valkey; each
-# dispatched run handles one issue as before.
+# dispatched run handles one issue.
 #
 # The schedule runs unless the CI_FIX_ISSUES_AUTO_DISPATCH repository variable
 # is "false". An issue's fix is posted on the issue unless CI_FIX_ISSUES_PUBLISH
@@ -53,8 +53,6 @@ jobs:
 
       - name: Set up agent dependencies
         uses: ./.github/actions/setup-agent
-        with:
-          install-claude: "false"
 
       - name: Generate target repository token
         id: target-token

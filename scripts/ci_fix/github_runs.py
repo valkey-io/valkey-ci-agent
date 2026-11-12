@@ -181,9 +181,8 @@ def job_priority(name: str) -> int:
     test. A formatting, lint or build job comes next. Its fix is often in the
     CI definition or the toolchain, which the bot changes only on a backport
     branch it owns, and a build break in the code also fails every test job,
-    whose log shows it. A
-    sanitizer or valgrind failure is the most likely to be flaky or to need a
-    judgement call. Unrecognised names sort last.
+    whose log shows it. A sanitizer or valgrind failure is the most likely to
+    be flaky or to need a judgement call. Unrecognised names sort last.
     """
     lowered = name.lower()
     if any(token in lowered for token in ("asan", "ubsan", "tsan", "sanitizer", "valgrind")):

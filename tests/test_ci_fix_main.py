@@ -116,7 +116,7 @@ def test_the_result_is_commented_and_reacted_to(wired) -> None:
     report = main_mod.report_result(MagicMock(), plan, result)
 
     assert report["action"] == "pushed"
-    assert "Pushed `bbbbbbbbbbbb`" in wired.posted[0][2]
+    assert f"Pushed {'b' * 40} to this branch" in wired.posted[0][2]
     assert wired.reacted == [(7, ResultKind.PUSHED)]
 
 

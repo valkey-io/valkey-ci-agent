@@ -498,8 +498,8 @@ def fit_subject(subject: str) -> str:
     if len(subject) <= 72:
         return subject
     words = subject[:72].rstrip().split(" ")
-    if len(words) > 1:
-        words.pop()  # likely cut mid-word
+    if len(words) > 1 and subject[71] != " " and subject[72] != " ":
+        words.pop()  # cut mid-word
     # "Fix x during y in" reads as a mistake: do not end on a word that only leads to the next.
     while len(words) > 1 and words[-1].lower().strip("(`") in _DANGLING:
         words.pop()

@@ -811,7 +811,7 @@ def test_a_ci_sweep_pr_someone_else_opened_is_never_pushed_to(monkeypatch: pytes
     result = publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
 
     assert result.kind is ResultKind.REFUSED
-    assert "not the CI agent's" in result.summary
+    assert "is not owned by the CI agent." in result.summary
 
 
 def test_an_upstream_fix_for_a_sweep_is_to_be_backported_not_cherry_picked(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -7,8 +7,9 @@ name: CI Fix Run
 #   plan -> fix-in-job | fix-in-container | fix-local -> publish
 #
 # plan binds the request to one exact failed job, and resolves that job from
-# its workflow file at the failed commit (scripts/ci_fix/run.py,
-# scripts/ci_fix/ci_job.py). The fix is prepared inside that very job: on its
+# its workflow file at the commit the fix is prepared on
+# (scripts/ci_fix/run.py, scripts/ci_fix/ci_job.py). The fix is prepared
+# inside that very job: on its
 # runner, in its container if it has one (fix-in-container), after its own
 # checkouts, setup and build (the plan's setup.sh). Then, instead of its tests,
 # the agent fixes the failure and code verifies the fix with the job's own
@@ -89,8 +90,9 @@ jobs:
           owner: ${{ inputs.target_owner }}
           repositories: ${{ inputs.target_repo }}
           # The plan reads the PR, the run, its log and the workflow file,
-          # and reads target PR/issue state. It writes only when reporting a
-          # successfully recovered publication from an earlier attempt.
+          # and reads target PR/issue state. It writes only comments and
+          # reactions: a refusal, the reaction to a maintainer's command, or
+          # a publication recovered from an earlier attempt.
           permission-members: read
           permission-actions: read
           permission-contents: read

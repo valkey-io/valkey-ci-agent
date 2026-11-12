@@ -13,7 +13,7 @@ from scripts.ci_fix.models import (
     FixTarget,
     TargetKind,
 )
-from scripts.ci_fix.push import PushFailed, PushRefused, commit_message, push_candidate
+from scripts.ci_fix.push import PushFailed, PushRefused, commit_message, fit_subject, push_candidate
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -484,6 +484,13 @@ def test_a_clipped_subject_does_not_end_on_a_dangling_word() -> None:
     subject = commit_message(candidate).splitlines()[0]
 
     assert subject == "Fix diskless all replicas drop during rdb pipe"
+
+
+def test_a_subject_cut_between_words_keeps_its_last_word() -> None:
+    whole = "Fix " + "x" * 63 + " word"  # 72 characters, then the cut falls on a space
+    assert fit_subject(whole + " more") == whole
+    # Cut mid-word, the partial word goes.
+    assert fit_subject(whole + "y more") == "Fix " + "x" * 63
 
 
 def test_commit_message_is_concise_and_wraps_the_explanation() -> None:

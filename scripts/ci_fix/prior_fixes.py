@@ -259,9 +259,10 @@ def render_prior_fixes(repo_dir: str, fixes: tuple[PriorFix, ...]) -> str:
     lines = [
         "# Merged changes that may already fix this failure",
         "",
-        "Found by searching history for the failing test's name, its file, and",
-        "the issue number. They are leads, not conclusions: read each diff and",
-        "decide whether it addresses the root cause in the job log.",
+        "Found by searching history for the failing test's name, its file, the",
+        "files the log names, and the issue number. They are leads, not",
+        "conclusions: read each diff and decide whether it addresses the root",
+        "cause in the job log.",
         "",
     ]
     for fix in fixes:

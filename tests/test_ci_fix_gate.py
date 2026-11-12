@@ -196,7 +196,7 @@ def test_an_unauthorized_commenter_is_refused_before_anything_is_read(monkeypatc
     )
 
     assert isinstance(result, GateRejection)
-    assert result.reason == "@mallory is not an active member of valkey-io/contributors; refusing."
+    assert result.reason == "@mallory is not an active member of valkey-io/contributors."
 
 
 def test_bot_backport_branch_uses_backport_update_policy(monkeypatch) -> None:

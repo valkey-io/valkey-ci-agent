@@ -1,9 +1,9 @@
-"""Fix one current-head CI failure on an open backport sweep PR.
+"""Fix one current-head CI failure on an open bot-owned PR into a release branch.
 
-This module is intentionally only a selector and front door. It finds the
-bot-owned sweep PR for one registered release branch, waits for its current
-head's CI to finish, chooses one unhandled actionable job, and plans its fix,
-which runs like every other (:mod:`scripts.ci_fix.run`).
+It follows every open bot-owned PR into one registered release branch, the
+sweep PR first. For a PR whose current head's CI has finished, it selects one
+unhandled actionable failure, plans its fix, which runs like every other
+(:mod:`scripts.ci_fix.run`), and reports the result.
 
 When the sweep PR's own CI has nothing left to fix, the release branch's
 failures in the newest scheduled run of every release branch (Valkey's
@@ -15,10 +15,10 @@ added to its CI-sweep PR (:mod:`scripts.backport.ci_sweep`), so that they are
 reviewed apart from the backports. A job with a fix there is not fixed again.
 
 The engine owns diagnosis, editing, and publication. The target PR's normal CI
-remains the final verifier, matching the existing backport workflow model.
-Published fixes and reasoned refusals are commented on the target PR. Failed
-attempts are counted from plan artifacts in the agent repository, so they
-remain bounded without adding error or infrastructure comments to the PR.
+remains the final verifier. Published fixes and reasoned refusals are
+commented on the target PR. Failed attempts are counted from plan artifacts in
+the agent repository, so they remain bounded without adding error or
+infrastructure comments to the PR.
 """
 
 from __future__ import annotations
@@ -204,7 +204,7 @@ def _followup_for_pr(
     head_branch = str(getattr(getattr(pr, "head", None), "ref", "") or "")
     if not is_writable_branch(head_branch):
         return None, "head-branch-not-writable"
-    rejection = _validate_sweep_pr(
+    rejection = _validate_bot_pr(
         pr,
         repo_full_name=repo_entry.repo,
         target_branch=target_branch,
@@ -495,14 +495,14 @@ def _suggest_backport(pull: Any, result: FixResult, body: str, markers: str) -> 
 _MAX_SCANNED_PRS = 50
 
 
-def _validate_sweep_pr(
+def _validate_bot_pr(
     pr: Any,
     *,
     repo_full_name: str,
     target_branch: str,
     bot_login: str,
 ) -> str:
-    """Return ``""`` only for the expected open, bot-owned sweep PR."""
+    """Return ``""`` only for an open, bot-owned PR into the target branch from this repository."""
     if str(getattr(pr, "state", "open") or "") != "open":
         return "pr-not-open"
     if str(getattr(pr.base, "ref", "") or "") != target_branch:

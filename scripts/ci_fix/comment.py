@@ -10,9 +10,7 @@ from scripts.ci_fix.models import (
     FixCandidate,
     FixResult,
     ResultKind,
-    TargetKind,
 )
-from scripts.ci_fix.policy import target_capabilities
 from scripts.common.text_utils import compact_text
 
 _MAX_OTHER_JOBS = 10
@@ -38,7 +36,7 @@ def render_result(result: FixResult) -> str:
             return f"#{result.pr_number} fixes {job}. Backport it to `{failure.base_branch}`."
 
     if result.kind is ResultKind.PUSHED:
-        body = [f"Pushed `{result.commit_sha[:12]}` to this branch with a fix for {job}.", ""]
+        body = [f"Pushed {result.commit_sha} to this branch with a fix for {job}.", ""]
         body += _context(result)
         body += [_footer("This PR's own CI decides whether the fix holds, and the bot never merges.")]
         return "\n".join(body)
@@ -222,17 +220,15 @@ def _footer(text: str) -> str:
 
 
 def candidate_patch(candidate: FixCandidate | None) -> list[str]:
-    """The candidate's patch as a fenced block, when there is one that fits a comment."""
+    """The candidate's patch as a fenced block, when there is one.
+
+    Every suggested patch is already held to a comment's size, by the engine
+    or by publication.
+    """
     if candidate is None:
         return []
     if not candidate.patch:
         return []
-    patch_limit = target_capabilities(TargetKind.SUGGEST).patch_limit
-    if len(candidate.patch) > patch_limit:
-        return [
-            "The proposed patch exceeded the comment-size limit and was not posted.",
-            "",
-        ]
     return [
         "Proposed patch:",
         "",

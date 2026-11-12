@@ -73,7 +73,7 @@ def test_pushed_result_defers_to_normal_pr_ci() -> None:
     )
 
     assert body.startswith(
-        "Pushed `bbbbbbbbbbbb` to this branch with a fix for `test-ubuntu` "
+        f"Pushed {'b' * 40} to this branch with a fix for `test-ubuntu` "
         "([run](https://github.com/o/r/actions/runs/9))."
     )
     assert "**What failed:** zset payload" in body
@@ -97,20 +97,6 @@ def test_suggestion_contains_the_patch_and_bound_head() -> None:
     assert f"prepared against `{_SHA[:12]}`. Nothing was pushed to this branch." in body
     assert "Proposed patch" in body
     assert "````diff" in body
-
-
-def test_oversized_patch_is_not_partially_posted() -> None:
-    body = render_result(
-        FixResult(
-            kind=ResultKind.SUGGESTED,
-            summary="suggested",
-            task=_task(),
-            candidate=_candidate(patch="x" * 45_001),
-        )
-    )
-
-    assert "exceeded the comment-size limit" in body
-    assert "x" * 1_000 not in body
 
 
 def test_refused_and_failed_results_are_plainly_reported() -> None:

@@ -2,8 +2,9 @@
 
 The CI-fix bot fixes a failure inside the very job that failed: same runner,
 container, setup, build flags and test command. :func:`resolve` reads that
-job from the workflow file at the failed commit, as GitHub ran it: the matrix
-entry is the one whose display name is the failed job's, and every
+job from the workflow file at the commit the fix is prepared on, as GitHub
+ran it: the matrix entry is the one whose display name is the failed job's,
+and every
 ``${{ }}`` expression the job needs is evaluated in the failed run's context
 (:func:`evaluate`). The result, a :class:`JobSpec`, is what ``ci-fix-run.yml``
 runs the fix in: the job's runner and container, its two checkouts, its setup
@@ -11,9 +12,10 @@ steps up to its tests (:func:`setup_script` replays them), and its own build
 and test commands (:class:`JobCommands`).
 
 The agent can run in a job on an Ubuntu or macOS runner, or in a container on
-an Ubuntu runner, but not in a VM; it needs one ``make`` step and one
-``runtest`` command, which its rebuilds and test runs repeat. Anything this
-module does not follow exactly (a step of another kind, an expression that
+an Ubuntu runner, but not in a VM; it needs one ``make`` step and a single
+command for at least one suite the bot runs (``./runtest``,
+``./runtest-moduleapi`` or ``make test-unit``), which its rebuilds and test
+runs repeat. Anything this module does not follow exactly (a step of another kind, an expression that
 reads secrets or another step's outputs, a matrix it cannot enumerate) raises
 :class:`Unsupported`: then no job can host the fix, which is prepared on the
 bot's own runner instead. A job is never run in a way GitHub would not run it.
@@ -771,7 +773,7 @@ class _Parser:
         if self._accept("("):
             return self._call(text)
         if text not in self.context:
-            raise Unsupported(f"the expression reads {text}, which a fix job does not have")
+            raise Unsupported(f"the expression reads {text!r}, which a fix job does not know")
         path = [text]
         while self._accept("."):
             kind, part = self._next()
