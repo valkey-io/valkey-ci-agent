@@ -133,11 +133,12 @@ def test_dispatch_credential_is_scoped_to_dispatch_step() -> None:
     assert token["with"]["permission-actions"] == "write"
     dispatch = _step("rebuild", step_id="dispatch")
     assert dispatch["env"]["GH_TOKEN"] == "${{ steps.token.outputs.token }}"
-    for step_id in ("locate", "watch", "conclusion"):
-        assert _step("rebuild", step_id=step_id)["env"]["GH_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
+    assert _step("rebuild", step_id="locate")["env"]["GH_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
+    for step in _job("previous-rebuild")["steps"]:
+        assert step["env"]["GH_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
 
 
-def test_dispatch_is_correlated_and_real_result_is_waited_for() -> None:
+def test_dispatch_is_correlated_and_not_waited_for() -> None:
     dispatch = _step("rebuild", step_id="dispatch")["run"]
     assert "${{ github.run_id }}-${{ github.run_attempt }}" in dispatch
     assert "gh workflow run ci.yml" in dispatch
@@ -149,8 +150,23 @@ def test_dispatch_is_correlated_and_real_result_is_waited_for() -> None:
     assert "--workflow ci.yml" in locate
     assert "--branch mainline" in locate
     assert "--created" not in locate
-    assert "--exit-status" in _step("rebuild", step_id="watch")["run"]
-    assert "gh run view" in _step("rebuild", step_id="conclusion")["run"]
+    assert "gh run watch" not in _PATH.read_text(encoding="utf-8")
+    assert _job("rebuild")["timeout-minutes"] <= 15
+
+
+def test_next_scan_fails_on_last_weeks_failed_rebuild() -> None:
+    lookback = _job("previous-rebuild")
+    assert "needs" not in lookback
+    assert lookback["if"] == "github.repository == 'valkey-io/valkey-ci-agent'"
+    (step,) = lookback["steps"]
+    run = step["run"]
+    assert "date -u -d '8 days ago'" in run
+    assert "--workflow ci.yml" in run
+    assert "--event workflow_dispatch" in run
+    assert '--created ">=${SINCE}"' in run
+    assert 'startswith("CVE rebuild ")' in run
+    assert '.status == "completed" and .conclusion != "success"' in run
+    assert "exit 1" in run
 
 
 def test_reports_use_collects_per_architecture_result() -> None:
