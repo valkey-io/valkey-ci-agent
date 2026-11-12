@@ -455,7 +455,10 @@ change that fixes the root cause the log shows. Reject one that weakens or
 skips a test, hides a product defect, or changes more than the failure needs.
 Reject a longer timeout, more retries or a looser threshold unless the patch's
 author shows why the old value was wrong; and any change whose purpose is to
-let a test run alone or under a particular test selection.
+let a test run alone or under a particular test selection. Reject a handler
+for a state that cannot happen, an exact assertion on state the server is
+still changing, a new helper where an existing one does the job, and
+comments that narrate the fix or its history.
 Code never runs the failing test before the fix, so a failure that was not
 reproduced first is the normal case and no reason to reject. A fix that is
 correct under every cause the evidence leaves open is acceptable when its
