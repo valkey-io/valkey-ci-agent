@@ -22,9 +22,11 @@ History bounds the candidate branches and the model can only narrow them: it
 sees which branches carry each introducing commit, and per branch whether
 the modified files, the patch, and the named identifiers are there, so a fix
 to a recent feature that merely touches an old signature is not offered to
-old branches. A PR changing only tests, test harness, CI, or docs is never
-suggested. Precision matters more than recall: lower-confidence suggestions
-go to the job summary only.
+old branches. Precision matters more than recall: lower-confidence
+suggestions go to the job summary only. A PR changing only docs is never
+suggested. One changing only tests, test harness, or CI (docs aside) is judged,
+since a release branch can need it to keep its own CI working, but its
+verdict is at most "medium", so it is reported and never commented on.
 
 Two more checks keep suggestions to what maintainers would act on. A PR
 maintainers already took to a branch that was GA when the PR merged (queued
@@ -68,6 +70,7 @@ from scripts.backport.eligibility_evidence import (
     BranchEvidence,
     branch_evidence,
     changed_paths,
+    is_docs_only_change,
     is_non_product_change,
     site_present,
     subject_identifiers,
@@ -96,7 +99,7 @@ logger = logging.getLogger(__name__)
 COMMENT_MARKER = "<!-- valkey-ci-agent:backport-eligibility -->"
 # Bumped whenever a change would judge a PR differently: earlier results are
 # then ignored and every PR in the window is judged again.
-RESULT_VERSION = 2
+RESULT_VERSION = 3
 # Outcomes a later run reuses for the same merge commit. "would-comment" is
 # settled only for another dry run: a live run judges it again and comments.
 # "undecided", "error", and "already-commented" are never reused.
@@ -184,13 +187,18 @@ affected. Answer only from `candidate_branches` that have `branch_evidence`.
 - Fixes for crashes, assertions, hangs, data loss or corruption, memory safety,
   memory leaks, wrong replies, protocol violations, replication, persistence,
   cluster, ACL or security problems, including rare edge cases.
+- Test, test harness, and CI fixes a branch needs to keep its own CI working:
+  a fix to a test or the harness, including a fix for a flaky test, when the
+  test and the code that makes it fail are on the branch; or a fix to a CI
+  workflow or tool setup that the branch also uses and that breaks there the
+  same way. The failure is then the test or CI job failing on that branch.
 
 ## Do not backport
 
 - New features, commands, arguments, configuration, or behavior changes.
 - Performance improvements, refactors, cleanup, renames, comments, and docs.
-- Test, test harness, CI, workflow, and developer tooling changes, including
-  fixes for flaky tests.
+- New tests or coverage for code that is not broken, test speedups, test or
+  CI cleanup, and developer tooling changes.
 
 When you are unsure whether the PR is a fix, or whether the defect exists on a
 branch, leave that branch out. A change labelled as a performance issue, or
@@ -201,7 +209,8 @@ name; otherwise "medium" or "low".
 
 For every branch you name, give its `failure_site`: the concrete code that
 produces the user-visible failure on that branch (the assert that fires, the
-function that dereferences NULL, the config or command that has to be set),
+function that dereferences NULL, the config or command that has to be set,
+the assertion in the test that fails, the workflow step that breaks),
 as a `file` path and a `symbol` copied verbatim from the code in the diff: an
 identifier or a short single-line fragment. Lines the PR edits are not enough:
 if the failure needs code that a branch may not have, cite that code. Each
@@ -263,6 +272,8 @@ class Candidate:
     # Per-branch checks; when present, a branch without evidence, or whose
     # evidence shows it lacks everything the PR is about, is not offered.
     evidence: tuple[BranchEvidence, ...] | None = None
+    # The PR changes only tests, test harness, CI, or docs.
+    non_product: bool = False
 
     @property
     def branches(self) -> set[str]:
@@ -847,10 +858,14 @@ _TRADEOFF_RE = re.compile(r"\btrade[- ]?offs?\b", re.IGNORECASE)
 
 
 def _cap_confidence(candidate: Candidate, verdict: Verdict) -> Verdict:
-    """At most "medium" for performance-labelled or tradeoff PRs: never commented."""
+    """At most "medium" for test/CI-only, performance-labelled, or tradeoff PRs: never commented."""
     if verdict.confidence != "high":
         return verdict
     source = candidate.source
+    if candidate.non_product:
+        logger.info("#%d changes only tests, test harness, or CI; capping confidence at medium",
+                    source.number)
+        return replace(verdict, confidence="medium")
     performance = [label for label in source.labels if "perf" in label.lower()]
     texts = [source.pr.title, source.pr.body, *source.linked_issues]
     if performance or any(_TRADEOFF_RE.search(text or "") for text in texts):
@@ -1225,7 +1240,6 @@ def precheck(
       "not-on-base": there is nothing on the branch to trace or backport.
     * A change history cannot delimit (see :func:`resolve_change_base`) needs
       a maintainer's review.
-    * A PR changing only tests, test harness, CI, or docs is not eligible.
 
     Otherwise the change's start is returned for :func:`assess`. The clone
     holds every commit of the development branch, so a merge commit it
@@ -1246,8 +1260,6 @@ def precheck(
         # History cannot say what the PR changed. Nothing is wrong with the
         # run, so this warns rather than failing it.
         return {"action": "needs-review", "detail": f"complete merged change unknown: {exc}"}
-    if is_non_product_change(changed_paths(repo_dir, base, sha)):
-        return {"action": "not-eligible", "detail": "changes only tests, test harness, CI, or docs"}
     return base
 
 
@@ -1262,11 +1274,17 @@ def assess(
 ) -> Candidate | dict[str, Any]:
     """Return the PR as a candidate for the model, or its result when history settles it.
 
-    *base* is where the change starts, from :func:`precheck`. History bounds
-    the branches; per-branch evidence then drops a branch that carries none
-    of what the PR is about. A git failure raises.
+    *base* is where the change starts, from :func:`precheck`. A PR changing
+    only docs is not eligible; one changing only tests, test harness, CI, or
+    docs is judged but marked, so its verdict is capped. This runs after
+    triage, so maintainers queueing such a PR still reads as "triaged".
+    History bounds the branches; per-branch evidence then drops a branch that
+    carries none of what the PR is about. A git failure raises.
     """
     sha = source.pr.merge_commit_sha
+    paths = changed_paths(repo_dir, base, sha)
+    if is_docs_only_change(paths):
+        return {"action": "not-eligible", "detail": "changes only docs"}
     try:
         origins = trace_origins(
             repo_dir, source, branches, git_env=git_env, history=history, base=base,
@@ -1277,7 +1295,8 @@ def assess(
         return {"action": "not-eligible", "detail": "only adds new files"}
     # Bound the prompt without dropping the only history evidence for an
     # older release branch.
-    candidate = Candidate(source, _select_origins(origins, _MAX_ORIGINS))
+    candidate = Candidate(source, _select_origins(origins, _MAX_ORIGINS),
+                          non_product=is_non_product_change(paths))
     traced = sorted(candidate.branches, key=_branch_sort_key, reverse=True)
     if not traced:
         return {"action": "not-eligible", "detail": "no release branch still needs the change"}

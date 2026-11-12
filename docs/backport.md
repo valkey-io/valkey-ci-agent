@@ -172,7 +172,10 @@ Claude then reads the diff and the list of candidate branches and decides
 whether the change is worth backporting, and to which of those branches. It
 can narrow the list but never add to it. The agent posts one comment per PR
 naming the branches and their boards, and only when Claude is highly
-confident. PRs that change only tests, CI, or docs are never suggested. If it
+confident. PRs that change only docs are never suggested. PRs that change
+only tests or CI are judged too, since a release branch may need a test or CI
+fix to keep its own CI working, but they are never commented on: they appear
+in the job summary with the branches Claude picked. If it
 can't reach a decision about a PR, it posts nothing for that PR and marks the
 run as failed, so the next day's run tries again.
 
