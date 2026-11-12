@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 from github.GithubException import GithubException
 
-from scripts.backport import candidate_apply, sweep_git, sweep_graphql, sweep_validation
+from scripts.backport import candidate_apply, ci_sweep, sweep_git, sweep_graphql, sweep_validation
 from scripts.backport import sweep as backport_sweep
 from scripts.backport.candidate_apply import apply_candidate
 from scripts.backport.missing_test_adaptation import (
@@ -1936,6 +1936,61 @@ def test_prepared_state_binds_identity_and_uses_fresh_token(monkeypatch, tmp_pat
     )
     assert failed.error == "Target branch 8.1 changed during preparation"
     assert published == []
+
+
+def test_the_ci_sweep_plan_made_in_preparation_is_carried_out_on_publication(monkeypatch, tmp_path):
+    """Planned with the agent and no write token; carried out with git and the publication token."""
+    repo_dir = tmp_path / "worktree"
+    repo_dir.mkdir()
+    plan = ci_sweep.Plan(61, "c" * 40, keep=("a" * 40,), dropped=(("b" * 40, "Fix x", "test-x", "why"),))
+    prepared = backport_sweep.PreparedBranchSweep(
+        repo_full_name="valkey-io/valkey", push_repo="valkey-io/valkey", target_branch="8.1",
+        backport_branch="agent/backport/sweep/8.1", repo_dir=str(repo_dir), target_head="targetsha",
+        prepared_head="preparedsha", expected_remote_head="oldsha", expected_pr_number=7,
+        result=BranchSweepResult(
+            target_branch="8.1", candidates_found=1, results=[CandidateResult(10, "PR 10", "applied")],
+        ),
+        ci_sweep=plan,
+    )
+    state = tmp_path / "state.json"
+    backport_sweep.write_prepared_sweep(str(state), prepared)
+    loaded = backport_sweep.load_prepared_sweep(
+        str(state), repo_full_name="valkey-io/valkey", push_repo="valkey-io/valkey", target_branch="8.1",
+        backport_branch="agent/backport/sweep/8.1", backport_label="backport",
+        llm_conflict_label="ai-resolved-conflicts",
+    )
+    assert loaded.ci_sweep == plan
+
+    monkeypatch.setattr(backport_sweep, "head_sha", lambda _repo: "preparedsha")
+    monkeypatch.setattr(
+        backport_sweep, "_remote_branch_sha",
+        lambda _gh, _repo, branch: {"8.1": "targetsha", "agent/backport/sweep/8.1": "oldsha"}[branch],
+    )
+    sweep_pr = SimpleNamespace(number=7, base=SimpleNamespace(ref="8.1"))
+    monkeypatch.setattr(backport_sweep, "find_existing_pr", lambda *_a, **_k: sweep_pr)
+    monkeypatch.setattr(backport_sweep, "list_applied_prs_on_branch", lambda *_a: [])
+    monkeypatch.setattr(backport_sweep, "upsert_pr", lambda *_a, **_k: "pr-url")
+    pushed = []
+    monkeypatch.setattr(
+        backport_sweep, "push_backport_branch", lambda _repo, branch, env, **kwargs: pushed.append((branch, kwargs)),
+    )
+    applied = {}
+
+    def apply(_gh, _repo, **kwargs):
+        applied.update(kwargs)
+        kwargs["push"]("wt", "newhead", "c" * 40)
+
+    monkeypatch.setattr(ci_sweep, "apply", apply)
+
+    backport_sweep.publish_prepared_sweep(loaded, "fresh-publication-token", gh=MagicMock())
+
+    assert applied["plan"] == plan and applied["sweep_pr"] == 7 and applied["sweep_head"] == "preparedsha"
+    # The sweep first, then the CI-sweep branch, each with its lease.
+    assert [branch for branch, _kwargs in pushed] == ["agent/backport/sweep/8.1", "agent/backport/ci-sweep/8.1"]
+    assert pushed[1][1]["expected_remote_head"] == "c" * 40 and pushed[1][1]["prepared_head"] == "newhead"
+    assert pushed[1][1]["branch_prefix"] == "agent/backport/ci-sweep"
+
+
 def test_process_branch_applied_cap_ignores_skipped_candidates(monkeypatch):
     candidates = [
         ProjectBackportCandidate(

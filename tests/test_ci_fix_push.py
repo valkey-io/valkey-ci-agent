@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -459,6 +460,19 @@ def test_only_ci_fix_and_backport_namespaces_are_writable(branch: str) -> None:
         )
 
 
+def test_the_agents_title_is_the_commit_subject() -> None:
+    """Not "Fix test-valgrind-test (integration-type): integration/replication,", from the job and its tests."""
+    titled = FixCandidate(
+        action=CandidateAction.PATCH, title="Wait for the forkless save cancel in replication tests",
+        failing_check="test-valgrind-test (integration-type): integration/replication, five forkless full sync tests",
+    )
+    untitled = replace(titled, title="")
+
+    assert commit_message(titled).splitlines()[0] == "Wait for the forkless save cancel in replication tests"
+    # Without one, the subject still never ends on a comma.
+    assert not commit_message(untitled).splitlines()[0].endswith(",")
+
+
 def test_a_clipped_subject_does_not_end_on_a_dangling_word() -> None:
     """A fix pushed to 7.2 was titled "Fix diskless all replicas drop during rdb pipe in"."""
     candidate = FixCandidate(
@@ -512,3 +526,140 @@ def test_a_ported_upstream_commit_that_changes_ci_definitions_is_not_pushed(
     with pytest.raises(PushRefused, match="changes .github/workflows/ci.yml"):
         push_candidate(FixCandidate(action=CandidateAction.PORT, port_commit=port_sha),
                        _target(head_sha), git_env={})
+
+
+def _sweep_target(head_sha: str) -> FixTarget:
+    return replace(_target(head_sha), fix_branch="agent/backport/ci-sweep/9.0")
+
+
+def _advance(tmp_path: Path, remote: Path, branch: str, path: str, text: str) -> str:
+    """Commit ``path`` onto ``branch`` of ``remote``, as a new backport would."""
+    work = tmp_path / f"advance-{path}"
+    _git(tmp_path, "clone", "-q", "-b", branch, str(remote), str(work))
+    (work / path).write_text(text)
+    _git(work, "add", path)
+    _git(work, "-c", "user.name=B", "-c", "user.email=b@example.com", "commit", "-qm", f"add {path}")
+    _git(work, "push", "-q", "origin", branch)
+    return _git(work, "rev-parse", "HEAD").strip()
+
+
+def test_a_sweep_fix_starts_the_ci_sweep_branch_and_leaves_the_sweep_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    patch = _patch_for(tmp_path, head_sha, remote)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+
+    pushed = push_candidate(_candidate(patch), _sweep_target(head_sha), git_env={})
+
+    assert _git(remote, "rev-parse", "agent/backport/sweep/9.0").strip() == head_sha
+    assert _git(remote, "rev-parse", "agent/backport/ci-sweep/9.0").strip() == pushed
+    assert _git(remote, "rev-parse", f"{pushed}^").strip() == head_sha
+    with pytest.raises(PushRefused, match="target branch changed"):
+        push_candidate(_candidate(patch), _sweep_target(head_sha), git_env={})
+
+
+_TRAILERS = ("CI-Fix-Job: test-ubuntu", "CI-Fix-Run: https://x/runs/1")
+
+
+def test_a_later_fix_goes_on_top_of_the_ci_sweep_fixes_rebuilt_on_the_sweeps_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    first = push_candidate(
+        _candidate(_patch_for(tmp_path, head_sha, remote)), _sweep_target(head_sha), git_env={}, trailers=_TRAILERS,
+    )
+    assert _git(remote, "log", "-1", "--format=%B", first).rstrip().endswith("\n\n" + "\n".join(_TRAILERS))
+    newer = _advance(tmp_path, remote, "agent/backport/sweep/9.0", "backport.txt", "a backport\n")
+    patch = _patch_for(tmp_path, newer, remote, path="other.txt")
+
+    pushed = push_candidate(
+        _candidate(patch, path="other.txt"), _sweep_target(newer), git_env={}, onto=first,
+        trailers=("CI-Fix-Job: test-alpine",),
+    )
+
+    assert _git(remote, "rev-parse", "agent/backport/sweep/9.0").strip() == newer
+    assert _git(remote, "rev-parse", "agent/backport/ci-sweep/9.0").strip() == pushed
+    # The sweep's head, then the earlier fix, then this one: no merge, like the sweep's own history.
+    assert _git(remote, "rev-list", "--parents", "-n", "1", pushed).split()[1:] == [
+        _git(remote, "rev-parse", f"{pushed}^").strip(),
+    ]
+    assert _git(remote, "rev-parse", f"{pushed}~2").strip() == newer
+    assert "CI-Fix-Job: test-ubuntu" in _git(remote, "log", "-1", "--format=%B", f"{pushed}^")
+    # Against the sweep, the branch shows only the fixes.
+    assert _git(remote, "diff", "--name-only", newer, pushed).split() == ["fix.txt", "other.txt"]
+
+
+def test_a_fix_on_the_same_sweep_head_leaves_the_earlier_fixes_commits_as_they_are(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Their comments and table rows name them by commit."""
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    first = push_candidate(
+        _candidate(_patch_for(tmp_path, head_sha, remote)), _sweep_target(head_sha), git_env={}, trailers=_TRAILERS,
+    )
+    patch = _patch_for(tmp_path, head_sha, remote, path="other.txt")
+
+    pushed = push_candidate(
+        _candidate(patch, path="other.txt"), _sweep_target(head_sha), git_env={}, onto=first, trailers=_TRAILERS,
+    )
+
+    assert _git(remote, "rev-parse", f"{pushed}^").strip() == first
+
+
+def test_a_fix_that_does_not_apply_on_top_of_the_ci_sweep_fixes_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    first = push_candidate(
+        _candidate(_patch_for(tmp_path, head_sha, remote)), _sweep_target(head_sha), git_env={}, trailers=_TRAILERS,
+    )
+    checkout = tmp_path / "conflicting"
+    _git(tmp_path, "clone", "-q", str(remote), str(checkout))
+    _git(checkout, "checkout", "-q", head_sha)
+    (checkout / "fix.txt").write_text("another fix\n")
+    _git(checkout, "add", "--intent-to-add", "fix.txt")
+    patch = _git(checkout, "diff", "--binary", "HEAD")
+
+    with pytest.raises(PushRefused, match="does not apply on top of agent/backport/ci-sweep/9.0"):
+        push_candidate(_candidate(patch), _sweep_target(head_sha), git_env={}, onto=first, trailers=_TRAILERS)
+    assert _git(remote, "rev-parse", "agent/backport/ci-sweep/9.0").strip() == first
+
+
+def test_a_ci_sweep_branch_with_someone_elses_commit_is_not_rebuilt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    push_candidate(
+        _candidate(_patch_for(tmp_path, head_sha, remote)), _sweep_target(head_sha), git_env={}, trailers=_TRAILERS,
+    )
+    theirs = _advance(tmp_path, remote, "agent/backport/ci-sweep/9.0", "manual.txt", "a maintainer's change\n")
+    patch = _patch_for(tmp_path, head_sha, remote, path="other.txt")
+
+    with pytest.raises(PushRefused, match="commits the bot did not make"):
+        push_candidate(_candidate(patch, path="other.txt"), _sweep_target(head_sha), git_env={}, onto=theirs)
+    assert _git(remote, "rev-parse", "agent/backport/ci-sweep/9.0").strip() == theirs
+
+
+def test_a_ci_sweep_branch_that_moved_is_not_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote, head_sha, _port_sha = _remote(tmp_path)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    first = push_candidate(_candidate(_patch_for(tmp_path, head_sha, remote)), _sweep_target(head_sha), git_env={})
+    moved = _advance(tmp_path, remote, "agent/backport/ci-sweep/9.0", "manual.txt", "a maintainer's change\n")
+    patch = _patch_for(tmp_path, head_sha, remote, path="other.txt")
+
+    with pytest.raises(PushRefused, match="moved"):
+        push_candidate(_candidate(patch, path="other.txt"), _sweep_target(head_sha), git_env={}, onto=first)
+    assert _git(remote, "rev-parse", "agent/backport/ci-sweep/9.0").strip() == moved

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -68,6 +69,7 @@ def _pr(
             repo=SimpleNamespace(full_name="valkey-io/valkey"),
         ),
         get_issue_comments=lambda: list(comments),
+        get_commits=lambda: [],
         create_issue_comment=post,
     )
     pr.posted = posted
@@ -139,6 +141,7 @@ def _select(
     prior_plans=(),
     release_run=None,
     release_jobs=(),
+    ci_sweep=None,
 ):
     pr = pr or _pr()
     runs = runs if runs is not None else [_run()]
@@ -151,7 +154,7 @@ def _select(
     monkeypatch.setattr(
         ci_followup,
         "find_existing_pr",
-        lambda *_args: pr,
+        lambda *args: ci_sweep if args[-1].startswith("agent/backport/ci-sweep/") else pr,
     )
     attempts_by_run = {
         int(run.id): int(getattr(run, "run_attempt", 1) or 1)
@@ -810,3 +813,106 @@ def test_the_sweep_pr_is_followed_up_before_a_fix_pr(monkeypatch) -> None:
         _gh([], sweep, open_prs=[fix]), repo_entry=_entry(), target_branch="9.0", bot_login=_BOT,
     )
     assert target is not None and target.pr is sweep
+
+
+def test_a_sweep_fix_goes_to_the_ci_sweep_branch_and_a_fix_prs_to_its_own(monkeypatch) -> None:
+    """The sweep carries only backports; a fix PR the bot opened is its own fix's place."""
+    assert _plan(monkeypatch, _target(_pr())).task.target.fix_branch == "agent/backport/ci-sweep/9.0"
+
+    fix = _fix_pr()
+    target = replace(_target(fix), head_branch=fix.head.ref, head_sha=fix.head.sha)
+    task = _plan(monkeypatch, target).task
+    assert task.target.branch == fix.head.ref and task.target.fix_branch == ""
+
+
+def _ci_sweep_with(*jobs: str):
+    """An open CI-sweep PR whose commits are a backport its branch was built on and a fix for each of ``jobs``."""
+    backport = SimpleNamespace(message="Backport x (#1)\n\nBackport-Source-PR: 1")
+    commits = [SimpleNamespace(sha="b" * 40, commit=backport)]
+    commits += [
+        SimpleNamespace(sha=f"{index:040x}", commit=SimpleNamespace(message=f"Fix {job}\n\nCI-Fix-Job: {job}"))
+        for index, job in enumerate(jobs, 1)
+    ]
+    return SimpleNamespace(number=4400, get_commits=lambda: list(commits))
+
+
+def test_a_job_with_a_fix_in_the_open_ci_sweep_pr_is_not_fixed_again(monkeypatch) -> None:
+    """The sweep's head is without the fix until the CI-sweep PR is merged, on every new head."""
+    target, reason, _gh_client = _select(monkeypatch, ci_sweep=_ci_sweep_with("unit tests"))
+    assert target is None and reason == "no-unhandled-actionable-failures"
+
+    # A fix the sweep's rebase dropped is no longer there, and its job is fixed again.
+    target, reason, _gh_client = _select(monkeypatch, ci_sweep=_ci_sweep_with("test-alpine"))
+    assert reason == "actionable" and target.job.id == 3
+
+    # With no CI-sweep PR open, nothing holds a fix.
+    target, reason, _gh_client = _select(monkeypatch)
+    assert reason == "actionable"
+
+
+def test_a_weekly_failure_with_a_fix_in_the_ci_sweep_pr_is_not_fixed_again(monkeypatch) -> None:
+    target, _reason, _gh_client = _select_weekly(monkeypatch, ci_sweep=_ci_sweep_with("test-ubuntu-tls"))
+
+    # test-ubuntu-tls has its fix there; the branch's next failure is taken instead.
+    assert target is not None and target.release_run and target.job.id == 72
+
+
+def test_a_sweep_fix_is_a_line_on_the_sweep_pr_and_explained_on_the_ci_sweep_pr(monkeypatch) -> None:
+    sweep, ci_sweep = _pr(), _pr()
+    gh = MagicMock()
+    gh.get_repo.return_value.get_pull.side_effect = lambda number: {4226: sweep, 61: ci_sweep}[number]
+    plan = _plan(monkeypatch, _target(sweep, job=FailedJob("test-ubuntu-tls", id=27)))
+    candidate = FixCandidate(action=CandidateAction.PATCH, failing_check="t", root_cause="The test races the save.")
+
+    ci_followup.report_result(gh, plan, FixResult(
+        kind=ResultKind.PUSHED, summary="s", task=plan.task, candidate=candidate, commit_sha="b" * 40, pr_number=61,
+    ))
+
+    (line,) = sweep.posted
+    assert "Pushed a fix for `test-ubuntu-tls`" in line and f"to #61: {'b' * 40}." in line
+    assert "races the save" not in line and " outcome=pushed -->" in line
+    (explained,) = ci_sweep.posted
+    assert explained.startswith(f"Pushed {'b' * 40} with a fix for `test-ubuntu-tls`")
+    assert "#4226" in explained and "The test races the save." in explained
+
+
+
+def _suggest(monkeypatch, sweep, job: str, job_id: int):
+    gh = MagicMock()
+    gh.get_repo.return_value.get_pull.return_value = sweep
+    plan = _plan(monkeypatch, _target(sweep, job=FailedJob(job, id=job_id)))
+    candidate = FixCandidate(action=CandidateAction.PORT, port_commit="c" * 40)
+    ci_followup.report_result(gh, plan, FixResult(
+        kind=ResultKind.SUGGESTED, summary="s", task=plan.task, candidate=candidate, pr_number=4726,
+    ))
+
+
+def test_an_upstream_fix_is_suggested_once_however_many_failures_it_fixes(monkeypatch) -> None:
+    comments: list = []
+    sweep = _pr(comments=comments)
+    sweep.create_issue_comment = lambda body: comments.append(SimpleNamespace(
+        user=SimpleNamespace(login="valkeyrie-ops[bot]"), body=body,
+    ))
+
+    _suggest(monkeypatch, sweep, "test-ubuntu-tls", 27)
+    (comment,) = comments
+    assert "#4726 fixes `test-ubuntu-tls` ([run](" in comment.body and "). Backport it to `9.0`." in comment.body
+    assert "<!-- valkey-ci-agent:backport-suggestion pr=4726 -->" in comment.body
+    assert " outcome=suggested reason=backport -->" in comment.body
+
+    edits = []
+    comment.edit = lambda body: edits.append(body)
+    _suggest(monkeypatch, sweep, "test-alpine", 28)
+    assert len(comments) == 1
+    (edited,) = edits
+    assert edited.startswith(comment.body) and "It also fixes `test-alpine`." in edited
+    assert edited.count("reason=backport") == 2
+
+
+def test_a_failure_whose_upstream_fix_was_suggested_waits_for_the_backport(monkeypatch) -> None:
+    key = ci_followup._job_key(_run(), "unit tests")
+    suggested = _marker(head="b" * 40, job=9, key=key, outcome="suggested", reason="backport")
+
+    target, reason, _gh_client = _select(monkeypatch, pr=_pr(comments=(suggested,)))
+
+    assert target is None and reason == "no-unhandled-actionable-failures"

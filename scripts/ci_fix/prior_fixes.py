@@ -358,7 +358,9 @@ _SIBLING_COMMITS = 10
 _REVERTS_RE = re.compile(r"This reverts commit ([0-9a-f]{40})")
 
 
-def sibling_branch_changes(repo_dir: str, paths: tuple[str, ...], *, own_branch: str, base_branch: str) -> str:
+def sibling_branch_changes(
+    repo_dir: str, paths: tuple[str, ...], *, own_branch: str, base_branch: str, compared_with: str = "",
+) -> str:
     """Markdown: what the bot's pull requests into the other release branches changed in ``paths``, with diffs.
 
     One failure shows up on several release branches, and each fix was
@@ -370,7 +372,9 @@ def sibling_branch_changes(repo_dir: str, paths: tuple[str, ...], *, own_branch:
     ``own_branch`` is the branch the fix is pushed to
     (``agent/backport/sweep/8.1`` into ``8.1``); its siblings are the other
     branches under the same prefix, each compared with the release branch it
-    is named after. A commit that was reverted, and its revert, are left out.
+    is named after, or with that release's branch under ``compared_with``: a
+    CI-sweep branch with its sweep branch, so that only its fixes are shown.
+    A commit that was reverted, and its revert, are left out.
     """
     suffix = f"/{base_branch}"
     if not paths or not base_branch or not own_branch.endswith(suffix):
@@ -388,7 +392,7 @@ def sibling_branch_changes(repo_dir: str, paths: tuple[str, ...], *, own_branch:
         release = ref.removeprefix(f"origin/{prefix}/")
         if release == base_branch:
             continue
-        revision_range = f"origin/{release}..{ref}"
+        revision_range = f"origin/{compared_with}/{release}..{ref}" if compared_with else f"origin/{release}..{ref}"
         try:
             undone = set(_REVERTS_RE.findall(git_output(repo_dir, "log", "--format=%B", revision_range)))
             lines, diffs = [], []
@@ -408,6 +412,32 @@ def sibling_branch_changes(repo_dir: str, paths: tuple[str, ...], *, own_branch:
         if lines:
             sections.append("\n".join([f"# Release branch `{release}` (`{ref.removeprefix('origin/')}`)", "", *lines, *diffs]))
     return "\n\n".join(sections) + "\n" if sections else ""
+
+
+def pending_fixes(repo_dir: str, fix_branch: str) -> str:
+    """Markdown: the commits ``fix_branch`` has that the checkout lacks, with diffs.
+
+    A sweep PR's fixes wait in its CI-sweep PR, so the sweep's head, and its
+    CI, are without them until that is merged: the same test failing in
+    another job would otherwise be fixed again.
+    """
+    ref = f"origin/{fix_branch}"
+    try:
+        commits = _log(repo_dir, f"HEAD..{ref}", f"--max-count={_SIBLING_COMMITS}")
+        lines, diffs = [], []
+        for sha in commits:
+            subject, date = _subject_and_date(repo_dir, sha)
+            lines.append(f"- `{sha[:12]}` {date} {subject}")
+            diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha)
+            if len(diff) > _DIFF_CHARS:
+                diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+            diffs += ["", f"## `{sha[:12]}`: {subject}", "", "```diff", diff.rstrip("\n"), "```"]
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("Could not read what %s adds: %s", ref, exc)
+        return ""
+    if not lines:
+        return ""
+    return "\n".join([f"# `{fix_branch}`", "", *lines, *diffs]) + "\n"
 
 
 def summarize_prior_fixes(fixes: tuple[PriorFix, ...]) -> str:

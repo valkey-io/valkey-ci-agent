@@ -2,7 +2,8 @@
 
 Publication is intentionally ordinary:
 
-* update a bot-owned PR branch;
+* update a bot-owned PR branch, or, for a backport sweep PR, the CI-sweep
+  PR into it, which it opens when there is none;
 * suggest a patch on a contributor PR; or
 * create a draft fix PR for a detector issue.
 
@@ -12,13 +13,15 @@ This module never merges a pull request.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Any
 
 from github.GithubException import GithubException
 
+from scripts.backport import ci_sweep
 from scripts.backport.pr_creator import create_pull_from_push_repo
-from scripts.backport.sweep_prs import find_existing_pr
+from scripts.backport.sweep_prs import delete_stale_backport_branch, find_existing_pr
 from scripts.ci_fix.comment import candidate_context, prose
 from scripts.ci_fix.issue_state import has_open_linked_pr, parse_detector_occurrence
 from scripts.ci_fix.models import (
@@ -31,16 +34,19 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.policy import allows_ci_changes, can_update_branch, target_capabilities
+from scripts.ci_fix.policy import allows_ci_changes, can_update_branch, is_bot_author, target_capabilities
 from scripts.ci_fix.push import (
     PushFailed,
     PushRefused,
     PushStale,
+    commit_message,
     fit_subject,
     push_candidate,
 )
 from scripts.common.git_clone import is_full_sha
 from scripts.common.github_client import retry_github_call
+
+logger = logging.getLogger(__name__)
 
 
 class TargetRevalidationFailed(Exception):
@@ -77,6 +83,8 @@ def publish_candidate(
             f"a {target.kind.value} target.",
         )
 
+    if target.fix_branch and candidate.action is CandidateAction.PORT:
+        return _suggest_backport(gh, task, candidate)
     if target.kind is TargetKind.SUGGEST:
         return _publish_suggestion(gh, task, candidate)
     if candidate.not_run and candidate.action is CandidateAction.PATCH:
@@ -151,6 +159,9 @@ def _publish_update(
     *,
     git_env: dict[str, str],
 ) -> FixResult:
+    if task.target.fix_branch:
+        return _publish_ci_sweep(gh, task, candidate, git_env=git_env)
+
     def check() -> str:
         return _validate_pr_target(gh, task, require_bot=True)
 
@@ -177,6 +188,191 @@ def _publish_update(
         candidate=candidate,
         commit_sha=commit_sha,
     )
+
+
+def _suggest_backport(gh: Any, task: FixTask, candidate: FixCandidate) -> FixResult:
+    """A merged upstream fix for a sweep's failure, as the pull request to backport.
+
+    The sweep backports pull requests, and knows which it has by their
+    number: a cherry-pick of the commit here would be one it does not know,
+    and could backport again.
+    """
+    commit = candidate.port_commit.strip()
+    try:
+        number = _upstream_pr(gh, task.failure.repo_full_name, commit)
+    except Exception as exc:  # noqa: BLE001 - retry can recover GitHub API failures
+        return _failed(task, candidate, f"The pull request of upstream commit {commit[:12]} could not be found: {exc}")
+    if not number:
+        return _refused(task, candidate, f"Upstream commit {commit[:12]} fixes it, but no merged pull request has it.")
+    return FixResult(
+        kind=ResultKind.SUGGESTED,
+        summary=f"#{number} fixes it upstream; it is to be backported to {task.failure.base_branch}.",
+        task=task,
+        candidate=candidate,
+        pr_number=number,
+    )
+
+
+def _upstream_pr(gh: Any, repo_full_name: str, commit: str) -> int:
+    """The merged pull request that brought ``commit`` to the default branch, or 0."""
+    pulls = retry_github_call(
+        lambda: list(gh.get_repo(repo_full_name).get_commit(commit).get_pulls()),
+        retries=2,
+        description=f"find the pull request of {commit[:12]}",
+    )
+    merged = [pull for pull in pulls if getattr(pull, "merged_at", None)]
+    return int(merged[0].number) if merged else 0
+
+
+def _publish_ci_sweep(
+    gh: Any,
+    task: FixTask,
+    candidate: FixCandidate,
+    *,
+    git_env: dict[str, str],
+) -> FixResult:
+    """Add the fix to the sweep PR's CI-sweep PR, opening it when there is none.
+
+    The fix was run on the sweep PR's head, which is checked again before the
+    push, as for any update. The CI-sweep branch is that head with its fixes
+    on top (:mod:`scripts.backport.ci_sweep`), so its pull request shows only
+    the fixes.
+    """
+    target = task.target
+    fixed = candidate.failing_check or task.failure.job_name
+    try:
+        pull, onto = _ci_sweep_pr(gh, task)
+    except Exception as exc:  # noqa: BLE001 - retry can recover GitHub API failures
+        return _failed(task, candidate, f"The CI-sweep branch {target.fix_branch} could not be checked: {exc}")
+    if pull is not None:
+        named = f"PR #{int(pull.number)} from {target.fix_branch}"
+        if not is_bot_author(str(getattr(getattr(pull, "user", None), "login", "") or "")):
+            return _refused(task, candidate, f"{named} is not the CI agent's.")
+        if str(getattr(getattr(pull, "base", None), "ref", "") or "") != target.branch:
+            return _refused(task, candidate, f"{named} is not into {target.branch}.")
+
+    def check() -> str:
+        return _validate_pr_target(gh, task, require_bot=True)
+
+    try:
+        commit_sha = push_candidate(
+            candidate,
+            target,
+            git_env=git_env,
+            pre_push_check=check,
+            allow_ci_changes=allows_ci_changes(task),
+            onto=onto,
+            trailers=ci_sweep.trailers(task.failure.job_name, task.failure.run_url, candidate.adapts),
+        )
+    except PushRefused as exc:
+        return _refused(task, candidate, str(exc))
+    except PushFailed as exc:
+        return _failed(task, candidate, str(exc))
+    text = _ci_sweep_body(gh, task, candidate, commit_sha)
+    if pull is None:
+        try:
+            pull = retry_github_call(
+                lambda: create_pull_from_push_repo(
+                    gh.get_repo(task.failure.repo_full_name),
+                    base_repo=task.failure.repo_full_name,
+                    push_repo=target.repo_full_name,
+                    title=f"[CI] CI Fix Sweep for {task.failure.base_branch}",
+                    body=text,
+                    head_branch=target.fix_branch,
+                    base_branch=target.branch,
+                    draft=False,
+                ),
+                retries=2,
+                description=f"open the CI-sweep PR from {target.fix_branch}",
+            )
+        except Exception as exc:  # noqa: BLE001 - the next attempt opens it from the pushed branch
+            return _failed(
+                task, candidate,
+                f"The fix is on {target.fix_branch} ({commit_sha[:12]}), but its PR could not be opened: {exc}",
+                commit_sha=commit_sha,
+            )
+        kind, summary = ResultKind.OPENED, f"Opened the CI-sweep PR #{int(pull.number)} with a fix for {fixed}."
+        _point_sweep_at(gh, task, int(pull.number))
+    else:
+        try:
+            retry_github_call(lambda: pull.edit(body=text), retries=2, description=f"describe #{int(pull.number)}")
+        except Exception as exc:  # noqa: BLE001 - the fix is on the branch and in a comment
+            logger.warning("Could not update #%s's table: %s", pull.number, exc)
+        kind, summary = ResultKind.PUSHED, f"Pushed a fix for {fixed} to the CI-sweep PR #{int(pull.number)}."
+    return FixResult(
+        kind=kind, summary=summary, task=task, candidate=candidate, commit_sha=commit_sha,
+        pr_number=int(pull.number), pr_url=str(getattr(pull, "html_url", "") or ""),
+    )
+
+
+def _ci_sweep_pr(gh: Any, task: FixTask) -> tuple[Any | None, str]:
+    """The open CI-sweep PR and its head, or no PR and the head of a branch left without one.
+
+    A branch whose pull request was merged or closed is deleted, as the sweep
+    deletes its own stale branch: its fixes are on the sweep branch or were
+    turned down. One that never had a pull request is a fix pushed before
+    opening one failed, and is continued.
+    """
+    target = task.target
+    pull = find_existing_pr(gh, task.failure.repo_full_name, target.repo_full_name, target.fix_branch)
+    if pull is not None:
+        return pull, str(pull.head.sha)
+    repo = retry_github_call(
+        lambda: gh.get_repo(target.repo_full_name), retries=2, description=f"get {target.repo_full_name}",
+    )
+    try:
+        branch = retry_github_call(
+            lambda: repo.get_branch(target.fix_branch), retries=2,
+            description=f"get {target.repo_full_name}:{target.fix_branch}",
+        )
+    except GithubException as exc:
+        if exc.status == 404:
+            return None, ""
+        raise
+    owner = target.repo_full_name.split("/", 1)[0]
+    closed = retry_github_call(
+        lambda: list(repo.get_pulls(state="closed", head=f"{owner}:{target.fix_branch}")),
+        retries=2, description=f"list closed PRs from {target.fix_branch}",
+    )
+    head = str(branch.commit.sha)
+    if any(str(getattr(getattr(pull, "head", None), "sha", "") or "") == head for pull in closed):
+        delete_stale_backport_branch(gh, target.repo_full_name, target.fix_branch)
+        return None, ""
+    return None, head
+
+
+def _ci_sweep_body(gh: Any, task: FixTask, candidate: FixCandidate, commit_sha: str) -> str:
+    """The CI-sweep PR's description, its table read from the commits the push put on the sweep's head.
+
+    Not from the pull request's own list of commits, which can lag behind a
+    push. When they cannot be read, the table has this fix alone.
+    """
+    try:
+        compared = retry_github_call(
+            lambda: gh.get_repo(task.target.repo_full_name).compare(task.target.expected_sha, commit_sha),
+            retries=2, description=f"compare {task.target.fix_branch} with its sweep",
+        )
+        fixes = ci_sweep.commit_fixes(compared.commits)
+    except Exception as exc:  # noqa: BLE001 - the fix is pushed either way
+        logger.warning("Could not read the fixes on %s: %s", task.target.fix_branch, exc)
+        fixes = [ci_sweep.Fix(
+            commit_sha, commit_message(candidate).splitlines()[0],
+            task.failure.job_name, task.failure.run_url, candidate.adapts,
+        )]
+    return ci_sweep.body(task.failure.base_branch, task.failure.pr_number, fixes)
+
+
+def _point_sweep_at(gh: Any, task: FixTask, number: int) -> None:
+    """Say at the top of the sweep PR that its CI fixes are in ``number``; the sweep says it again as it rebuilds."""
+    try:
+        sweep = retry_github_call(
+            lambda: gh.get_repo(task.failure.repo_full_name).get_pull(task.failure.pr_number),
+            retries=2, description=f"get #{task.failure.pr_number}",
+        )
+        text = ci_sweep.with_sweep_line(str(getattr(sweep, "body", "") or ""), number)
+        retry_github_call(lambda: sweep.edit(body=text), retries=2, description=f"point #{sweep.number} at #{number}")
+    except Exception as exc:  # noqa: BLE001 - the CI-sweep PR names the sweep PR either way
+        logger.warning("Could not point the sweep PR at #%s: %s", number, exc)
 
 
 def _publish_draft(

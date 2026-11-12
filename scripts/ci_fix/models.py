@@ -162,6 +162,11 @@ class FixTarget:
     base_repo_full_name: str = ""
     branch: str = ""
     expected_sha: str = ""
+    # Set for a backport sweep PR: its fix is prepared and run on ``branch``
+    # at ``expected_sha``, but pushed to this branch, whose pull request into
+    # ``branch`` collects the sweep's CI fixes for review apart from its
+    # backports.
+    fix_branch: str = ""
 
 
 @dataclass(frozen=True)
@@ -198,6 +203,8 @@ class FixCandidate:
     changed_paths: tuple[str, ...] = ()
     port_commit: str = ""
     validation: str = ""
+    # The agent's commit subject for a patch: what the change does.
+    title: str = ""
     # The merged upstream commit a patch adapts to this branch, checked by
     # code; set only where an upstream change comes first (FixContext.upstream_first).
     adapts: str = ""
@@ -239,6 +246,9 @@ class FixContext:
     # What the bot's pull requests into the other release branches changed in
     # the failure's files: one failure is fixed the same way on every branch.
     sibling_changes: str = ""
+    # The fixes already made for this sweep PR, waiting in its CI-sweep PR and
+    # not on the working commit: a failure is not fixed twice.
+    pending_fixes: str = ""
     # How code verifies a candidate, and whether it does.
     verification: str = ""
     verified_by_code: bool = False

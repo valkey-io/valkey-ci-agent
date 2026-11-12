@@ -39,9 +39,8 @@ repos:
         outputs:
           - "src/unit/test_files.h"
     repair_validation_failures: true
-    # Off for now: CI fixes are not to be pushed onto the sweep PRs. They will
-    # go to a separate PR into the sweep branch instead.
-    automatic_ci_followup: false
+    # A sweep PR's CI fixes go to its CI-sweep PR, never onto the sweep branch.
+    automatic_ci_followup: true
     ci_followup_ignored_jobs:
       # Only Actions job names are matched. DCO and Codecov reach the PR as check
       # runs owned by their own GitHub Apps, never as jobs of a workflow run, so
@@ -55,7 +54,7 @@ repos:
       - "notify-about-job-results*"
       - "code-coverage*"
     # weekly.yml runs daily.yml's jobs on every release branch: a branch's
-    # failures there are fixed on its open sweep PR, like the PR's own.
+    # failures there are fixed for its open sweep PR, like the PR's own.
     ci_followup_release_workflow: weekly.yml
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts

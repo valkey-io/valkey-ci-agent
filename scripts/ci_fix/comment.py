@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from scripts.ci_fix.models import (
+    Failure,
     FailureType,
     FixCandidate,
     FixResult,
@@ -22,9 +23,19 @@ _INLINE_COMMAND_CHARS = 80
 def render_result(result: FixResult) -> str:
     """Return the maintainer-facing report for one fix attempt."""
     failure = result.task.failure
-    job = f"`{prose(failure.job_name, 300)}`" if failure.job_name else "the failed job"
-    if failure.run_url:
-        job += f" ([run]({failure.run_url}))"
+    job = _job(failure)
+
+    if result.task.target.fix_branch:
+        # A sweep PR is told in a line where its fix went, or why there is
+        # none: the fix is explained on the CI-sweep PR, where it is reviewed.
+        if result.kind is ResultKind.OPENED:
+            return f"Opened #{result.pr_number} with a fix for {job}: {result.commit_sha}."
+        if result.kind is ResultKind.PUSHED:
+            return f"Pushed a fix for {job} to #{result.pr_number}: {result.commit_sha}."
+        if result.kind is ResultKind.REFUSED:
+            return f"No fix for {job}. {sentence(result.summary)}"
+        if result.kind is ResultKind.SUGGESTED and result.pr_number:
+            return f"#{result.pr_number} fixes {job}. Backport it to `{failure.base_branch}`."
 
     if result.kind is ResultKind.PUSHED:
         body = [f"Pushed `{result.commit_sha[:12]}` to this branch with a fix for {job}.", ""]
@@ -51,6 +62,45 @@ def render_result(result: FixResult) -> str:
         return "\n".join(body).rstrip()
 
     return f"The fix attempt for {job} stopped with an error: {sentence(result.summary)}"
+
+
+# A sentence of the agent's summary about whether its fix ran: it writes it
+# before code runs the test, and code says what ran instead.
+_SELF_CHECK_RE = re.compile(r"\b(?:unverified|nothing was (?:run|built)|not (?:been )?(?:run|built|verified))\b", re.I)
+_PASSED_RE = re.compile(r"passed (\d+) loop")
+
+
+def render_ci_sweep_fix(result: FixResult) -> str:
+    """The CI-sweep PR's short report of a fix pushed to it; the diagnosis and checks are folded away."""
+    failure = result.task.failure
+    # A bare SHA, which GitHub links to the commit.
+    body = [f"Pushed {result.commit_sha} with a fix for {_job(failure)} on #{failure.pr_number}.", ""]
+    candidate = result.candidate
+    if candidate is not None:
+        sentences = re.split(r"(?<=[.!?])\s+", candidate.summary.strip())
+        said = " ".join(part for part in sentences if part and not _SELF_CHECK_RE.search(part))
+        if said:
+            body += [prose(said, 600), ""]
+        passed = _PASSED_RE.search(candidate.verification)
+        body += [
+            f"The failing test passed {_plural(passed.group(1) + ' loop(s)')} with the fix, "
+            "and the bot's review approved it." if passed else "The bot's review approved it.",
+            "",
+            "<details><summary>Diagnosis and checks</summary>",
+            "",
+            *candidate_context(candidate, include_reasoning=True, include_failing_check=True),
+            "</details>",
+            "",
+        ]
+    body += [_footer(f"#{failure.pr_number}'s CI decides whether the fix holds once this is merged, "
+                     "and the bot never merges.")]
+    return "\n".join(body)
+
+
+def _job(failure: Failure) -> str:
+    """The failed job as a comment names it, with its run."""
+    job = f"`{prose(failure.job_name, 300)}`" if failure.job_name else "the failed job"
+    return f"{job} ([run]({failure.run_url}))" if failure.run_url else job
 
 
 def _context(result: FixResult, *, include_reasoning: bool = True) -> list[str]:

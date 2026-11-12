@@ -289,6 +289,17 @@ def test_the_agent_may_name_the_tests_the_log_shows_failing(tmp_path, monkeypatc
     )
 
 
+def test_the_agent_titles_its_patch(tmp_path, monkeypatch) -> None:
+    seen = {}
+    monkeypatch.setattr(agent_mod, "run_agent", lambda _profile, prompt, **_k: seen.update(prompt=prompt) or _result(
+        {"action": "patch", "summary": "fixed", "changed_paths": ["a.c"], "title": "Wait for the save to end"}))
+
+    candidate = agent_mod.run_fix_agent(_task(), str(tmp_path), "log")
+
+    assert candidate.title == "Wait for the save to end"
+    assert '"title": "a patch\'s commit subject' in seen["prompt"]
+
+
 def test_where_an_upstream_change_comes_first_the_agent_is_told_and_its_claim_is_read(
     tmp_path, monkeypatch,
 ) -> None:
@@ -316,6 +327,13 @@ def test_where_an_upstream_change_comes_first_the_agent_is_told_and_its_claim_is
     assert "other-release-branches.md" in seen["prompt"]
     assert "the same fix on every release branch" in seen["prompt"]
     assert candidate.adapts == "d" * 40
+    assert "pending-fixes.md" not in seen["prompt"]
+
+    # The fixes already made for this sweep PR, waiting in its CI-sweep PR: one failure, one fix.
+    pending = FixContext(upstream_first=True, pending_fixes="# `agent/backport/ci-sweep/9.0`\n")
+    agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=pending)
+    assert "pending-fixes.md" in seen["prompt"]
+    assert "refuse and say which one: a failure is not fixed twice" in seen["prompt"]
 
 
 def test_the_review_is_told_when_a_release_branchs_patch_is_not_an_upstream_change(tmp_path, monkeypatch) -> None:

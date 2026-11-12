@@ -37,7 +37,8 @@ What you get back depends on whose PR it is. On a contributor's PR, or a PR
 from a fork, the bot never pushes anything. It posts the fix as a patch in a
 comment, and the author can apply it or not. On the bot's own PRs, meaning
 backport PRs and the PRs it opened to fix something, it pushes the fix as a
-new commit.
+new commit. A sweep PR carries only backports, so its fix goes to its CI-sweep
+PR instead ([Backports](backport.md#when-a-backport-prs-own-ci-fails)).
 
 ## Other ways a fix starts
 

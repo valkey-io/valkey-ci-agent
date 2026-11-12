@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from github.GithubException import GithubException
 
+from scripts.backport import ci_sweep
 from scripts.ci_fix.github_runs import (
     FailedJob,
     failed_jobs_for_run,
@@ -320,6 +321,8 @@ def build_fix_task(
         base_repo_full_name=pr_repo_full_name,
         branch=head_branch,
         expected_sha=head_sha,
+        # A sweep PR carries only backports, whoever asks for its fix.
+        fix_branch=ci_sweep.fix_branch_for(head_branch, base_branch) if bot_owned else "",
     )
     failure = Failure(
         repo_full_name=pr_repo_full_name,

@@ -10,6 +10,10 @@ failures in the newest scheduled run of every release branch (Valkey's
 weekly.yml) are fixed on the sweep PR the same way: its backports are what
 the branch will be.
 
+A sweep PR's fixes are not pushed to it: each is run on its head and then
+added to its CI-sweep PR (:mod:`scripts.backport.ci_sweep`), so that they are
+reviewed apart from the backports. A job with a fix there is not fixed again.
+
 The engine owns diagnosis, editing, and publication. The target PR's normal CI
 remains the final verifier, matching the existing backport workflow model.
 Published fixes and reasoned refusals are commented on the target PR. Failed
@@ -23,14 +27,15 @@ import hashlib
 import logging
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any
 
+from scripts.backport import ci_sweep
 from scripts.backport.registry import RepoEntry, load_registry
 from scripts.backport.sweep import _BRANCH_PREFIX
 from scripts.backport.sweep_prs import find_existing_pr
-from scripts.ci_fix.comment import render_result
+from scripts.ci_fix.comment import render_ci_sweep_fix, render_result
 from scripts.ci_fix.github_runs import (
     FailedJob,
     most_actionable_failure,
@@ -51,7 +56,7 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.policy import is_backport_branch, is_writable_branch
+from scripts.ci_fix.policy import is_backport_branch, is_bot_author, is_writable_branch
 from scripts.common.github_client import retry_github_call
 from scripts.common.valkey_ci import Source
 from scripts.common.workflow_jobs import job_is_ignored
@@ -68,6 +73,11 @@ _MARKER_RE = re.compile(
 # On a refusal's marker when the fixer itself declined the job, rather than a
 # prepared fix being refused at publication (the head moved, the PR closed).
 _DECLINED = "declined"
+# On the marker of a failure an upstream pull request fixes, which the sweep
+# PR was told to backport: the job is left alone until it is.
+_BACKPORT = "backport"
+_SUGGESTION = "<!-- valkey-ci-agent:backport-suggestion pr={number} -->"
+_FIXED_KINDS = frozenset({ResultKind.PUSHED, ResultKind.OPENED})
 _MAX_ATTEMPTS_PER_HEAD = 7
 # An attempt whose fix job failed before the engine started (a runner that
 # could not install or build) says nothing about the job and is not one of
@@ -104,6 +114,10 @@ class _HandledFailures:
     reported_job_ids: frozenset[int]
     attempt_count: int
     unstarted_count: int
+    # Jobs whose upstream fix the sweep PR was told to backport, on any head.
+    backport_keys: frozenset[str] = frozenset()
+    # Jobs, by name, with a fix in the open CI-sweep PR.
+    fixed_jobs: frozenset[str] = frozenset()
 
 
 def find_followup_target(
@@ -200,12 +214,15 @@ def _followup_for_pr(
         return None, rejection
 
     head_sha = str(getattr(pr.head, "sha", "") or "")
+    is_sweep = head_branch == f"{_BRANCH_PREFIX}/{target_branch}"
     handled = _handled_failures(
         pr,
         head_sha,
         bot_login,
         prior_plans=prior_plans,
     )
+    if is_sweep:
+        handled = replace(handled, fixed_jobs=_ci_sweep_jobs(gh, repo_entry, target_branch))
     if handled.attempt_count >= _MAX_ATTEMPTS_PER_HEAD or handled.unstarted_count >= _MAX_UNSTARTED_PER_HEAD:
         return None, "attempt-budget-exhausted"
 
@@ -228,11 +245,12 @@ def _followup_for_pr(
         gh, repo_entry.repo, current_runs,
         keep=lambda run, job: bool(job.id)
         and job.id not in handled.job_ids
-        and _job_key(run, job.name) not in handled.job_keys
+        and _job_key(run, job.name) not in handled.job_keys | handled.backport_keys
+        and job.name not in handled.fixed_jobs
         and not job_is_ignored(job.name, repo_entry.ci_followup_ignored_jobs),
     )
     release_run = False
-    if picked is None and head_branch == f"{_BRANCH_PREFIX}/{target_branch}":
+    if picked is None and is_sweep:
         # The pull request's own CI has nothing left to fix: the release
         # branch's failures are fixed on its sweep PR too.
         picked = _release_run_failure(gh, repo_entry, target_branch, handled)
@@ -243,6 +261,21 @@ def _followup_for_pr(
     return FollowupTarget(
         pr=pr, run=run, head_sha=head_sha, head_branch=head_branch, job=job, release_run=release_run,
     ), "actionable"
+
+
+def _ci_sweep_jobs(gh: Any, repo_entry: RepoEntry, target_branch: str) -> frozenset[str]:
+    """The jobs with a fix in the open CI-sweep PR, by its commits' trailers.
+
+    A fix the sweep's rebase dropped is no longer there, and its job is fixed
+    again if it still fails.
+    """
+    branch = ci_sweep.ci_sweep_branch(target_branch)
+    pull = find_existing_pr(gh, repo_entry.repo, repo_entry.effective_push_repo, branch)
+    if pull is None:
+        return frozenset()
+    return frozenset(fix.job for fix in retry_github_call(
+        lambda: ci_sweep.pr_fixes(pull), retries=2, description=f"list the fixes on #{pull.number}",
+    ))
 
 
 def release_job_name(job_name: str, branch: str) -> str:
@@ -273,7 +306,8 @@ def _release_run_failure(
             bool(name and job.id)
             and job.id not in handled.job_ids
             and job.id not in handled.reported_job_ids
-            and _job_key(run, job.name) not in handled.job_keys
+            and _job_key(run, job.name) not in handled.job_keys | handled.backport_keys
+            and name not in handled.fixed_jobs
             and not job_is_ignored(name, repo_entry.ci_followup_ignored_jobs)
         )
 
@@ -356,6 +390,7 @@ def plan_request(
             base_repo_full_name=repo_entry.repo,
             branch=target.head_branch,
             expected_sha=target.head_sha,
+            fix_branch=ci_sweep.fix_branch_for(target.head_branch, target_branch),
         ),
         # A backport branch's failure is usually a missing upstream change; a
         # pushed CI fix or a draft PR has no upstream counterpart to port.
@@ -378,15 +413,35 @@ def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:
         )
         body = f"{lead}\n\n" + render_result(result)
         declined = result.candidate is not None and result.candidate.action is CandidateAction.REFUSE
-        reason = f" reason={_DECLINED}" if declined else ""
-        body += "\n\n" + "\n".join(
+        backport = bool(plan.task.target.fix_branch and result.kind is ResultKind.SUGGESTED and result.pr_number)
+        reason = f" reason={_DECLINED}" if declined else f" reason={_BACKPORT}" if backport else ""
+        markers = "\n".join(
             marker.removesuffix(" -->") + f" outcome={result.kind.value}{reason} -->" for marker in plan.markers
         )
-        retry_github_call(
-            lambda: gh.get_repo(failure.repo_full_name).get_pull(failure.pr_number).create_issue_comment(body),
+        pull = retry_github_call(
+            lambda: gh.get_repo(failure.repo_full_name).get_pull(failure.pr_number),
             retries=3,
-            description=f"post automatic CI follow-up on #{failure.pr_number}",
+            description=f"get #{failure.pr_number}",
         )
+        if backport:
+            _suggest_backport(pull, result, body, markers)
+        else:
+            retry_github_call(
+                lambda: pull.create_issue_comment(f"{body}\n\n{markers}"),
+                retries=3,
+                description=f"post automatic CI follow-up on #{failure.pr_number}",
+            )
+        if plan.task.target.fix_branch and result.pr_number and result.kind in _FIXED_KINDS:
+            explained = render_ci_sweep_fix(result)
+            try:
+                retry_github_call(
+                    lambda: gh.get_repo(failure.repo_full_name).get_pull(result.pr_number)
+                    .create_issue_comment(explained),
+                    retries=3,
+                    description=f"explain the fix on #{result.pr_number}",
+                )
+            except Exception as exc:  # noqa: BLE001 - the commit message explains it too
+                logger.warning("Could not explain the fix on #%s: %s", result.pr_number, exc)
     response: dict[str, Any] = {
         "repo": failure.repo_full_name,
         "branch": failure.base_branch,
@@ -404,6 +459,36 @@ def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:
     if result.commit_sha:
         response["commit"] = result.commit_sha
     return response
+
+
+def _suggest_backport(pull: Any, result: FixResult, body: str, markers: str) -> None:
+    """Say once on the sweep PR which upstream pull request to backport.
+
+    A second failure the same pull request fixes is added to that comment,
+    with its marker, rather than said again.
+    """
+    tag = _SUGGESTION.format(number=result.pr_number)
+    comments = retry_github_call(
+        lambda: list(pull.get_issue_comments()), retries=2, description=f"list comments on #{pull.number}",
+    )
+    earlier = next((
+        comment for comment in comments
+        if is_bot_author(str(getattr(getattr(comment, "user", None), "login", "") or ""))
+        and tag in str(getattr(comment, "body", "") or "")
+    ), None)
+    if earlier is None:
+        retry_github_call(
+            lambda: pull.create_issue_comment(f"{body}\n\n{tag}\n{markers}"),
+            retries=3,
+            description=f"suggest backporting #{result.pr_number} on #{pull.number}",
+        )
+        return
+    also = f"It also fixes `{result.task.failure.job_name}`."
+    retry_github_call(
+        lambda: earlier.edit(body=f"{earlier.body}\n{also}\n{markers}"),
+        retries=3,
+        description=f"add a failure to the suggestion of #{result.pr_number} on #{pull.number}",
+    )
 
 
 # How many open PRs into one branch are inspected for a bot-owned fix PR.
@@ -456,11 +541,13 @@ def _handled_failures(
     the engine started (a runner outage) is neither an attempt nor a failure
     of its job: it is counted on its own. A job the fixer declined
     ``_MAX_REFUSALS_PER_JOB`` times on any of the PR's heads is retired on
-    this one too.
+    this one too. A job whose upstream fix the PR was told to backport waits
+    for that backport.
     """
     job_ids: set[int] = set()
     job_keys: set[str] = set()
     reported_job_ids: set[int] = set()
+    backport_keys: set[str] = set()
     failed_ids: Counter[int] = Counter()
     failed_keys: Counter[str] = Counter()
     refused_keys: Counter[str] = Counter()
@@ -486,6 +573,10 @@ def _handled_failures(
         refused_keys.update(
             match.group("key") for match in every_head
             if match.group("key") and match.group("reason") == _DECLINED
+        )
+        backport_keys.update(
+            match.group("key") for match in every_head
+            if match.group("key") and match.group("reason") == _BACKPORT
         )
         matches = tuple(match for match in every_head if match.group("head") == head_sha)
         if any(match.group("outcome") != ResultKind.REFUSED.value for match in matches):
@@ -534,6 +625,7 @@ def _handled_failures(
         reported_job_ids=frozenset(reported_job_ids),
         attempt_count=attempt_count,
         unstarted_count=unstarted_count,
+        backport_keys=frozenset(backport_keys),
     )
 
 

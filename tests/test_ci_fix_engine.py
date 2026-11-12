@@ -1091,8 +1091,34 @@ def test_a_backport_fix_is_shown_what_the_other_release_branches_changed(tmp_pat
     engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=general)
 
     assert backport.contexts[0].sibling_changes == "# Release branch `9.1`\n"
-    assert asked[0][1] == {"own_branch": "agent/backport/sweep/main", "base_branch": "main"} and len(asked) == 1
+    assert asked[0][1] == {"own_branch": "agent/backport/sweep/main", "base_branch": "main", "compared_with": ""}
+    assert len(asked) == 1
     assert general.contexts[0].sibling_changes == ""
+    assert backport.contexts[0].pending_fixes == ""
+
+
+def test_a_sweep_fix_is_shown_the_ci_sweep_prs_fixes_and_their_siblings(tmp_path, monkeypatch):
+    source, head_sha = _source_repo(tmp_path)
+    _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+    asked = []
+    monkeypatch.setattr(engine_mod, "sibling_branch_changes",
+                        lambda _repo, _paths, **kwargs: asked.append((kwargs["own_branch"], kwargs["compared_with"]))
+                        or f"# {kwargs['own_branch']}\n")
+    monkeypatch.setattr(engine_mod, "pending_fixes", lambda _repo, branch: f"# `{branch}`\n")
+    task = _backport(_task(head_sha))
+    task = replace(task, target=replace(
+        task.target, branch="agent/backport/sweep/main", fix_branch="agent/backport/ci-sweep/main",
+    ))
+    agent = _adapting_agent("")
+
+    engine_mod.prepare_fix(task, _LOG, agent_func=agent)
+
+    # The other CI-sweep branches against their sweeps, so their backports are not shown twice.
+    assert asked == [("agent/backport/sweep/main", ""), ("agent/backport/ci-sweep/main", "agent/backport/sweep")]
+    context = agent.contexts[0]
+    assert context.sibling_changes == "# agent/backport/sweep/main\n# agent/backport/ci-sweep/main\n"
+    assert context.pending_fixes == "# `agent/backport/ci-sweep/main`\n"
 
 
 def test_a_backport_branch_takes_a_patch_that_adapts_a_merged_upstream_commit(tmp_path, monkeypatch):

@@ -62,6 +62,7 @@ from scripts.ci_fix.prior_fixes import (
     failing_test_history,
     find_prior_fixes,
     paths_in_log,
+    pending_fixes,
     render_prior_fixes,
     sibling_branch_changes,
     summarize_prior_fixes,
@@ -402,12 +403,22 @@ def _establish(
         ),
         unported_index=unported_index(repo_dir) if upstream_first else "",
         sibling_changes=(
-            sibling_branch_changes(
-                repo_dir, tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths])),
-                own_branch=task.target.branch, base_branch=task.failure.base_branch,
+            # The other release branches' sweeps, and the CI-sweep PRs that
+            # collect their fixes until those are merged, each against its sweep.
+            "".join(
+                sibling_branch_changes(
+                    repo_dir, tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths])),
+                    own_branch=branch, base_branch=task.failure.base_branch, compared_with=compared_with,
+                )
+                for branch, compared_with in (
+                    (task.target.branch, ""),
+                    (task.target.fix_branch, task.target.branch.removesuffix(f"/{task.failure.base_branch}")),
+                )
+                if branch
             )
             if upstream_first and task.policy is FixPolicy.BACKPORT else ""
         ),
+        pending_fixes=pending_fixes(repo_dir, task.target.fix_branch) if task.target.fix_branch else "",
         verification=described,
         verified_by_code=plan is not None,
         upstream_first=upstream_first,

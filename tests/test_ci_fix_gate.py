@@ -208,6 +208,14 @@ def test_bot_backport_branch_uses_backport_update_policy(monkeypatch) -> None:
     assert result.failure.job_id == 11
     assert result.failure.run_attempt == 2
     assert result.policy is FixPolicy.BACKPORT
+    # A sweep PR carries only backports: a maintainer's fix goes to its CI-sweep PR, as the follow-up's does.
+    assert result.target.fix_branch == "agent/backport/ci-sweep/8.0"
+
+
+def test_a_fix_for_another_bot_branch_goes_onto_it(monkeypatch) -> None:
+    result = _build(monkeypatch, gh=_gh(branch="agent/ci-fix/issue-9-100-1")[0])
+    assert isinstance(result, FixTask)
+    assert result.target.kind is TargetKind.UPDATE_PR and result.target.fix_branch == ""
 
 
 @pytest.mark.parametrize(
