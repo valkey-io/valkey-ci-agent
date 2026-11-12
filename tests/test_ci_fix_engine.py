@@ -1331,6 +1331,74 @@ def test_a_session_that_dies_on_a_model_api_error_twice_is_a_failed_attempt(tmp_
     assert agent.call_count == 2
 
 
+def _valgrind_repo(tmp_path):
+    """A checkout with a Tcl test file and runtest, whose CI log names no test: a valgrind report."""
+    source, _head = _source_repo(tmp_path)
+    (source / "runtest").write_text("#!/bin/sh\n", encoding="utf-8")
+    (source / "tests" / "unit").mkdir(parents=True)
+    (source / "tests" / "unit" / "save.tcl").write_text('test "Save with bgsave" {\n    r ping\n}\n', encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "A test")
+    return source, git(source, "rev-parse", "HEAD")
+
+
+def _naming_agent(*named):
+    """An agent that fixes value.txt and names ``named`` as the tests the log shows failing."""
+    def agent(task, repo_dir, job_log, **_kwargs):  # noqa: ARG001
+        (Path(repo_dir) / "value.txt").write_text("right\n", encoding="utf-8")
+        return FixCandidate(action=CandidateAction.PATCH, failing_check="valgrind", root_cause="a race",
+                            reasoning="fix it", changed_paths=("value.txt",), failing_tests=named)
+    return agent
+
+
+_VALGRIND_LOG = "[err]: Valgrind error: ==20204== Memcheck, a memory error detector\n"
+
+
+def test_a_failure_no_test_was_named_for_runs_the_test_the_agent_named(tmp_path, monkeypatch):
+    """Code could not read the test from the log; the agent did, and with it the fix is run, not posted."""
+    from scripts.ci_fix.models import FailedTest
+
+    source, head_sha = _valgrind_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
+    commands = []
+
+    candidate = engine_mod.prepare_fix(
+        _task(head_sha), _VALGRIND_LOG, agent_func=_naming_agent(FailedTest("Save with bgsave", "tests/unit/save.tcl")),
+        review_func=lambda *_a, **_k: (True, "the named test is the one in the report"),
+        test_func=lambda _repo, command, _timeout: commands.append(command) or TestRun(
+            True, "[ok]: Save with bgsave (1 ms)", report="[ok]: Save with bgsave (1 ms)"),
+        job=JobCommands(build="make valgrind", runtest="./runtest --valgrind --clients 1 --timeout 2400"),
+    )
+
+    assert candidate.action is CandidateAction.PATCH and not candidate.not_run
+    assert any("--valgrind" in c and "--only 'Save with bgsave'" in c and "unit/save" in c for c in commands)
+    assert "ran the one the author named: `Save with bgsave` in `tests/unit/save.tcl`" in candidate.verification
+    assert "this fix was reviewed, not run" not in candidate.verification
+
+
+@pytest.mark.parametrize("named", [
+    ("Not a test in the file", "tests/unit/save.tcl"),
+    ("Save with bgsave", "tests/unit/missing.tcl"),
+    ("Save with bgsave", "../outside.tcl"),
+])
+def test_a_named_test_that_is_not_in_the_checkout_is_not_run(tmp_path, monkeypatch, named):
+    from scripts.ci_fix.models import FailedTest
+
+    source, head_sha = _valgrind_repo(tmp_path)
+    _install_clone(monkeypatch, source)
+    monkeypatch.setattr(engine_mod, "plan_for", _REAL_PLAN_FOR)
+    commands = []
+
+    candidate = engine_mod.prepare_fix(
+        _task(head_sha), _VALGRIND_LOG, agent_func=_naming_agent(FailedTest(*named)),
+        review_func=lambda *_a, **_k: (True, "fine"),
+        test_func=lambda _repo, command, _timeout: commands.append(command) or TestRun(True, ""),
+    )
+
+    assert candidate.not_run and commands == []
+
+
 def test_a_later_round_whose_agent_fails_is_a_failed_attempt_not_a_refusal(tmp_path, monkeypatch):
     source, head_sha = _source_repo(tmp_path)
     _install_clone(monkeypatch, source)

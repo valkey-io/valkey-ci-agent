@@ -234,6 +234,9 @@ def plan_for(
     moduleapi = bool(job.moduleapi) and _in_moduleapi(tests[0].file)
     tests = tuple(test for test in tests if _in_moduleapi(test.file) == moduleapi)
     base = job.moduleapi if moduleapi else job.runtest
+    if not base:
+        # A job with only some of the suites (Daily's valgrind "misc" jobs run only the module API tests).
+        return None
     # runtest keeps the last --timeout. The job's own watchdog is kept (Daily's
     # valgrind jobs pass 2400: a test under valgrind is slow, not hung) up to
     # the cap; past it, the notes say a [TIMEOUT] may be verification's own.

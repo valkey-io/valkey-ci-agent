@@ -78,7 +78,16 @@ no history ("previously", "now"), and no PR or issue numbers.
   same change.
 - Do not reorder or rename tests; other tests in a file may depend on state
   that earlier ones leave behind.
-- A tag that skips a test is not a fix for a race.
+- A tag that skips a test is not a fix for a race. Skipping is right only
+  where the test cannot apply (the platform lacks the feature, or a tool the
+  test needs is missing), with the reason next to the skip.
+- Do not make a test or the harness ignore what it reports (an error, a
+  warning, a log line, a sanitizer or valgrind finding) or accept an outcome
+  it rejected. Find why the report happens and remove that: a harness that
+  signals a server during its exit-time leak check is fixed by waiting for
+  the server to exit, not by ignoring the warning that results. A test may
+  accept more outcomes, or a looser limit, only when every outcome it would
+  then accept is correct server behaviour, and the fix says why.
 - Do not change `.github/` unless your policy says a CI change is allowed.
 
 ## Running a test

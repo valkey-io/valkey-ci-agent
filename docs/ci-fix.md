@@ -88,6 +88,14 @@ merged upstream comes first, and where none fixes the failure Claude writes a
 patch. When there is nothing upstream to port, as on `unstable` itself, the
 patch is reviewed but not run.
 
+Claude reads the whole log, and often can tell which test a report or a test
+client's exception came from where the bot's parser cannot. It names that
+test, and the bot runs it with the change the way the job runs it, under
+valgrind or a sanitizer when the job uses one. The bot checks only that the
+test is in the checkout; the reviewer is told the test was named by Claude
+and checks it against the log. A job that runs only the module API tests,
+like Daily's valgrind "misc" jobs, is replayed in its own environment too.
+
 The bot never pushes a patch it wrote and could not run. It posts the patch
 in a comment, says that it was not run, and leaves it for a person to apply.
 A port of a commit merged upstream is still pushed when it only builds here:

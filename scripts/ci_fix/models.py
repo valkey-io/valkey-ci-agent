@@ -201,6 +201,10 @@ class FixCandidate:
     # The merged upstream commit a patch adapts to this branch, checked by
     # code; set only where an upstream change comes first (FixContext.upstream_first).
     adapts: str = ""
+    # The tests the agent read in the log as the ones that failed. Code runs
+    # them when it could name none itself: a valgrind or sanitizer report,
+    # or a test client's exception, names no test on its result line.
+    failing_tests: tuple[FailedTest, ...] = ()
     # What code established about the candidate (local test runs and the
     # review), for the maintainer report. Never written by the agent.
     verification: str = ""
