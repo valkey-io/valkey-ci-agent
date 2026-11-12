@@ -265,9 +265,28 @@ def test_a_fix_that_will_not_be_run_says_what_is_and_is_not_established(tmp_path
     agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=FixContext(
         reviewed_only=True, verification="No command here can run the failing check, so this fix was reviewed, not run."))
 
-    assert "your patch will be\nreviewed and published as not run" in seen["prompt"]
-    assert "say plainly what the log and the code establish\nand what they do not" in seen["prompt"]
+    assert "Unless\nyou name it in `failing_tests` and code can run it" in seen["prompt"]
+    assert "say plainly what the log and the code establish and what they\ndo not" in seen["prompt"]
     assert "### Verification\nNo command here can run the failing check" in seen["prompt"]
+    assert "If you can, name it in `failing_tests`" in seen["prompt"]
+
+
+def test_the_agent_may_name_the_tests_the_log_shows_failing(tmp_path, monkeypatch) -> None:
+    """A valgrind or sanitizer report, or a test client's exception, names no test on its result line."""
+    from scripts.ci_fix.models import FailedTest
+
+    tests = [{"file": "tests/unit/moduleapi/rdbloadsave.tcl", "name": "Module rdbloadsave with bgsave"},
+             {"file": "tests/unit/a.tcl", "name": ""}, {"file": "", "name": "no file"}, "not a test",
+             {"file": "tests/unit/a.tcl", "name": ""}]
+    monkeypatch.setattr(agent_mod, "run_agent", lambda *_a, **_k: _result(
+        {"action": "patch", "summary": "fixed", "changed_paths": ["a.c"], "failing_tests": tests}))
+
+    candidate = agent_mod.run_fix_agent(_task(), str(tmp_path), "log")
+
+    assert candidate.failing_tests == (
+        FailedTest("Module rdbloadsave with bgsave", "tests/unit/moduleapi/rdbloadsave.tcl"),
+        FailedTest("", "tests/unit/a.tcl"),
+    )
 
 
 def test_where_an_upstream_change_comes_first_the_agent_is_told_and_its_claim_is_read(

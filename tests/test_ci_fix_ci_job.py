@@ -622,6 +622,24 @@ def test_valkeys_sanitizer_entry_resolves_with_its_compiler():
     assert spec.commands.build.startswith("export CC='gcc'\nmake all-with-unit-tests OPT=-O3 SANITIZER=address")
 
 
+def test_a_job_that_runs_only_the_module_api_tests_can_host_a_fix():
+    """Daily's valgrind "misc" job runs only runtest-moduleapi: its valgrind reports were checked without valgrind."""
+    module_only = (
+        DAILY.replace("        run: ./runtest ${{ github.event_name != 'pull_request' && '--accurate' || '' }} "
+                      "--dump-logs ${{github.event.inputs.test_args}}\n",
+                      "        run: CFLAGS='-Werror' ./runtest-moduleapi --valgrind --clients 1 --dump-logs\n")
+        .replace("      - name: backward compatibility tests with OSS Redis 7.0\n        run: ./runtest --tags compatible-redis\n", "")
+    )
+
+    spec = _resolve(module_only, "test-ubuntu-jemalloc")
+
+    assert spec.commands.runtest == "" and spec.commands.unittest == ""
+    assert spec.commands.moduleapi == "CFLAGS='-Werror' ./runtest-moduleapi --valgrind --clients 1 --dump-logs"
+    with pytest.raises(Unsupported, match="no single test command"):
+        _resolve(module_only.replace("./runtest-moduleapi --valgrind --clients 1 --dump-logs", "./runtest-sentinel"),
+                 "test-ubuntu-jemalloc")
+
+
 def test_valkeys_valgrind_shard_runs_its_own_job_instance():
     spec = _resolve(_DAILY, "test-valgrind-test (unit)")
 

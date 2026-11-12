@@ -267,8 +267,10 @@ def _spec(job_id: str, name: str, job: dict[str, Any], context: dict[str, Any]) 
 
     tests = [(str(step.get("name") or ""), _rendered_run(step, context)) for step in steps if _suite(_script(step))]
     runtest = _suite_command(tests, "valkey", "./runtest")
-    if not runtest:
-        raise Unsupported("the job has no single runtest command")
+    moduleapi = _suite_command(tests, "modules", "./runtest-moduleapi")
+    unittest = _suite_command(tests, "unittest", "make test-unit")
+    if not (runtest or moduleapi or unittest):
+        raise Unsupported("the job has no single test command for a suite the bot runs")
     make = _step(builds[0], context)
     checkout = checkouts[0] if checkouts else None
     # The fix job reads these as workflow outputs, one line each.
@@ -286,8 +288,8 @@ def _spec(job_id: str, name: str, job: dict[str, Any], context: dict[str, Any]) 
         commands=JobCommands(
             build=_build_command({**env, **make.env}, make.run),
             runtest=runtest,
-            moduleapi=_suite_command(tests, "modules", "./runtest-moduleapi"),
-            unittest=_suite_command(tests, "unittest", "make test-unit"),
+            moduleapi=moduleapi,
+            unittest=unittest,
         ),
     )
 

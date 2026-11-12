@@ -193,7 +193,7 @@ def prepare_fix(
         return _fix_loop(
             task, repo_dir, original_head, job_log, context, plan,
             agent_func=agent_func, review=review_func or review_candidate,
-            run_test=run_test if runs_tests and plan is not None else None, deadline=deadline, job=job, tests=tests,
+            run_test=run_test if runs_tests else None, deadline=deadline, job=job, tests=tests,
         )
 
 
@@ -559,6 +559,17 @@ def _fix_loop(
             continue
 
         checks = list(established)
+        round_plan = plan
+        named = _named_plan(task, repo_dir, candidate, context, job) if run_test is not None else None
+        if named is not None:
+            round_plan, named_tests = named
+            # Not the plan code made before the agent ran, which ran nothing.
+            checks = [check for check in checks if check != context.verification]
+            checks.append(
+                "Code could not tell from the log which test failed, so it ran the one the author named: "
+                + ", ".join(f"`{test.name}` in `{test.file}`" if test.name else f"`{test.file}`" for test in named_tests)
+                + ". Check against the log that it is the test that failed."
+            )
         if context.upstream_first and candidate.action is CandidateAction.PATCH and not candidate.adapts:
             checks.append(_OWN_FIX)
         if outcome.undeclared:
@@ -575,8 +586,8 @@ def _fix_loop(
         touches: tuple[int, ...] = ()
         try:
             failed = ""
-            if run_test is not None and plan is not None:
-                failed = _verify(reviewed, repo_dir, plan, run_test, deadline, checks)
+            if run_test is not None and round_plan is not None:
+                failed = _verify(reviewed, repo_dir, round_plan, run_test, deadline, checks)
             if not failed:
                 # The reviewer sees what the checks showed, not only the plan.
                 approved, reasoning = review(
@@ -608,7 +619,7 @@ def _fix_loop(
             continue
         return replace(
             candidate, verification="\n".join(checks), also_touches=touches,
-            not_run=context.reviewed_only or context.only_built,
+            not_run=(context.reviewed_only or context.only_built) and named is None,
         )
     return _refusal(
         f"No candidate passed its test and review in {MAX_ROUNDS} attempts. Last: {last}",
@@ -736,6 +747,40 @@ def tree_patch(repo_dir: str) -> str:
 
 def _noun(candidate: FixCandidate) -> str:
     return "port" if candidate.action is CandidateAction.PORT else "patch"
+
+
+def _named_plan(
+    task: FixTask, repo_dir: str, candidate: FixCandidate, context: FixContext, job: JobCommands | None,
+) -> tuple[VerifyPlan, tuple[FailedTest, ...]] | None:
+    """The plan that runs the tests the agent named, when code could name none: (plan, tests), or None.
+
+    A valgrind or sanitizer report, or a test client's exception, names no
+    test on its result line; the agent reads the whole log and can. Only a
+    test that is in the checkout is run, and the reviewer is told which one
+    it was and asked to check it against the log.
+    """
+    if not (context.reviewed_only or context.only_built) or not candidate.failing_tests:
+        return None
+    named = []
+    for test in locate_unit_tests(repo_dir, candidate.failing_tests):
+        path = Path(repo_dir, test.file)
+        if ".." in Path(test.file).parts or not _inside_checkout(repo_dir, path) or not path.is_file():
+            continue
+        if test.name and test.name not in path.read_text(encoding="utf-8", errors="replace"):
+            continue
+        named.append(test)
+    if not named:
+        return None
+    plan = plan_for(repo_dir, tuple(named), scheduled=task.failure.scheduled, job=job)
+    return (plan, plan.tests or tuple(named)) if plan is not None else None
+
+
+def _inside_checkout(repo_dir: str, path: Path) -> bool:
+    try:
+        path.resolve().relative_to(Path(repo_dir).resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _established_checks(context: FixContext) -> list[str]:
