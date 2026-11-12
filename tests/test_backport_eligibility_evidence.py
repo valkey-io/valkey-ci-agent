@@ -11,6 +11,7 @@ from scripts.backport import eligibility
 from scripts.backport.eligibility import BranchHistory, MergedSourcePR
 from scripts.backport.eligibility_evidence import (
     branch_evidence,
+    is_docs_only_change,
     is_non_product_change,
     subject_identifiers,
 )
@@ -90,6 +91,19 @@ def test_non_product_change(paths, expected):
     assert is_non_product_change(paths) is expected
 
 
+@pytest.mark.parametrize(
+    ("paths", "expected"),
+    [
+        (["README.md", "docs/design.md"], True),
+        (["README.md", "tests/unit/type/zset.tcl"], False),
+        ([".github/workflows/ci.yml"], False),
+        ([], False),
+    ],
+)
+def test_docs_only_change(paths, expected):
+    assert is_docs_only_change(paths) is expected
+
+
 def test_subject_identifiers_keep_names_the_code_has(repo):
     clone, fix = repo["clone"], repo["fix"]
     ids = subject_identifiers(
@@ -157,13 +171,28 @@ def test_evidence_drops_a_branch_without_the_named_config(repo, monkeypatch):
     }
 
 
-def test_test_only_pr_is_never_a_candidate(repo):
+def test_test_only_pr_is_a_marked_candidate(repo):
     clone = repo["clone"]
     upstream = Path(clone).parent / "upstream"
     fix = _commit(upstream, {"tests/unit/shutdown.tcl": "test {old} {fixed}\n"}, "Deflake shutdown test (#5)")
     subprocess.run(["git", "-C", clone, "fetch", "-q", "origin"], check=True)
-    result = eligibility.precheck(clone, _source(fix, "Deflake shutdown test"), "unstable")
-    assert result == {"action": "not-eligible", "detail": "changes only tests, test harness, CI, or docs"}
-    # A product change is not settled early: precheck hands back where it starts.
-    product = eligibility.precheck(clone, _source(repo["fix"], "Fix shutdown"), "unstable")
-    assert product == _git(Path(clone), "rev-parse", f"{repo['fix']}^").strip()
+    source = _source(fix, "Deflake shutdown test")
+    # precheck no longer settles it: it hands back where the change starts.
+    base = eligibility.precheck(clone, source, "unstable")
+    assert base == _git(Path(clone), "rev-parse", f"{fix}^").strip()
+    candidate = eligibility.assess(clone, source, ["9.0"], base=base, history=BranchHistory(clone))
+    assert isinstance(candidate, eligibility.Candidate)
+    assert candidate.non_product and candidate.branches == {"9.0"}
+    product = eligibility.assess(clone, _source(repo["fix"], "Fix shutdown"), ["9.0"],
+                                 base=f"{repo['fix']}^", history=BranchHistory(clone))
+    assert isinstance(product, eligibility.Candidate) and not product.non_product
+
+
+def test_docs_only_pr_is_never_a_candidate(repo):
+    clone = repo["clone"]
+    upstream = Path(clone).parent / "upstream"
+    fix = _commit(upstream, {"docs/shutdown.md": "How shutdown works.\n"}, "Document shutdown (#6)")
+    subprocess.run(["git", "-C", clone, "fetch", "-q", "origin"], check=True)
+    result = eligibility.assess(clone, _source(fix, "Document shutdown"), ["9.0"],
+                                base=f"{fix}^", history=BranchHistory(clone))
+    assert result == {"action": "not-eligible", "detail": "changes only docs"}

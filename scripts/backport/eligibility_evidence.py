@@ -27,15 +27,20 @@ from typing import Iterable, Sequence
 
 from scripts.common.proc import PROCESS_BASICS, filter_env, git_output, run_git
 
-# Paths whose changes never ship to users: tests, test harness, CI, docs.
-# A PR touching only these is never suggested for backport.
+# Docs paths. A PR touching only these is never suggested for backport.
+DOC_PATTERNS = (
+    "*.md",
+    "docs/*",
+)
+# Paths whose changes never ship to users: tests, test harness, CI, and docs.
+# A release branch can still need them to keep its own CI working, so such a
+# PR is judged, but never commented on.
 NON_PRODUCT_PATTERNS = (
     "tests/*",
     "src/unit/*",
     ".github/*",
     "ci/*",
-    "*.md",
-    "docs/*",
+    *DOC_PATTERNS,
 )
 
 # Bounds on what is extracted and asked of each branch.
@@ -60,9 +65,18 @@ _GENERIC = frozenset({
 
 def is_non_product_change(paths: Iterable[str]) -> bool:
     """True when every changed path is a test, harness, CI, or doc file."""
+    return _all_match(paths, NON_PRODUCT_PATTERNS)
+
+
+def is_docs_only_change(paths: Iterable[str]) -> bool:
+    """True when every changed path is a doc file."""
+    return _all_match(paths, DOC_PATTERNS)
+
+
+def _all_match(paths: Iterable[str], patterns: Sequence[str]) -> bool:
     paths = list(paths)
     return bool(paths) and all(
-        any(fnmatch.fnmatch(path, pattern) for pattern in NON_PRODUCT_PATTERNS) for path in paths
+        any(fnmatch.fnmatch(path, pattern) for pattern in patterns) for path in paths
     )
 
 

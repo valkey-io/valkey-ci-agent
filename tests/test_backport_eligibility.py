@@ -895,7 +895,7 @@ def test_run_gives_the_model_branch_evidence_and_linked_issues(wired):
 def test_prompt_asks_for_precision():
     prompt = eligibility._PROMPT_TEMPLATE
     assert "when the evidence is thin, answer true" not in prompt.lower()
-    assert "confidence" in prompt and "fixes for flaky tests" in prompt.lower()
+    assert "confidence" in prompt and "a fix for a flaky test" in prompt.lower()
 
 
 @pytest.mark.parametrize(("value", "expected"), [
@@ -1199,21 +1199,51 @@ def test_run_merge_commit_not_on_the_development_branch_is_not_on_base(wired, up
     assert result["errors"] == []
 
 
-def test_run_classifies_test_only_prs_before_any_history_query(wired, upstream, monkeypatch):
-    (upstream["path"] / "tests").mkdir()
-    test_only = _commit(upstream["path"], "tests/t.tcl", "test {x} {}\n", "deflake (#108)")
-
-    def no_triage(*args: Any, **kwargs: Any) -> list[str]:
-        raise AssertionError("triage must not run for a test-only PR")
-
-    monkeypatch.setattr(eligibility, "triaged_branches", no_triage)
+def _test_only_pr(wired, upstream) -> None:
+    """Replace the PRs with #108, a deflake of a test 9.1 carries."""
+    repo = upstream["path"]
+    (repo / "tests").mkdir()
+    added = _commit(repo, "tests/t.tcl", "test {x} {\n    after 10\n}\n", "add test (#107)")
+    _git(repo, "checkout", "-q", "9.1")
+    _git(repo, "cherry-pick", added)
+    _git(repo, "checkout", "-q", "unstable")
+    deflake = _commit(repo, "tests/t.tcl", "test {x} {\n    wait_for_ok\n}\n", "deflake (#108)")
     wired.nodes[:] = [{"number": 108, "mergedAt": "2000-01-01T00:00:00Z",
-                       "mergeCommit": {"oid": test_only},
-                       "commits": {"nodes": [{"commit": {"oid": test_only}}]}}]
-    result = eligibility.run(repo_entry=wired.entry, date="2026-10-12", token="t", run_fn=_model([]))
-    assert result["prs"]["108"] == {
-        "action": "not-eligible", "detail": "changes only tests, test harness, CI, or docs",
-    }
+                       "mergeCommit": {"oid": deflake},
+                       "commits": {"nodes": [{"commit": {"oid": deflake}}]}}]
+
+
+def test_run_judges_a_test_only_pr_but_never_comments(wired, upstream):
+    _test_only_pr(wired, upstream)
+    prompts: list[str] = []
+    result = eligibility.run(
+        repo_entry=wired.entry, date="2026-10-12", token="t",
+        run_fn=_model([{"pr": 108, "backport": True, "branches": ["9.1"],
+                        "reason": "The test flakes on 9.1."}], prompts),
+    )
+    assert any('"number": 108' in prompt for prompt in prompts)
+    entry = result["prs"]["108"]
+    assert entry["action"] == "not-commented"
+    assert entry["confidence"] == "medium" and entry["branches"] == ["9.1"]
+    assert result["errors"] == [] and wired.posted == []
+
+
+def test_run_test_only_pr_maintainers_queued_is_triaged(wired, upstream, monkeypatch):
+    _test_only_pr(wired, upstream)
+    wired.nodes[0]["projectItems"] = {"nodes": [{"project": {"number": 11, "owner": {"login": "org"}}}]}
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(eligibility, "ga_dates", lambda *_: {"9.0": epoch, "9.1": epoch})
+    result = eligibility.run(repo_entry=wired.entry, date="2026-10-12", token="t", run_fn=_never_called)
+    assert result["prs"]["108"] == {"action": "triaged", "triaged_on": ["9.1"]}
+
+
+def test_run_docs_only_pr_is_not_eligible_without_the_model(wired, upstream):
+    docs = _commit(upstream["path"], "README.md", "# Valkey\n", "docs (#109)")
+    wired.nodes[:] = [{"number": 109, "mergedAt": "2000-01-01T00:00:00Z",
+                       "mergeCommit": {"oid": docs},
+                       "commits": {"nodes": [{"commit": {"oid": docs}}]}}]
+    result = eligibility.run(repo_entry=wired.entry, date="2026-10-12", token="t", run_fn=_never_called)
+    assert result["prs"]["109"] == {"action": "not-eligible", "detail": "changes only docs"}
 
 
 def test_reads_labels_of_the_pr_and_its_linked_issues():
