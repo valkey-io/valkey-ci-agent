@@ -39,7 +39,9 @@ repos:
         outputs:
           - "src/unit/test_files.h"
     repair_validation_failures: true
-    automatic_ci_followup: true
+    # Off for now: CI fixes are not to be pushed onto the sweep PRs. They will
+    # go to a separate PR into the sweep branch instead.
+    automatic_ci_followup: false
     ci_followup_ignored_jobs:
       # Only Actions job names are matched. DCO and Codecov reach the PR as check
       # runs owned by their own GitHub Apps, never as jobs of a workflow run, so
