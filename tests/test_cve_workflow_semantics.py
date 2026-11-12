@@ -160,7 +160,7 @@ def test_next_scan_fails_on_last_weeks_failed_rebuild() -> None:
     assert lookback["if"] == "github.repository == 'valkey-io/valkey-ci-agent'"
     (step,) = lookback["steps"]
     run = step["run"]
-    assert "date -u -d '7 days ago'" in run
+    assert "date -u -d '8 days ago'" in run
     assert "--workflow ci.yml" in run
     assert "--event workflow_dispatch" in run
     assert '--created ">=${SINCE}"' in run
