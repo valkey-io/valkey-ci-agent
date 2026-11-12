@@ -380,6 +380,7 @@ def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) 
     # run on a new model turned down the one merged fix for a flake because it widened an assertion.
     assert "do not judge its design again" in seen["prompt"]
     assert "a looser threshold unless" not in seen["prompt"] and "is a rejection" not in seen["prompt"]
+    assert "for a state that cannot happen" not in seen["prompt"]
 
     # A fix written here is judged on its merits, against the repository's conventions; and a
     # verified candidate's review reads what the checks found, and what a patch says it adapts.
@@ -395,6 +396,9 @@ def test_the_review_sees_the_port_verification_and_guide(tmp_path, monkeypatch) 
     assert "What code checked:\nWith the fix, `make` builds." in seen["prompt"]
     assert f"adapts upstream commit {'d' * 40}" in seen["prompt"]
     assert "a looser threshold unless" in seen["prompt"] and "do not judge its design again" not in seen["prompt"]
+    # Written fixes are also held to the test-quality rules in the bot's guide.
+    assert "for a state that cannot happen" in seen["prompt"]
+    assert "comments that narrate the fix" in seen["prompt"]
     assert "a skip tag instead of a fix, is a rejection" in seen["prompt"]
 
 

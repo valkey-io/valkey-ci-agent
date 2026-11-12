@@ -52,6 +52,26 @@ A test that fails once in many runs is still a bug. Find the race in the log
 Valgrind and sanitizer builds are many times slower; scale a wait with
 `$::valgrind` rather than hard-coding a longer one everywhere.
 
+## Writing the test
+
+- Assert an exact value only while the state it reads cannot move. While the
+  server is still doing work in the background, assert a bound
+  (`assert_range`, `assert_morethan`) or wait for the state first.
+- Fix a race by holding the moving part still, not by waiting longer:
+  `pause_process` and `resume_process` stop and resume a server, and
+  `tests/support/util.tcl` has more.
+- Give every wait a failure message that prints the state it was waiting
+  for, in `wait_for_condition`'s `else` clause, so the next failure explains
+  itself.
+- Check a result by reading the data back. That the server did not crash is
+  not a check.
+- Use an existing helper before writing a new one.
+
+## Comments
+
+A comment says what the code does or why, briefly. No narration of the fix,
+no history ("previously", "now"), and no PR or issue numbers.
+
 ## Scope
 
 - Keep the change minimal and easy to backport: release branches take the
