@@ -111,19 +111,58 @@ pushed a fix to.
 
 Every hour it waits until all the CI runs on a PR's latest commit have
 finished, then picks one failed job it hasn't tried yet and hands it to the
-[CI fix bot](ci-fix.md). The fix is pushed as a new commit on top, and the
-PR's CI runs again. The bot never rewrites the branch and doesn't add a DCO
-sign-off to these commits, so a maintainer certifies the change when they
-merge it.
+[CI fix bot](ci-fix.md). On any PR but a sweep PR, the fix is pushed as a new
+commit on top, and the PR's CI runs again. The bot never rewrites that
+branch, and doesn't add a DCO sign-off to its commits, so a maintainer
+certifies the change when they merge it.
+
+A sweep PR carries only backports. Its fixes are prepared and tested on its
+latest commit like any other, then go to its CI-sweep PR: the branch
+`agent/backport/ci-sweep/<release>`, opened as a PR into the sweep branch the
+first time there is a fix. It reads like the sweep PR: titled `[CI] CI Fix
+Sweep for <release>`, with a table of the fixes, one row each, and each fix
+explained in a short comment on it. The sweep PR says at the top, above its
+table, which PR holds its CI fixes.
+
+The branch is always the sweep's head with the fixes on top, one commit each,
+so the PR shows only the fixes. Each fix's commit names the job it fixes
+(`CI-Fix-Job:`), and a job with a fix there is not fixed again. When the sweep
+takes new backports, which rebases its branch, the sweep rebuilds the CI-sweep
+branch on its new head and force-pushes it with a lease:
+
+- A fix whose change the sweep now has is dropped.
+- A fix that conflicts with the sweep is dropped, and its job is fixed again if
+  it still fails.
+- A fix whose files a new backport changed is reviewed by the agent, and
+  dropped if the backport made it unneeded.
+
+Each drop is said in one line on the CI-sweep PR. The rebuild is planned while
+the sweep is prepared, with no write token, and carried out with git when it
+is published. A CI-sweep branch with commits the bot didn't make is no longer
+rebuilt, and the bot says so once.
+
+Merging the CI-sweep PR puts the fixes on the sweep branch, and the sweep PR's
+CI then shows whether they hold: the CI-sweep PR's own CI is shorter, because
+Daily CI runs only on pull requests into a release branch. If the sweep PR is
+merged first, the CI-sweep PR is closed, and failures that remain are fixed
+again for the next sweep. Once it is merged or closed, the next fix starts a
+new one.
+
+When the fix is a pull request already merged upstream, the bot doesn't
+cherry-pick it: the sweep knows a backport by its pull request, and would take
+it again. It says on the sweep PR, in one line, which pull request to
+backport. A second failure the same pull request fixes is added to that
+comment rather than said again, and the failures it names are left alone
+after that.
 
 Valkey also tests every release branch once a week (`weekly.yml`). When a
 sweep PR's own CI has nothing left to fix, the agent takes that branch's
-failures from the newest weekly run, one an hour, and fixes them on the sweep
-PR under the same rules. The fix is prepared and tested on the sweep PR's
+failures from the newest weekly run, one an hour, and fixes them for the
+sweep PR under the same rules. The fix is prepared and tested on the sweep PR's
 latest commit, not on the commit the weekly run tested, and the comment says
 which run it came from. A weekly failure is handled once, however often the
-PR's head moves. Without an open sweep PR for the branch there is nowhere to
-push, and nothing is done.
+PR's head moves. Without an open sweep PR for the branch there is nothing to
+fix them on, and nothing is done.
 
 A few rules keep this from going in circles. The agent makes at most seven
 attempts on any one commit. A run that fails before the agent starts, because

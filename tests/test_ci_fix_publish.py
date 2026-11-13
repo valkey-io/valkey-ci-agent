@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from github.GithubException import GithubException
 
+from scripts.backport import ci_sweep
 from scripts.ci_fix import publish as publish_mod
 from scripts.ci_fix.models import (
     CandidateAction,
@@ -633,3 +634,216 @@ def test_a_fix_is_still_published_when_its_test_failed_again_while_it_was_prepar
     result = publish_candidate(gh, task, _candidate(), git_env={}, issue_publication=IssuePublication.COMMENT)
 
     assert result.kind is ResultKind.SUGGESTED
+
+
+_CI_SWEEP = "agent/backport/ci-sweep/9.0"
+_RUN = "https://github.com/valkey-io/valkey/actions/runs/100"
+
+
+def _sweep_task() -> FixTask:
+    task = _task(TargetKind.UPDATE_PR)
+    return replace(task, target=replace(task.target, fix_branch=_CI_SWEEP))
+
+
+def _commit(sha: str, message: str) -> SimpleNamespace:
+    return SimpleNamespace(sha=sha, commit=SimpleNamespace(message=message))
+
+
+def _ci_sweep_pr(*, author: str | None = None, commits=()) -> SimpleNamespace:
+    return SimpleNamespace(
+        number=61,
+        body="",
+        edit=MagicMock(),
+        get_commits=lambda: list(commits),
+        html_url="https://github.com/valkey-io/valkey/pull/61",
+        user=SimpleNamespace(login=author or f"{APP_LOGIN}[bot]"),
+        base=SimpleNamespace(ref="agent/backport/sweep/9.0"),
+        head=SimpleNamespace(sha=_NEW, ref=_CI_SWEEP),
+    )
+
+
+_PUSHED = _commit("d" * 40, f"Fix unit/x\n\nCI-Fix-Job: unit tests\nCI-Fix-Run: {_RUN}")
+
+
+def _ci_sweep_gh(*, branch_sha: str = "", closed=(), pushed=(_PUSHED,)):
+    """A repository whose CI-sweep branch, after the push, adds ``pushed`` to the sweep's head."""
+    sweep = _pr()
+    sweep.body = "# Backport sweep for 9.0\n\n## Applied\n\n| a |\n\n---\n*Generated*"
+    sweep.edit = MagicMock()
+    gh, repo = _gh(pr=sweep)
+
+    def get_branch(name: str):
+        if name == _CI_SWEEP and branch_sha:
+            return SimpleNamespace(commit=SimpleNamespace(sha=branch_sha))
+        raise GithubException(404, {"message": "Not Found"})
+
+    repo.get_branch.side_effect = get_branch
+    repo.get_pulls.return_value = list(closed)
+    repo.compare.return_value = SimpleNamespace(commits=list(pushed))
+    return gh, repo, sweep
+
+
+def _push_recording(seen: dict):
+    def push(candidate, target, *, git_env, pre_push_check, allow_ci_changes, onto="", trailers=()):
+        # The sweep PR the fix was run on is what is checked before the push.
+        assert pre_push_check() == ""
+        seen.update(target=target, onto=onto, trailers=trailers)
+        return "d" * 40
+    return push
+
+
+def test_a_sweep_fix_opens_the_ci_sweep_pr_into_the_sweep_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    gh, _repo, sweep = _ci_sweep_gh()
+    seen: dict = {}
+    monkeypatch.setattr(publish_mod, "push_candidate", _push_recording(seen))
+    monkeypatch.setattr(publish_mod, "find_existing_pr", lambda *_a, **_k: None)
+    create = MagicMock(return_value=SimpleNamespace(number=61, html_url="https://example/pull/61"))
+    monkeypatch.setattr(publish_mod, "create_pull_from_push_repo", create)
+
+    result = publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
+
+    assert result.kind is ResultKind.OPENED
+    assert (result.pr_number, result.commit_sha) == (61, "d" * 40)
+    assert seen["onto"] == ""
+    # The commit says which job it fixes: the rebuild and the follow-up read it there.
+    assert seen["trailers"] == ("CI-Fix-Job: unit tests", f"CI-Fix-Run: {_RUN}")
+    kwargs = create.call_args.kwargs
+    assert (kwargs["head_branch"], kwargs["base_branch"], kwargs["draft"]) == (
+        _CI_SWEEP, "agent/backport/sweep/9.0", False,
+    )
+    # Laid out like the sweep PR, so that it reads the same.
+    assert kwargs["title"] == "[CI] CI Fix Sweep for 9.0"
+    assert kwargs["body"] == ci_sweep.body("9.0", 7, [ci_sweep.Fix("d" * 40, "Fix unit/x", "unit tests", _RUN)])
+    # And the sweep PR says where its CI fixes are, above its footer.
+    told = sweep.edit.call_args.kwargs["body"]
+    assert "# Backport sweep for 9.0\n\nCI fixes for this sweep are in #61.\n\n## Applied" in told
+
+
+def test_a_later_sweep_fix_is_added_to_the_open_ci_sweep_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    earlier = _commit("e" * 40, "Fix earlier\n\nCI-Fix-Job: test-alpine\nCI-Fix-Run: https://x/runs/9")
+    added = _commit("d" * 40, "Fix unit/x\n\nCI-Fix-Job: unit tests\nCI-Fix-Adapts: " + "c" * 40)
+    gh, repo, _sweep = _ci_sweep_gh(pushed=(earlier, added))
+    seen: dict = {}
+    monkeypatch.setattr(publish_mod, "push_candidate", _push_recording(seen))
+    # The pull request's own list of commits lags behind the push: the table is read from the push.
+    pull = _ci_sweep_pr(commits=[earlier])
+    monkeypatch.setattr(publish_mod, "find_existing_pr", lambda *_a, **_k: pull)
+    create = MagicMock()
+    monkeypatch.setattr(publish_mod, "create_pull_from_push_repo", create)
+
+    result = publish_candidate(gh, _sweep_task(), replace(_candidate(), adapts="c" * 40), git_env={})
+
+    assert result.kind is ResultKind.PUSHED
+    assert result.pr_number == 61
+    assert seen["onto"] == _NEW
+    assert seen["trailers"][-1] == "CI-Fix-Adapts: " + "c" * 40
+    create.assert_not_called()
+    repo.compare.assert_called_once_with(_HEAD, "d" * 40)
+    assert pull.edit.call_args.kwargs["body"] == ci_sweep.body("9.0", 7, [
+        ci_sweep.Fix("e" * 40, "Fix earlier", "test-alpine", "https://x/runs/9"),
+        ci_sweep.Fix("d" * 40, "Fix unit/x", "unit tests", "", "c" * 40),
+    ])
+
+
+def test_a_ci_sweep_table_that_cannot_be_read_has_the_new_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    gh, repo, _sweep = _ci_sweep_gh()
+    repo.compare.side_effect = GithubException(502, {"message": "Bad Gateway"})
+    monkeypatch.setattr(publish_mod, "push_candidate", _push_recording({}))
+    monkeypatch.setattr(publish_mod, "find_existing_pr", lambda *_a, **_k: None)
+    create = MagicMock(return_value=SimpleNamespace(number=61, html_url=""))
+    monkeypatch.setattr(publish_mod, "create_pull_from_push_repo", create)
+
+    publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
+
+    assert create.call_args.kwargs["body"] == ci_sweep.body(
+        "9.0", 7, [ci_sweep.Fix("d" * 40, "Fix unit/x", "unit tests", _RUN)],
+    )
+
+
+def test_a_ci_sweep_branch_whose_pr_was_closed_is_deleted_and_started_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed = [SimpleNamespace(number=50, head=SimpleNamespace(sha="e" * 40))]
+    gh, _repo, _sweep = _ci_sweep_gh(branch_sha="e" * 40, closed=closed)
+    seen: dict = {}
+    deleted = MagicMock()
+    monkeypatch.setattr(publish_mod, "push_candidate", _push_recording(seen))
+    monkeypatch.setattr(publish_mod, "find_existing_pr", lambda *_a, **_k: None)
+    monkeypatch.setattr(publish_mod, "delete_stale_backport_branch", deleted)
+    monkeypatch.setattr(
+        publish_mod, "create_pull_from_push_repo",
+        MagicMock(return_value=SimpleNamespace(number=62, html_url="")),
+    )
+
+    result = publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
+
+    assert result.kind is ResultKind.OPENED
+    deleted.assert_called_once_with(gh, "valkey-io/valkey", _CI_SWEEP)
+    assert seen["onto"] == ""
+
+
+def test_a_ci_sweep_branch_left_without_a_pr_is_continued(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even when an earlier CI-sweep PR from the same branch was closed: its fix was pushed after."""
+    closed = [SimpleNamespace(number=50, head=SimpleNamespace(sha="a" * 40))]
+    gh, _repo, _sweep = _ci_sweep_gh(branch_sha="e" * 40, closed=closed)
+    seen: dict = {}
+    deleted = MagicMock()
+    monkeypatch.setattr(publish_mod, "push_candidate", _push_recording(seen))
+    monkeypatch.setattr(publish_mod, "find_existing_pr", lambda *_a, **_k: None)
+    monkeypatch.setattr(publish_mod, "delete_stale_backport_branch", deleted)
+    monkeypatch.setattr(
+        publish_mod, "create_pull_from_push_repo",
+        MagicMock(return_value=SimpleNamespace(number=62, html_url="")),
+    )
+
+    result = publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
+
+    assert result.kind is ResultKind.OPENED
+    deleted.assert_not_called()
+    assert seen["onto"] == "e" * 40
+
+
+def test_a_ci_sweep_pr_someone_else_opened_is_never_pushed_to(monkeypatch: pytest.MonkeyPatch) -> None:
+    gh, _repo, _sweep = _ci_sweep_gh()
+    monkeypatch.setattr(publish_mod, "push_candidate", lambda *_a, **_k: pytest.fail("pushed"))
+    monkeypatch.setattr(publish_mod, "find_existing_pr", lambda *_a, **_k: _ci_sweep_pr(author="someone"))
+
+    result = publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
+
+    assert result.kind is ResultKind.REFUSED
+    assert "is not owned by the CI agent." in result.summary
+
+
+def test_an_upstream_fix_for_a_sweep_is_to_be_backported_not_cherry_picked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sweep knows a backported pull request by its number; a cherry-pick of its commit it would take again."""
+    gh, repo, _sweep = _ci_sweep_gh()
+    repo.get_commit.return_value.get_pulls.return_value = [
+        SimpleNamespace(number=4726, merged_at=None), SimpleNamespace(number=4727, merged_at="2026-11-01"),
+    ]
+    monkeypatch.setattr(publish_mod, "push_candidate", lambda *_a, **_k: pytest.fail("pushed"))
+
+    result = publish_candidate(gh, _sweep_task(), _candidate(action=CandidateAction.PORT), git_env={})
+
+    assert result.kind is ResultKind.SUGGESTED and result.pr_number == 4727
+    repo.get_commit.assert_called_once_with("c" * 40)
+
+    repo.get_commit.return_value.get_pulls.return_value = []
+    result = publish_candidate(gh, _sweep_task(), _candidate(action=CandidateAction.PORT), git_env={})
+    assert result.kind is ResultKind.REFUSED and "no merged pull request" in result.summary
+
+
+def test_a_ci_sweep_table_has_the_new_fix_when_github_answers_from_before_the_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    earlier = _commit("e" * 40, "Fix earlier\n\nCI-Fix-Job: test-alpine")
+    gh, _repo, _sweep = _ci_sweep_gh(pushed=(earlier,))
+    monkeypatch.setattr(publish_mod, "push_candidate", _push_recording({}))
+    pull = _ci_sweep_pr(commits=[earlier])
+    monkeypatch.setattr(publish_mod, "find_existing_pr", lambda *_a, **_k: pull)
+
+    publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
+
+    assert pull.edit.call_args.kwargs["body"] == ci_sweep.body("9.0", 7, [
+        ci_sweep.Fix("e" * 40, "Fix earlier", "test-alpine"),
+        ci_sweep.Fix("d" * 40, "Fix unit/x", "unit tests", _RUN),
+    ])

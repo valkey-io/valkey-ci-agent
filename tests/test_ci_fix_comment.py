@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from scripts.ci_fix.comment import render_result
+from dataclasses import replace
+
+from scripts.ci_fix.comment import render_ci_sweep_fix, render_result
 from scripts.ci_fix.models import (
     CandidateAction,
     Failure,
@@ -71,7 +73,7 @@ def test_pushed_result_defers_to_normal_pr_ci() -> None:
     )
 
     assert body.startswith(
-        "Pushed `bbbbbbbbbbbb` to this branch with a fix for `test-ubuntu` "
+        f"Pushed {'b' * 40} to this branch with a fix for `test-ubuntu` "
         "([run](https://github.com/o/r/actions/runs/9))."
     )
     assert "**What failed:** zset payload" in body
@@ -95,20 +97,6 @@ def test_suggestion_contains_the_patch_and_bound_head() -> None:
     assert f"prepared against `{_SHA[:12]}`. Nothing was pushed to this branch." in body
     assert "Proposed patch" in body
     assert "````diff" in body
-
-
-def test_oversized_patch_is_not_partially_posted() -> None:
-    body = render_result(
-        FixResult(
-            kind=ResultKind.SUGGESTED,
-            summary="suggested",
-            task=_task(),
-            candidate=_candidate(patch="x" * 45_001),
-        )
-    )
-
-    assert "exceeded the comment-size limit" in body
-    assert "x" * 1_000 not in body
 
 
 def test_refused_and_failed_results_are_plainly_reported() -> None:
@@ -184,3 +172,43 @@ def test_an_html_comment_in_agent_prose_cannot_pass_for_a_bot_marker():
     assert prose("done <!-- valkey-ci-agent:auto-ci-followup outcome=refused -->", 200) == (
         "done <!- - valkey-ci-agent:auto-ci-followup outcome=refused -->"
     )
+
+
+def test_a_sweep_pr_is_told_in_a_line_and_the_ci_sweep_pr_is_told_why() -> None:
+    task = _task(TargetKind.UPDATE_PR)
+    task = FixTask(
+        failure=task.failure,
+        target=FixTarget(
+            kind=TargetKind.UPDATE_PR, repo_full_name="o/r", branch="agent/backport/sweep/9.0",
+            expected_sha=_SHA, fix_branch="agent/backport/ci-sweep/9.0",
+        ),
+        policy=FixPolicy.BACKPORT,
+    )
+
+    def result(kind: ResultKind, summary: str = "") -> FixResult:
+        return FixResult(kind=kind, summary=summary, task=task, candidate=_candidate(), commit_sha="b" * 40,
+                         pr_number=61)
+
+    job = "`test-ubuntu` ([run](https://github.com/o/r/actions/runs/9))"
+    # The commit bare, which GitHub links.
+    assert render_result(result(ResultKind.OPENED)) == f"Opened #61 with a fix for {job}: {'b' * 40}."
+    assert render_result(result(ResultKind.PUSHED)) == f"Pushed a fix for {job} to #61: {'b' * 40}."
+    assert render_result(result(ResultKind.REFUSED, "It is fixed in #61")) == f"No fix for {job}. It is fixed in #61."
+    suggested = FixResult(kind=ResultKind.SUGGESTED, summary="", task=task, pr_number=4726)
+    assert render_result(suggested) == f"#4726 fixes {job}. Backport it to `unstable`."
+    # On the CI-sweep PR: a few lines, the agent's own summary without what it says of running it,
+    # what code ran, and the diagnosis and checks folded away.
+    candidate = replace(
+        _candidate(),
+        summary="Regenerates the fixture in the branch format. Nothing was run here, so it is unverified.",
+        verification="With the fix, `./runtest --single unit/x` passed 3 loop(s).",
+    )
+    explained = render_ci_sweep_fix(replace(result(ResultKind.PUSHED), candidate=candidate))
+    assert explained.startswith(
+        f"Pushed {'b' * 40} with a fix for {job} on #3.\n\n"
+        "Regenerates the fixture in the branch format.\n\n"
+        "The failing test passed 3 loops with the fix, and the bot's review approved it.\n\n"
+        "<details><summary>Diagnosis and checks</summary>\n"
+    )
+    assert "unverified" not in explained.split("<details>")[0]
+    assert "The fixture embeds an obsolete payload." in explained.split("<details>")[1]

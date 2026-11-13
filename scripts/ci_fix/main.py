@@ -71,7 +71,7 @@ def plan_request(
         commenter=commenter, org=_AUTH_ORG, auth_team=_AUTH_TEAM,
     )
     if isinstance(task, GateError):
-        kind, body = ResultKind.FAILED, f"CI-fix could not evaluate this request: {task.reason}"
+        kind, body = ResultKind.FAILED, ""
     elif isinstance(task, GateRejection):
         kind, body = ResultKind.REFUSED, f"No fix prepared: {task.reason}"
     else:
@@ -106,11 +106,12 @@ def _report(
             _post_comment(gh, repo_full_name, pr_number, body)
     finally:
         _react_outcome(gh, repo_full_name, comment_id, kind)
-    level = {
-        ResultKind.PUSHED: logging.INFO,
-        ResultKind.OPENED: logging.INFO,
-        ResultKind.FAILED: logging.ERROR,
-    }.get(kind, logging.WARNING)
+    if kind is ResultKind.FAILED:
+        level = logging.ERROR
+    elif kind.successful:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
     log_outcome(
         logger, level, "CI fix for %s#%s %s: %s", repo_full_name, pr_number, kind.value, " ".join(summary.split()),
     )

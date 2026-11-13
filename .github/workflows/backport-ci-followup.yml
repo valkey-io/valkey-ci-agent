@@ -3,7 +3,9 @@ name: Backport CI Follow-up
 # Find one current-head failure on an open bot-owned PR into each enabled
 # branch, and fix it like every other failure (ci-fix-run.yml): prepared
 # inside the Valkey job that failed when it can host it, pushed to the
-# bot's branch, and verified by the target PR's normal CI. Only repositories
+# bot's branch (a sweep PR's to its CI-sweep PR), and verified by the target
+# PR's normal CI. When a sweep PR's own CI has nothing left, the branch's
+# failures in the newest weekly run are fixed the same way. Only repositories
 # whose registry entry enables automatic_ci_followup are followed up.
 on:
   schedule:

@@ -1,6 +1,6 @@
 """Carry a fix's state from one workflow job to the next, as JSON.
 
-A detector-issue fix runs as three jobs (plan, fix, publish); each reads what
+Every fix runs as three jobs (plan, fix, publish); each reads what
 the one before wrote. The state is plain dataclasses (``FixTask``,
 ``FixCandidate``, ...), so it is encoded field by field and decoded by the
 same type hints: no pickling, and a value that does not fit its field is an
@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
 
 T = TypeVar("T")
-# ``X | None`` (3.10+) as well as ``Optional[X]``.
-_UNIONS = (Union, getattr(types, "UnionType", Union))
+# ``Optional[X]`` is a typing.Union; ``X | None`` is a types.UnionType.
+_UNIONS = (Union, types.UnionType)
 
 
 def encode(value: Any) -> Any:

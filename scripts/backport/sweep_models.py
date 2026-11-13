@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from scripts.backport import models as _models
+
+if TYPE_CHECKING:
+    from scripts.backport.ci_sweep import Plan
 
 ProjectBackportCandidate = _models.BackportCandidate
 CandidateResult = _models.CandidateResult
@@ -58,3 +62,5 @@ class PreparedBranchSweep:
     result: BranchSweepResult
     backport_label: str = "backport"
     llm_conflict_label: str = "ai-resolved-conflicts"
+    # How the open CI-sweep PR goes onto this head, if there is one.
+    ci_sweep: Plan | None = None

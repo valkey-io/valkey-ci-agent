@@ -109,7 +109,7 @@ def test_run_fix_agent_uses_exact_log_and_one_edit_session(tmp_path, monkeypatch
     assert "Normal target-repository CI is authoritative" in seen["prompt"]
     assert "Choose `refuse` only when you can justify no\nchange" in seen["prompt"]
     assert "one change is\ncorrect under each of them" in seen["prompt"]
-    assert "Do not commit or push" in seen["prompt"]
+    assert "Never commit, push, create a branch, or modify `.git`." in seen["prompt"]
     assert candidate.action is CandidateAction.PATCH
     assert candidate.failure_type is FailureType.DETERMINISTIC
     assert candidate.changed_paths == ("src/parser.c",)
@@ -265,8 +265,9 @@ def test_a_fix_that_will_not_be_run_says_what_is_and_is_not_established(tmp_path
     agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=FixContext(
         reviewed_only=True, verification="No command here can run the failing check, so this fix was reviewed, not run."))
 
-    assert "Unless\nyou name it in `failing_tests` and code can run it" in seen["prompt"]
-    assert "say plainly what the log and the code establish and what they\ndo not" in seen["prompt"]
+    assert "No run will catch a wrong guess" in seen["prompt"]
+    assert "say plainly what the log\nand the code establish and what they do not" in seen["prompt"]
+    assert "do not claim to have run\nanything" in seen["prompt"]
     assert "### Verification\nNo command here can run the failing check" in seen["prompt"]
     assert "If you can, name it in `failing_tests`" in seen["prompt"]
 
@@ -287,6 +288,17 @@ def test_the_agent_may_name_the_tests_the_log_shows_failing(tmp_path, monkeypatc
         FailedTest("Module rdbloadsave with bgsave", "tests/unit/moduleapi/rdbloadsave.tcl"),
         FailedTest("", "tests/unit/a.tcl"),
     )
+
+
+def test_the_agent_titles_its_patch(tmp_path, monkeypatch) -> None:
+    seen = {}
+    monkeypatch.setattr(agent_mod, "run_agent", lambda _profile, prompt, **_k: seen.update(prompt=prompt) or _result(
+        {"action": "patch", "summary": "fixed", "changed_paths": ["a.c"], "title": "Wait for the save to end"}))
+
+    candidate = agent_mod.run_fix_agent(_task(), str(tmp_path), "log")
+
+    assert candidate.title == "Wait for the save to end"
+    assert '"title": "a patch\'s commit subject' in seen["prompt"]
 
 
 def test_where_an_upstream_change_comes_first_the_agent_is_told_and_its_claim_is_read(
@@ -316,6 +328,13 @@ def test_where_an_upstream_change_comes_first_the_agent_is_told_and_its_claim_is
     assert "other-release-branches.md" in seen["prompt"]
     assert "the same fix on every release branch" in seen["prompt"]
     assert candidate.adapts == "d" * 40
+    assert "pending-fixes.md" not in seen["prompt"]
+
+    # The fixes already made for this sweep PR, waiting in its CI-sweep PR: one failure, one fix.
+    pending = FixContext(upstream_first=True, pending_fixes="# `agent/backport/ci-sweep/9.0`\n")
+    agent_mod.run_fix_agent(_task(), str(tmp_path), "log", context=pending)
+    assert "pending-fixes.md" in seen["prompt"]
+    assert "refuse and say which one: a failure is not fixed twice" in seen["prompt"]
 
 
 def test_the_review_is_told_when_a_release_branchs_patch_is_not_an_upstream_change(tmp_path, monkeypatch) -> None:

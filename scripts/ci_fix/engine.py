@@ -7,8 +7,9 @@ that job's own setup and build (``scripts/ci_fix/job.sh``):
 1. **Find existing fixes**: search history for a merged change that names the
    failing test, changes its file, or references its issue
    (:mod:`scripts.ci_fix.prior_fixes`).
-2. **Fix**: the CI job's log is the evidence of what fails. One agent session, told what step 1 found, the job log and the
-   repository's test conventions, ports an existing fix or writes a patch.
+2. **Fix**: the CI job's log is the evidence of what fails. One agent
+   session, told what step 1 found, the job log and the repository's test
+   conventions, ports an existing fix or writes a patch.
 3. **Verify and review**: the candidate (a port is cherry-picked into the
    checkout first) must build and pass the failing test, once and then
    looped, the way its CI job runs it (:mod:`scripts.ci_fix.verification`
@@ -62,6 +63,7 @@ from scripts.ci_fix.prior_fixes import (
     failing_test_history,
     find_prior_fixes,
     paths_in_log,
+    pending_fixes,
     render_prior_fixes,
     sibling_branch_changes,
     summarize_prior_fixes,
@@ -126,8 +128,7 @@ _BUILD_BROKE_RE = re.compile(r"make(?:\[\d+\])?: \*\*\* .*Error \d+")
 # At most this many of a job's failing tests are searched for and verified.
 _MAX_TESTS = 3
 
-# Where a repository's test conventions for the agent live, and the
-# repository's own docs that the agent should read when present.
+# Where the bot's guide for each repository lives.
 _GUIDES_DIR = Path(__file__).resolve().parent / "guides"
 # The repository's own guidelines, given to the agent and the reviewer at the
 # end of the bot's guide. Not CONTRIBUTING.md, which is about process (the
@@ -175,7 +176,7 @@ def prepare_fix(
         return _refusal("The failed job has no valid job id.")
 
     if not job_log:
-        return _refusal("The exact failed-job log is unavailable; no fix was prepared.")
+        return _refusal("The exact failed-job log is unavailable. No change was made.")
 
     with checkout(task, repo_dir) as (repo_dir, original_head):
         deadline = time.monotonic() + PREPARE_BUDGET_S
@@ -193,7 +194,7 @@ def prepare_fix(
         return _fix_loop(
             task, repo_dir, original_head, job_log, context, plan,
             agent_func=agent_func, review=review_func or review_candidate,
-            run_test=run_test if runs_tests else None, deadline=deadline, job=job, tests=tests,
+            run_test=run_test if runs_tests else None, deadline=deadline, job=job,
         )
 
 
@@ -202,8 +203,8 @@ def _unverifiable_refusal(context: FixContext, plan: VerifyPlan | None) -> FixCa
     if plan is not None:
         return None
     return _refusal(
-        "No command on this runner can run the failing test, so a fix could not be checked. "
-        "No edit was attempted.",
+        "No command here can run the failing check, so a fix could not be checked. "
+        "No change was made.",
         verification="\n".join(_established_checks(context)),
     )
 
@@ -309,7 +310,7 @@ def failed_tests(task: FixTask, job_log: str) -> tuple[FailedTest, ...]:
         # A sentinel or legacy-cluster test names no file and no command here
         # runs it, but its name still finds the upstream change that fixes it.
         tests = [FailedTest(name, "") for name in failed_instance_tests_in_log(job_log)]
-    # A log or issue names the file; one that leaves tests/ is not a test.
+    # A log or issue names the file; one named with ".." would leave the checkout.
     return tuple(test for test in tests if ".." not in Path(test.file).parts)[:_MAX_TESTS]
 
 
@@ -343,8 +344,8 @@ def _establish(
     """What the agent is told before it starts, and how code will check its patch.
 
     The CI job's log shows the failure; the plan is the command that
-    verifies a candidate. What the history
-    search found, and the repository's test guide, go to the agent too.
+    verifies a candidate. What the history search found, and the
+    repository's test guide, go to the agent too.
     """
     plan = None
     upstream_first = only_built = False
@@ -391,23 +392,31 @@ def _establish(
     guide = guide_for(task.failure.repo_full_name)
     if guide:
         guide += repository_guidelines(repo_dir)
+    named_paths = tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths]))
     context = FixContext(
         prior_fixes=summarize_prior_fixes(fixes),
         prior_fixes_detail=render_prior_fixes(repo_dir, fixes),
         prior_fixes_searched=found is not None,
         test_history=history,
-        unported_changes=(
-            unported_changes(repo_dir, tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths])))
-            if upstream_first else ""
-        ),
+        unported_changes=unported_changes(repo_dir, named_paths) if upstream_first else "",
         unported_index=unported_index(repo_dir) if upstream_first else "",
         sibling_changes=(
-            sibling_branch_changes(
-                repo_dir, tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths])),
-                own_branch=task.target.branch, base_branch=task.failure.base_branch,
+            # The other release branches' sweeps, and the CI-sweep PRs that
+            # collect their fixes until those are merged, each against its sweep.
+            "".join(
+                sibling_branch_changes(
+                    repo_dir, named_paths,
+                    own_branch=branch, base_branch=task.failure.base_branch, compared_with=compared_with,
+                )
+                for branch, compared_with in (
+                    (task.target.branch, ""),
+                    (task.target.fix_branch, task.target.branch.removesuffix(f"/{task.failure.base_branch}")),
+                )
+                if branch
             )
             if upstream_first and task.policy is FixPolicy.BACKPORT else ""
         ),
+        pending_fixes=pending_fixes(repo_dir, task.target.fix_branch) if task.target.fix_branch else "",
         verification=described,
         verified_by_code=plan is not None,
         upstream_first=upstream_first,
@@ -503,7 +512,6 @@ def _fix_loop(
     run_test: TestFunc | None,
     deadline: float,
     job: JobCommands | None = None,
-    tests: tuple[FailedTest, ...] = (),
 ) -> FixCandidate:
     established = _established_checks(context)
     feedback = ""
@@ -513,7 +521,7 @@ def _fix_loop(
         # Running out of time, or an agent crash, says nothing about the
         # failure: it is a failed attempt, which may be retried, not a refusal.
         if attempt > 1 and remaining < _MIN_ROUND_S:
-            raise RuntimeError(f"Ran out of time after {attempt - 1} attempt(s). Last: {last}")
+            raise RuntimeError(f"Ran out of time after {attempt - 1} round(s). Last: {last}")
         # What comes after the agent: verification and review, or review
         # alone. In a short budget, at most half of what is left.
         reserve = min(_VERIFY_RESERVE_S if run_test is not None else _REVIEW_RESERVE_S, remaining // 2)
@@ -549,7 +557,7 @@ def _fix_loop(
         except Exception as exc:
             if attempt == 1:
                 raise
-            raise RuntimeError(f"The agent failed on attempt {attempt}: {exc}. Last: {last}") from exc
+            raise RuntimeError(f"The agent failed in round {attempt}: {exc}. Last: {last}") from exc
         candidate = outcome.candidate
         if candidate.action is CandidateAction.REFUSE:
             return replace(candidate, verification="\n".join(established))
@@ -601,7 +609,7 @@ def _fix_loop(
                     checks.append(f"Review: {reasoning}" if reasoning else f"Review approved the {_noun(candidate)}.")
             if not failed:
                 if attempt > 1:
-                    checks.append(f"Accepted on attempt {attempt} of {MAX_ROUNDS}.")
+                    checks.append(f"Accepted on round {attempt} of {MAX_ROUNDS}.")
                 # While the change is still in the tree: a port's cherry-pick
                 # is undone below, and its patch is the one it applied.
                 touches = other_issues_touched(task, reviewed, repo_dir, run_test, deadline, checks, job=job)
@@ -622,7 +630,7 @@ def _fix_loop(
             not_run=(context.reviewed_only or context.only_built) and named is None,
         )
     return _refusal(
-        f"No candidate passed its test and review in {MAX_ROUNDS} attempts. Last: {last}",
+        f"No candidate passed its test and review in {MAX_ROUNDS} rounds. Last: {last}",
         verification="\n".join(established),
     )
 
@@ -631,7 +639,8 @@ def _fix_loop(
 class RoundOutcome:
     """One agent round: the checked candidate, applied in the tree as ``applied``.
 
-    ``feedback`` is set, and nothing is applied, when a port did not apply.
+    ``feedback`` is set, and nothing is applied, when the candidate was
+    rejected or a port did not apply.
     """
 
     candidate: FixCandidate
@@ -1029,12 +1038,12 @@ class PortNotApplied(Exception):
 
 
 def restore(repo_dir: str) -> None:
-    """Undo a cherry-pick into the working tree, keeping ignored build output."""
+    """Reset the working tree to the working commit, keeping ignored build output."""
     for args in (("cherry-pick", "--quit"), ("reset", "--hard", "--quiet", "HEAD"), ("clean", "-fdq")):
         try:
             run_git(repo_dir, *args)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            logger.warning("Could not run git %s after a port", " ".join(args))
+            logger.warning("Could not run git %s to reset the tree", " ".join(args))
 
 
 def _remove_ignored(repo_dir: str) -> None:
@@ -1097,19 +1106,17 @@ def _checked_candidate(
         )
     if candidate.action is CandidateAction.PORT:
         if changed_paths:
-            raise _Rejected(
-                "The agent mixed an upstream port with working-tree edits; no candidate was published."
-            )
+            raise _Rejected("You mixed an upstream port with working-tree edits: choose one.")
         if not is_full_sha(candidate.port_commit):
             raise _Rejected("The proposed upstream port is not a full commit SHA.")
         return replace(candidate, patch="", changed_paths=(), adapts="", validation="")
 
     if not changed_paths:
-        raise _Rejected("The agent selected a patch but made no working-tree changes.")
+        raise _Rejected("You chose `patch` but changed no files.")
     try:
         patch = build_approved_patch(repo_dir, changed_paths, strict=True)
     except EmptyPatch:
-        raise _Rejected("The agent selected a patch but produced no patch content.")
+        raise _Rejected("You chose `patch` but your changes make an empty patch.")
     adapts = ""
     if upstream_first and _adapts(repo_dir, candidate.adapts, changed_paths, patch):
         adapts = candidate.adapts

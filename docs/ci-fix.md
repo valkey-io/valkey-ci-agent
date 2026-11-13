@@ -26,18 +26,21 @@ words:
 
 Without a link, the bot picks the failure on the PR's latest commit that it is
 most likely to be able to fix. It prefers ordinary test jobs, then lint and
-build jobs, whose fix often belongs in the CI configuration the bot won't
-touch, and leaves sanitizer and valgrind jobs for last. `@valkeyrie-bot fix`
-works as well.
+build jobs, whose fix often belongs in the CI configuration, which the bot
+changes only on its own backport branches, and leaves sanitizer and valgrind
+jobs for last. `@valkeyrie-bot fix` works as well.
 
-The bot looks for new requests every hour. When it picks yours up, it reacts
-to your comment, and it replies on the PR when it is done.
+The bot looks for new requests every half hour. When it picks yours up, it
+reacts to your comment. When it is done, it replies on the PR with the fix or
+the reason there is none. An attempt that fails, because the bot crashed or
+ran out of time, posts nothing: your comment gets a thumbs-down reaction.
 
 What you get back depends on whose PR it is. On a contributor's PR, or a PR
 from a fork, the bot never pushes anything. It posts the fix as a patch in a
 comment, and the author can apply it or not. On the bot's own PRs, meaning
 backport PRs and the PRs it opened to fix something, it pushes the fix as a
-new commit.
+new commit. A sweep PR carries only backports, so its fix goes to its CI-sweep
+PR instead ([Backports](backport.md#when-a-backport-prs-own-ci-fails)).
 
 ## Other ways a fix starts
 
@@ -49,8 +52,8 @@ described in [Backports](backport.md#when-a-backport-prs-own-ci-fails).
 
 When the [Test Failure Detector](test-failure-detector.md) files an issue for
 a test that failed in Daily CI, the bot can try to fix that too. A maintainer
-can start this for one issue by hand, and an hourly dispatcher can start it
-for every eligible issue once it is switched on. See
+can start this for one issue by hand, and an hourly dispatcher starts it for
+every eligible issue unless it is switched off. See
 [Fixing detector issues](#fixing-detector-issues).
 
 ## What the bot does with a failure
@@ -108,13 +111,13 @@ which ends with Valkey's own guidelines (`AGENTS.md`, `DEVELOPMENT_GUIDE.md`,
 `tests/README.md` and `src/unit/README.md`). Those are taken from the default
 branch, so an older release branch gets the current ones and a pull request
 cannot change the rules its fix is judged by. The reviewer reads the same
-file. It then does one
-of three things: ports an existing fix (preferred when one fits), writes a
-small patch, or declines. It is told to aim for the fix a maintainer would
-write. Where the evidence leaves a few possible causes and one change is right
-under each of them, it makes that change and says what is not established. It
-declines only when it can justify no change. Claude works in a scratch copy of the code. It can
-edit files there but cannot commit or push.
+file. Claude then does one of three things: ports an existing fix (preferred
+when one fits), writes a small patch, or declines. It is told to aim for the
+fix a maintainer would write. Where the evidence leaves a few possible causes
+and one change is right under each of them, it makes that change and says what
+is not established. It declines only when it can justify no change. Claude
+works in a scratch copy of the code. It can edit files there but cannot commit
+or push.
 
 On a backport branch a change that is merged upstream comes first. Claude
 ports the commit, or adapts it and names it. Claude cannot run git, so
@@ -269,10 +272,11 @@ reach the model, and that is it. Separate jobs before and after it hold
 short-lived tokens for reading the failure and for publishing the result.
 
 Claude, and every build and test command the bot runs, run as a separate
-system account, `ci-fix-agent`. That account cannot read the workflow's
-environment. Claude is started with only the AWS credentials it needs for the
-model, and build and test commands get no credentials at all. Valkey's build
-and test dependencies are installed before any credentials exist.
+system account, which `scripts/ci_fix/job.sh` creates with a random name for
+each fix job. That account cannot read the workflow's environment. Claude is
+started with only the AWS credentials it needs for the model, and build and
+test commands get no credentials at all. Valkey's build and test dependencies
+are installed before any credentials exist.
 
 That account owns the code while it works, so the bot is careful when it takes
 the code back. It stops if `.git` was replaced, because a planted git
@@ -304,7 +308,7 @@ gh workflow run ci-fix.yml --repo valkey-io/valkey-ci-agent \
   --field run_url=https://github.com/valkey-io/valkey/actions/runs/123456789/job/987654321
 ```
 
-To pick up fix comments now instead of waiting for the hourly check:
+To pick up fix comments now instead of waiting for the next check:
 
 ```bash
 gh workflow run ci-fix-comment-poll.yml --repo valkey-io/valkey-ci-agent \
@@ -336,9 +340,9 @@ behaviour can be adjusted with these repository variables:
 | `CI_FIX_ISSUES_PUBLISH` | `comment` | `comment` posts the patch on the issue; `draft-pr` opens a draft PR. |
 | `CI_AGENT_CLAUDE_MODEL` | unset | Use a different model, for example `opus`. |
 
-`CI_FIX_AGENT_USER` names the separate account, and is set to `ci-fix-agent`
-by the workflow. Which jobs the bot ignores, and whether it follows up on
-backport PRs, is set per repository in [`repos.yml`](registry.md).
+`CI_FIX_AGENT_USER` names the separate account; `scripts/ci_fix/job.sh`
+creates the account and sets it. Which jobs the bot ignores, and whether it
+follows up on backport PRs, is set per repository in [`repos.yml`](registry.md).
 
 Comment requests are currently limited to `valkey-io/valkey`. Most of the
 engine doesn't care which repository it works on, but recreating a job and

@@ -8,9 +8,9 @@ that are worth an attempt. An issue is skipped while:
   after its issue, see ``RUN_NAME``),
 - it is assigned or an open pull request links it (``validate_issue``),
 - the bot already reported a fix or a refusal for the occurrence it records
-  (``fix_reported``), or two of its runs for that occurrence failed
-  (``failed_attempts``; a failed attempt is never commented on the issue):
-  a newer occurrence makes it eligible again.
+  (``fix_reported``), or ``MAX_FAILED_ATTEMPTS`` of its runs for that
+  occurrence failed (``failed_attempts``; a failed attempt is never
+  commented on the issue): a newer occurrence makes it eligible again.
 
 At most ``max_runs`` ci-fix-issues runs are active at once, counting the ones
 already running. One run still handles exactly one issue.

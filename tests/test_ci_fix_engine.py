@@ -183,7 +183,7 @@ def test_prepare_fix_refuses_without_exact_log_or_edits(tmp_path, monkeypatch) -
         ),
     )
     assert no_edits.action is CandidateAction.REFUSE
-    assert "made no working-tree changes" in no_edits.summary
+    assert "You chose `patch` but changed no files." in no_edits.summary
 
 
 def test_prepare_fix_rejects_agent_commit(tmp_path, monkeypatch) -> None:
@@ -231,7 +231,7 @@ def test_prepare_fix_sends_a_mixed_port_and_edits_back(tmp_path, monkeypatch) ->
     )
 
     assert candidate.action is CandidateAction.REFUSE
-    assert "mixed an upstream port" in feedback[1]
+    assert "You mixed an upstream port with working-tree edits: choose one." in feedback[1]
     assert "still holds your previous edits" in feedback[1]
 
 
@@ -584,7 +584,7 @@ def test_a_fix_whose_test_still_fails_goes_back_with_the_output(tmp_path, monkey
     candidate = _prepare(tmp_path, monkeypatch, agent)
     assert candidate.action is CandidateAction.PATCH
     assert "With your change" in agent.feedback[1] and "loops=1` could not run the tests" in agent.feedback[1]
-    assert "Accepted on attempt 2 of 3." in candidate.verification
+    assert "Accepted on round 2 of 3." in candidate.verification
     assert "+right" in candidate.patch and "almost" not in candidate.patch
 
 
@@ -619,7 +619,7 @@ def test_no_new_round_starts_without_time_to_finish_it(tmp_path, monkeypatch):
     monkeypatch.setattr(engine_mod, "PREPARE_BUDGET_S", 60)
     agent = _value_agent("almost", "right")
     # A failed attempt, which a follow-up retries, not a refusal that retires the job.
-    with pytest.raises(RuntimeError, match=r"^Ran out of time after 1 attempt\(s\)\."):
+    with pytest.raises(RuntimeError, match=r"^Ran out of time after 1 round\(s\)\."):
         _prepare(tmp_path, monkeypatch, agent)
     assert len(agent.feedback) == 1
 
@@ -1091,8 +1091,34 @@ def test_a_backport_fix_is_shown_what_the_other_release_branches_changed(tmp_pat
     engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=general)
 
     assert backport.contexts[0].sibling_changes == "# Release branch `9.1`\n"
-    assert asked[0][1] == {"own_branch": "agent/backport/sweep/main", "base_branch": "main"} and len(asked) == 1
+    assert asked[0][1] == {"own_branch": "agent/backport/sweep/main", "base_branch": "main", "compared_with": ""}
+    assert len(asked) == 1
     assert general.contexts[0].sibling_changes == ""
+    assert backport.contexts[0].pending_fixes == ""
+
+
+def test_a_sweep_fix_is_shown_the_ci_sweep_prs_fixes_and_their_siblings(tmp_path, monkeypatch):
+    source, head_sha = _source_repo(tmp_path)
+    _upstream_commit(source, head_sha)
+    _install_clone(monkeypatch, source)
+    asked = []
+    monkeypatch.setattr(engine_mod, "sibling_branch_changes",
+                        lambda _repo, _paths, **kwargs: asked.append((kwargs["own_branch"], kwargs["compared_with"]))
+                        or f"# {kwargs['own_branch']}\n")
+    monkeypatch.setattr(engine_mod, "pending_fixes", lambda _repo, branch: f"# `{branch}`\n")
+    task = _backport(_task(head_sha))
+    task = replace(task, target=replace(
+        task.target, branch="agent/backport/sweep/main", fix_branch="agent/backport/ci-sweep/main",
+    ))
+    agent = _adapting_agent("")
+
+    engine_mod.prepare_fix(task, _LOG, agent_func=agent)
+
+    # The other CI-sweep branches against their sweeps, so their backports are not shown twice.
+    assert asked == [("agent/backport/sweep/main", ""), ("agent/backport/ci-sweep/main", "agent/backport/sweep")]
+    context = agent.contexts[0]
+    assert context.sibling_changes == "# agent/backport/sweep/main\n# agent/backport/ci-sweep/main\n"
+    assert context.pending_fixes == "# `agent/backport/ci-sweep/main`\n"
 
 
 def test_a_backport_branch_takes_a_patch_that_adapts_a_merged_upstream_commit(tmp_path, monkeypatch):
@@ -1410,7 +1436,7 @@ def test_a_later_round_whose_agent_fails_is_a_failed_attempt_not_a_refusal(tmp_p
             raise RuntimeError("CI-fix agent failed with exit code 1")
         return first(task, repo_dir, job_log, **kwargs)
 
-    with pytest.raises(RuntimeError, match="^The agent failed on attempt 2") as raised:
+    with pytest.raises(RuntimeError, match="^The agent failed in round 2") as raised:
         engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent)
 
     assert "With your change" in str(raised.value)

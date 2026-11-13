@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ if __package__ in {None, ""}:
 from github import Auth, Github
 from github.GithubException import GithubException
 
+from scripts.backport import ci_sweep
 from scripts.backport.candidate_apply import apply_candidate
 from scripts.backport.git_commands import head_sha
 from scripts.backport.git_commands import run_git as _run_git
@@ -56,6 +58,7 @@ from scripts.backport.sweep_validation import (
     run_test_commands,
     validate_branch_with_optional_repair,
 )
+from scripts.ci_fix.agent import fix_still_needed
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.job_summary import emit_job_summary
 from scripts.common.logging_utils import (
@@ -454,6 +457,7 @@ def _prepare_branch(
 
             push_url = github_https_url(push_repo)
             _run_git(tmpdir, "remote", "add", "push_target", push_url, env=git_env)
+            ci_pull = _fetch_ci_sweep(gh, repo_full_name, push_repo, target_branch, tmpdir, git_env)
             if existing_pr is not None:
                 if expected_remote_head is None:
                     raise RuntimeError(
@@ -705,6 +709,7 @@ def _prepare_branch(
             if result_is_on_backport_branch(item)
         ]
         if committed and branch_has_changes(tmpdir, target_branch):
+            prepared_head = head_sha(tmpdir)
             prepared = PreparedBranchSweep(
                 repo_full_name=repo_full_name,
                 push_repo=push_repo,
@@ -712,12 +717,13 @@ def _prepare_branch(
                 backport_branch=backport_branch,
                 repo_dir=tmpdir,
                 target_head=target_head,
-                prepared_head=head_sha(tmpdir),
+                prepared_head=prepared_head,
                 expected_remote_head=expected_remote_head,
                 expected_pr_number=expected_pr_number,
                 result=result,
                 backport_label=backport_label,
                 llm_conflict_label=llm_conflict_label,
+                ci_sweep=_plan_ci_sweep(tmpdir, ci_pull, prepared_head, expected_pr_number),
             )
             preserve_repo = True
             return result, prepared
@@ -837,6 +843,7 @@ def publish_prepared_sweep(
             backport_label=prepared.backport_label,
             llm_conflict_label=prepared.llm_conflict_label,
         )
+        _apply_ci_sweep(gh, prepared, github_token)
     except Exception as exc:
         logger.exception("Error publishing branch %s", prepared.target_branch)
         for item in result.results:
@@ -847,6 +854,71 @@ def publish_prepared_sweep(
     finally:
         shutil.rmtree(prepared.repo_dir, ignore_errors=True)
     return result
+
+
+def _fetch_ci_sweep(
+    gh: Any, repo_full_name: str, push_repo: str, target_branch: str, repo_dir: str, git_env: dict[str, str],
+) -> Any | None:
+    """The open CI-sweep PR into this sweep, its branch fetched to ``ci_sweep.PLANNED_REF``; never fails the sweep."""
+    branch = ci_sweep.ci_sweep_branch(target_branch)
+    try:
+        pull = find_existing_pr(gh, repo_full_name, push_repo, branch)
+        if pull is not None:
+            _run_git(repo_dir, "fetch", "push_target", f"+refs/heads/{branch}:{ci_sweep.PLANNED_REF}", env=git_env)
+        return pull
+    except Exception as exc:  # noqa: BLE001 - the CI-sweep PR is rebuilt on the next sweep
+        logger.warning("Could not read the CI-sweep PR of %s: %s", target_branch, exc)
+        return None
+
+
+def _plan_ci_sweep(repo_dir: str, pull: Any | None, sweep_head: str, sweep_pr: int | None) -> ci_sweep.Plan | None:
+    """How the CI-sweep PR goes onto the new sweep head, with its fixes reviewed; never fails the sweep."""
+    if pull is None:
+        return None
+
+    def review(fix: ci_sweep.Fix, backports: str) -> tuple[bool, str]:
+        return fix_still_needed(repo_dir, fix.sha, fix.job, backports)
+
+    try:
+        return ci_sweep.plan(
+            repo_dir, pull=pull, ci_sweep=ci_sweep.PLANNED_REF, sweep_head=sweep_head, sweep_pr=sweep_pr,
+            review=review,
+        )
+    except Exception as exc:  # noqa: BLE001 - the CI-sweep PR is rebuilt on the next sweep
+        logger.warning("Could not plan the CI-sweep PR #%s: %s", getattr(pull, "number", "?"), exc)
+        return None
+
+
+def _apply_ci_sweep(gh: Any, prepared: PreparedBranchSweep, github_token: str) -> None:
+    """Rebuild, push, describe or close the CI-sweep PR as planned; never fails the sweep.
+
+    The sweep PR's description, which the sweep has just rewritten, names the
+    CI-sweep PR again whenever one is open, planned or not.
+    """
+    branch = ci_sweep.ci_sweep_branch(prepared.target_branch)
+    try:
+        sweep_pr = find_existing_pr(gh, prepared.repo_full_name, prepared.push_repo, prepared.backport_branch)
+        if prepared.ci_sweep is not None:
+            plan = prepared.ci_sweep
+            with GitAuth(github_token, prefix="ci-sweep-publish-git-askpass-") as git_auth:
+                def push(worktree: str, head: str, expected: str) -> None:
+                    push_backport_branch(
+                        worktree, branch, git_auth.env(), push_repo=prepared.push_repo, prepared_head=head,
+                        expected_remote_head=expected, branch_prefix=ci_sweep.BRANCH_PREFIX,
+                    )
+
+                ci_sweep.apply(
+                    gh, prepared.repo_dir, repo_full_name=prepared.repo_full_name, release=prepared.target_branch,
+                    plan=plan, sweep_head=prepared.prepared_head,
+                    sweep_pr=int(sweep_pr.number) if sweep_pr is not None else None, push=push,
+                )
+        ci_pull = find_existing_pr(gh, prepared.repo_full_name, prepared.push_repo, branch)
+        if ci_pull is not None and sweep_pr is not None:
+            text = ci_sweep.with_sweep_line(str(getattr(sweep_pr, "body", "") or ""), int(ci_pull.number))
+            if text != sweep_pr.body:
+                sweep_pr.edit(body=text)
+    except Exception as exc:  # noqa: BLE001 - the CI-sweep PR is rebuilt on the next sweep
+        logger.warning("Could not update the CI-sweep PR of %s: %s", prepared.target_branch, exc)
 
 
 def _remote_branch_sha(gh: Any, repo_name: str, branch: str) -> str | None:
@@ -898,6 +970,7 @@ def write_prepared_sweep(path: str, prepared: PreparedBranchSweep) -> None:
         "prepared_head": prepared.prepared_head,
         "expected_remote_head": prepared.expected_remote_head,
         "expected_pr_number": prepared.expected_pr_number,
+        "ci_sweep": dataclasses.asdict(prepared.ci_sweep) if prepared.ci_sweep is not None else None,
         "candidates_found": prepared.result.candidates_found,
         "results": [_result_to_dict(item) for item in prepared.result.results],
     }
@@ -970,6 +1043,22 @@ def load_prepared_sweep(
         result=result,
         backport_label=backport_label,
         llm_conflict_label=llm_conflict_label,
+        ci_sweep=_plan_from_dict(payload.get("ci_sweep")),
+    )
+
+
+def _plan_from_dict(data: Any) -> ci_sweep.Plan | None:
+    if not isinstance(data, dict):
+        return None
+    return ci_sweep.Plan(
+        pr_number=int(data["pr_number"]),
+        head=str(data["head"]),
+        keep=tuple(data.get("keep") or ()),
+        dropped=tuple(
+            (str(sha), str(subject), str(job), str(why)) for sha, subject, job, why in data.get("dropped") or ()
+        ),
+        close=str(data.get("close") or ""),
+        foreign=bool(data.get("foreign")),
     )
 
 

@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from github.GithubException import GithubException
 
+from scripts.backport import ci_sweep
 from scripts.ci_fix.github_runs import (
     FailedJob,
     failed_jobs_for_run,
@@ -145,10 +146,10 @@ def is_authorized(
 ) -> bool:
     """Return True only if ``username`` is allowed to drive the bot.
 
-    ``username`` must be a GitHub-verified principal (``github.actor`` for the
-    current dispatch). A future comment trigger must pass ``comment.user.login``
-    from the event payload, never a value forwarded through a dispatch input,
-    which any opener of the wrapper could set.
+    ``username`` must be a GitHub-verified principal (``github.actor`` for a
+    dispatch, the comment's ``user.login`` for a polled command), never a value
+    forwarded through a dispatch input, which any opener of the wrapper could
+    set.
 
     The primary source is active membership of ``org/team_slug``. Fails closed:
     any error reading membership (permission, network, missing team) returns
@@ -157,11 +158,9 @@ def is_authorized(
     ``raise_on_error`` raises a read error other than "not a member" instead,
     for a caller that reports it as retryable.
 
-    An explicit allowlist may be supplied via ``CI_FIX_AUTH_ALLOWLIST`` (a
-    comma-separated list of logins). It is empty by default - in production the
-    team membership check is the only path. It exists so the same gate can be
-    exercised end-to-end in a fork environment where the production team is not
-    readable, without weakening the default behavior.
+    ``CI_FIX_AUTH_ALLOWLIST``, a comma-separated list of logins that is empty
+    by default, also authorizes, for testing the gate in a fork that cannot
+    read the production team.
     """
     if not username:
         return False
@@ -210,12 +209,12 @@ def build_fix_task(
         return GateError(f"Could not authorize @{commenter}: {exc}")
     if not authorized:
         return GateRejection(
-            f"@{commenter} is not an active member of {org}/{auth_team}; refusing."
+            f"@{commenter} is not an active member of {org}/{auth_team}."
         )
     if command.run_id and f"{command.run_owner}/{command.run_repo}" != pr_repo_full_name:
         return GateRejection(
             f"The linked run belongs to {command.run_owner}/{command.run_repo}, "
-            f"not {pr_repo_full_name}; refusing."
+            f"not {pr_repo_full_name}."
         )
 
     try:
@@ -239,9 +238,12 @@ def build_fix_task(
     base_branch = str(getattr(getattr(pr, "base", None), "ref", "") or "")
     author = str(getattr(getattr(pr, "user", None), "login", "") or "")
     if str(getattr(pr, "state", "") or "") != "open":
-        return GateRejection(f"PR #{pr_number} is not open; refusing.")
+        return GateRejection(f"PR #{pr_number} is not open.")
     if not all((head_sha, head_branch, head_repo, base_branch)):
-        return GateRejection("Could not determine the PR head and base; refusing.")
+        return GateRejection("Could not determine the PR head and base.")
+    if head_branch.startswith(f"{ci_sweep.BRANCH_PREFIX}/"):
+        # A commit pushed here directly is not a fix the rebuild knows, and stops it.
+        return GateRejection(f"A CI-sweep PR's fixes are asked for on its sweep PR, the one into {base_branch}.")
 
     selected: FailedJob
     if command.run_id:
@@ -272,7 +274,7 @@ def build_fix_task(
             matched = next((job for job in failed if job.id == command.job_id), None)
             if matched is None:
                 return GateRejection(
-                    f"Job {command.job_id} is not a failed job of run {command.run_id}; refusing."
+                    f"Job {command.job_id} is not a failed job of run {command.run_id}."
                 )
             selected = matched
         else:
@@ -320,6 +322,8 @@ def build_fix_task(
         base_repo_full_name=pr_repo_full_name,
         branch=head_branch,
         expected_sha=head_sha,
+        # A sweep PR carries only backports, whoever asks for its fix.
+        fix_branch=ci_sweep.fix_branch_for(head_branch, base_branch) if bot_owned else "",
     )
     failure = Failure(
         repo_full_name=pr_repo_full_name,

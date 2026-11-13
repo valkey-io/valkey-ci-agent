@@ -196,7 +196,7 @@ def test_an_unauthorized_commenter_is_refused_before_anything_is_read(monkeypatc
     )
 
     assert isinstance(result, GateRejection)
-    assert result.reason == "@mallory is not an active member of valkey-io/contributors; refusing."
+    assert result.reason == "@mallory is not an active member of valkey-io/contributors."
 
 
 def test_bot_backport_branch_uses_backport_update_policy(monkeypatch) -> None:
@@ -208,6 +208,14 @@ def test_bot_backport_branch_uses_backport_update_policy(monkeypatch) -> None:
     assert result.failure.job_id == 11
     assert result.failure.run_attempt == 2
     assert result.policy is FixPolicy.BACKPORT
+    # A sweep PR carries only backports: a maintainer's fix goes to its CI-sweep PR, as the follow-up's does.
+    assert result.target.fix_branch == "agent/backport/ci-sweep/8.0"
+
+
+def test_a_fix_for_another_bot_branch_goes_onto_it(monkeypatch) -> None:
+    result = _build(monkeypatch, gh=_gh(branch="agent/ci-fix/issue-9-100-1")[0])
+    assert isinstance(result, FixTask)
+    assert result.target.kind is TargetKind.UPDATE_PR and result.target.fix_branch == ""
 
 
 @pytest.mark.parametrize(
@@ -470,3 +478,10 @@ def test_without_link_scopes_newest_run_selection_to_pr_branch(monkeypatch) -> N
         20,
         run_attempt=1,
     )
+
+
+def test_a_fix_command_on_a_ci_sweep_pr_is_refused(monkeypatch) -> None:
+    """A commit pushed there directly is not a fix its rebuild knows, and would stop it."""
+    result = _build(monkeypatch, gh=_gh(branch="agent/backport/ci-sweep/8.0")[0])
+    assert isinstance(result, GateRejection)
+    assert "asked for on its sweep PR" in result.reason

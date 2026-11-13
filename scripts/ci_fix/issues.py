@@ -1,10 +1,12 @@
-"""Open a draft fix PR for one Test Failure Detector issue.
+"""Fix one Test Failure Detector issue.
 
 It validates one detector-authored issue, binds one exact failed job of the
-scheduled Daily run it records, and plans a draft PR against the branch that
-run tested. The fix
-runs like every other (:mod:`scripts.ci_fix.run`); this module also rechecks
-the issue right before publication, and reports the result on it.
+scheduled Daily run it records, and plans a fix on the branch that run
+tested. The fix runs like every other (:mod:`scripts.ci_fix.run`); this
+module also rechecks the issue right before publication, and reports the
+result on it. By default the fix is posted on the issue as a patch for a
+maintainer to apply; with ``CI_FIX_ISSUES_PUBLISH=draft-pr`` it opens as a
+draft PR instead.
 
 The target repository's ordinary pull-request CI and human review are the
 verification authority. Each detector occurrence has one deterministic
@@ -422,10 +424,8 @@ def _terminal_comment(
     if action == ResultKind.OPENED.value:
         link = f"[#{pr_number}]({pr_url})" if pr_url else f"#{pr_number}"
         message = f"Opened draft PR {link} with a fix. Its CI and a maintainer's review decide whether it merges."
-    elif action == ResultKind.REFUSED.value:
-        message = f"No fix was opened. {sentence(summary)}"
     else:
-        message = f"The fix attempt stopped with an error: {sentence(summary)}"
+        message = f"No fix was opened. {sentence(summary)}"
     body = f"{message}\n\n{source}."
     checks = check_items(checked)
     if checks and action == ResultKind.OPENED.value:
@@ -597,8 +597,10 @@ def prepare_issue(
             "action": "skipped",
             "reason": f"the bot is done with run {failure.run_id}",
         }
-    # A crash from here on is a failed attempt, recorded on the issue: left
-    # unrecorded, the issue would be dispatched again every hour.
+    # A crash from here on is a failed attempt. Nothing is posted on the
+    # issue, but the run fails, and the dispatcher counts failed runs
+    # (scripts/ci_fix/issue_dispatch.py) so the issue is not dispatched again
+    # every hour.
     try:
         return _plan_occurrence(gh, artifact_client, repo_full_name, repo, issue, failure, ignored_jobs, bot_login)
     except Exception as exc:  # noqa: BLE001 - every attempt gets a recorded result
@@ -721,7 +723,6 @@ def _plan_occurrence(
         recovery_task,
         failure=replace(
             recovery_task.failure,
-            head_sha=tested_sha or base_sha,
             job_id=int(job.id),
             job_name=job.name,
             description=description,
