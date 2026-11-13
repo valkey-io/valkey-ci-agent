@@ -330,7 +330,10 @@ def test_another_release_branchs_ci_sweep_fixes_are_listed_without_its_sweeps_ba
     git(upstream, "checkout", "-q", "-b", "agent/backport/sweep/9.1", "9.1")
     commit(upstream, TEST_FILE, "test v1\na backport\n", "Backport something (#1)")
     git(upstream, "checkout", "-q", "-b", "agent/backport/ci-sweep/9.1")
-    fix = commit(upstream, TEST_FILE, "test v1\na backport\nwait for the replica\n", "Wait for the replica")
+    fix = commit(
+        upstream, TEST_FILE, "test v1\na backport\nwait for the replica\n",
+        "Wait for the replica\n\nCI-Fix-Job: test-ubuntu",
+    )
     git(upstream, "checkout", "-q", "-b", "agent/backport/ci-sweep/9.0", "9.0")
     _refresh(clone, "origin/agent/backport/sweep/9.0")
 
@@ -350,7 +353,7 @@ def test_the_fixes_waiting_in_the_ci_sweep_pr_are_listed_with_their_diffs(tmp_pa
     commit(upstream, "src/server.c", "a backport\n", "Backport something (#1)")
     # The CI-sweep branch is the sweep's head with the fixes on top.
     git(upstream, "checkout", "-q", "-b", "agent/backport/ci-sweep/9.0")
-    fix = commit(upstream, TEST_FILE, "test v1\nwait for the replica\n", "Wait for the replica")
+    fix = commit(upstream, TEST_FILE, "test v1\nwait for the replica\n", "Wait for the replica\n\nCI-Fix-Job: test-a")
     _refresh(clone, "origin/agent/backport/sweep/9.0")
 
     listed = pending_fixes(str(clone), "agent/backport/ci-sweep/9.0")
@@ -359,3 +362,21 @@ def test_the_fixes_waiting_in_the_ci_sweep_pr_are_listed_with_their_diffs(tmp_pa
     assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
     assert "+wait for the replica" in listed and "Backport something" not in listed
     assert pending_fixes(str(clone), "agent/backport/ci-sweep/9.1") == ""
+
+
+def test_a_ci_sweep_branch_behind_its_sweep_shows_only_its_fixes(tmp_path):
+    """Before the next sweep rebuilds it, it still has the old sweep's commits, which the head now lacks."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    git(upstream, "checkout", "-q", "-b", "agent/backport/sweep/9.0", "9.0")
+    commit(upstream, "src/server.c", "an old backport\n", "Backport something (#1)\n\nBackport-Source-PR: 1")
+    git(upstream, "checkout", "-q", "-b", "agent/backport/ci-sweep/9.0")
+    fix = commit(upstream, TEST_FILE, "test v1\nwait\n", "Wait for the replica\n\nCI-Fix-Job: test-ubuntu")
+    # The sweep is rebuilt without that commit's old copy.
+    git(upstream, "checkout", "-q", "-B", "agent/backport/sweep/9.0", "9.0")
+    commit(upstream, "src/server.c", "a rebased backport\n", "Backport something (#1)\n\nBackport-Source-PR: 1")
+    _refresh(clone, "origin/agent/backport/sweep/9.0")
+
+    listed = pending_fixes(str(clone), "agent/backport/ci-sweep/9.0")
+
+    assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
+    assert "Backport something" not in listed

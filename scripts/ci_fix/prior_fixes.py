@@ -23,6 +23,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.backport.ci_sweep import as_fix
 from scripts.ci_fix.models import FailedTest
 from scripts.common.git_clone import is_full_sha
 from scripts.common.proc import default_branch_ref, git_output, is_ancestor
@@ -401,6 +402,9 @@ def sibling_branch_changes(
                 body = git_output(repo_dir, "show", "-s", "--format=%B", sha)
                 if sha in undone or _REVERTS_RE.search(body):
                     continue
+                if compared_with and as_fix(sha, body) is None:
+                    # A CI-sweep branch behind its sweep has the sweep's old commits too: only its fixes count.
+                    continue
                 subject, date = _subject_and_date(repo_dir, sha)
                 lines.append(f"- `{sha[:12]}` {date} {subject}")
                 diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha, "--", *paths)
@@ -424,7 +428,11 @@ def pending_fixes(repo_dir: str, fix_branch: str) -> str:
     """
     ref = f"origin/{fix_branch}"
     try:
-        commits = _log(repo_dir, f"HEAD..{ref}", f"--max-count={_SIBLING_COMMITS}")
+        # Only its fixes: while it is behind the sweep it also has the sweep's old commits.
+        commits = [
+            sha for sha in _log(repo_dir, f"HEAD..{ref}")
+            if as_fix(sha, git_output(repo_dir, "show", "-s", "--format=%B", sha)) is not None
+        ][:_SIBLING_COMMITS]
         lines, diffs = [], []
         for sha in commits:
             subject, date = _subject_and_date(repo_dir, sha)

@@ -241,6 +241,9 @@ def build_fix_task(
         return GateRejection(f"PR #{pr_number} is not open.")
     if not all((head_sha, head_branch, head_repo, base_branch)):
         return GateRejection("Could not determine the PR head and base.")
+    if head_branch.startswith(f"{ci_sweep.BRANCH_PREFIX}/"):
+        # A commit pushed here directly is not a fix the rebuild knows, and stops it.
+        return GateRejection(f"A CI-sweep PR's fixes are asked for on its sweep PR, the one into {base_branch}.")
 
     selected: FailedJob
     if command.run_id:

@@ -42,6 +42,9 @@ FOREIGN_MARKER = "<!-- valkey-ci-agent:ci-sweep-foreign -->"
 # publication to rebuild from.
 PLANNED_REF = "refs/ci-sweep/planned"
 
+# At most this much of the new backports' diffs goes to the still-needed review.
+_REVIEW_DIFF_CHARS = 20_000
+
 DROPPED_ON_SWEEP = "the sweep has the same change"
 DROPPED_CONFLICT = "it conflicts with the sweep"
 
@@ -128,8 +131,11 @@ class Plan:
 def fixes_on(repo_dir: str, sweep: str, ci_sweep: str) -> tuple[list[Fix], list[Fix], bool]:
     """The fixes ``ci_sweep`` adds to ``sweep``, those ``sweep`` already has, and whether it has others.
 
-    ``git cherry`` compares commits by their patch: the old sweep commits a
-    CI-sweep branch was built on match the rebased ones, and are not fixes.
+    A CI-sweep branch is an old sweep head with the fixes on top. The commits
+    below its first fix are that old sweep's, however the rebase changed their
+    patches (a moved context line, a resolved conflict); a commit above it
+    that is not a fix is someone else's. ``git cherry`` says which fixes the
+    sweep now has, by their patch.
     """
     adds: list[Fix] = []
     has: list[Fix] = []
@@ -141,8 +147,7 @@ def fixes_on(repo_dir: str, sweep: str, ci_sweep: str) -> tuple[list[Fix], list[
             continue
         fix = as_fix(sha, git_output(repo_dir, "show", "-s", "--format=%B", sha))
         if fix is None:
-            # A rebased backport matches by patch; anything else is someone's.
-            foreign = foreign or sign == "+"
+            foreign = foreign or bool(adds or has)
             continue
         (adds if sign == "+" else has).append(fix)
     return adds, has, foreign
@@ -220,13 +225,13 @@ def _review(
 ) -> tuple[list[Fix], list[tuple[Fix, str]]]:
     """Ask, of each fix whose files the sweep's new backports change, whether it is still needed.
 
-    A backport is new when the CI-sweep branch has no commit with its patch:
-    the sweep's rebase gives the old ones new commits, with the same patches.
+    A sweep commit is new unless the CI-sweep branch already has the pull
+    request it backports: the sweep's rebase gives the old ones new commits,
+    whose patches may differ.
     """
+    had = set(_source_prs(repo_dir, f"{sweep_head}..{ci_sweep}").values()) - {""}
     backports = [
-        sha for sign, _, sha in (line.partition(" ") for line in git_output(
-            repo_dir, "cherry", ci_sweep, sweep_head,
-        ).splitlines()) if sign == "+"
+        sha for sha, pr in _source_prs(repo_dir, f"{ci_sweep}..{sweep_head}").items() if not pr or pr not in had
     ]
     still, unneeded = [], []
     for fix in kept:
@@ -236,6 +241,8 @@ def _review(
             for sha in backports
             if files and git_output(repo_dir, "diff", "--name-only", f"{sha}~1", sha, "--", *files).strip()
         )
+        if len(new) > _REVIEW_DIFF_CHARS:
+            new = new[:_REVIEW_DIFF_CHARS] + "\n[... diff truncated ...]"
         if not new.strip():
             still.append(fix)
             continue
@@ -249,6 +256,15 @@ def _review(
         else:
             unneeded.append((fix, why or "a new backport made it unneeded"))
     return still, unneeded
+
+
+def _source_prs(repo_dir: str, revisions: str) -> dict[str, str]:
+    """Each commit in ``revisions``, oldest first, and the pull request its Backport-Source-PR trailer names."""
+    output = git_output(
+        repo_dir, "log", "--reverse", "--no-merges",
+        "--format=%H %(trailers:key=Backport-Source-PR,valueonly,separator=%x2C)", revisions,
+    )
+    return {sha: pr.strip() for sha, _, pr in (line.partition(" ") for line in output.splitlines() if line)}
 
 
 def replay(repo_dir: str, sweep_head: str, ci_sweep: str, keep: tuple[str, ...]) -> str:
@@ -362,7 +378,3 @@ def apply(
         pull.create_issue_comment(dropped_comment(plan.dropped))
     if sweep_pr:
         pull.edit(body=body(release, sweep_pr, fixes))
-        sweep = repo.get_pull(sweep_pr)
-        text = with_sweep_line(str(getattr(sweep, "body", "") or ""), plan.pr_number)
-        if text != sweep.body:
-            sweep.edit(body=text)

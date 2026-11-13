@@ -843,8 +843,7 @@ def publish_prepared_sweep(
             backport_label=prepared.backport_label,
             llm_conflict_label=prepared.llm_conflict_label,
         )
-        if prepared.ci_sweep is not None:
-            _apply_ci_sweep(gh, prepared, prepared.ci_sweep, github_token)
+        _apply_ci_sweep(gh, prepared, github_token)
     except Exception as exc:
         logger.exception("Error publishing branch %s", prepared.target_branch)
         for item in result.results:
@@ -890,23 +889,34 @@ def _plan_ci_sweep(repo_dir: str, pull: Any | None, sweep_head: str, sweep_pr: i
         return None
 
 
-def _apply_ci_sweep(gh: Any, prepared: PreparedBranchSweep, plan: ci_sweep.Plan, github_token: str) -> None:
-    """Rebuild, push, describe or close the CI-sweep PR as planned; never fails the sweep."""
+def _apply_ci_sweep(gh: Any, prepared: PreparedBranchSweep, github_token: str) -> None:
+    """Rebuild, push, describe or close the CI-sweep PR as planned; never fails the sweep.
+
+    The sweep PR's description, which the sweep has just rewritten, names the
+    CI-sweep PR again whenever one is open, planned or not.
+    """
+    branch = ci_sweep.ci_sweep_branch(prepared.target_branch)
     try:
         sweep_pr = find_existing_pr(gh, prepared.repo_full_name, prepared.push_repo, prepared.backport_branch)
-        with GitAuth(github_token, prefix="ci-sweep-publish-git-askpass-") as git_auth:
-            def push(worktree: str, head: str, expected: str) -> None:
-                push_backport_branch(
-                    worktree, ci_sweep.ci_sweep_branch(prepared.target_branch), git_auth.env(),
-                    push_repo=prepared.push_repo, prepared_head=head, expected_remote_head=expected,
-                    branch_prefix=ci_sweep.BRANCH_PREFIX,
-                )
+        if prepared.ci_sweep is not None:
+            plan = prepared.ci_sweep
+            with GitAuth(github_token, prefix="ci-sweep-publish-git-askpass-") as git_auth:
+                def push(worktree: str, head: str, expected: str) -> None:
+                    push_backport_branch(
+                        worktree, branch, git_auth.env(), push_repo=prepared.push_repo, prepared_head=head,
+                        expected_remote_head=expected, branch_prefix=ci_sweep.BRANCH_PREFIX,
+                    )
 
-            ci_sweep.apply(
-                gh, prepared.repo_dir, repo_full_name=prepared.repo_full_name, release=prepared.target_branch,
-                plan=plan, sweep_head=prepared.prepared_head,
-                sweep_pr=int(sweep_pr.number) if sweep_pr is not None else None, push=push,
-            )
+                ci_sweep.apply(
+                    gh, prepared.repo_dir, repo_full_name=prepared.repo_full_name, release=prepared.target_branch,
+                    plan=plan, sweep_head=prepared.prepared_head,
+                    sweep_pr=int(sweep_pr.number) if sweep_pr is not None else None, push=push,
+                )
+        ci_pull = find_existing_pr(gh, prepared.repo_full_name, prepared.push_repo, branch)
+        if ci_pull is not None and sweep_pr is not None:
+            text = ci_sweep.with_sweep_line(str(getattr(sweep_pr, "body", "") or ""), int(ci_pull.number))
+            if text != sweep_pr.body:
+                sweep_pr.edit(body=text)
     except Exception as exc:  # noqa: BLE001 - the CI-sweep PR is rebuilt on the next sweep
         logger.warning("Could not update the CI-sweep PR of %s: %s", prepared.target_branch, exc)
 

@@ -478,3 +478,10 @@ def test_without_link_scopes_newest_run_selection_to_pr_branch(monkeypatch) -> N
         20,
         run_attempt=1,
     )
+
+
+def test_a_fix_command_on_a_ci_sweep_pr_is_refused(monkeypatch) -> None:
+    """A commit pushed there directly is not a fix its rebuild knows, and would stop it."""
+    result = _build(monkeypatch, gh=_gh(branch="agent/backport/ci-sweep/8.0")[0])
+    assert isinstance(result, GateRejection)
+    assert "asked for on its sweep PR" in result.reason

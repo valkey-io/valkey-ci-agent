@@ -158,7 +158,8 @@ def test_publication_pushes_the_rebuilt_branch_and_rewrites_its_table(tmp_path) 
     assert "Fix test-a (`test-a`): the sweep has the same change." in comment
     text = pull.edit.call_args.kwargs["body"]
     assert f"| {head} | `test-c` | Fix test-c |  |" in text and "test-a" not in text
-    assert "Automated.\n\nCI fixes for this sweep are in #61.\n\n## Applied" in sweep.edit.call_args.kwargs["body"]
+    # The sweep PR is pointed at it by the sweep's publication (sweep._apply_ci_sweep), plan or not.
+    sweep.edit.assert_not_called()
 
 
 def test_publication_closes_a_ci_sweep_pr_with_no_fix_left_or_for_an_earlier_sweep(tmp_path) -> None:
@@ -207,3 +208,71 @@ def test_the_sweep_line_goes_at_the_top_once() -> None:
     # One left lower down by an earlier version, or naming an earlier CI-sweep PR, is replaced.
     lower = text.replace("\n---\n", "\nCI fixes for this sweep are in #50.\n\n---\n")
     assert ci_sweep.with_sweep_line(lower, 61) == once
+
+
+def test_a_backport_the_rebase_changed_is_the_old_sweep_not_someone_elses(tmp_path) -> None:
+    """A moved context line, or a conflict resolved in the rebase, gives a backport a new patch."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "9.0")
+    git(repo, "config", "user.name", "T")
+    git(repo, "config", "user.email", "t@example.com")
+    commit(repo, "src.c", "a\nb\nc\nd\ne\n", "Base")
+    git(repo, "checkout", "-q", "-b", "sweep")
+    commit(repo, "src.c", "a\nb\nc changed\nd\ne\n", "Backport x (#1)\n\nBackport-Source-PR: 1")
+    git(repo, "checkout", "-q", "-b", "ci")
+    commit(repo, "test.tcl", "fixed\n", "Wait for it\n\nCI-Fix-Job: test-a")
+    ci = git(repo, "rev-parse", "HEAD")
+    # The release branch changes the line next to the backport's, and the sweep is rebuilt on it.
+    git(repo, "checkout", "-q", "-B", "sweep", "9.0")
+    commit(repo, "src.c", "a\nb changed upstream\nc\nd\ne\n", "Release commit")
+    commit(repo, "src.c", "a\nb changed upstream\nc changed\nd\ne\n", "Backport x (#1)\n\nBackport-Source-PR: 1")
+    sweep_head = git(repo, "rev-parse", "HEAD")
+    assert git(repo, "cherry", sweep_head, ci).splitlines()[0].startswith("+")  # git cherry alone says: not the sweep's
+    reviewed = []
+
+    plan = ci_sweep.plan(
+        str(repo), pull=_pull(ci), ci_sweep=ci, sweep_head=sweep_head, sweep_pr=7,
+        review=lambda fix, backports: reviewed.append(backports) or (True, ""),
+    )
+
+    assert not plan.foreign and len(plan.keep) == 1 and not plan.dropped
+    # The rebased backport is not a new one, so nothing asks whether the fix is still needed.
+    assert reviewed == []
+
+
+def test_a_commit_above_the_fixes_that_is_not_a_fix_is_someone_elses(tmp_path) -> None:
+    repo, sweep_head, ci = _repo(tmp_path)
+    git(repo, "checkout", "-q", ci)
+    theirs = commit(repo, "manual.txt", "a maintainer's change\n", "Adjust the fix")
+
+    adds, _has, foreign = ci_sweep.fixes_on(str(repo), sweep_head, theirs)
+
+    assert foreign and [fix.job for fix in adds] == ["test-a", "test-b", "test-c"]
+
+
+def test_the_new_backports_given_to_the_review_are_capped(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "9.0")
+    git(repo, "config", "user.name", "T")
+    git(repo, "config", "user.email", "t@example.com")
+    commit(repo, "test.tcl", "one\n" + "x\n" * 50 + "two\n", "Base")
+    git(repo, "checkout", "-q", "-b", "ci")
+    commit(repo, "test.tcl", "one fixed\n" + "x\n" * 50 + "two\n", "Fix test-d\n\nCI-Fix-Job: test-d")
+    ci = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "-b", "sweep", "9.0")
+    # Far from the fix's lines: no conflict, but a large diff to the same file.
+    sweep_head = commit(
+        repo, "test.tcl", "one\n" + "x\n" * 50 + "two\n" + "y\n" * 200, "Backport z (#3)\n\nBackport-Source-PR: 3",
+    )
+    monkeypatch.setattr(ci_sweep, "_REVIEW_DIFF_CHARS", 200)
+    seen = []
+
+    ci_sweep.plan(
+        str(repo), pull=_pull(ci), ci_sweep=ci, sweep_head=sweep_head, sweep_pr=7,
+        review=lambda fix, backports: seen.append(backports) or (True, ""),
+    )
+
+    (backports,) = seen
+    assert len(backports) <= 200 + len("\n[... diff truncated ...]") and backports.endswith("[... diff truncated ...]")

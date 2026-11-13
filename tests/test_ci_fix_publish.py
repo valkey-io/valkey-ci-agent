@@ -830,3 +830,20 @@ def test_an_upstream_fix_for_a_sweep_is_to_be_backported_not_cherry_picked(monke
     repo.get_commit.return_value.get_pulls.return_value = []
     result = publish_candidate(gh, _sweep_task(), _candidate(action=CandidateAction.PORT), git_env={})
     assert result.kind is ResultKind.REFUSED and "no merged pull request" in result.summary
+
+
+def test_a_ci_sweep_table_has_the_new_fix_when_github_answers_from_before_the_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    earlier = _commit("e" * 40, "Fix earlier\n\nCI-Fix-Job: test-alpine")
+    gh, _repo, _sweep = _ci_sweep_gh(pushed=(earlier,))
+    monkeypatch.setattr(publish_mod, "push_candidate", _push_recording({}))
+    pull = _ci_sweep_pr(commits=[earlier])
+    monkeypatch.setattr(publish_mod, "find_existing_pr", lambda *_a, **_k: pull)
+
+    publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
+
+    assert pull.edit.call_args.kwargs["body"] == ci_sweep.body("9.0", 7, [
+        ci_sweep.Fix("e" * 40, "Fix earlier", "test-alpine"),
+        ci_sweep.Fix("d" * 40, "Fix unit/x", "unit tests", _RUN),
+    ])

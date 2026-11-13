@@ -4072,3 +4072,27 @@ def test_sweep_outcome_sentence_and_level():
                     "(errored: #2); no PR change")
     result.results[0] = CandidateResult(1, "ok", "error", "x")
     assert sweep_mod.sweep_outcome(result)[0] == logging.ERROR
+
+
+def test_the_sweep_pr_names_its_open_ci_sweep_pr_even_without_a_plan(monkeypatch, tmp_path):
+    """The sweep has just rewritten its description; a CI-sweep PR it could not plan is still there."""
+    prepared = backport_sweep.PreparedBranchSweep(
+        repo_full_name="valkey-io/valkey", push_repo="valkey-io/valkey", target_branch="8.1",
+        backport_branch="agent/backport/sweep/8.1", repo_dir=str(tmp_path), target_head="t",
+        prepared_head="p", expected_remote_head=None, expected_pr_number=7,
+        result=BranchSweepResult(target_branch="8.1", candidates_found=0),
+    )
+    sweep_pr = SimpleNamespace(
+        number=7, body="# Backport sweep for 8.1\n\nAutomated.\n\n## Applied\n", edit=MagicMock(),
+    )
+    ci_pr = SimpleNamespace(number=61)
+    monkeypatch.setattr(
+        backport_sweep, "find_existing_pr",
+        lambda _gh, _repo, _push, branch: {"agent/backport/sweep/8.1": sweep_pr,
+                                            "agent/backport/ci-sweep/8.1": ci_pr}[branch],
+    )
+    monkeypatch.setattr(ci_sweep, "apply", lambda *_a, **_k: pytest.fail("nothing was planned"))
+
+    backport_sweep._apply_ci_sweep(MagicMock(), prepared, "token")
+
+    assert "Automated.\n\nCI fixes for this sweep are in #61.\n\n## Applied" in sweep_pr.edit.call_args.kwargs["body"]

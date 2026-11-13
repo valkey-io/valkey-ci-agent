@@ -363,10 +363,13 @@ def _ci_sweep_body(gh: Any, task: FixTask, candidate: FixCandidate, commit_sha: 
         fixes = ci_sweep.commit_fixes(compared.commits)
     except Exception as exc:  # noqa: BLE001 - the fix is pushed either way
         logger.warning("Could not read the fixes on %s: %s", task.target.fix_branch, exc)
-        fixes = [ci_sweep.Fix(
+        fixes = []
+    # GitHub can answer for a moment from before the push: this fix is there either way.
+    if commit_sha not in {fix.sha for fix in fixes}:
+        fixes.append(ci_sweep.Fix(
             commit_sha, commit_message(candidate).splitlines()[0],
             task.failure.job_name, task.failure.run_url, candidate.adapts,
-        )]
+        ))
     return ci_sweep.body(task.failure.base_branch, task.failure.pr_number, fixes)
 
 
