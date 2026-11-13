@@ -42,6 +42,7 @@ scripts/
   backport/              Backports, suggestions, CI follow-up, onboarding release lines
   ci_fix/                The CI fix bot
   test_failure_detector/ Daily CI failures to issues
+  ci_health/             Daily CI history and flakiness statistics (no workflow yet)
   fuzzer/                Fuzzer run triage
   release_notes/         Release notes and review comments on release PRs
   release/               Release preparation, tracking and publication
@@ -93,8 +94,9 @@ cut and release automation are built the same way.
 | Release automation | [release-automation.md](release-automation.md) | `scripts/release/main.py` |
 | CVE scan | [cve-scan.md](cve-scan.md) | `scripts/cve_scan/sweep.py` |
 
-Two more are planned: a PR reviewer with a second, skeptical pass, and
-detection of flaky tests across Daily runs.
+A PR reviewer with a second, skeptical pass is planned. Detection of flaky
+tests across Daily runs is in progress: [CI health](ci-health.md) has the
+statistics layer, and the workflow that feeds it follows.
 
 ## How Claude is run
 
@@ -142,7 +144,8 @@ commands from `repos.yml`.
 For issues, `incidents.py` turns a failure into a stable fingerprint, and
 `issue_dedup.py` uses that fingerprint to open a new issue or update the
 existing one. The detector and the fuzzer monitor both use it, each with
-their own way of writing the issue.
+their own way of writing the issue, and CI health keys its records with the
+same fingerprint so a scorecard row and the detector's issue share an id.
 
 `isolation.py` runs a command, or Claude, as the separate `ci-fix-agent`
 account with its own home and temporary directories, and takes the code back
