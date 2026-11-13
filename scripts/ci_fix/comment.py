@@ -34,6 +34,16 @@ def render_result(result: FixResult) -> str:
             return f"No fix for {job}. {sentence(result.summary)}"
         if result.kind is ResultKind.SUGGESTED and result.pr_number:
             return f"#{result.pr_number} fixes {job}. Backport it to `{failure.base_branch}`."
+        if result.kind is ResultKind.SUGGESTED and result.candidate is not None:
+            return "\n".join([
+                f"A fix for {job} could not be run here, so it was not pushed.",
+                "",
+                "<details><summary>Proposed patch</summary>",
+                "",
+                _fenced(result.candidate.patch, lang="diff"),
+                "",
+                "</details>",
+            ])
 
     if result.kind is ResultKind.PUSHED:
         body = [f"Pushed {result.commit_sha} to this branch with a fix for {job}.", ""]

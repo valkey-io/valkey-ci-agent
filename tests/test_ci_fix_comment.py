@@ -196,6 +196,12 @@ def test_a_sweep_pr_is_told_in_a_line_and_the_ci_sweep_pr_is_told_why() -> None:
     assert render_result(result(ResultKind.REFUSED, "It is fixed in #61")) == f"No fix for {job}. It is fixed in #61."
     suggested = FixResult(kind=ResultKind.SUGGESTED, summary="", task=task, pr_number=4726)
     assert render_result(suggested) == f"#4726 fixes {job}. Backport it to `unstable`."
+    # A fix not run here: a line, with the patch folded away.
+    unrun = FixResult(kind=ResultKind.SUGGESTED, summary="", task=task, candidate=replace(_candidate(), not_run=True))
+    assert render_result(unrun) == (
+        f"A fix for {job} could not be run here, so it was not pushed.\n\n"
+        f"<details><summary>Proposed patch</summary>\n\n```diff\n{_candidate().patch.rstrip()}\n```\n\n</details>"
+    )
     # On the CI-sweep PR: a few lines, the agent's own summary without what it says of running it,
     # what code ran, and the diagnosis and checks folded away.
     candidate = replace(

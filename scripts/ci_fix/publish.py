@@ -89,7 +89,9 @@ def publish_candidate(
             f"a {target.kind.value} target.",
         )
 
-    if target.fix_branch and candidate.action is CandidateAction.PORT:
+    if target.fix_branch and (candidate.action is CandidateAction.PORT or candidate.not_run and candidate.adapts):
+        # A sweep backports an upstream fix by its pull request, and one not
+        # run here is never pushed: the pull request is the fix to name.
         return _suggest_backport(gh, task, candidate)
     if target.kind is TargetKind.SUGGEST:
         return _publish_suggestion(gh, task, candidate)
@@ -205,7 +207,7 @@ def _suggest_backport(gh: Any, task: FixTask, candidate: FixCandidate) -> FixRes
     number: a cherry-pick of the commit here would be one it does not know,
     and could backport again.
     """
-    commit = candidate.port_commit.strip()
+    commit = (candidate.port_commit or candidate.adapts).strip()
     try:
         number = _upstream_pr(gh, task.failure.repo_full_name, commit)
     except Exception as exc:  # noqa: BLE001 - retry can recover GitHub API failures
@@ -284,7 +286,7 @@ def _publish_ci_sweep(
                     gh.get_repo(task.failure.repo_full_name),
                     base_repo=task.failure.repo_full_name,
                     push_repo=target.repo_full_name,
-                    title=f"[CI] CI Fix Sweep for {task.failure.base_branch}",
+                    title=f"[CI] CI fix sweep for {task.failure.base_branch}",
                     body=text,
                     head_branch=target.fix_branch,
                     base_branch=target.branch,

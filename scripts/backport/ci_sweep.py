@@ -286,7 +286,7 @@ def body(release: str, sweep_pr: int, fixes: list[Fix]) -> str:
         # A bare SHA, which GitHub links to the commit.
         rows.append(f"| {fix.sha} | {job} | {_esc(fix.subject)} | {detail} |")
     return "\n".join([
-        f"# CI Fix Sweep for {release}",
+        f"# CI fix sweep for {release}",
         "",
         f"Automated fixes for CI failures on #{sweep_pr}.",
         "",
