@@ -17,3 +17,6 @@ __pycache__/
 .env.*
 !.env.example
 valkey_ci_agent.egg-info/
+
+.venv/
+.venv39/

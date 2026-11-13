@@ -56,8 +56,13 @@ Valkey container images for known CVEs. When a rebuild would fix one, it builds
 the image itself and scans it to prove the fix before asking valkey-container
 to rebuild and publish. See [CVE scan](docs/cve-scan.md).
 
-Two more are planned: a PR reviewer with a second, skeptical pass, and
-detection of flaky tests across Daily runs.
+**CI health.** Every morning the agent records the night's Daily run and the
+failures of its failed jobs in a history store, then works out, per test, how
+often it fails, whether it is flaky or simply broken, and which commits turned
+it from green to red. The results are JSON for now; a dashboard and a Slack
+report follow. See [CI health](docs/ci-health.md).
+
+A PR reviewer with a second, skeptical pass is planned.
 
 ## Using it
 
@@ -107,6 +112,7 @@ scripts/
   backport/               Backports, backport suggestions, CI follow-up
   ci_fix/                 The CI fix bot
   test_failure_detector/  Daily CI failures to issues
+  ci_health/              Daily CI history and flakiness statistics
   fuzzer/                 Fuzzer run triage
   release_notes/          Release notes and review comments on release PRs
   release/                Release preparation and publication
