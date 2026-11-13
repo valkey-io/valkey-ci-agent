@@ -1967,3 +1967,59 @@ def test_verification_may_use_the_rest_of_the_deadline_not_one_commands_default(
     """#5301 and 9.2's 40-loop checks died at 1800s with hours of the session left."""
     assert engine_mod._timeout(time.monotonic() + 3 * 3600) > engine_mod.TEST_TIMEOUT_S
     assert engine_mod._timeout(time.monotonic() - 5) == 60
+
+
+_ADDS_TESTS = """\
+diff --git a/tests/unit/a.tcl b/tests/unit/a.tcl
+--- a/tests/unit/a.tcl
++++ b/tests/unit/a.tcl
+@@ -1,2 +1,6 @@
++    test "New wait is right" {
++    test {Braced name} {
++    test "Built from $var" {
+     test "Old one" {
+diff --git a/src/a.c b/src/a.c
+--- a/src/a.c
++++ b/src/a.c
+@@ -1 +1,2 @@
++    test "not a test file" {
+"""
+
+
+def test_the_tests_a_patch_adds_are_found_by_name_and_file():
+    assert engine_mod.added_tests(_ADDS_TESTS) == (
+        FailedTest("New wait is right", "tests/unit/a.tcl"), FailedTest("Braced name", "tests/unit/a.tcl"),
+    )
+
+
+def test_a_test_the_patch_adds_is_run_once_and_its_failure_goes_back_to_the_agent(tmp_path, monkeypatch):
+    """#5382 added a test it never ran, and it failed on the sweep PR."""
+    seen, checks = [], []
+
+    def run(_repo, command, _timeout):
+        seen.append(command)
+        if "Braced" in command:
+            return TestRun(False, "", "[err]: Braced name in tests/unit/a.tcl")
+        return TestRun(True, "", "[ok]: New wait is right (1 ms)")
+
+    def plan_for(_repo, tests, **_kwargs):
+        return VerifyPlan(build="make", test=f"only {tests[0].name} --loops {LOOPS}", tests=tests)
+
+    monkeypatch.setattr(engine_mod, "plan_for", plan_for)
+    feedback = engine_mod._verify_added_tests(
+        _task("a" * 40), SimpleNamespace(patch=_ADDS_TESTS), str(tmp_path), run, time.monotonic() + 600, checks, None,
+    )
+
+    assert seen == ["make", "make && only New wait is right --loops 1", "make", "make && only Braced name --loops 1"]
+    assert feedback.startswith("Your patch adds `Braced name` in `tests/unit/a.tcl`, which does not pass.")
+
+
+def test_a_test_the_patch_adds_that_nothing_here_runs_is_named_in_the_checks(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine_mod, "plan_for", lambda *_args, **_kwargs: None)
+    checks: list[str] = []
+
+    assert engine_mod._verify_added_tests(
+        _task("a" * 40), SimpleNamespace(patch=_ADDS_TESTS), str(tmp_path),
+        lambda *_args: pytest.fail("nothing runs"), time.monotonic() + 600, checks, None,
+    ) == ""
+    assert checks[0] == "The patch adds `New wait is right` in `tests/unit/a.tcl`, which no command here can run."

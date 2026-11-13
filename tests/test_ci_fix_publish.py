@@ -712,7 +712,7 @@ def test_a_sweep_fix_opens_the_ci_sweep_pr_into_the_sweep_branch(monkeypatch: py
         _CI_SWEEP, "agent/backport/sweep/9.0", False,
     )
     # Laid out like the sweep PR, so that it reads the same.
-    assert kwargs["title"] == "[CI] CI Fix Sweep for 9.0"
+    assert kwargs["title"] == "[CI] CI fix sweep for 9.0"
     assert kwargs["body"] == ci_sweep.body("9.0", 7, [ci_sweep.Fix("d" * 40, "Fix unit/x", "unit tests", _RUN)])
     # And the sweep PR says where its CI fixes are, above its footer.
     told = sweep.edit.call_args.kwargs["body"]
@@ -830,6 +830,21 @@ def test_an_upstream_fix_for_a_sweep_is_to_be_backported_not_cherry_picked(monke
     repo.get_commit.return_value.get_pulls.return_value = []
     result = publish_candidate(gh, _sweep_task(), _candidate(action=CandidateAction.PORT), git_env={})
     assert result.kind is ResultKind.REFUSED and "no merged pull request" in result.summary
+
+
+def test_a_sweep_fix_not_run_here_that_adapts_an_upstream_fix_is_that_fix_to_backport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9.1's clang-format job: upstream #3913 fixes it, and a patch nothing here could run was posted instead."""
+    gh, repo, _sweep = _ci_sweep_gh()
+    repo.get_commit.return_value.get_pulls.return_value = [SimpleNamespace(number=3913, merged_at="2026-11-01")]
+    monkeypatch.setattr(publish_mod, "push_candidate", lambda *_a, **_k: pytest.fail("pushed"))
+    adapted = replace(_candidate(), not_run=True, adapts="d" * 40)
+
+    result = publish_candidate(gh, _sweep_task(), adapted, git_env={})
+
+    assert result.kind is ResultKind.SUGGESTED and result.pr_number == 3913
+    repo.get_commit.assert_called_once_with("d" * 40)
 
 
 def test_a_ci_sweep_table_has_the_new_fix_when_github_answers_from_before_the_push(

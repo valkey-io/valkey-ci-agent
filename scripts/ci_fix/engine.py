@@ -596,6 +596,8 @@ def _fix_loop(
             failed = ""
             if run_test is not None and round_plan is not None:
                 failed = _verify(reviewed, repo_dir, round_plan, run_test, deadline, checks)
+                if not failed:
+                    failed = _verify_added_tests(task, reviewed, repo_dir, run_test, deadline, checks, job)
             if not failed:
                 # The reviewer sees what the checks showed, not only the plan.
                 approved, reasoning = review(
@@ -840,6 +842,52 @@ def other_issues_touched(
             f"The patch changes {name}, issue {ref}'s test, which did not pass with it."
         )
     return tuple(touched)
+
+
+# A Tcl test the patch adds: ``test "name"`` or ``test {name}`` on an added line. A name built
+# from variables is not one ``--only`` can find, and is left out.
+_ADDED_TEST_RE = re.compile(r'^\+\s*test\s+(?:"([^"$\[]+)"|\{([^}$\[]+)\})')
+
+
+def added_tests(patch: str) -> tuple[FailedTest, ...]:
+    """The Tcl tests ``patch`` adds under ``tests/``, by name and file."""
+    tests: list[FailedTest] = []
+    path = ""
+    for line in patch.splitlines():
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else ""
+        elif path.startswith("tests/") and path.endswith(".tcl"):
+            match = _ADDED_TEST_RE.match(line)
+            if match:
+                tests.append(FailedTest(match.group(1) or match.group(2), path))
+    return tuple(dict.fromkeys(tests))[:_MAX_TESTS]
+
+
+def _verify_added_tests(
+    task: FixTask,
+    candidate: FixCandidate,
+    repo_dir: str,
+    run_test: TestFunc,
+    deadline: float,
+    checks: list[str],
+    job: JobCommands | None,
+) -> str:
+    """Run each test the patch adds once; "" when they pass, else feedback for the agent.
+
+    The failing test passing does not show that a test the patch brings with
+    it does: an upstream test adapted with its fix can need more than this
+    branch has.
+    """
+    for test in added_tests(candidate.patch):
+        named = f"`{test.name}` in `{test.file}`"
+        plan = plan_for(repo_dir, (test,), scheduled=task.failure.scheduled, job=job)
+        if plan is None:
+            checks.append(f"The patch adds {named}, which no command here can run.")
+            continue
+        failed = _verify_with_plan(replace(plan, single_run=True), repo_dir, run_test, deadline, checks)
+        if failed:
+            return f"Your patch adds {named}, which does not pass. {failed}"
+    return ""
 
 
 def changed_lines(patch: str) -> dict[str, set[int]]:
