@@ -23,7 +23,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from scripts.backport.sweep_git import BRANCH_PREFIX as SWEEP_PREFIX
+from scripts.backport.sweep_prs import find_existing_pr
 from scripts.backport.sweep_reporting import _esc
+from scripts.common.github_client import retry_github_call
 from scripts.common.proc import git_output, run_git
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,40 @@ def fix_branch_for(branch: str, release: str) -> str:
     return ci_sweep_branch(release) if branch == f"{SWEEP_PREFIX}/{release}" else ""
 
 
+def closed_branches(gh: Any, repo: str, push_repo: str) -> tuple[str, ...]:
+    """The CI-sweep branches in ``push_repo`` whose pull request into ``repo`` was merged or closed.
+
+    Their fixes were merged or turned down, so they are neither fixes still
+    waiting for review nor examples for another release. Publication deletes
+    such a branch before it adds the next fix. When they cannot be listed,
+    none is.
+    """
+    owner = push_repo.split("/", 1)[0]
+
+    def closed(branch: str, head: str) -> bool:
+        if find_existing_pr(gh, repo, push_repo, branch) is not None:
+            return False
+        pulls = retry_github_call(
+            lambda: list(gh.get_repo(repo).get_pulls(state="closed", head=f"{owner}:{branch}")),
+            retries=2, description=f"list closed PRs from {branch}",
+        )
+        # Not a fix pushed since, whose pull request could not be opened.
+        return any(str(getattr(getattr(pull, "head", None), "sha", "") or "") == head for pull in pulls)
+
+    try:
+        refs = retry_github_call(
+            lambda: list(gh.get_repo(push_repo).get_git_matching_refs(f"heads/{BRANCH_PREFIX}/")),
+            retries=2, description="list the CI-sweep branches",
+        )
+        return tuple(
+            branch for ref in refs
+            if closed(branch := str(ref.ref).removeprefix("refs/heads/"), str(ref.object.sha))
+        )
+    except Exception as exc:  # noqa: BLE001 - the fix is still made, with every branch in sight
+        logger.warning("Could not list the CI-sweep branches without a PR: %s", exc)
+        return ()
+
+
 def sweep_marker(number: int) -> str:
     return _SWEEP_MARKER.format(number=number)
 
@@ -73,9 +109,12 @@ def sweep_of(body: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def trailers(job: str, run_url: str, adapts: str = "") -> tuple[str, ...]:
-    """The trailers a fix's commit carries, by which the rebuild and the follow-up know it."""
-    pairs = ((JOB_TRAILER, job), (RUN_TRAILER, run_url), (ADAPTS_TRAILER, adapts))
+def trailers(job: str, run_url: str) -> tuple[str, ...]:
+    """The trailers a fix's commit carries, by which the rebuild and the follow-up know it.
+
+    An earlier fix that adapted an upstream commit also has an ``ADAPTS_TRAILER``.
+    """
+    pairs = ((JOB_TRAILER, job), (RUN_TRAILER, run_url))
     return tuple(f"{key}: {value}" for key, value in pairs if value)
 
 

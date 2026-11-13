@@ -167,6 +167,9 @@ class FixTarget:
     # ``branch`` collects the sweep's CI fixes for review apart from its
     # backports.
     fix_branch: str = ""
+    # With ``fix_branch``: the CI-sweep branches that had no open pull
+    # request when the fix was planned (:func:`ci_sweep.closed_branches`).
+    closed_fix_branches: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
