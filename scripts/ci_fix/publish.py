@@ -89,9 +89,9 @@ def publish_candidate(
             f"a {target.kind.value} target.",
         )
 
-    if target.fix_branch and (candidate.action is CandidateAction.PORT or candidate.not_run and candidate.adapts):
-        # A sweep backports an upstream fix by its pull request, and one not
-        # run here is never pushed: the pull request is the fix to name.
+    if target.fix_branch and (candidate.action is CandidateAction.PORT or candidate.adapts):
+        # A sweep backports an upstream fix by its pull request, adapted or
+        # not: the pull request is the fix to name.
         return _suggest_backport(gh, task, candidate)
     if target.kind is TargetKind.SUGGEST:
         return _publish_suggestion(gh, task, candidate)
@@ -272,7 +272,7 @@ def _publish_ci_sweep(
             pre_push_check=check,
             allow_ci_changes=allows_ci_changes(task),
             onto=onto,
-            trailers=ci_sweep.trailers(task.failure.job_name, task.failure.run_url, candidate.adapts),
+            trailers=ci_sweep.trailers(task.failure.job_name, task.failure.run_url),
         )
     except PushRefused as exc:
         return _refused(task, candidate, str(exc))
@@ -370,7 +370,7 @@ def _ci_sweep_body(gh: Any, task: FixTask, candidate: FixCandidate, commit_sha: 
     if commit_sha not in {fix.sha for fix in fixes}:
         fixes.append(ci_sweep.Fix(
             commit_sha, commit_message(candidate).splitlines()[0],
-            task.failure.job_name, task.failure.run_url, candidate.adapts,
+            task.failure.job_name, task.failure.run_url,
         ))
     return ci_sweep.body(task.failure.base_branch, task.failure.pr_number, fixes)
 

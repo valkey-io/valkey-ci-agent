@@ -407,6 +407,7 @@ def _establish(
                 sibling_branch_changes(
                     repo_dir, named_paths,
                     own_branch=branch, base_branch=task.failure.base_branch, compared_with=compared_with,
+                    skip=task.target.closed_fix_branches,
                 )
                 for branch, compared_with in (
                     (task.target.branch, ""),
@@ -416,7 +417,11 @@ def _establish(
             )
             if upstream_first and task.policy is FixPolicy.BACKPORT else ""
         ),
-        pending_fixes=pending_fixes(repo_dir, task.target.fix_branch) if task.target.fix_branch else "",
+        pending_fixes=(
+            # A CI-sweep branch whose pull request was closed holds fixes that were turned down.
+            pending_fixes(repo_dir, task.target.fix_branch)
+            if task.target.fix_branch and task.target.fix_branch not in task.target.closed_fix_branches else ""
+        ),
         verification=described,
         verified_by_code=plan is not None,
         upstream_first=upstream_first,

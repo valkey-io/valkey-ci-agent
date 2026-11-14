@@ -354,6 +354,7 @@ def plan_request(
         }
 
     selected_job = target.job
+    fix_branch = ci_sweep.fix_branch_for(target.head_branch, target_branch)
     run_attempt = int(getattr(target.run, "run_attempt", 1) or 1)
     job_name, described = selected_job.name, f"the failure in job `{selected_job.name}`"
     if target.release_run:
@@ -390,7 +391,10 @@ def plan_request(
             base_repo_full_name=repo_entry.repo,
             branch=target.head_branch,
             expected_sha=target.head_sha,
-            fix_branch=ci_sweep.fix_branch_for(target.head_branch, target_branch),
+            fix_branch=fix_branch,
+            closed_fix_branches=(
+                ci_sweep.closed_branches(gh, repo_entry.repo, repo_entry.effective_push_repo) if fix_branch else ()
+            ),
         ),
         # A backport branch's failure is usually a missing upstream change; a
         # pushed CI fix or a draft PR has no upstream counterpart to port.
