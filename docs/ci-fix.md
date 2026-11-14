@@ -39,8 +39,9 @@ What you get back depends on whose PR it is. On a contributor's PR, or a PR
 from a fork, the bot never pushes anything. It posts the fix as a patch in a
 comment, and the author can apply it or not. On the bot's own PRs, meaning
 backport PRs and the PRs it opened to fix something, it pushes the fix as a
-new commit. A sweep PR carries only backports, so its fix goes to its CI-sweep
-PR instead ([Backports](backport.md#when-a-backport-prs-own-ci-fails)).
+new commit. A sweep PR carries only backports, so its fix goes to unstable
+first when unstable has the failing test, or else to its CI-sweep PR
+([Backports](backport.md#when-a-backport-prs-own-ci-fails)).
 
 ## Other ways a fix starts
 
@@ -353,10 +354,14 @@ another repository would need its own tokens and triggers.
 
 Every fix runs as the same three jobs in `ci-fix-run.yml`, driven by
 `scripts/ci_fix/run.py`: a plan job that pins down the failure and works out
-how to recreate the job, a fix job, and a publish job. The fix job is called
-`fix-in-job` when it recreates the failed job, `fix-in-container` when that
-job ran in a container, and `fix-local` when it falls back to the bot's own
-runner. The jobs pass their state to each other as JSON (`state.py`).
+how to recreate the job, a fix job, and a publish job. The fix job comes from
+`ci-fix-job.yml`, and is called `fix-in-job` when it recreates the failed job,
+`fix-in-container` when that job ran in a container, and `fix-local` when it
+falls back to the bot's own runner. A sweep PR's fix for a test unstable has
+too gets two more jobs before publish: `plan-upstream` finds unstable's own
+job of the same name, and `fix-upstream` makes the fix for unstable in it, or
+on the bot's runner when that job cannot host it. The jobs pass their state to
+each other as JSON (`state.py`).
 
 Each way of starting a fix has a small front door that checks the request and
 turns it into the same `FixTask`: `main.py` for PR requests,

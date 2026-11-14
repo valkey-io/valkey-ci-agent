@@ -327,13 +327,19 @@ def test_ci_fix_issue_runs_are_named_for_the_dispatcher():
     assert RUN_NAME.match(without).group("issue", "run") == ("123", None)
 
 
-# --- ci-fix-run.yml: every fix is plan -> fix-in-job | fix-in-container | fix-local -> publish
+# --- ci-fix-run.yml: every fix is plan -> fix -> [plan-upstream -> fix-upstream] -> publish,
+# each fix job one of ci-fix-job.yml's fix-in-job | fix-in-container | fix-local
 
 _RUN = Path(".github/workflows/ci-fix-run.yml")
+_JOB = Path(".github/workflows/ci-fix-job.yml")
 
 
 def _run_jobs():
     return yaml.safe_load(_RUN.read_text(encoding="utf-8"))["jobs"]
+
+
+def _fix_jobs():
+    return yaml.safe_load(_JOB.read_text(encoding="utf-8"))["jobs"]
 
 
 def test_every_fix_front_door_runs_the_shared_fix():
@@ -358,10 +364,22 @@ def test_every_fix_front_door_runs_the_shared_fix():
 
 def test_only_the_plan_and_publish_jobs_hold_a_github_token():
     jobs = _run_jobs()
-    for job_id, command in (("plan", "python -m scripts.ci_fix.run plan"),
+    for job_id, command in (("plan", "python -m scripts.ci_fix.run plan "),
+                            ("plan-upstream", "python -m scripts.ci_fix.run plan-upstream"),
                             ("publish", "python -m scripts.ci_fix.run publish")):
         steps = jobs[job_id]["steps"]
         tokens = [step for step in steps if "actions/create-github-app-token@" in step.get("uses", "")]
+        assert not any("configure-aws-credentials@" in step.get("uses", "") for step in steps), job_id
+        assert "\n".join(step.get("run", "") for step in steps).count(command) == 1, job_id
+        assert jobs[job_id]["runs-on"] == "ubuntu-24.04", job_id
+        if job_id == "plan-upstream":
+            # It only reads the default branch: its tip, the test's file and the workflow file.
+            assert [token["id"] for token in tokens] == ["target-token"]
+            assert {k: v for k, v in tokens[0]["with"].items() if k.startswith("permission-")} == {
+                "permission-contents": "read", "permission-metadata": "read",
+            }
+            assert jobs[job_id]["permissions"] == {"contents": "read"}
+            continue
         plan = job_id == "plan"
         assert [token["id"] for token in tokens] == (["target-token"] if plan else ["target-token", "ci-token"])
         permissions = {k: v for k, v in tokens[0]["with"].items() if k.startswith("permission-")}
@@ -384,8 +402,6 @@ def test_only_the_plan_and_publish_jobs_hold_a_github_token():
             assert {k: v for k, v in ci["with"].items() if not k.startswith("permission-")} == {
                 k: v for k, v in plain["with"].items() if not k.startswith("permission-")
             }
-        assert not any("configure-aws-credentials@" in step.get("uses", "") for step in steps), job_id
-        assert "\n".join(step.get("run", "") for step in steps).count(command) == 1, job_id
         if job_id == "publish":
             publish_step = next(step for step in steps if command in step.get("run", ""))
             assert publish_step["env"]["CI_FIX_ISSUES_PUBLISH"] == "${{ vars.CI_FIX_ISSUES_PUBLISH }}"
@@ -395,8 +411,8 @@ def test_only_the_plan_and_publish_jobs_hold_a_github_token():
         assert jobs[job_id]["permissions"] == {
             **({"actions": "read"} if job_id == "plan" else {}), "contents": "read",
         }, job_id
-        assert jobs[job_id]["runs-on"] == "ubuntu-24.04", job_id
-    assert _RUN.read_text(encoding="utf-8").count("actions/create-github-app-token@") == 3
+    assert _RUN.read_text(encoding="utf-8").count("actions/create-github-app-token@") == 4
+    assert "create-github-app-token@" not in _JOB.read_text(encoding="utf-8")
     assert jobs["plan"]["outputs"]["ci_changes"] == "${{ steps.plan.outputs.ci_changes }}"
 
 
@@ -406,23 +422,23 @@ _FIX_JOBS = ("fix-in-job", "fix-in-container", "fix-local")
 def test_the_fix_runs_in_the_failed_job_or_on_the_bots_runner():
     from scripts.ci_fix.engine import AWS_SESSION_S
 
-    jobs = _run_jobs()
+    jobs = _fix_jobs()
     in_job, in_container, local = (jobs[job_id] for job_id in _FIX_JOBS)
-    assert "needs.plan.outputs.container == ''" in in_job["if"] and "container" not in in_job
-    assert "needs.plan.outputs.container != ''" in in_container["if"]
-    assert in_container["container"] == "${{ needs.plan.outputs.container }}"
+    assert "inputs.container == ''" in in_job["if"] and "container" not in in_job
+    assert "inputs.container != ''" in in_container["if"]
+    assert in_container["container"] == "${{ inputs.container }}"
     # Without git in the container, job.sh makes the checkout an archive of the commit.
-    assert in_container["env"]["CI_FIX_REPOSITORY"] == "${{ needs.plan.outputs.use_repo }}"
-    assert in_container["env"]["CI_FIX_COMMIT"] == "${{ needs.plan.outputs.use_git_ref }}"
+    assert in_container["env"]["CI_FIX_REPOSITORY"] == "${{ inputs.use_repo }}"
+    assert in_container["env"]["CI_FIX_COMMIT"] == "${{ inputs.use_git_ref }}"
     for job in (in_job, in_container):
-        assert job["runs-on"] == "${{ needs.plan.outputs.runs_on }}"
-        assert job["timeout-minutes"] == "${{ fromJSON(needs.plan.outputs.timeout_minutes) }}"
+        assert job["runs-on"] == "${{ inputs.runs_on }}"
+        assert job["timeout-minutes"] == "${{ fromJSON(inputs.timeout_minutes) }}"
         assert job["env"]["CI_FIX_IN_JOB"] == "1"
         main, extra, download = job["steps"][:3]
-        assert main["with"]["repository"] == "${{ needs.plan.outputs.use_repo }}"
-        assert main["with"]["ref"] == "${{ needs.plan.outputs.use_git_ref }}"
-        assert extra["if"] == "needs.plan.outputs.extra_repository != ''"
-        assert extra["with"]["path"] == "${{ needs.plan.outputs.extra_path }}"
+        assert main["with"]["repository"] == "${{ inputs.use_repo }}"
+        assert main["with"]["ref"] == "${{ inputs.use_git_ref }}"
+        assert extra["if"] == "inputs.extra_repository != ''"
+        assert extra["with"]["path"] == "${{ inputs.extra_path }}"
         assert download["name"] == "CI fix: download the plan"
         setup = next(step for step in job["steps"] if step["name"] == "Run the job's own setup and build")
         assert setup["shell"] == "bash"
@@ -432,13 +448,47 @@ def test_the_fix_runs_in_the_failed_job_or_on_the_bots_runner():
     assert local["timeout-minutes"] * 60 == AWS_SESSION_S
     for job_id in _FIX_JOBS:
         assert jobs[job_id]["permissions"] == {"contents": "read", "id-token": "write"}, job_id
-    assert jobs["publish"]["needs"] == ["plan", *_FIX_JOBS]
+        steps = jobs[job_id]["steps"]
+        download = next(step for step in steps if step.get("name") == "CI fix: download the plan")
+        upload = next(step for step in steps if step.get("name") == "CI fix: upload the result")
+        assert download["with"]["name"] == "${{ inputs.plan }}", job_id
+        assert upload["with"]["name"] == "${{ inputs.result }}", job_id
+
+
+def test_a_sweeps_fix_for_a_test_unstable_has_is_made_in_unstables_own_job():
+    jobs = _run_jobs()
+    outputs = ("mode", "job", "runs_on", "container", "timeout_minutes", "use_repo", "use_git_ref",
+               "extra_repository", "extra_ref", "extra_path")
+    for job_id, plan_job, artifacts in (("fix", "plan", ("ci-fix-plan", "ci-fix-result")),
+                                        ("fix-upstream", "plan-upstream",
+                                         ("ci-fix-upstream-plan", "ci-fix-upstream-result"))):
+        job = jobs[job_id]
+        assert job["uses"] == f"./{_JOB.as_posix()}" and job["needs"] == plan_job
+        assert job["permissions"] == {"contents": "read", "id-token": "write"}
+        assert job["secrets"] == {"AWS_ROLE_ARN": "${{ secrets.AWS_ROLE_ARN }}"}
+        assert job["with"] == {
+            "plan": f"{artifacts[0]}-${{{{ inputs.key }}}}", "result": f"{artifacts[1]}-${{{{ inputs.key }}}}",
+            **{name: f"${{{{ needs.{plan_job}.outputs.{name} }}}}" for name in outputs},
+        }
+        assert set(jobs[plan_job]["outputs"]) >= set(outputs)
+    # In unstable's job, or on the bot's runner when it cannot host the fix, like the release branch's.
+    assert jobs["fix-upstream"]["if"] == jobs["fix"]["if"].replace("needs.plan.", "needs.plan-upstream.")
+    assert jobs["plan-upstream"]["needs"] == ["plan", "fix"]
+    assert "needs.plan.outputs.upstream == 'true'" in jobs["plan-upstream"]["if"]
+    assert jobs["plan"]["outputs"]["upstream"] == "${{ steps.plan.outputs.upstream }}"
+    assert jobs["publish"]["needs"] == ["plan", "fix", "plan-upstream", "fix-upstream"]
+    # A sweep's outcome is the one plan-upstream passed on or unstable's job made, never the release branch's.
+    download = next(step for step in jobs["publish"]["steps"] if step.get("name") == "Download the fix")
+    assert download["with"]["name"] == (
+        "${{ needs.plan.outputs.upstream == 'true' && format('ci-fix-upstream-result-{0}', inputs.key)"
+        " || format('ci-fix-result-{0}', inputs.key) }}"
+    )
 
 
 def test_every_fix_job_uses_the_same_isolated_lifecycle():
     from scripts.ci_fix.engine import AWS_SESSION_S
 
-    jobs = _run_jobs()
+    jobs = _fix_jobs()
     for job_id in _FIX_JOBS:
         steps = jobs[job_id]["steps"]
         names = [step.get("name") for step in steps]
@@ -478,7 +528,7 @@ def test_every_fix_job_uses_the_same_isolated_lifecycle():
 
 def test_the_job_setup_and_dependencies_run_before_any_credential_and_the_agent_apart():
     for job_id in _FIX_JOBS:
-        names = [step.get("name") for step in _run_jobs()[job_id]["steps"]]
+        names = [step.get("name") for step in _fix_jobs()[job_id]["steps"]]
         before = "Install Valkey build and test dependencies" if job_id == "fix-local" else "Run the job's own setup and build"
         assert names.index(before) < names.index("CI fix: configure AWS credentials"), job_id
         if job_id != "fix-local":
@@ -687,8 +737,8 @@ def test_the_isolation_tests_also_run_as_root_in_a_container():
 def test_a_rerun_of_a_fix_replaces_its_artifacts():
     """An artifact name is unique per run: re-running a failed fix run would fail on its upload."""
     uploads = [
-        step for job in _run_jobs().values() for step in job.get("steps") or []
+        step for jobs in (_run_jobs(), _fix_jobs()) for job in jobs.values() for step in job.get("steps") or []
         if "actions/upload-artifact@" in step.get("uses", "")
     ]
-    assert len(uploads) == 5
+    assert len(uploads) == 7
     assert all(step["with"].get("overwrite") is True for step in uploads)

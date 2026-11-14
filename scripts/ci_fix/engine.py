@@ -55,8 +55,10 @@ from scripts.ci_fix.models import (
     FixCandidate,
     FixContext,
     FixPolicy,
+    FixTarget,
     FixTask,
     TargetKind,
+    UpstreamRun,
 )
 from scripts.ci_fix.policy import target_capabilities
 from scripts.ci_fix.prior_fixes import (
@@ -196,6 +198,144 @@ def prepare_fix(
             agent_func=agent_func, review=review_func or review_candidate,
             run_test=run_test if runs_tests else None, deadline=deadline, job=job,
         )
+
+
+# A fix for the default branch has to pass this many loops there, or every
+# loop its test can run.
+UPSTREAM_MIN_LOOPS = 10
+
+
+def upstream_task(task: FixTask, sha: str) -> FixTask:
+    """The task of making ``task``'s fix for ``task.target.upstream_branch``, at its commit ``sha``.
+
+    It runs in that branch's own CI job, the one named like the failed job in
+    the same workflow file at ``sha`` (``scripts/ci_fix/run.py`` ``plan_upstream``).
+    """
+    branch, release = task.target.upstream_branch, task.failure.base_branch
+    return replace(
+        task,
+        failure=replace(task.failure, base_branch=branch, head_sha=sha, workflow_sha="", description=(
+            f"{task.failure.description} It failed on release branch `{release}`, where the fix below was made. "
+            f"The working tree is the default branch, `{branch}`, which has the failing test: make the same fix "
+            f"here, written for this branch's code, or refuse and say why this branch needs none."
+        )),
+        target=FixTarget(
+            kind=TargetKind.DRAFT_PR, repo_full_name=task.target.repo_full_name,
+            base_repo_full_name=task.target.base_repo_full_name, branch=f"{branch}-fix", expected_sha=sha,
+        ),
+        policy=FixPolicy.GENERAL,
+        open_fixes=(),
+    )
+
+
+def prepare_upstream(
+    task: FixTask,
+    job_log: str,
+    release: FixCandidate,
+    agent_func: AgentFunc = run_fix_agent,
+    review_func: ReviewFunc | None = None,
+    test_func: TestFunc | None = None,
+    *,
+    sha: str,
+    repo_dir: str = "",
+    job: JobCommands | None = None,
+) -> FixCandidate:
+    """``release``, the release branch's fix for ``task``, made for ``task.target.upstream_branch`` at ``sha``.
+
+    A sweep's failure in a test the default branch shares is fixed there
+    once, and backported. ``repo_dir`` is the default branch's own CI job's
+    checkout, after that job's setup and build, or, when that job cannot
+    host a fix, a clone is made on the bot's runner. The release branch's
+    patch is applied there, and has to build and pass, looped at least
+    ``UPSTREAM_MIN_LOOPS`` times. When it does not apply, or does not pass,
+    the agent makes the same fix for the default branch's code, which is
+    checked and reviewed like any other. Either is ``release.upstream``. When
+    the agent finds the default branch needs none, ``release`` is the release
+    branch's own fix, and says why in its verification; when no fix can be
+    made there, ``release.upstream_refusal`` says why.
+    """
+    branch = task.target.upstream_branch
+    on_branch = upstream_task(task, sha)
+    with checkout(on_branch, repo_dir) as (repo_dir, _head):
+        deadline = time.monotonic() + PREPARE_BUDGET_S
+        run_test = test_func or run_test_command
+        review = review_func or review_candidate
+        tests = locate_unit_tests(repo_dir, failed_tests(task, job_log)) or release.failing_tests
+        failed = ""
+        try:
+            run_git(repo_dir, "apply", "--whitespace=nowarn", "-", input=release.patch)
+        except subprocess.CalledProcessError:
+            logger.info("The fix does not apply to %s at %s as it is", branch, sha[:12])
+        else:
+            plan = plan_for(repo_dir, tests, scheduled=task.failure.scheduled, job=job)
+            checks = [f"The fix applies to `{branch}` at `{sha[:12]}`, and was run there too."]
+            if plan is None:
+                failed = f"No command here can run the failing test on `{branch}`."
+            else:
+                failed = _verify(
+                    release, repo_dir, plan, run_test, deadline, checks, min_loops=UPSTREAM_MIN_LOOPS,
+                ) or _verify_added_tests(on_branch, release, repo_dir, run_test, deadline, checks, job)
+            if not failed:
+                return replace(release, upstream=UpstreamRun(
+                    sha=sha, tests=tests, verification="\n".join(checks),
+                    patch=release.patch, changed_paths=release.changed_paths,
+                ))
+            restore(repo_dir)
+        made = _made_upstream(
+            on_branch, task.failure.base_branch, repo_dir, release, tests, job_log, failed,
+            agent_func=agent_func, review=review, run_test=run_test, deadline=deadline, job=job,
+        )
+    if made.agent_refused:
+        # The default branch needs no fix: the release branch's is its own.
+        return replace(release, verification="\n".join(filter(None, (
+            release.verification, f"On `{branch}`, which has the failing test, the agent made no fix: {made.summary}",
+        ))))
+    if made.action is not CandidateAction.PATCH or made.not_run:
+        return replace(release, upstream_refusal=(
+            f"`{branch}` has the failing test, but no fix for it could be made there. {made.summary}"
+        ))
+    return replace(release, upstream=UpstreamRun(
+        sha=sha, tests=tests, verification=made.verification, patch=made.patch, changed_paths=made.changed_paths,
+        title=made.title or release.title, reasoning=made.reasoning,
+    ))
+
+
+def _made_upstream(
+    task: FixTask,
+    release_branch: str,
+    repo_dir: str,
+    candidate: FixCandidate,
+    tests: tuple[FailedTest, ...],
+    job_log: str,
+    failed: str,
+    *,
+    agent_func: AgentFunc,
+    review: ReviewFunc,
+    run_test: TestFunc,
+    deadline: float,
+    job: JobCommands | None,
+) -> FixCandidate:
+    """The agent's fix for ``task``, the default branch's: ``candidate``, the release branch's, made for its code."""
+    branch, sha = task.failure.base_branch, task.failure.head_sha
+    context, plan = _establish(
+        task, repo_dir, tests, paths_in_log(repo_dir, job_log), runs_tests=True, job=job, job_log=job_log,
+    )
+    refusal = _unverifiable_refusal(context, plan)
+    if refusal is not None:
+        return refusal
+    shown = "\n\n".join(part for part in (
+        f"The fix made on `{release_branch}`, which passed there:",
+        f"Root cause: {candidate.root_cause}" if candidate.root_cause else "",
+        f"The fix: {candidate.reasoning}" if candidate.reasoning else "",
+        f"```diff\n{candidate.patch}\n```",
+        f"On `{branch}` as it is, it did not pass:\n\n{failed}" if failed else
+        f"It does not apply to `{branch}` as it is: this branch's code differs.",
+    ) if part)
+    return _fix_loop(
+        task, repo_dir, sha, job_log, replace(context, release_fix=shown), plan,
+        agent_func=agent_func, review=review, run_test=run_test, deadline=deadline, job=job,
+        min_loops=UPSTREAM_MIN_LOOPS,
+    )
 
 
 def _unverifiable_refusal(context: FixContext, plan: VerifyPlan | None) -> FixCandidate | None:
@@ -422,6 +562,9 @@ def _establish(
             pending_fixes(repo_dir, task.target.fix_branch)
             if task.target.fix_branch and task.target.fix_branch not in task.target.closed_fix_branches else ""
         ),
+        open_fixes="".join(
+            f"## #{fix.number}: {fix.title}\n\n```diff\n{fix.diff}\n```\n\n" for fix in task.open_fixes
+        ),
         verification=described,
         verified_by_code=plan is not None,
         upstream_first=upstream_first,
@@ -517,6 +660,7 @@ def _fix_loop(
     run_test: TestFunc | None,
     deadline: float,
     job: JobCommands | None = None,
+    min_loops: int = 1,
 ) -> FixCandidate:
     established = _established_checks(context)
     feedback = ""
@@ -579,7 +723,9 @@ def _fix_loop(
             # Not the plan code made before the agent ran, which ran nothing.
             checks = [check for check in checks if check != context.verification]
             checks.append(
-                "Code could not tell from the log which test failed, so it ran the one the author named: "
+                ("On this branch the failing test may have another name, so code ran the ones the author named: "
+                 if context.release_fix else
+                 "Code could not tell from the log which test failed, so it ran the one the author named: ")
                 + ", ".join(f"`{test.name}` in `{test.file}`" if test.name else f"`{test.file}`" for test in named_tests)
                 + ". Check against the log that it is the test that failed."
             )
@@ -600,7 +746,7 @@ def _fix_loop(
         try:
             failed = ""
             if run_test is not None and round_plan is not None:
-                failed = _verify(reviewed, repo_dir, round_plan, run_test, deadline, checks)
+                failed = _verify(reviewed, repo_dir, round_plan, run_test, deadline, checks, min_loops=min_loops)
                 if not failed:
                     failed = _verify_added_tests(task, reviewed, repo_dir, run_test, deadline, checks, job)
             if not failed:
@@ -771,18 +917,22 @@ def _named_plan(
     """The plan that runs the tests the agent named, when code could name none: (plan, tests), or None.
 
     A valgrind or sanitizer report, or a test client's exception, names no
-    test on its result line; the agent reads the whole log and can. Only a
-    test that is in the checkout is run, and the reviewer is told which one
-    it was and asked to check it against the log.
+    test on its result line; the agent reads the whole log and can. On the
+    default branch, the release branch's failing test may have another name
+    there (a test split into variants), which its file may build from
+    variables. Only a test that is in the checkout is run, and the reviewer is
+    told which one it was and asked to check it against the log.
     """
-    if not (context.reviewed_only or context.only_built) or not candidate.failing_tests:
+    if not (context.reviewed_only or context.only_built or context.release_fix) or not candidate.failing_tests:
         return None
     named = []
     for test in locate_unit_tests(repo_dir, candidate.failing_tests):
         path = Path(repo_dir, test.file)
         if ".." in Path(test.file).parts or not _inside_checkout(repo_dir, path) or not path.is_file():
             continue
-        if test.name and test.name not in path.read_text(encoding="utf-8", errors="replace"):
+        # A name built from variables is not in the file: one that does not
+        # run is caught by the run (VerifyPlan.ran), and the agent is told.
+        if test.name and not context.release_fix and test.name not in path.read_text(encoding="utf-8", errors="replace"):
             continue
         named.append(test)
     if not named:
@@ -960,6 +1110,8 @@ def _verify(
     run_test: TestFunc,
     deadline: float,
     checks: list[str],
+    *,
+    min_loops: int = 1,
 ) -> str:
     """Run the candidate's tests; "" when they hold, else feedback for the agent.
 
@@ -970,7 +1122,7 @@ def _verify(
     _remove_ignored(repo_dir)
     if any(path.startswith("deps/") for path in changed_lines(candidate.patch)):
         _rebuild_dependencies(repo_dir)
-    return _verify_with_plan(plan, repo_dir, run_test, deadline, checks)
+    return _verify_with_plan(plan, repo_dir, run_test, deadline, checks, min_loops=min(min_loops, plan.loops))
 
 
 def _rebuild_dependencies(repo_dir: str) -> None:
@@ -990,6 +1142,8 @@ def _verify_with_plan(
     run_test: TestFunc,
     deadline: float,
     checks: list[str],
+    *,
+    min_loops: int = 1,
 ) -> str:
     """The patched code building and its test passing, the way the CI job runs it; feedback when not.
 
@@ -1016,6 +1170,9 @@ def _verify_with_plan(
             return _not_passing(current, current.quoted(1), 1, first)
         current = current.fallback
     loops = _loops_that_fit(current, first.seconds, deadline)
+    if loops < min(min_loops, current.loops):
+        # Nothing is known about the change: the attempt failed, and is retried.
+        raise RuntimeError(f"Only {loops} loop(s) of `{current.quoted(1)}` fit in the time left, not {min_loops}.")
     if loops > 1:
         looped = _run(run_test, repo_dir, current.command(loops), deadline)
         if not (looped.passed and current.ran(looped)):
@@ -1146,7 +1303,12 @@ def _checked_candidate(
 
     changed_paths = worktree_changed_paths(repo_dir, strict=True)
     if candidate.action is CandidateAction.REFUSE:
-        return replace(candidate, patch="", changed_paths=(), port_commit="", adapts="", validation="")
+        # Only a pull request the agent was shown can be the one that fixes it.
+        shown = {fix.number for fix in task.open_fixes}
+        return replace(
+            candidate, patch="", changed_paths=(), port_commit="", adapts="", validation="",
+            open_fix=candidate.open_fix if candidate.open_fix in shown else 0, agent_refused=True,
+        )
     if not candidate.failing_check:
         # The job is what failed, whatever else the agent left out.
         candidate = replace(candidate, failing_check=task.failure.job_name)

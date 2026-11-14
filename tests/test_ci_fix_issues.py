@@ -133,7 +133,7 @@ def _issue(
 
 
 def _linked_pr_event(number: int = 7) -> SimpleNamespace:
-    source = SimpleNamespace(pull_request=object(), state="open", title="Deflake", body=f"Fixes #{number}")
+    source = SimpleNamespace(number=31, pull_request=object(), state="open", title="Deflake", body=f"Fixes #{number}")
     return SimpleNamespace(
         event="cross-referenced",
         source=SimpleNamespace(issue=source),

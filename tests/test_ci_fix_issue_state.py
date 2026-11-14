@@ -25,7 +25,7 @@ def test_parse_detector_occurrence_rejects_missing_or_malformed_markers() -> Non
 
 
 def _event(event: str = "cross-referenced", state: str = "open", title: str = "", body: str = "") -> SimpleNamespace:
-    source = SimpleNamespace(pull_request=object(), state=state, title=title, body=body)
+    source = SimpleNamespace(number=31, pull_request=object(), state=state, title=title, body=body)
     return SimpleNamespace(event=event, source=SimpleNamespace(issue=source))
 
 

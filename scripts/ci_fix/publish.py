@@ -6,6 +6,8 @@ A candidate is published in one of these ways:
   PR into it, which it opens when there is none;
 * for a sweep PR's failure that a merged upstream commit fixes, name the
   upstream PR the sweep should backport;
+* for a sweep PR's failure in a test the default branch shares, open it
+  as a pull request into the default branch (:mod:`scripts.ci_fix.upstream`);
 * suggest a patch on a contributor PR;
 * post a patch on a detector issue; or
 * open a draft fix PR for a detector issue.
@@ -24,6 +26,7 @@ from github.GithubException import GithubException
 from scripts.backport import ci_sweep
 from scripts.backport.pr_creator import create_pull_from_push_repo
 from scripts.backport.sweep_prs import delete_stale_backport_branch, find_existing_pr
+from scripts.ci_fix import upstream
 from scripts.ci_fix.comment import candidate_context, prose
 from scripts.ci_fix.issue_state import has_open_linked_pr, parse_detector_occurrence
 from scripts.ci_fix.models import (
@@ -73,6 +76,8 @@ def publish_candidate(
     or as a patch posted on the issue, which pushes nothing.
     """
     if candidate.action is CandidateAction.REFUSE:
+        if task.target.fix_branch and candidate.open_fix:
+            return upstream.open_fix_result(task, candidate)
         return FixResult(
             kind=ResultKind.REFUSED,
             summary=candidate.summary or candidate.reasoning or "No safe fix was found.",
@@ -93,6 +98,9 @@ def publish_candidate(
         # A sweep backports an upstream fix by its pull request, adapted or
         # not: the pull request is the fix to name.
         return _suggest_backport(gh, task, candidate)
+    if target.fix_branch and (candidate.upstream is not None or candidate.upstream_refusal):
+        # The fix is the default branch's too: it is made there, and backported.
+        return upstream.publish(gh, task, candidate, git_env=git_env)
     if target.kind is TargetKind.SUGGEST:
         return _publish_suggestion(gh, task, candidate)
     if candidate.not_run and candidate.action is CandidateAction.PATCH:

@@ -1,0 +1,322 @@
+name: CI Fix Job
+
+# One fix job of ci-fix-run.yml, for the plan its artifact `plan` holds: in
+# the failed job itself, on its runner (fix-in-job), in its container if it
+# has one (fix-in-container), or, when that job cannot host the fix, on the
+# bot's own runner (fix-local). It holds no GitHub token. Its outcome is the
+# artifact `result`. ci-fix-run.yml calls it for the failed job, and for a
+# sweep's failure in a test the default branch has too, again for the default
+# branch's own job of the same name.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "The plan's artifact"
+        required: true
+        type: string
+      result:
+        description: "The artifact the outcome is uploaded as"
+        required: true
+        type: string
+      # Where the fix runs, as ci-fix-run.yml's plan job resolved it (scripts/ci_fix/run.py).
+      mode:
+        required: true
+        type: string
+      job:
+        type: string
+        default: ""
+      runs_on:
+        type: string
+        default: ""
+      container:
+        type: string
+        default: ""
+      timeout_minutes:
+        type: string
+        default: ""
+      use_repo:
+        type: string
+        default: ""
+      use_git_ref:
+        type: string
+        default: ""
+      extra_repository:
+        type: string
+        default: ""
+      extra_ref:
+        type: string
+        default: ""
+      extra_path:
+        type: string
+        default: ""
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # The failed job, on its own runner. A job with a container runs in
+  # fix-in-container instead: an empty container value does not reliably
+  # mean none.
+  fix-in-job:
+    name: "Fix in ${{ inputs.job }}"
+    if: inputs.mode == 'job' && inputs.container == ''
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CI_FIX_IN_JOB: "1"
+    steps:
+      - name: Check out the commit to fix
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.use_repo }}
+          ref: ${{ inputs.use_git_ref }}
+          persist-credentials: false
+      - name: Check out the job's other repository
+        if: inputs.extra_repository != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.extra_repository }}
+          ref: ${{ inputs.extra_ref }}
+          path: ${{ inputs.extra_path }}
+          persist-credentials: false
+      - name: 'CI fix: download the plan'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ inputs.plan }}
+          path: ${{ runner.temp }}/ci-fix-plan
+      - name: 'CI fix: check out the agent'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .ci-fix-agent
+          persist-credentials: false
+      - name: 'CI fix: set up the agent'
+        uses: ./.ci-fix-agent/.github/actions/setup-agent
+        with:
+          path: .ci-fix-agent
+          install-claude: 'true'
+      - name: 'CI fix: stage the isolated checkout'
+        shell: bash
+        run: bash .ci-fix-agent/scripts/ci_fix/job.sh stage
+      - name: Run the job's own setup and build
+        shell: bash
+        run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" setup
+      - name: 'CI fix: configure AWS credentials'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ci-fix-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 18000
+      - name: 'CI fix: prepare the fix in this job'
+        shell: bash
+        env:
+          CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
+        run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
+      - name: 'CI fix: ensure the fix has a result'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ensure-result
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh ensure-result
+          fi
+      - name: 'CI fix: clean up the isolated checkout'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" cleanup
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh cleanup
+          fi
+      - name: 'CI fix: upload the result'
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.result }}
+          path: ${{ runner.temp }}/ci-fix-out/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+  # The failed job in its container on its runner, as root; the agent's own
+  # tools come from the distribution's packages.
+  fix-in-container:
+    name: "Fix in ${{ inputs.job }}"
+    if: inputs.mode == 'job' && inputs.container != ''
+    runs-on: ${{ inputs.runs_on }}
+    container: ${{ inputs.container }}
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CI_FIX_IN_JOB: "1"
+      # Without git in the container, the checkout is an archive of this.
+      CI_FIX_REPOSITORY: ${{ inputs.use_repo }}
+      CI_FIX_COMMIT: ${{ inputs.use_git_ref }}
+    steps:
+      - name: Check out the commit to fix
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.use_repo }}
+          ref: ${{ inputs.use_git_ref }}
+          persist-credentials: false
+      - name: Check out the job's other repository
+        if: inputs.extra_repository != ''
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.extra_repository }}
+          ref: ${{ inputs.extra_ref }}
+          path: ${{ inputs.extra_path }}
+          persist-credentials: false
+      - name: 'CI fix: download the plan'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ inputs.plan }}
+          path: ${{ runner.temp }}/ci-fix-plan
+      - name: 'CI fix: check out the agent'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .ci-fix-agent
+          persist-credentials: false
+      - name: 'CI fix: set up the agent'
+        uses: ./.ci-fix-agent/.github/actions/setup-agent
+        with:
+          path: .ci-fix-agent
+          install-claude: 'true'
+          system-packages: 'true'
+      - name: 'CI fix: stage the isolated checkout'
+        shell: bash
+        run: bash .ci-fix-agent/scripts/ci_fix/job.sh stage
+      - name: Run the job's own setup and build
+        shell: bash
+        run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" setup
+      - name: 'CI fix: configure AWS credentials'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ci-fix-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 18000
+      - name: 'CI fix: prepare the fix in this job'
+        shell: bash
+        env:
+          CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
+        run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
+      - name: 'CI fix: ensure the fix has a result'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ensure-result
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh ensure-result
+          fi
+      - name: 'CI fix: clean up the isolated checkout'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" cleanup
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh cleanup
+          fi
+      - name: 'CI fix: upload the result'
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.result }}
+          path: ${{ runner.temp }}/ci-fix-out/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+  fix-local:
+    name: "Fix on the bot's runner"
+    if: inputs.mode == 'local'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: 'CI fix: download the plan'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ inputs.plan }}
+          path: ${{ runner.temp }}/ci-fix-plan
+      - name: Install Valkey build and test dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            build-essential pkg-config libssl-dev tcl8.6 tclx tcl-tls valgrind
+      # The CI-fix steps every fix job ends with.
+      - name: 'CI fix: check out the agent'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .ci-fix-agent
+          persist-credentials: false
+      - name: 'CI fix: set up the agent'
+        uses: ./.ci-fix-agent/.github/actions/setup-agent
+        with:
+          path: .ci-fix-agent
+          install-claude: 'true'
+      - name: 'CI fix: stage the isolated checkout'
+        shell: bash
+        run: bash .ci-fix-agent/scripts/ci_fix/job.sh stage
+      - name: 'CI fix: configure AWS credentials'
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ci-fix-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 18000
+      - name: 'CI fix: prepare the fix in this job'
+        shell: bash
+        env:
+          CI_AGENT_CLAUDE_MODEL: ${{ vars.CI_AGENT_CLAUDE_MODEL }}
+        run: bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" run
+      - name: 'CI fix: ensure the fix has a result'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ensure-result
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh ensure-result
+          fi
+      - name: 'CI fix: clean up the isolated checkout'
+        if: always()
+        shell: bash
+        run: |
+          if [[ -x "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" ]]; then
+            bash "${RUNNER_TEMP}/ci-fix-agent/scripts/ci_fix/job.sh" cleanup
+          elif [[ -x .ci-fix-agent/scripts/ci_fix/job.sh ]]; then
+            bash .ci-fix-agent/scripts/ci_fix/job.sh cleanup
+          fi
+      - name: 'CI fix: upload the result'
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.result }}
+          path: ${{ runner.temp }}/ci-fix-out/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true

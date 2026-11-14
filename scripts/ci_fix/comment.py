@@ -26,6 +26,11 @@ def render_result(result: FixResult) -> str:
     if result.task.target.fix_branch:
         # A sweep PR is told in a line where its fix went, or why there is
         # none: the fix is explained on the CI-sweep PR, where it is reviewed.
+        upstream, base = result.task.target.upstream_branch, failure.base_branch
+        if result.open_upstream and result.kind is ResultKind.OPENED:
+            return f"Opened #{result.pr_number} into `{upstream}` with a fix for {job}. Backport it to `{base}` once it merges."
+        if result.open_upstream:
+            return f"#{result.pr_number}, open on `{upstream}`, fixes {job}. Backport it to `{base}` once it merges."
         if result.kind is ResultKind.OPENED:
             return f"Opened #{result.pr_number} with a fix for {job}: {result.commit_sha}."
         if result.kind is ResultKind.PUSHED:

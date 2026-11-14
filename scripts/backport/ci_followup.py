@@ -10,9 +10,12 @@ failures in the newest scheduled run of every release branch (Valkey's
 weekly.yml) are fixed on the sweep PR the same way: its backports are what
 the branch will be.
 
-A sweep PR's fixes are not pushed to it: each is run on its head and then
-added to its CI-sweep PR (:mod:`scripts.backport.ci_sweep`), so that they are
-reviewed apart from the backports. A job with a fix there is not fixed again.
+A sweep PR's fixes are not pushed to it. A fix for a test the default branch
+shares is made there too and opened as a pull request into it, which the
+sweep backports once it merges (:mod:`scripts.ci_fix.upstream`). Any other is
+run on its head and then added to its CI-sweep PR (:mod:`scripts.backport.ci_sweep`),
+so that it is reviewed apart from the backports. A job with a fix there is not
+fixed again.
 
 The engine owns diagnosis, editing, and publication. The target PR's normal CI
 remains the final verifier. Published fixes and reasoned refusals are
@@ -35,6 +38,7 @@ from scripts.backport import ci_sweep
 from scripts.backport.registry import RepoEntry, load_registry
 from scripts.backport.sweep import _BRANCH_PREFIX
 from scripts.backport.sweep_prs import find_existing_pr
+from scripts.ci_fix import upstream
 from scripts.ci_fix.comment import render_ci_sweep_fix, render_result
 from scripts.ci_fix.github_runs import (
     FailedJob,
@@ -355,6 +359,21 @@ def plan_request(
 
     selected_job = target.job
     fix_branch = ci_sweep.fix_branch_for(target.head_branch, target_branch)
+    upstream_branch = ""
+    if fix_branch:
+        # A sweep's own fix that applies to the default branch is a pull
+        # request into it (scripts/ci_fix/upstream.py). While the bot has as
+        # many of those open as it may, the sweep's failures wait.
+        upstream_branch = str(retry_github_call(
+            lambda: gh.get_repo(repo_entry.repo).default_branch, retries=2, description=f"get {repo_entry.repo}",
+        ))
+        if upstream.cap_reached(gh, repo_entry.repo, upstream_branch):
+            return {
+                "repo": repo_entry.repo,
+                "branch": target_branch,
+                "action": "skipped",
+                "reason": "upstream-pr-cap-reached",
+            }
     run_attempt = int(getattr(target.run, "run_attempt", 1) or 1)
     job_name, described = selected_job.name, f"the failure in job `{selected_job.name}`"
     if target.release_run:
@@ -395,6 +414,7 @@ def plan_request(
             closed_fix_branches=(
                 ci_sweep.closed_branches(gh, repo_entry.repo, repo_entry.effective_push_repo) if fix_branch else ()
             ),
+            upstream_branch=upstream_branch,
         ),
         # A backport branch's failure is usually a missing upstream change; a
         # pushed CI fix or a draft PR has no upstream counterpart to port.
@@ -416,8 +436,15 @@ def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:
             "pull request is into." if failure.scheduled else f"Automatic follow-up on this {what}'s CI."
         )
         body = f"{lead}\n\n" + render_result(result)
-        declined = result.candidate is not None and result.candidate.action is CandidateAction.REFUSE
-        backport = bool(plan.task.target.fix_branch and result.kind is ResultKind.SUGGESTED and result.pr_number)
+        declined = (
+            result.kind is ResultKind.REFUSED
+            and result.candidate is not None and result.candidate.action is CandidateAction.REFUSE
+        )
+        # A pull request that fixes it upstream, merged or open: the job waits for its backport.
+        backport = bool(
+            plan.task.target.fix_branch and result.pr_number
+            and (result.kind is ResultKind.SUGGESTED or result.open_upstream)
+        )
         reason = f" reason={_DECLINED}" if declined else f" reason={_BACKPORT}" if backport else ""
         markers = "\n".join(
             marker.removesuffix(" -->") + f" outcome={result.kind.value}{reason} -->" for marker in plan.markers
@@ -435,7 +462,7 @@ def report_result(gh: Any, plan: FixPlan, result: FixResult) -> dict[str, Any]:
                 retries=3,
                 description=f"post automatic CI follow-up on #{failure.pr_number}",
             )
-        if plan.task.target.fix_branch and result.pr_number and result.kind in _FIXED_KINDS:
+        if plan.task.target.fix_branch and result.pr_number and result.kind in _FIXED_KINDS and not backport:
             explained = render_ci_sweep_fix(result)
             try:
                 retry_github_call(

@@ -170,6 +170,10 @@ class FixTarget:
     # With ``fix_branch``: the CI-sweep branches that had no open pull
     # request when the fix was planned (:func:`ci_sweep.closed_branches`).
     closed_fix_branches: tuple[str, ...] = ()
+    # With ``fix_branch``: the default branch. A fix of the bot's own is run
+    # there too, and when it applies there it is a pull request into it, not
+    # a CI-sweep fix (:mod:`scripts.ci_fix.upstream`).
+    upstream_branch: str = ""
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,39 @@ class OtherIssue:
 
     number: int
     test: FailedTest
+
+
+@dataclass(frozen=True)
+class OpenFix:
+    """An open pull request into the default branch that may fix the failure, as the agent is shown it."""
+
+    number: int
+    title: str
+    # Its diff to the files the failure names, or its whole diff, shortened.
+    diff: str = ""
+
+
+@dataclass(frozen=True)
+class UpstreamRun:
+    """The fix made for the default branch too, for a pull request into it."""
+
+    # The default branch commit it was made on and run on.
+    sha: str
+    # The failing tests it ran there: one pull request a test.
+    tests: tuple[FailedTest, ...]
+    # What code established there, for the pull request.
+    verification: str
+    # The change on the default branch: the release branch's own patch when
+    # it applies there and passes, else the agent's adaptation of it.
+    patch: str = ""
+    changed_paths: tuple[str, ...] = ()
+    # Set for an adaptation: its commit subject, and why it is the change.
+    title: str = ""
+    reasoning: str = ""
+
+    @property
+    def adapted(self) -> bool:
+        return bool(self.title or self.reasoning)
 
 
 @dataclass(frozen=True)
@@ -190,6 +227,9 @@ class FixTask:
     # Other open detector issues whose test this patch may also fix. Each is
     # verified on its own before the draft PR claims to fix it.
     other_issues: tuple[OtherIssue, ...] = ()
+    # Open pull requests into ``target.upstream_branch`` that name the failing
+    # test or close its detector issue: one may already fix the failure.
+    open_fixes: tuple[OpenFix, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -226,6 +266,19 @@ class FixCandidate:
     # A patch like that is posted for a person to apply, never pushed. Never
     # written by the agent.
     not_run: bool = False
+    # An open pull request into the default branch (one of
+    # ``FixTask.open_fixes``) that the agent says fixes the failure, on a
+    # refusal; checked by code.
+    open_fix: int = 0
+    # A refusal the agent made, not code (for a check, review or session
+    # that failed). Never written by the agent.
+    agent_refused: bool = False
+    # The fix made for the default branch too, and passed there. Never
+    # written by the agent.
+    upstream: Optional[UpstreamRun] = None
+    # Why no fix for the default branch, whose failing test it shares, could
+    # be made. Never written by the agent.
+    upstream_refusal: str = ""
 
 
 @dataclass(frozen=True)
@@ -252,6 +305,12 @@ class FixContext:
     # The fixes already made for this sweep PR, waiting in its CI-sweep PR and
     # not on the working commit: a failure is not fixed twice.
     pending_fixes: str = ""
+    # Open pull requests into the default branch that may fix the failure
+    # (``FixTask.open_fixes``), with their diffs.
+    open_fixes: str = ""
+    # On the default branch: the fix made for the release branch that
+    # failed, to make the same fix here (``engine.prepare_upstream``).
+    release_fix: str = ""
     # How code verifies a candidate, and whether it does.
     verification: str = ""
     verified_by_code: bool = False
@@ -281,6 +340,10 @@ class FixResult:
     commit_sha: str = ""
     pr_number: int = 0
     pr_url: str = ""
+    # ``pr_number`` is an open pull request into the default branch that
+    # fixes the failure, one this attempt opened or one already open: the
+    # sweep backports it once it merges.
+    open_upstream: bool = False
 
 
 @dataclass(frozen=True)

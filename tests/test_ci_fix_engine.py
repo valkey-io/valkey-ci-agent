@@ -384,7 +384,7 @@ def test_a_port_is_tested_and_the_checkout_restored(tmp_path, monkeypatch) -> No
         return _port_agent(commit)(task, repo_dir, job_log)
 
     agent.trees = []
-    monkeypatch.setattr(engine_mod, "_verify", lambda candidate, repo_dir, *a: seen.append(
+    monkeypatch.setattr(engine_mod, "_verify", lambda candidate, repo_dir, *a, **_k: seen.append(
         (Path(repo_dir) / "value.txt").read_text()) or "it still fails")
     candidate = engine_mod.prepare_fix(_task(head_sha), _LOG, agent_func=agent, test_func=test)
 
