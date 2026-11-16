@@ -1,4 +1,4 @@
-"""Run one CI fix as three jobs: plan, fix, publish.
+"""Run one CI fix as three jobs: plan, fix, publish; a sweep's, as five.
 
 Every front door runs its fix the same way, through ``ci-fix-run.yml``:
 a Test Failure Detector issue (:mod:`scripts.ci_fix.issues`), a maintainer's
@@ -15,6 +15,14 @@ request's red head (:mod:`scripts.backport.ci_followup`).
    fix or a refusal is reported on the target PR or issue; a failure stays in
    this repository's workflow logs and retry state.
 
+A backport sweep's fix of the bot's own, for a test the default branch has
+too, is made for the default branch before it is published:
+``plan-upstream`` (:func:`plan_upstream`) resolves the default branch's own
+job of the same name, and a second ``fix`` job, that one (or the bot's
+runner, when it cannot host a fix), makes the same fix there
+(:func:`scripts.ci_fix.engine.prepare_upstream`). Its outcome is the one
+published.
+
 The plan, the resolved job and the fix's outcome pass between the jobs as
 JSON (:mod:`scripts.ci_fix.state`).
 """
@@ -25,6 +33,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -32,11 +41,13 @@ from typing import Any, Callable
 from github import Auth, Github, GithubException
 
 from scripts.backport import ci_followup
-from scripts.ci_fix import issues
+from scripts.ci_fix import issues, upstream
 from scripts.ci_fix import main as pr_command
 from scripts.ci_fix.ci_job import JobSpec, Unsupported, resolve, setup_script, workflow_source
-from scripts.ci_fix.engine import prepare_fix
+from scripts.ci_fix.engine import failed_tests, prepare_fix, prepare_upstream, upstream_task
 from scripts.ci_fix.models import (
+    CandidateAction,
+    FixCandidate,
     FixOutcome,
     FixPlan,
     FixResult,
@@ -59,6 +70,10 @@ PLAN_FILE = "plan.json"
 JOB_FILE = "job.json"
 SETUP_FILE = "setup.sh"
 OUTCOME_FILE = "outcome.json"
+# In the plan of a fix for the default branch: the release branch's fix it is made from.
+RELEASE_FILE = "release.json"
+# And the default branch's commit it is made on.
+SHA_FILE = "sha"
 _PRIOR_PLAN_ARTIFACTS = 20
 # How a detector issue's fix is published (models.IssuePublication): a
 # repository variable, so that the draft PRs can be turned on without a change.
@@ -124,12 +139,25 @@ def _plan_job(gh: Any, artifact_client: Any, planned: FixPlan, out: Path) -> dic
     failure = planned.task.failure
     job_log = str(artifact_client.download_job_log(failure.repo_full_name, failure.job_id) or "")
     fix_plan = replace(planned, job_log=job_log)
+    if fix_plan.task.target.upstream_branch:
+        # Read from the log, as the engine reads them: the fix job has no GitHub token.
+        open_fixes = upstream.find_open_fixes(gh, fix_plan.task, failed_tests(fix_plan.task, job_log))
+        fix_plan = replace(fix_plan, task=replace(fix_plan.task, open_fixes=open_fixes))
     save(out / PLAN_FILE, fix_plan)
-    spec = job_for(gh, fix_plan.task)
-    # Publish asks for workflows:write only when the push may change .github/.
-    ci_changes = "true" if allows_ci_changes(fix_plan.task) else ""
+    return {
+        **_job_outputs(gh, fix_plan.task, out),
+        # Publish asks for workflows:write only when the push may change .github/.
+        "ci_changes": "true" if allows_ci_changes(fix_plan.task) else "",
+        # A sweep's fix may be made for the default branch too (plan_upstream).
+        "upstream": "true" if fix_plan.task.target.upstream_branch else "",
+    }
+
+
+def _job_outputs(gh: Any, task: FixTask, out: Path) -> dict[str, str]:
+    """Where ``task``'s fix runs: its job, saved in ``out`` with its setup, or the bot's runner."""
+    spec = job_for(gh, task)
     if spec is None:
-        return {"mode": "local", "ci_changes": ci_changes}
+        return {"mode": "local"}
     save(out / JOB_FILE, spec)
     (out / SETUP_FILE).write_text(setup_script(spec), encoding="utf-8")
     checkout = spec.checkout
@@ -139,13 +167,69 @@ def _plan_job(gh: Any, artifact_client: Any, planned: FixPlan, out: Path) -> dic
         "runs_on": spec.runs_on,
         "container": spec.container,
         "timeout_minutes": str(spec.timeout_minutes),
-        "use_repo": fix_plan.task.target.repo_full_name,
-        "use_git_ref": checked_out(fix_plan.task),
+        "use_repo": task.target.repo_full_name,
+        "use_git_ref": checked_out(task),
         "extra_repository": checkout.repository if checkout else "",
         "extra_ref": checkout.ref if checkout else "",
         "extra_path": checkout.path if checkout else "",
-        "ci_changes": ci_changes,
     }
+
+
+def plan_upstream(gh: Any, plan_dir: Path, outcome_dir: Path, out: Path, result_dir: Path) -> dict[str, str]:
+    """Plan making a sweep's fix for the default branch in that branch's own job, or pass its outcome on.
+
+    The fix is the bot's own patch, run on the release branch, for a test the
+    default branch has too. The default branch's job is the one named like
+    the failed job, in the same workflow file at the branch's tip: its setup
+    installs and builds what the branch needs, and it runs the test the way
+    the branch's CI does. Then ``out`` holds that job's plan, the release
+    branch's fix (``RELEASE_FILE``) and the branch's tip (``SHA_FILE``), and
+    ``mode`` is ``job``, or ``local`` when the job cannot host a fix, which
+    is then made on the bot's runner. Otherwise the outcome for publish, the
+    release branch's as it is, is in ``result_dir``.
+    """
+    fix_plan = load(plan_dir / PLAN_FILE, FixPlan)
+    source = outcome_dir / OUTCOME_FILE
+    if not source.is_file():
+        # Publish reports a fix job that ended without a result.
+        return {"mode": ""}
+    result_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        outcome = load(source, FixOutcome)
+    except (OSError, ValueError, TypeError, KeyError):
+        # Publish reports it as unreadable.
+        shutil.copyfile(source, result_dir / OUTCOME_FILE)
+        return {"mode": ""}
+    candidate, task = outcome.candidate, fix_plan.task
+    branch = task.target.upstream_branch
+    tests = (candidate.failing_tests or failed_tests(task, fix_plan.job_log)) if candidate else ()
+    if not (
+        candidate and branch and tests and candidate.action is CandidateAction.PATCH
+        and not candidate.adapts and not candidate.not_run
+    ):
+        save(result_dir / OUTCOME_FILE, outcome)
+        return {"mode": ""}
+    repo = gh.get_repo(task.failure.repo_full_name)
+    sha = repo.get_branch(branch).commit.sha
+    if not all(_has_file(repo, test.file, sha) for test in tests if test.file):
+        logger.info("%s does not have the failing test: the fix is %s's own", branch, task.failure.base_branch)
+        save(result_dir / OUTCOME_FILE, outcome)
+        return {"mode": ""}
+    outputs = _job_outputs(gh, upstream_task(task, sha), out)
+    save(out / PLAN_FILE, fix_plan)
+    save(out / RELEASE_FILE, candidate)
+    (out / SHA_FILE).write_text(sha, encoding="utf-8")
+    return outputs
+
+
+def _has_file(repo: Any, path: str, sha: str) -> bool:
+    try:
+        repo.get_contents(path, ref=sha)
+    except GithubException as exc:
+        if exc.status == 404:
+            return False
+        raise
+    return True
 
 
 def checked_out(task: FixTask) -> str:
@@ -191,7 +275,12 @@ def fix(plan_dir: Path, out: Path, *, repo_dir: str = "") -> FixOutcome:
     save(out / OUTCOME_FILE, FixOutcome(error="the fix job stopped before the fix finished", started=True))
     try:
         job = load(plan_dir / JOB_FILE, JobSpec).commands if (plan_dir / JOB_FILE).exists() else None
-        candidate = prepare_fix(fix_plan.task, fix_plan.job_log, repo_dir=repo_dir, job=job)
+        if (plan_dir / RELEASE_FILE).exists():
+            release = load(plan_dir / RELEASE_FILE, FixCandidate)
+            sha = (plan_dir / SHA_FILE).read_text(encoding="utf-8").strip()
+            candidate = prepare_upstream(fix_plan.task, fix_plan.job_log, release, sha=sha, repo_dir=repo_dir, job=job)
+        else:
+            candidate = prepare_fix(fix_plan.task, fix_plan.job_log, repo_dir=repo_dir, job=job)
         outcome = FixOutcome(candidate=candidate, started=True)
     except Exception as exc:  # noqa: BLE001 - the publish job reports every outcome
         logger.exception("CI-fix failed")
@@ -302,6 +391,13 @@ def main(argv: list[str] | None = None) -> int:
     plan_.add_argument("--request", required=True, help="the front door's request, as JSON")
     plan_.add_argument("--out", required=True, type=Path)
     plan_.add_argument("--key", default="", help="this fix's workflow artifact key")
+    upstream_ = commands.add_parser(
+        "plan-upstream", help="plan making a sweep's fix for the default branch, in that branch's own job",
+    )
+    upstream_.add_argument("--plan", required=True, type=Path)
+    upstream_.add_argument("--outcome", required=True, type=Path, help="the release branch's fix job's result")
+    upstream_.add_argument("--out", required=True, type=Path)
+    upstream_.add_argument("--result", required=True, type=Path, help="where the outcome for publish goes, if no job")
     fix_ = commands.add_parser("fix", help="prepare the planned fix; needs no GitHub token")
     fix_.add_argument("--plan", required=True, type=Path)
     fix_.add_argument("--out", required=True, type=Path)
@@ -360,6 +456,9 @@ def main(argv: list[str] | None = None) -> int:
         _write_outputs(outputs)
         action = outputs.get("action", "")
         return 1 if action == ResultKind.FAILED.value else 0
+    if args.command == "plan-upstream":
+        _write_outputs(plan_upstream(gh, args.plan, args.outcome, args.out, args.result))
+        return 0
 
     run_url = "{}/{}/actions/runs/{}".format(
         os.environ.get("GITHUB_SERVER_URL", "https://github.com"),

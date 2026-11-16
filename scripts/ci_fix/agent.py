@@ -128,6 +128,7 @@ Finish with only this JSON object:
   "changed_paths": ["path/edited/by/the/patch"],
   "port_commit": "{port_instruction}",
   "adapts_commit": "full SHA of the merged upstream commit a patch adapts, otherwise empty",
+  "open_fix": 0,
   "failing_tests": [{{"file": "tests/... or src/unit/... file of a test the log shows failing", "name": "the test's exact name, or empty for the whole file"}}],
   "validation": "optional notes: what you ruled out, what a maintainer should know"
 }}
@@ -240,6 +241,29 @@ def _context_prompt(context: FixContext, context_dir: Path, allows_port: bool) -
             "with its diff. They wait in a pull request of their own and are not on the working commit, so "
             "this pull request's CI still fails without them. When one of them already fixes this failure, "
             "refuse and say which one: a failure is not fixed twice. Otherwise do not repeat or undo them."
+        )
+    if context.release_fix:
+        release = context_dir / "release-branch-fix.md"
+        release.write_text(context.release_fix, encoding="utf-8")
+        sections.append(
+            "### The fix made on the release branch\n"
+            f"{release} holds the fix made for this failure on the release branch where it happened, with "
+            "its diagnosis. Make the same fix here: the same change where this branch's code is the same, "
+            "written for this branch's code where it differs, and nothing else. Say in `validation` how it "
+            "differs from the release branch's fix, and why. This branch may name the failing test "
+            "differently, as when a test was split into variants: then list this branch's tests that are the "
+            "failing one in `failing_tests`, each with its exact name as this branch's file builds it, and "
+            "code runs those instead."
+        )
+    if context.open_fixes:
+        open_fixes = context_dir / "open-pull-requests.md"
+        open_fixes.write_text(context.open_fixes, encoding="utf-8")
+        sections.append(
+            "### Open pull requests into the default branch\n"
+            f"{open_fixes} lists the open pull requests into the default branch that name the failing test "
+            "or close its detector issue, each with its diff. When one of them fixes this failure, refuse, "
+            "set `open_fix` to its number, and say why in `reasoning`: the fix is made once, there, and "
+            "backported. Otherwise leave `open_fix` at 0."
         )
     if context.verification:
         section = f"### Verification\n{context.verification}"
@@ -425,7 +449,18 @@ def _candidate_from_payload(payload: dict[str, Any]) -> FixCandidate:
         adapts=_text(payload.get("adapts_commit"), 40).lower(),
         validation=_text(payload.get("validation"), 2_000),
         title=_text(payload.get("title"), 120),
+        open_fix=_number(payload.get("open_fix")),
     )
+
+
+def _number(value: Any) -> int:
+    """A pull request number the agent named, or 0."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    text = str(value or "").strip().lstrip("#")
+    return int(text) if text.isdigit() else 0
 
 
 def _failure_type(value: Any) -> FailureType:

@@ -316,14 +316,16 @@ def build_fix_task(
         author=author,
     )
     target_kind = TargetKind.UPDATE_PR if bot_owned else TargetKind.SUGGEST
+    # A sweep PR carries only backports, whoever asks for its fix.
+    fix_branch = ci_sweep.fix_branch_for(head_branch, base_branch) if bot_owned else ""
     target = FixTarget(
         kind=target_kind,
         repo_full_name=head_repo,
         base_repo_full_name=pr_repo_full_name,
         branch=head_branch,
         expected_sha=head_sha,
-        # A sweep PR carries only backports, whoever asks for its fix.
-        fix_branch=ci_sweep.fix_branch_for(head_branch, base_branch) if bot_owned else "",
+        fix_branch=fix_branch,
+        closed_fix_branches=ci_sweep.closed_branches(gh, pr_repo_full_name, head_repo) if fix_branch else (),
     )
     failure = Failure(
         repo_full_name=pr_repo_full_name,

@@ -344,6 +344,11 @@ def test_another_release_branchs_ci_sweep_fixes_are_listed_without_its_sweeps_ba
 
     assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
     assert "Backport something" not in listed
+    # One whose pull request was closed: its fix was turned down.
+    assert sibling_branch_changes(
+        str(clone), (TEST_FILE,), own_branch="agent/backport/ci-sweep/9.0", base_branch="9.0",
+        compared_with="agent/backport/sweep", skip=("agent/backport/ci-sweep/9.1",),
+    ) == ""
 
 
 def test_the_fixes_waiting_in_the_ci_sweep_pr_are_listed_with_their_diffs(tmp_path):
@@ -380,3 +385,8 @@ def test_a_ci_sweep_branch_behind_its_sweep_shows_only_its_fixes(tmp_path):
 
     assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
     assert "Backport something" not in listed
+    # One whose pull request was closed: its fix was turned down.
+    assert sibling_branch_changes(
+        str(clone), (TEST_FILE,), own_branch="agent/backport/ci-sweep/9.0", base_branch="9.0",
+        compared_with="agent/backport/sweep", skip=("agent/backport/ci-sweep/9.1",),
+    ) == ""

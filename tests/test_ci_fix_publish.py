@@ -721,7 +721,7 @@ def test_a_sweep_fix_opens_the_ci_sweep_pr_into_the_sweep_branch(monkeypatch: py
 
 def test_a_later_sweep_fix_is_added_to_the_open_ci_sweep_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     earlier = _commit("e" * 40, "Fix earlier\n\nCI-Fix-Job: test-alpine\nCI-Fix-Run: https://x/runs/9")
-    added = _commit("d" * 40, "Fix unit/x\n\nCI-Fix-Job: unit tests\nCI-Fix-Adapts: " + "c" * 40)
+    added = _commit("d" * 40, "Fix unit/x\n\nCI-Fix-Job: unit tests")
     gh, repo, _sweep = _ci_sweep_gh(pushed=(earlier, added))
     seen: dict = {}
     monkeypatch.setattr(publish_mod, "push_candidate", _push_recording(seen))
@@ -731,17 +731,16 @@ def test_a_later_sweep_fix_is_added_to_the_open_ci_sweep_pr(monkeypatch: pytest.
     create = MagicMock()
     monkeypatch.setattr(publish_mod, "create_pull_from_push_repo", create)
 
-    result = publish_candidate(gh, _sweep_task(), replace(_candidate(), adapts="c" * 40), git_env={})
+    result = publish_candidate(gh, _sweep_task(), _candidate(), git_env={})
 
     assert result.kind is ResultKind.PUSHED
     assert result.pr_number == 61
     assert seen["onto"] == _NEW
-    assert seen["trailers"][-1] == "CI-Fix-Adapts: " + "c" * 40
     create.assert_not_called()
     repo.compare.assert_called_once_with(_HEAD, "d" * 40)
     assert pull.edit.call_args.kwargs["body"] == ci_sweep.body("9.0", 7, [
         ci_sweep.Fix("e" * 40, "Fix earlier", "test-alpine", "https://x/runs/9"),
-        ci_sweep.Fix("d" * 40, "Fix unit/x", "unit tests", "", "c" * 40),
+        ci_sweep.Fix("d" * 40, "Fix unit/x", "unit tests"),
     ])
 
 
@@ -845,6 +844,20 @@ def test_a_sweep_fix_not_run_here_that_adapts_an_upstream_fix_is_that_fix_to_bac
 
     assert result.kind is ResultKind.SUGGESTED and result.pr_number == 3913
     repo.get_commit.assert_called_once_with("d" * 40)
+
+
+def test_a_sweep_fix_that_ran_here_and_adapts_an_upstream_fix_is_that_fix_to_backport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """8.0's #5400: a run adaptation of upstream #2283 was pushed to the CI-sweep PR instead of named."""
+    gh, repo, _sweep = _ci_sweep_gh()
+    repo.get_commit.return_value.get_pulls.return_value = [SimpleNamespace(number=2283, merged_at="2025-07-03")]
+    monkeypatch.setattr(publish_mod, "push_candidate", lambda *_a, **_k: pytest.fail("pushed"))
+
+    result = publish_candidate(gh, _sweep_task(), replace(_candidate(), adapts="c" * 40), git_env={})
+
+    assert result.kind is ResultKind.SUGGESTED and result.pr_number == 2283
+    repo.get_commit.assert_called_once_with("c" * 40)
 
 
 def test_a_ci_sweep_table_has_the_new_fix_when_github_answers_from_before_the_push(

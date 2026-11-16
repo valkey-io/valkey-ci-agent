@@ -116,8 +116,31 @@ commit on top, and the PR's CI runs again. The bot never rewrites that
 branch, and doesn't add a DCO sign-off to its commits, so a maintainer
 certifies the change when they merge it.
 
-A sweep PR carries only backports. Its fixes are prepared and tested on its
-latest commit like any other, then go to its CI-sweep PR: the branch
+A sweep PR carries only backports, and its failures are fixed on unstable
+first when they can be. When a PR into unstable already fixes the failure, the
+bot says on the sweep PR which one to backport: a merged one, or an open one
+once it merges. The agent is shown the open PRs into unstable that name the
+failing test or close its detector issue. Otherwise the agent writes a fix on
+the sweep PR's latest commit. When unstable has the failing test, the fix is
+made there too, in a second fix job: unstable's own CI job of the same name,
+with its setup and build, or the bot's runner when that job cannot host a fix
+(one that builds inside `docker run`). The fix is the same patch when it
+applies and passes, or else the agent's own version of it for unstable's code,
+which is checked and reviewed like any other fix. It has to pass at least 10
+loops of the failing test on unstable, and is opened as a PR into unstable
+from `agent/ci-fix/upstream/<test>`. The sweep PR is told to backport it once
+it merges, and the job is left alone until then. When the agent finds that
+unstable needs no fix, because its code differs, the fix is the release
+branch's own and goes to the CI-sweep PR, which says why. When no fix for
+unstable can be made, nothing is published, and the sweep PR says why.
+
+There is one such PR per failing test, whichever release branches fail it,
+and the bot has at most three PRs into unstable open at once. While it has
+three, the sweep PRs' failures wait.
+
+A fix for a test unstable doesn't have is the release branch's own. It is
+prepared and tested on the sweep PR's latest commit like any other, then goes
+to its CI-sweep PR: the branch
 `agent/backport/ci-sweep/<release>`, opened as a PR into the sweep branch the
 first time there is a fix. It reads like the sweep PR: titled `[CI] CI Fix
 Sweep for <release>`, with a table of the fixes, one row each, and each fix

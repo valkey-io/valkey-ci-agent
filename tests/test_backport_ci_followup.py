@@ -479,15 +479,51 @@ def _target(
     )
 
 
-def _plan(monkeypatch, target, reason="actionable"):
+def _plan(monkeypatch, target, reason="actionable", *, upstream_open: int = 0):
     monkeypatch.setattr(
         ci_followup, "load_registry",
         lambda _path: SimpleNamespace(get_branch=lambda repo, branch: (_entry(), None)),
     )
     monkeypatch.setattr(ci_followup, "find_followup_target", lambda *_args, **_kwargs: (target, reason))
+    client = MagicMock()
+    client.get_repo.return_value.default_branch = "unstable"
+    # The bot's open pull requests into the default branch.
+    client.search_issues.return_value.totalCount = upstream_open
     return ci_followup.plan_request(
-        MagicMock(), None, {"repo": "valkey-io/valkey", "branch": "9.0"}, bot_login=_BOT,
+        client, None, {"repo": "valkey-io/valkey", "branch": "9.0"}, bot_login=_BOT,
     )
+
+
+def test_a_sweep_fix_is_run_on_the_default_branch_too(monkeypatch) -> None:
+    plan = _plan(monkeypatch, _target(_pr()))
+
+    assert plan.task.target.upstream_branch == "unstable"
+
+
+def test_while_the_bot_has_its_most_pull_requests_into_the_default_branch_open_a_sweep_waits(monkeypatch) -> None:
+    result = _plan(monkeypatch, _target(_pr()), upstream_open=3)
+
+    assert result == {"repo": "valkey-io/valkey", "branch": "9.0", "action": "skipped",
+                      "reason": "upstream-pr-cap-reached"}
+
+
+def test_a_fix_opened_into_the_default_branch_is_a_line_on_the_sweep_pr_and_its_job_waits(monkeypatch) -> None:
+    sweep = _pr()
+    client = MagicMock()
+    client.get_repo.return_value.get_pull.side_effect = lambda number: {4226: sweep}[number]
+    plan = _plan(monkeypatch, _target(sweep, job=FailedJob("test-ubuntu-tls", id=27)))
+    candidate = FixCandidate(action=CandidateAction.PATCH, failing_check="t")
+
+    ci_followup.report_result(client, plan, FixResult(
+        kind=ResultKind.OPENED, summary="s", task=plan.task, candidate=candidate, commit_sha="b" * 40,
+        pr_number=9, open_upstream=True,
+    ))
+
+    # Not explained on #9, whose own description says it all.
+    (line,) = sweep.posted
+    assert line.splitlines()[2].startswith("Opened #9 into `unstable` with a fix for `test-ubuntu-tls` ([run](")
+    assert "Backport it to `9.0` once it merges." in line
+    assert "<!-- valkey-ci-agent:backport-suggestion pr=9 -->" in line and " outcome=opened reason=backport -->" in line
 
 
 def test_the_plan_binds_the_exact_job_and_its_markers(monkeypatch) -> None:

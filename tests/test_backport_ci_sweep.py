@@ -276,3 +276,25 @@ def test_the_new_backports_given_to_the_review_are_capped(tmp_path, monkeypatch)
 
     (backports,) = seen
     assert len(backports) <= 200 + len("\n[... diff truncated ...]") and backports.endswith("[... diff truncated ...]")
+
+
+def test_the_branches_whose_ci_sweep_pr_was_closed_are_found_by_their_head(monkeypatch) -> None:
+    """8.0's #5382 was closed and its branch kept; 9.0's PR is open; 9.1's never opened."""
+    def ref(branch: str, sha: str) -> SimpleNamespace:
+        return SimpleNamespace(ref=f"refs/heads/{ci_sweep.BRANCH_PREFIX}/{branch}", object=SimpleNamespace(sha=sha))
+
+    repo = MagicMock()
+    repo.get_git_matching_refs.return_value = [ref("8.0", "a" * 40), ref("9.0", "b" * 40), ref("9.1", "c" * 40)]
+    closed = {"o:agent/backport/ci-sweep/8.0": [SimpleNamespace(head=SimpleNamespace(sha="a" * 40))]}
+    repo.get_pulls.side_effect = lambda state, head: closed.get(head, [])
+    client = MagicMock()
+    client.get_repo.return_value = repo
+    monkeypatch.setattr(ci_sweep, "find_existing_pr", lambda _client, _repo, _push, branch: (
+        SimpleNamespace(number=5) if branch.endswith("/9.0") else None
+    ))
+
+    assert ci_sweep.closed_branches(client, "o/r", "o/r") == ("agent/backport/ci-sweep/8.0",)
+    repo.get_git_matching_refs.assert_called_once_with("heads/agent/backport/ci-sweep/")
+
+    repo.get_git_matching_refs.side_effect = RuntimeError("502")
+    assert ci_sweep.closed_branches(client, "o/r", "o/r") == ()

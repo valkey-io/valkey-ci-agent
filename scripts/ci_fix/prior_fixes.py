@@ -362,6 +362,7 @@ _REVERTS_RE = re.compile(r"This reverts commit ([0-9a-f]{40})")
 
 def sibling_branch_changes(
     repo_dir: str, paths: tuple[str, ...], *, own_branch: str, base_branch: str, compared_with: str = "",
+    skip: tuple[str, ...] = (),
 ) -> str:
     """Markdown: what the bot's pull requests into the other release branches changed in ``paths``, with diffs.
 
@@ -376,7 +377,8 @@ def sibling_branch_changes(
     branches under the same prefix, each compared with the release branch it
     is named after, or with that release's branch under ``compared_with``: a
     CI-sweep branch with its sweep branch, so that only its fixes are shown.
-    A commit that was reverted, and its revert, are left out.
+    A commit that was reverted, and its revert, are left out, and so are the
+    branches in ``skip``.
     """
     suffix = f"/{base_branch}"
     if not paths or not base_branch or not own_branch.endswith(suffix):
@@ -392,7 +394,7 @@ def sibling_branch_changes(
     sections: list[str] = []
     for ref in sorted(refs):
         release = ref.removeprefix(f"origin/{prefix}/")
-        if release == base_branch:
+        if release == base_branch or ref.removeprefix("origin/") in skip:
             continue
         revision_range = f"origin/{compared_with}/{release}..{ref}" if compared_with else f"origin/{release}..{ref}"
         try:

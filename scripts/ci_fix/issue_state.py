@@ -40,12 +40,18 @@ def has_open_linked_pr(issue: Any) -> bool:
     not working on it: one that cites the failure must not keep the issue
     from a fix.
     """
+    return bool(open_linked_prs(issue))
+
+
+def open_linked_prs(issue: Any) -> list[int]:
+    """The open pull requests that say they close ``issue`` (:func:`has_open_linked_pr`)."""
     timeline = retry_github_call(
         lambda: list(issue.get_timeline()),
         retries=2,
         description=f"read issue #{issue.number} timeline",
     )
     closes = re.compile(_CLOSING_REFERENCE.format(number=int(issue.number)), re.IGNORECASE)
+    linked: list[int] = []
     for event in timeline:
         if str(getattr(event, "event", "") or "") != "cross-referenced":
             continue
@@ -56,5 +62,5 @@ def has_open_linked_pr(issue: Any) -> bool:
             and str(getattr(source, "state", "") or "") == "open"
             and closes.search(f"{getattr(source, 'title', '') or ''}\n{getattr(source, 'body', '') or ''}")
         ):
-            return True
-    return False
+            linked.append(int(source.number))
+    return linked

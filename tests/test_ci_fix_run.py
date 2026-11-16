@@ -17,6 +17,7 @@ from scripts.ci_fix import run
 from scripts.ci_fix.ci_job import JOB_MINUTES, JobCommands, JobSpec, setup_script
 from scripts.ci_fix.models import (
     CandidateAction,
+    FailedTest,
     Failure,
     FixCandidate,
     FixOutcome,
@@ -97,7 +98,7 @@ def test_a_failure_its_job_can_host_is_fixed_in_that_job(front_door, workflows, 
         "mode": "job", "job": "test-ubuntu-latest", "runs_on": "ubuntu-latest", "container": "",
         "timeout_minutes": str(JOB_MINUTES), "use_repo": "valkey-io/valkey", "use_git_ref": _HEAD,
         "extra_repository": "ianlancetaylor/libbacktrace", "extra_ref": "b9e40069c0b47a722286b94eb5231f7f05c08713",
-        "extra_path": "libbacktrace", "ci_changes": "",
+        "extra_path": "libbacktrace", "ci_changes": "", "upstream": "",
     }
     # The PR's run used the workflow at its head.
     assert workflows == [("valkey-io/valkey", "ci", _HEAD)]
@@ -150,7 +151,7 @@ def test_an_issue_fix_replays_the_job_from_the_tip_it_checks_out(front_door, wor
 def test_a_failure_its_job_cannot_host_is_fixed_on_the_bots_runner(front_door, workflows, tmp_path):
     front_door.planned = _pr_plan("test-no-workflow-has-this-job")
 
-    assert _plan(tmp_path, front_door.planned) == {"mode": "local", "ci_changes": ""}
+    assert _plan(tmp_path, front_door.planned) == {"mode": "local", "ci_changes": "", "upstream": ""}
     assert (tmp_path / run.PLAN_FILE).exists()
     assert not (tmp_path / run.JOB_FILE).exists()
 
@@ -163,7 +164,7 @@ def test_a_workflow_that_cannot_be_read_falls_back_to_the_bots_runner(front_door
 
     monkeypatch.setattr(run, "workflow_source", unreadable)
 
-    assert _plan(tmp_path, front_door.planned) == {"mode": "local", "ci_changes": ""}
+    assert _plan(tmp_path, front_door.planned) == {"mode": "local", "ci_changes": "", "upstream": ""}
 
 
 @pytest.mark.parametrize(("branch", "policy", "kind", "expected"), [
@@ -187,8 +188,131 @@ def test_a_suggestion_is_never_run_in_a_job(front_door, workflows, tmp_path):
     front_door.planned = replace(plan, task=replace(plan.task, target=replace(plan.task.target,
                                                                              kind=TargetKind.SUGGEST)))
 
-    assert _plan(tmp_path, front_door.planned) == {"mode": "local", "ci_changes": ""}
+    assert _plan(tmp_path, front_door.planned) == {"mode": "local", "ci_changes": "", "upstream": ""}
     assert workflows == []
+
+
+_UNSTABLE = "e" * 40
+_SHARD_TEST = FailedTest("Replica keeps its shard_id", "tests/unit/cluster/reset.tcl")
+
+
+def _sweep_plan(job_name="test-sanitizer-address (clang)") -> FixPlan:
+    """A sweep PR's failure on 8.0, whose fix may be made for unstable too."""
+    task = FixTask(
+        Failure(repo_full_name="valkey-io/valkey", run_id=100, head_sha=_HEAD, job_id=22, job_name=job_name,
+                base_branch="8.0", pr_number=5077, source=Source.DAILY, workflow="daily", workflow_sha="f" * 40),
+        FixTarget(kind=TargetKind.UPDATE_PR, repo_full_name="valkey-io/valkey", base_repo_full_name="valkey-io/valkey",
+                  branch="agent/backport/sweep/8.0", expected_sha=_HEAD, fix_branch="agent/backport/ci-sweep/8.0",
+                  upstream_branch="unstable"),
+        FixPolicy.BACKPORT,
+    )
+    return FixPlan(front_door=FrontDoor.FOLLOW_UP, task=task, job_log="the log")
+
+
+_RELEASE_FIX = FixCandidate(
+    action=CandidateAction.PATCH, patch="diff", changed_paths=(_SHARD_TEST.file,), failing_tests=(_SHARD_TEST,),
+)
+
+
+def test_a_sweeps_fix_is_planned_for_unstable_after_its_own(front_door, workflows, tmp_path):
+    front_door.planned = _sweep_plan()
+
+    assert _plan(tmp_path, front_door.planned)["upstream"] == "true"
+
+
+def _unstable_repo(*, files=(_SHARD_TEST.file,)):
+    repo = MagicMock()
+    repo.get_branch.return_value.commit.sha = _UNSTABLE
+
+    def get_contents(path, ref):
+        assert ref == _UNSTABLE
+        if path not in files:
+            raise GithubException(404, "Not Found", None)
+
+    repo.get_contents.side_effect = get_contents
+    gh = MagicMock()
+    gh.get_repo.return_value = repo
+    return gh
+
+
+def _plan_upstream(tmp_path, gh, candidate=_RELEASE_FIX, plan=None):
+    save(tmp_path / "plan" / run.PLAN_FILE, plan or _sweep_plan())
+    save(tmp_path / "fix" / run.OUTCOME_FILE, FixOutcome(candidate=candidate, started=True))
+    return run.plan_upstream(gh, tmp_path / "plan", tmp_path / "fix", tmp_path / "out", tmp_path / "result")
+
+
+def test_a_sweeps_fix_is_made_for_unstable_in_unstables_own_job(workflows, tmp_path):
+    outputs = _plan_upstream(tmp_path, _unstable_repo())
+
+    assert outputs["mode"] == "job" and outputs["job"] == "test-sanitizer-address (clang)"
+    assert outputs["use_git_ref"] == _UNSTABLE
+    # Unstable's own workflow at its tip, not the one the release branch ran.
+    assert workflows == [("valkey-io/valkey", "daily", _UNSTABLE)]
+    spec = load(tmp_path / "out" / run.JOB_FILE, JobSpec)
+    assert (tmp_path / "out" / run.SETUP_FILE).read_text(encoding="utf-8") == setup_script(spec)
+    assert load(tmp_path / "out" / run.PLAN_FILE, FixPlan) == _sweep_plan()
+    assert load(tmp_path / "out" / run.RELEASE_FILE, FixCandidate) == _RELEASE_FIX
+    assert (tmp_path / "out" / run.SHA_FILE).read_text(encoding="utf-8") == _UNSTABLE
+    # Its outcome comes from that job.
+    assert not (tmp_path / "result" / run.OUTCOME_FILE).exists()
+
+
+def test_a_fix_for_a_test_unstable_lacks_is_published_as_it_is(workflows, tmp_path):
+    outputs = _plan_upstream(tmp_path, _unstable_repo(files=()))
+
+    assert outputs == {"mode": ""} and workflows == []
+    assert load(tmp_path / "result" / run.OUTCOME_FILE, FixOutcome) == FixOutcome(candidate=_RELEASE_FIX, started=True)
+
+
+@pytest.mark.parametrize("candidate", [
+    None, replace(_RELEASE_FIX, adapts="c" * 40), replace(_RELEASE_FIX, not_run=True),
+    replace(_RELEASE_FIX, action=CandidateAction.PORT), FixCandidate(action=CandidateAction.REFUSE),
+])
+def test_only_a_run_fix_of_the_bots_own_is_made_for_unstable(workflows, tmp_path, candidate):
+    gh = _unstable_repo()
+
+    assert _plan_upstream(tmp_path, gh, candidate) == {"mode": ""}
+    assert load(tmp_path / "result" / run.OUTCOME_FILE, FixOutcome).candidate == candidate
+    gh.get_repo.assert_not_called()
+
+
+def test_a_fix_whose_job_has_no_result_is_left_to_publish(tmp_path):
+    save(tmp_path / "plan" / run.PLAN_FILE, _sweep_plan())
+
+    assert run.plan_upstream(MagicMock(), tmp_path / "plan", tmp_path / "fix", tmp_path / "out", tmp_path / "result") \
+        == {"mode": ""}
+    assert not (tmp_path / "result").exists()
+
+
+def test_without_a_job_on_unstable_to_host_it_the_fix_is_made_on_the_bots_runner(workflows, tmp_path):
+    outputs = _plan_upstream(tmp_path, _unstable_repo(), plan=_sweep_plan("test-no-workflow-has-this-job"))
+
+    assert outputs == {"mode": "local"}
+    assert not (tmp_path / "out" / run.JOB_FILE).exists()
+    assert load(tmp_path / "out" / run.RELEASE_FILE, FixCandidate) == _RELEASE_FIX
+    assert (tmp_path / "out" / run.SHA_FILE).read_text(encoding="utf-8") == _UNSTABLE
+    assert not (tmp_path / "result" / run.OUTCOME_FILE).exists()
+
+
+def test_the_fix_job_for_unstable_makes_the_release_branchs_fix_there(monkeypatch, tmp_path):
+    save(tmp_path / run.PLAN_FILE, _sweep_plan())
+    save(tmp_path / run.RELEASE_FILE, _RELEASE_FIX)
+    (tmp_path / run.SHA_FILE).write_text(_UNSTABLE, encoding="utf-8")
+    made = replace(_RELEASE_FIX, upstream_refusal="no")
+    seen = {}
+
+    def prepare_upstream(task, job_log, release, **kwargs):
+        seen.update(task=task, log=job_log, release=release, **kwargs)
+        return made
+
+    monkeypatch.setattr(run, "prepare_upstream", prepare_upstream)
+    monkeypatch.setattr(run, "prepare_fix", lambda *_a, **_k: pytest.fail("the release branch's fix is made"))
+
+    outcome = run.fix(tmp_path, tmp_path / "out", repo_dir="/job")
+
+    assert seen == {"task": _sweep_plan().task, "log": "the log", "release": _RELEASE_FIX, "sha": _UNSTABLE,
+                    "repo_dir": "/job", "job": None}
+    assert outcome == FixOutcome(candidate=made, started=True)
 
 
 def test_a_crash_after_the_plan_is_reported_as_a_failed_attempt(front_door, tmp_path):
