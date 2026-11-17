@@ -362,8 +362,8 @@ def test_rc_follow_up_omits_ga_only_outputs() -> None:
     links = tracker_mod._downstream_links(rc)
     assert "Container PR search" in links
     assert "Bundle PR search" in links
+    assert "valkey-io.github.io/pulls?q=is%3Apr+head%3Aupdate-website-9.1.0-rc1" in links
     assert "Documentation" not in links
-    assert "Website" not in links
     assert "Helm" not in links
 
 

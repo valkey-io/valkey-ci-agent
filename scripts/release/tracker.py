@@ -763,10 +763,10 @@ def _downstream_links(tracker: Tracker) -> str:
             links.append(pr_search("valkey-doc", f"update-docs-{tracker.tag}", "Documentation"))
         else:
             links.append(f"[Documentation tag](https://github.com/{owner}/valkey-doc/tree/{tracker.tag})")
-        links.extend((
-            pr_search("valkey-io.github.io", f"update-website-{tracker.tag}", "Website"),
-            pr_search("valkey-helm", f"update-valkey-{tracker.tag}", "Helm"),
-        ))
+    # valkey.io lists release candidates too, so every release gets a page.
+    links.append(pr_search("valkey-io.github.io", f"update-website-{tracker.tag}", "Website"))
+    if tracker.stage == "ga":
+        links.append(pr_search("valkey-helm", f"update-valkey-{tracker.tag}", "Helm"))
 
     major, minor = (int(part) for part in tracker.version.split(".", 2)[:2])
     if major > 8 or (major == 8 and minor >= 1):
