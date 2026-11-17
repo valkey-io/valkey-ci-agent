@@ -312,6 +312,21 @@ def test_a_fix_that_passed_upstream_opens_a_pull_request_into_it(monkeypatch) ->
     assert "It passed 40 loops there." in body
 
 
+def test_the_agents_notes_are_shown_as_the_release_branchs(monkeypatch) -> None:
+    """The agent wrote its notes on the release branch's tree, before the fix was run on unstable."""
+    gh, _repo = _gh()
+    monkeypatch.setattr(upstream, "push_candidate", lambda *_a, **_k: "d" * 40)
+    create = MagicMock(return_value=SimpleNamespace(number=9, html_url=""))
+    monkeypatch.setattr(upstream, "create_pull_from_push_repo", create)
+
+    publish_mod.publish_candidate(gh, _task(), _candidate(validation="Nothing was run here."), git_env={})
+
+    body = create.call_args.kwargs["body"]
+    assert "The agent's own notes" not in body
+    notes = body.index("<details><summary>The agent's notes on <code>8.0</code></summary>")
+    assert body.index("What the bot checked on <code>8.0</code>") < notes < body.index("Nothing was run here.")
+
+
 def test_a_fix_made_for_unstables_code_is_the_one_pushed_there(monkeypatch) -> None:
     gh, _repo = _gh()
     pushed = {}

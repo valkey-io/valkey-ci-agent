@@ -739,6 +739,9 @@ def test_the_fix_is_verified_with_the_jobs_command(tmp_path, monkeypatch):
     assert contexts[0].verification.startswith("Code checks your change with")
     assert contexts[0].verified_by_code
     assert "passed 40 loop(s)" in candidate.verification
+    # What is published is what ran, with the plan's note, not what the agent was told.
+    assert "Code checks" not in candidate.verification
+    assert candidate.verification.count("a plain build stands in for it") == 1
 
 
 def test_a_detector_issue_for_a_c_unit_test_is_verified_with_gtest(tmp_path, monkeypatch):

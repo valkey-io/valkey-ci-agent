@@ -230,8 +230,8 @@ def on_upstream(candidate: FixCandidate) -> FixCandidate:
     return replace(
         candidate, patch=run.patch, changed_paths=run.changed_paths, title=run.title or candidate.title,
         reasoning=run.reasoning or candidate.reasoning, verification=run.verification,
-        # The agent's notes on an adaptation are its session's, which are not kept.
-        validation="" if run.adapted else candidate.validation,
+        # The agent's notes are on the release branch's tree (an adaptation's session's are not kept).
+        validation="",
     )
 
 
@@ -257,6 +257,11 @@ def _body(task: FixTask, candidate: FixCandidate) -> str:
     lines += [
         f"<details><summary>What the bot checked on <code>{release}</code></summary>", "",
         *check_items(candidate.verification), "", "</details>", "",
+    ]
+    if candidate.validation:
+        lines += [f"<details><summary>The agent's notes on <code>{release}</code></summary>", "",
+                  prose(candidate.validation, 2_000), "", "</details>", ""]
+    lines += [
         "---",
         "",
         "<sub>Prepared by the CI-fix bot, which never merges. This PR's CI and a maintainer's review decide. "
