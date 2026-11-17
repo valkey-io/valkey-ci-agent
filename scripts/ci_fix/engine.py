@@ -955,7 +955,8 @@ def _established_checks(context: FixContext) -> list[str]:
         checks.append("Existing fixes found: " + "; ".join(context.prior_fixes.splitlines()))
     elif context.prior_fixes_searched:
         checks.append("No merged change that looks like a fix was found.")
-    if context.verification:
+    # A plan is the agent's instructions; what it ran is published instead (``_verify``).
+    if context.verification and not context.verified_by_code:
         checks.append(context.verification)
     return checks
 
@@ -1117,8 +1118,10 @@ def _verify(
 
     The build or an earlier run could leave ignored files the patch does not
     show (a prebuilt server binary that keeps ``make`` from rebuilding), so
-    those go first: the build and tests run from source.
+    those go first: the build and tests run from source. The plan's notes
+    (a stand-in for the job, a run_solo file) go with what ran.
     """
+    checks.extend(plan.notes)
     _remove_ignored(repo_dir)
     if any(path.startswith("deps/") for path in changed_lines(candidate.patch)):
         _rebuild_dependencies(repo_dir)
