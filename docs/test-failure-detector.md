@@ -12,11 +12,10 @@ try to fix it.
 
 ## When it runs
 
-Daily CI starts at midnight UTC and usually finishes within four to seven
-hours. Of more than four hundred runs, only six took longer than seven hours,
-and the longest took ten. The detector runs at 23:00 UTC, which gives the run
-plenty of time to finish. If a night is ever missed, you can run the detector
-by hand for any run whose artifacts are still around, which is 30 days.
+Daily CI starts at midnight UTC. The detector runs at 06:00 UTC, allowing a
+two-hour buffer after recent Daily runs, which finish by about 04:00 UTC.
+If a night is ever missed, you can run the detector by hand for any run whose
+artifacts are still around, which is 30 days.
 
 ## What it does
 

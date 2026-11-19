@@ -2,7 +2,9 @@ name: Test Failure Detector
 
 on:
   schedule:
-    - cron: "0 23 * * *"
+    # Daily starts at 00:00 UTC and recent runs finish by about 04:00 UTC.
+    # Allow a two-hour buffer before scanning the latest completed run.
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       repo:
