@@ -10,11 +10,12 @@ does and how to run it, start from the [README](README.md).
 - The GitHub CLI, `gh`, to start workflows.
 - A GitHub token, for anything that talks to the GitHub API.
 - AWS credentials with access to Bedrock, for anything that calls Claude.
-- Claude Code CLI 2.1.286 or later, for anything that calls Claude: earlier
-  versions refuse Fable 5.2. The workflows use 2.1.300:
+- Claude Code CLI 2.1.321 or later, for anything that calls Claude: versions
+  before 2.1.286 refuse Fable 5.2, and versions before 2.1.321 run it but log
+  `unrecognized_model` on every session. The workflows use 2.1.321:
 
 ```bash
-npm install -g @anthropic-ai/claude-code@2.1.300
+npm install -g @anthropic-ai/claude-code@2.1.321
 ```
 
 ## Getting set up
