@@ -8,6 +8,7 @@ files, and git and GitHub are mocked.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from functools import partial
@@ -81,7 +82,7 @@ class TestStageHelpers:
         assert commit_title("9.1.0", "rc2") == "Update version to 9.1.0-rc2 and add release notes"
 
     def test_commit_title_ga(self) -> None:
-        assert commit_title("9.1.0", "ga") == "Add release notes entry for Valkey 9.1.0 GA"
+        assert commit_title("9.1.0", "ga") == "Add release notes entry for Valkey 9.1.0"
 
     def test_commit_title_patch_ga_omits_suffix(self) -> None:
         assert commit_title("9.1.1", "ga") == "Add release notes entry for Valkey 9.1.1"
@@ -681,6 +682,84 @@ class TestCutOrchestration:
         assert created == []                    # no PR opened
         assert not [c for c in calls if c[:1] == ("push",)]  # nothing pushed
 
+    @pytest.mark.parametrize("new_notes", [True, False])
+    def test_final_release_publishes_combined_rc_and_new_notes(self, monkeypatch, clone, new_notes):
+        from unittest.mock import MagicMock
+
+        writes = {}
+        self._setup(
+            monkeypatch, clone, line_exists={"9.1": True},
+            bullets=new_notes, had_prs=new_notes, writes=writes,
+        )
+        prior = rc.rn.render_version_section(
+            "9.1.0", "rc1", "LOW", "2026-06-01",
+            {"Bug Fixes": ["Earlier fix by @earlier (#1)"]},
+            display_name="Valkey", categories=projects.VALKEY_PROFILE.categories,
+        )
+        rc._write(os.path.join(clone, "00-RELEASENOTES"), prior)
+        version_path = os.path.join(clone, "src", "version.h")
+        with open(version_path, encoding="utf-8") as file:
+            version_text = file.read()
+        rc._write(version_path, projects.VALKEY_PROFILE.bumper.set_version(version_text, "9.1.0", "rc1"))
+        writes.clear()
+        bullets = [{"sources": [0], "category": "Bug Fixes", "text": "Earlier fix"}]
+        if new_notes:
+            bullets.append({"sources": [1], "category": "Bug Fixes", "text": "New fix"})
+        response = json.dumps({"bullets": bullets})
+        monkeypatch.setattr(rc.consolidate_mod, "consolidate_release_notes", partial(
+            rc.consolidate_mod.consolidate_release_notes,
+            run_fn=lambda *a, **k: (response, "", 0),
+        ))
+        repo = MagicMock()
+        repo.get_pulls.return_value = []
+        repo.create_pull.return_value = MagicMock(number=1, html_url="https://x/1")
+        monkeypatch.setattr(rc.publish_mod, "retry_github_call", lambda op, **k: op())
+
+        assert rc.cut(
+            repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+            profile=projects.VALKEY_PROFILE, version="9.1.0", stage="ga",
+            urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
+            contrib_base_ref=None, security_fixes=None, token="t", git_env={}, dry_run=False,
+        ) == 0
+        rendered = writes[os.path.join(clone, ".release-dest", "00-RELEASENOTES")]
+        assert "Valkey 9.1.0  -  Released Thu 25 June 2026" in rendered
+        assert "Valkey 9.1.0-rc1" not in rendered
+        assert "* Earlier fix by @earlier (#1)" in rendered
+        assert ("* New fix by @a (#40)" in rendered) == new_notes
+        body = repo.create_pull.call_args.kwargs["body"]
+        assert "Combined the notes from `rc1`" in body
+        assert "Empty release notes" not in body
+        assert "No new release notes" not in body
+        assert repo.create_pull.call_args.kwargs["draft"] is False
+
+    def test_failed_final_consolidation_cleans_up_without_writing_or_publishing(self, monkeypatch, clone):
+        from unittest.mock import MagicMock
+
+        writes = {}
+        calls = self._setup(monkeypatch, clone, line_exists={"9.1": True}, writes=writes)
+        rc._write(os.path.join(clone, "00-RELEASENOTES"), rc.rn.render_version_section(
+            "9.1.0", "rc1", "LOW", "2026-06-01", {"Bug Fixes": ["Earlier fix (#1)"]},
+            display_name="Valkey", categories=projects.VALKEY_PROFILE.categories,
+        ))
+        writes.clear()
+        monkeypatch.setattr(rc.consolidate_mod, "consolidate_release_notes", partial(
+            rc.consolidate_mod.consolidate_release_notes,
+            run_fn=lambda *a, **k: ('{"bullets":[]}', "", 0),
+        ))
+        repo = MagicMock()
+
+        with pytest.raises(ValueError, match="omitted"):
+            rc.cut(
+                repo, repo_full_name="valkey-io/valkey", source_clone_dir=clone,
+                profile=projects.VALKEY_PROFILE, version="9.1.0", stage="ga",
+                urgency="LOW", date="2026-06-25", tag_glob=None, base_ref=None,
+                contrib_base_ref=None, security_fixes=None, token="t", git_env={}, dry_run=False,
+            )
+        assert writes == {}
+        repo.create_pull.assert_not_called()
+        assert not any(cmd[:1] == ("push",) for cmd in calls)
+        assert not os.path.exists(os.path.join(clone, ".release-dest"))
+
     def _capture_discovery_range(self, monkeypatch, clone, *, line_exists, cut_kwargs):
         # Run cut() with regenerate_unreleased replaced by a spy that records the
         # (base_ref, tag_glob) discovery is asked to walk, so a test can assert the
@@ -751,7 +830,7 @@ class TestCutOrchestration:
         )
         assert created[0]["base"] == "9.1"                          # M.m line, not pre-release
         assert created[0]["head"] == "agent/release-cut/9.1.0-ga"   # prep branch lowercased
-        assert created[0]["title"] == "Add release notes entry for Valkey 9.1.0 GA"
+        assert created[0]["title"] == "Add release notes entry for Valkey 9.1.0"
         # No raw "-GA" leaks into the prep-branch push refspec.
         assert not any("9.1.0-GA" in " ".join(c) for c in calls if c[:1] == ("push",))
 
@@ -2160,7 +2239,7 @@ class TestRcSequenceWarningModuleRepos:
 class TestModuleCommitTitle:
     def test_ga_commit_title_uses_display_name(self) -> None:
         assert _commit_title("1.2.0", "ga", "Valkey Search") == (
-            "Add release notes entry for Valkey Search 1.2.0 GA"
+            "Add release notes entry for Valkey Search 1.2.0"
         )
 
     def test_rc_commit_title_is_display_neutral(self) -> None:

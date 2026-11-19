@@ -187,12 +187,10 @@ def render_header(major: int, minor: int, display_name: str) -> str:
 
 
 def stage_heading(version: str, stage: str, display_name: str) -> str:
-    """The version part of a dated heading: ``<Name> M.m.p[-rcN| GA]``."""
+    """The version part of a dated heading: ``<Name> M.m.p[-rcN]``."""
     if stage == "ga":
-        # Valkey uses "GA" for the initial M.m.0 release, while patch release
-        # headings are simply "<Name> M.m.p".
-        _major, _minor, patch = parse_version(version)
-        return "{} {}{}".format(display_name, version, " GA" if patch == 0 else "")
+        parse_version(version)
+        return "{} {}".format(display_name, version)
     return "{} {}-{}".format(display_name, version, stage)
 
 
