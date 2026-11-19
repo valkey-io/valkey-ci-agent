@@ -183,7 +183,7 @@ class TestRenderVersionSection:
         out = render_version_section(
             "9.1.0", "ga", "LOW", "2026-06-02", {"Bug Fixes": ["* fix (#1)"]}
         )
-        assert "Valkey 9.1.0 GA  -  Released Tue 02 June 2026" in out
+        assert "Valkey 9.1.0  -  Released Tue 02 June 2026" in out
         assert "This is the first stable release of Valkey 9.1." in out
         assert "### Bug Fixes\n* fix (#1)" in out
 
@@ -309,7 +309,7 @@ class TestModuleRepoRendering:
             display_name="Valkey Search",
             categories=_SEARCH.categories,
         )
-        assert "Valkey Search 1.2.0 GA  -  Released Tue 02 June 2026" in out
+        assert "Valkey Search 1.2.0  -  Released Tue 02 June 2026" in out
         assert "This is the first stable release of Valkey Search 1.2." in out
 
     def test_module_rc_heading(self) -> None:

@@ -47,9 +47,22 @@ kind of release covers:
 |---|---|---|---|
 | The first RC of a new minor | `9.2.0` | `rc1` | the previous release, such as `9.1.0` |
 | The next RC | `9.2.0` | `rc2` | `9.2.0-rc1` |
-| GA after the last RC | `9.2.0` | `ga` | the last RC, such as `9.2.0-rc2` |
+| GA after the last RC | `9.2.0` | `ga` | all RC notes, plus changes since the last RC |
 | A patch release | `9.1.9` | | `9.1.8` |
 | The first RC of a new major | `10.0.0` | `rc1` | the highest earlier release |
+
+For the final `.0` release, the agent first generates notes for changes since
+the last RC. It then uses AI to combine those notes with this version's RC
+sections into one dated section, reconciling duplicates and superseded changes.
+Every source entry must be accounted for, and code restores its authors and PR
+references. Security entries retain their supplied wording. An incomplete or
+invalid response is retried once. If it still fails validation, the cut stops
+before publication. RC-only changes retain their affected names and qualifier.
+
+The final section uses the version alone, such as `Valkey 9.2.0`, and ends with
+a sentence explaining that it covers all release candidates. To compare RCs,
+diff the notes files shipped with their tags. Patch releases prepend their own
+dated sections above the combined `.0` notes.
 
 By default the workflow does a dry run. It shows you the plan, including the
 exact commit range the notes will cover, without pushing anything. Once that

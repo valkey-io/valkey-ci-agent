@@ -22,6 +22,7 @@ from scripts.common.git_auth import github_https_url
 from scripts.common.job_summary import write_outputs
 from scripts.common.logging_utils import log_outcome
 from scripts.common.proc import BOT_EMAIL, BOT_NAME, git_output, run_git
+from scripts.release_notes import consolidate as consolidate_mod
 from scripts.release_notes import contributors as gc
 from scripts.release_notes import pipeline as pipeline_mod
 from scripts.release_notes import projects as projects_mod
@@ -100,6 +101,7 @@ class _NotesMeta:
     advisories: Optional[Any] = None    # security.AdvisorySelection when --security-from-advisories ran, else None
     uncategorized: Sequence[str] = ()   # bullets the model left in the catch-all category
     notes_range: Optional["_NotesRange"] = None  # resolved base/head refs + SHAs for the range display
+    consolidation: Optional[consolidate_mod.ConsolidationResult] = None
 
 
 def _split_version(version: str) -> tuple[int, int, int]:
@@ -239,9 +241,8 @@ def stage_release_name(version: str, stage_lc: str) -> str:
 def commit_title(version: str, stage_lc: str, display_name: str) -> str:
     """Match valkey's release commit titles."""
     if stage_lc == "ga":
-        _major, _minor, patch = _split_version(version)
-        suffix = " GA" if patch == 0 else ""
-        return f"Add release notes entry for {display_name} {version}{suffix}"
+        _split_version(version)
+        return f"Add release notes entry for {display_name} {version}"
     return f"Update version to {version}-{stage_lc} and add release notes"
 
 
@@ -923,13 +924,19 @@ def cut(
             profile=profile,
             pr_authors=regen.pr_authors,
         )
+        consolidation = consolidate_mod.consolidate_release_notes(
+            new_dest_notes, version=version, stage=plan.stage,
+            urgency=urgency, date=date, profile=profile, repo_dir=dest_dir,
+        )
+        final_grouped = grouped
+        if consolidation is not None:
+            new_dest_notes = consolidation.notes_text
+            final_grouped = consolidation.grouped
+            security_fixes = consolidation.security_fixes or None
 
-        # Count what survives into the dated section after the already-credited
-        # drop. When some PRs were dropped as duplicates but others remain, this
-        # is > 0 and the cut still ships real notes; only when it is 0 is the cut
-        # version-bump-only. The "No new release notes" section keys on this so a
-        # cut that drops a duplicate yet adds a new note is not mislabelled empty.
-        noted_bullet_count = sum(len(lines) for lines in grouped.values())
+        # Count the final dated section, including RC notes folded into a .0
+        # release. A final release with no new PRs can still carry a full section.
+        noted_bullet_count = sum(len(lines) for lines in final_grouped.values())
 
         # Resolve the exact base/head refs + SHAs the notes were computed over, so
         # the PR body/dry-run can show an auditable range (not just "base..HEAD").
@@ -951,7 +958,8 @@ def cut(
             security_fixes=security_fixes, security_noted_prs=security_noted_prs,
             baseline_unanchored=baseline_unanchored,
             advisories=advisories, notes_range=notes_range,
-            uncategorized=tuple(grouped.get(rn.CATCH_ALL_CATEGORY, ())),
+            uncategorized=tuple(final_grouped.get(rn.CATCH_ALL_CATEGORY, ())),
+            consolidation=consolidation,
         )
 
         if dry_run:
@@ -1036,8 +1044,10 @@ def _print_dry_run(
     if regen.uncertain:
         flagged = [f"#{n.pr_number} ({n.reason or 'no reason'})" for n in regen.uncertain]
         print(f"⚠️  notes to double-check: {flagged}")
+    if notes_meta.consolidation is not None:
+        print(f"consolidated release candidates: {list(notes_meta.consolidation.rc_stages)}")
     if not regen.had_prs:
-        print("note: no PRs in range (empty dated section)")
+        print("note: no new PRs in the discovery range")
     if notes_meta.advisories is not None:
         sel = notes_meta.advisories
         if sel.fetch_failed:
@@ -1234,7 +1244,7 @@ def _hold_reasons(plan: BranchPlan, notes_meta: "_NotesMeta") -> list[str]:
     # were included (every candidate AI-excluded or left undecided). A non-empty
     # security_fixes list counts as content (a security-only cut is legitimate, not
     # a generation miss).
-    if not (regen.bullet_count or notes_meta.already_credited or notes_meta.security_fixes) and (
+    if not (notes_meta.noted_bullet_count or regen.bullet_count or notes_meta.already_credited or notes_meta.security_fixes) and (
         not regen.had_prs or not regen.included
     ):
         reasons.append("empty release notes")
@@ -1408,6 +1418,7 @@ def _build_pr_body(
         f"- Promotes the release notes into a dated section, bumps "
         f"`{profile.bumper.version_file}`, and refreshes the running contributor list.\n"
         + _notes_range_body_section(notes_meta.notes_range, regen)
+        + _consolidation_section(notes_meta)
         + _rc_warning_section(plan)
         + _baseline_warning_section(notes_meta, version)
         + _empty_notes_section(notes_meta, plan, profile)
@@ -1435,6 +1446,19 @@ def _build_pr_body(
         + _declined_alignment_section(regen.declined_alignments)
         + _wording_alignment_section(regen)
         + "\n*Generated by valkey-ci-agent. Review before merging into the release line.*"
+    )
+
+
+def _consolidation_section(notes_meta: "_NotesMeta") -> str:
+    result = notes_meta.consolidation
+    if result is None:
+        return ""
+    stages = ", ".join(f"`{stage}`" for stage in result.rc_stages)
+    return (
+        f"\nCombined the notes from {stages} and the final release into one dated "
+        "section. AI reconciled duplicate and superseded entries. Code preserved "
+        "source PR credits, security entries and the contributor footer. Review "
+        "the combined wording before merging.\n"
     )
 
 
@@ -1536,7 +1560,7 @@ def _empty_notes_section(
     already-credited drop explains it.
     """
     regen = notes_meta.regen
-    if regen.bullet_count or notes_meta.already_credited or notes_meta.security_fixes:
+    if notes_meta.noted_bullet_count or regen.bullet_count or notes_meta.already_credited or notes_meta.security_fixes:
         return ""
     if not regen.had_prs:
         return (
