@@ -17,3 +17,25 @@ class PRActivity:
     last_code_at: datetime | None
     last_author_at: datetime | None
     last_maintainer_at: datetime | None
+
+
+@dataclass(frozen=True)
+class CandidatePolicy:
+    """Per-repository settings for picking candidates."""
+
+    days_without_code: int = 365
+    days_without_comments: int = 180
+    # Labels that tell the job to leave a PR alone, compared case-insensitively.
+    skip_labels: frozenset[str] = frozenset({"do-not-close", "to-be-merged"})
+    max_per_run: int = 10
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    """Whether one PR is due for review, and why."""
+
+    number: int
+    due: bool
+    reason: str
+    # The newer of the PR's last code and last comment; candidates are reviewed oldest first.
+    last_activity_at: datetime
