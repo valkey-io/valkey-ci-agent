@@ -1,0 +1,65 @@
+name: CI Fix Labelled
+
+# One run answers one labelling of a Valkey issue with `needs-agent-fix`: it
+# checks that a committer applied the label and that the issue is nobody
+# else's, writes a test that fails on unstable, makes the change that passes
+# it, and comments the result on the issue: the change as a patch, or the
+# draft PR that carries it when AGENT_FIX_PUBLISH is draft-pr, or why there is
+# none. A committer's review decides whether it is merged; this workflow
+# never merges. The change is made like every other fix (ci-fix-run.yml), in
+# Valkey's own pull request job when it can host it.
+# ci-fix-labelled-dispatch.yml finds an issue's active runs by this name, and
+# counts its failed attempts at a labelling, which are not commented.
+#
+# With `replay`, a commit, the change is made on that commit for any issue,
+# open or closed, and nothing is written to Valkey: the result is this run's
+# ci-fix-result artifact. Replaying a closed issue on the commit before its
+# fix shows what the bot would have done.
+run-name: "Agent fix issue #${{ inputs.issue }}${{ inputs.label_event && format(' (label {0})', inputs.label_event) || '' }}${{ inputs.replay && ' (replay)' || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue number"
+        required: true
+        type: number
+      label_event:
+        description: "The labelling's event id (set by the dispatcher; 0 for a manual run)"
+        required: false
+        type: number
+        default: 0
+      attempt:
+        description: "Which attempt at this labelling this is (set by the dispatcher)"
+        required: false
+        type: number
+        default: 0
+      replay:
+        description: "Replay on this full commit SHA and write nothing to Valkey (empty = answer the label)"
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: ci-fix-labelled-${{ inputs.issue }}${{ inputs.replay && format('-{0}', inputs.replay) || '' }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  fix:
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/ci-fix-run.yml
+    with:
+      front_door: label
+      request: ${{ format('{{"repo":"valkey-io/valkey","issue":{0},"attempt":{1},"replay":"{2}"}}', inputs.issue, inputs.attempt, inputs.replay) }}
+      key: label-${{ inputs.issue }}
+    secrets:
+      VALKEYRIE_BOT_APP_ID: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      VALKEYRIE_BOT_PRIVATE_KEY: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -35,6 +36,18 @@ class IssuePublication(str, Enum):
 
     COMMENT = "comment"
     DRAFT_PR = "draft-pr"
+
+    @classmethod
+    def from_env(cls, variable: str) -> "IssuePublication":
+        """The mode the environment variable ``variable`` names; a comment unless told otherwise."""
+        value = os.environ.get(variable, "").strip().lower()
+        if not value:
+            return cls.COMMENT
+        try:
+            return cls(value)
+        except ValueError:
+            choices = ", ".join(mode.value for mode in cls)
+            raise ValueError(f"{variable} must be one of {choices}, not {value!r}") from None
 
 
 class CandidateAction(str, Enum):
@@ -195,6 +208,30 @@ class OpenFix:
 
 
 @dataclass(frozen=True)
+class IssueRequest:
+    """An issue a committer labelled for a change (:mod:`scripts.ci_fix.labelled`).
+
+    No CI job failed: the evidence is a test the agent writes first, which
+    code sees fail on the unchanged code.
+    """
+
+    number: int
+    # The issue as it was when it was labelled. Anyone can write an issue:
+    # the agent reads this as data.
+    title: str
+    body: str
+    # The labelling this run answers: its event on the issue.
+    label_event: int = 0
+    # What committers said on the issue, ``login: text``, oldest first.
+    comments: tuple[str, ...] = ()
+    # A crash report: the server crashing is the failure its test shows.
+    # Anywhere else a crash stops the run, and nothing is published about it.
+    crash_report: bool = False
+    # A replay of a closed issue on the commit before its fix: nothing is published.
+    replay: bool = False
+
+
+@dataclass(frozen=True)
 class UpstreamRun:
     """The fix made for the default branch too, for a pull request into it."""
 
@@ -230,6 +267,9 @@ class FixTask:
     # Open pull requests into ``target.upstream_branch`` that name the failing
     # test or close its detector issue: one may already fix the failure.
     open_fixes: tuple[OpenFix, ...] = ()
+    # Set for a labelled issue, which has no failed job: ``failure`` then
+    # names the commit the change is made on and the CI job that hosts it.
+    request: Optional[IssueRequest] = None
 
 
 @dataclass(frozen=True)
@@ -279,6 +319,15 @@ class FixCandidate:
     # Why no fix for the default branch, whose failing test it shares, could
     # be made. Never written by the agent.
     upstream_refusal: str = ""
+    # For a labelled issue. Whether it asks for new behaviour, not a bug fix,
+    # and the acceptance criteria the agent read from it; on a refusal, the
+    # questions it could not answer without guessing.
+    feature: bool = False
+    criteria: tuple[str, ...] = ()
+    questions: tuple[str, ...] = ()
+    # The test that code saw fail before any change, as a patch: on a
+    # refusal, what the next person starts from. Never written by the agent.
+    test_patch: str = ""
 
 
 @dataclass(frozen=True)
@@ -327,6 +376,15 @@ class FixContext:
     # The bot's guide for the repository, ending with the repository's own
     # guidelines as its default branch has them.
     guide: str = ""
+    # For a labelled issue: what code saw its test do before any change, for
+    # the report; that test's patch and output, for the agent; and the patch
+    # and tests a change may add to and never rewrite.
+    evidence_check: str = ""
+    evidence_detail: str = ""
+    frozen_patch: str = ""
+    frozen_tests: tuple[FailedTest, ...] = ()
+    # The last commits to the files a change touches, for its reviewer.
+    past_changes: str = ""
 
 
 @dataclass(frozen=True)
@@ -385,6 +443,7 @@ class FrontDoor(str, Enum):
     ISSUE = "issue"  # a Test Failure Detector issue (scripts/ci_fix/issues.py)
     PR = "pr"  # a maintainer's command on a PR (scripts/ci_fix/main.py)
     FOLLOW_UP = "follow-up"  # a bot-owned PR's red head (scripts/backport/ci_followup.py)
+    LABEL = "label"  # an issue a committer labelled for a change (scripts/ci_fix/labelled.py)
 
 
 @dataclass(frozen=True)
@@ -404,6 +463,8 @@ class FixPlan:
     # (a runner that could not install or build): such an attempt says nothing
     # about the failure, so no front door counts it.
     never_started: bool = False
+    # LABEL: which attempt at the labelling this is. Only the last one's failure is reported.
+    attempt: int = 0
 
 
 @dataclass(frozen=True)

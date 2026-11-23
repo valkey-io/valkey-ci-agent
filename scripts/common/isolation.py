@@ -197,6 +197,7 @@ def as_user(
     *,
     home: str,
     cwd: str | os.PathLike[str] | None = None,
+    network: bool = True,
 ) -> IsolatedInvocation:
     """Describe ``argv`` running as ``user`` with a scrubbed environment.
 
@@ -204,7 +205,10 @@ def as_user(
     privileged launcher command line, where credentials would be visible to
     every process on the runner. When ``cwd`` is set, the command enters it
     after switching users: the workflow user may no longer be able to enter a
-    checkout once it belongs to the isolated account.
+    checkout once it belongs to the isolated account. Without ``network``
+    the command gets a network namespace of its own, with only a loopback
+    interface: a test written from an issue anyone can file reaches the
+    servers it starts and nothing else. Linux only.
     """
     if not argv:
         raise ValueError("an isolated invocation needs a command")
@@ -232,6 +236,8 @@ def as_user(
     # sudo-rs (Ubuntu 26.04) ignores a bare -E and passes nothing; both sudos
     # keep the variables named here. Only the names reach the command line.
     preserve = f"--preserve-env={','.join(sorted(scrubbed))}"
+    if not network and sys.platform != "linux":
+        raise RuntimeError("a command can only be kept off the network on Linux")
     if sys.platform == "darwin":
         return IsolatedInvocation(
             (_program("sudo"), "-n", preserve, "-u", user, "--", *command),
@@ -240,9 +246,14 @@ def as_user(
     # runuser, not ``sudo -u``: it needs only root, which a runner's sudo
     # grants. setpriv prevents a setuid helper from restoring privileges.
     root = () if os.geteuid() == 0 else (_program("sudo"), "-n", preserve)
+    # A new network namespace's loopback interface is down until it is set up.
+    offline = () if network else (
+        _program("unshare"), "--net", "--", _program("sh"), "-c", 'ip link set lo up && exec "$@"', "ci-fix-offline",
+    )
     return IsolatedInvocation(
         (
             *root,
+            *offline,
             _program("runuser"),
             "--preserve-environment",
             "-u",

@@ -45,7 +45,8 @@ first when unstable has the failing test, or else to its CI-sweep PR
 
 ## Other ways a fix starts
 
-The bot also starts without being asked in two situations.
+The bot also starts without being asked in two situations, and a committer
+can start it from an issue.
 
 When one of the bot's own backport PRs fails CI, the backport workflow's
 hourly CI follow-up hands one failed job at a time to this bot. That is
@@ -56,6 +57,11 @@ a test that failed in Daily CI, the bot can try to fix that too. A maintainer
 can start this for one issue by hand, and an hourly dispatcher starts it for
 every eligible issue unless it is switched off. See
 [Fixing detector issues](#fixing-detector-issues).
+
+When a committer labels an issue `needs-agent-fix`, there is no failed job at
+all. The bot first writes a test that fails because of what the issue
+reports, and then makes the change with that failing run as its evidence. See
+[Making the change an issue asks for](labelled-issues.md).
 
 ## What the bot does with a failure
 
@@ -107,7 +113,9 @@ it ran where it was merged, and the PR's own CI runs the check.
 
 **Claude diagnoses and edits.** Claude gets the job's whole log, whatever the
 history search found, the verification command, and Valkey's testing
-conventions: the bot's own guide in `scripts/ci_fix/guides/valkey-io__valkey.md`,
+conventions: the bot's own guide in `scripts/ci_fix/guides/` (how to tell
+what a failed job is in `valkey-io__valkey.failed-job.md`, then what every
+change follows in `valkey-io__valkey.md`),
 which ends with Valkey's own guidelines (`AGENTS.md`, `DEVELOPMENT_GUIDE.md`,
 `tests/README.md` and `src/unit/README.md`). Those are taken from the default
 branch, so an older release branch gets the current ones and a pull request
@@ -366,15 +374,17 @@ each other as JSON (`state.py`).
 Each way of starting a fix has a small front door that checks the request and
 turns it into the same `FixTask`: `main.py` for PR requests,
 `comment_poll.py` for picking up comments, `issues.py` and
-`issue_dispatch.py` for detector issues, and `scripts/backport/ci_followup.py`
-for backport PRs. `gate.py` parses commands and checks that the requester is
-allowed. `github_runs.py` and `issue_state.py` read the state of runs and
+`issue_dispatch.py` for detector issues, `scripts/backport/ci_followup.py`
+for backport PRs, and `labelled.py` for
+[labelled issues](labelled-issues.md). `gate.py` parses commands and checks
+that the requester is allowed. `github_runs.py` and `issue_state.py` read the state of runs and
 issues.
 
 `ci_job.py` reads the workflow file and writes the script that replays a
 job's setup, and `job.sh` runs the fix inside that job. `engine.py` runs the
-fix itself. It calls `prior_fixes.py` to search the history, `verification.py`
-to plan the command that verifies a fix, and `agent.py` for the Claude
+fix itself: `prepare_fix` from a failed job's log, and `prepare_change` from
+a test written first, for a labelled issue. It calls `prior_fixes.py` to
+search the history, `verification.py` to plan the command that verifies a fix, and `agent.py` for the Claude
 sessions that fix and review. `publish.py` and `push.py` check the destination again and publish.
 `comment.py` writes the bot's reply. `policy.py` lists what each kind of
 target allows, and `models.py` has the shared data types.

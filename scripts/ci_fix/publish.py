@@ -18,6 +18,7 @@ The PR's own CI decides; this module never merges.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import replace
 from typing import Any
 
@@ -27,8 +28,13 @@ from scripts.backport import ci_sweep
 from scripts.backport.pr_creator import create_pull_from_push_repo
 from scripts.backport.sweep_prs import delete_stale_backport_branch, find_existing_pr
 from scripts.ci_fix import upstream
-from scripts.ci_fix.comment import candidate_context, prose
-from scripts.ci_fix.issue_state import has_open_linked_pr, parse_detector_occurrence
+from scripts.ci_fix.comment import candidate_context, candidate_criteria, prose
+from scripts.ci_fix.issue_state import (
+    LINKED_PR,
+    has_open_linked_pr,
+    parse_detector_occurrence,
+    request_rejection,
+)
 from scripts.ci_fix.models import (
     CandidateAction,
     Failure,
@@ -36,6 +42,7 @@ from scripts.ci_fix.models import (
     FixResult,
     FixTask,
     IssuePublication,
+    IssueRequest,
     ResultKind,
     TargetKind,
 )
@@ -53,13 +60,34 @@ from scripts.common.github_client import retry_github_call
 
 logger = logging.getLogger(__name__)
 
-# How _validate_issue_target says a PR already links the issue, which
-# reconcile_draft_pr checks for.
-_LINKED_PR = "already has an open linked pull request"
+# What a credential looks like. The fix job holds no GitHub token, and its AWS
+# session credentials are not in the environment of the account that runs
+# the agent's tests: this is the last check before what the agent wrote leaves.
+_SECRETS = (
+    ("an AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("a GitHub token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})")),
+    ("a private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+)
 
 
 class TargetRevalidationFailed(Exception):
     """The target could not be revalidated because GitHub was unavailable."""
+
+
+def leaked_secret(candidate: FixCandidate) -> str:
+    """What looks like a credential in what ``candidate`` would publish, or "".
+
+    The lines a patch adds, and every text an agent wrote, the reviewer's
+    in the checks too; a patch's context lines are the repository's own.
+    """
+    added = "\n".join(
+        line for patch in (candidate.patch, candidate.test_patch) for line in patch.splitlines() if line.startswith("+")
+    )
+    text = "\n".join((
+        added, candidate.summary, candidate.title, candidate.root_cause, candidate.reasoning,
+        candidate.validation, candidate.verification, *candidate.criteria, *candidate.questions,
+    ))
+    return next((kind for kind, shape in _SECRETS if shape.search(text)), "")
 
 
 def publish_candidate(
@@ -75,6 +103,10 @@ def publish_candidate(
     ``issue_publication`` applies to a detector issue's fix: as a draft PR,
     or as a patch posted on the issue, which pushes nothing.
     """
+    secret = leaked_secret(candidate)
+    if secret:
+        # Without the candidate: its text is what holds the credential.
+        return _refused(task, None, f"What was prepared holds what looks like {secret}, so nothing was published.")
     if candidate.action is CandidateAction.REFUSE:
         if task.target.fix_branch and candidate.open_fix:
             return upstream.open_fix_result(task, candidate)
@@ -92,6 +124,11 @@ def publish_candidate(
             candidate,
             f"The {candidate.action.value} action is not supported for "
             f"a {target.kind.value} target.",
+        )
+    if task.request is not None and task.request.replay:
+        return FixResult(
+            kind=ResultKind.SUGGESTED, summary="Replay: the change was prepared, and nothing was published.",
+            task=task, candidate=candidate,
         )
 
     if target.fix_branch and (candidate.action is CandidateAction.PORT or candidate.adapts):
@@ -131,13 +168,15 @@ def _publish_issue_comment(gh: Any, task: FixTask, candidate: FixCandidate) -> F
     except TargetRevalidationFailed as exc:
         return _failed(task, candidate, str(exc))
     if rejection:
-        return _refused(task, candidate, f"Not posting the patch: {rejection}")
+        # A labelled issue that was taken, edited or called off gets the reason and nothing the run found.
+        return _refused(task, None if task.request is not None else candidate, f"Not posting the patch: {rejection}")
     limit = target_capabilities(TargetKind.SUGGEST).patch_limit
     if len(candidate.patch) > limit:
         # The candidate was prepared under the draft PR's limit; a comment
         # holds less. Said plainly, rather than a comment without its patch.
         # A patch that was not run is never pushed, so a draft PR is no help.
-        advice = "" if candidate.not_run else " Set CI_FIX_ISSUES_PUBLISH=draft-pr for a fix this size."
+        variable = "AGENT_FIX_PUBLISH" if task.request is not None else "CI_FIX_ISSUES_PUBLISH"
+        advice = "" if candidate.not_run else f" Set {variable}=draft-pr for a fix this size."
         return _refused(
             task,
             candidate,
@@ -415,7 +454,7 @@ def _publish_draft(
     except TargetRevalidationFailed as exc:
         return _failed(task, candidate, str(exc))
     if rejection:
-        return _refused(task, candidate, rejection)
+        return _refused(task, None if task.request is not None else candidate, rejection)
 
     def check_issue() -> str:
         return _validate_issue_target(gh, task)
@@ -539,7 +578,7 @@ def reconcile_draft_pr(
     if rejection:
         # The exact PR may have appeared between the first lookup and the
         # issue-timeline check. One final exact lookup resolves that race.
-        if _LINKED_PR in rejection:
+        if LINKED_PR in rejection:
             reused = _reuse_draft_pr(gh, task, candidate, commit_sha)
             if reused is not None:
                 return reused
@@ -673,13 +712,20 @@ def _validate_issue_target(gh: Any, task: FixTask) -> str:
         raise TargetRevalidationFailed(
             f"Issue #{issue_number} could not be revalidated ({exc})."
         ) from exc
+    if task.request is not None:
+        try:
+            return request_rejection(issue, task.request)
+        except Exception as exc:  # noqa: BLE001 - retry can recover GitHub API failures
+            raise TargetRevalidationFailed(
+                f"Issue #{issue_number} links could not be revalidated ({exc})."
+            ) from exc
     if str(getattr(issue, "state", "") or "") != "open":
         return f"Issue #{issue_number} is no longer open."
     if getattr(issue, "assignees", None):
         return f"Issue #{issue_number} is now assigned; leaving it to the assignee."
     try:
         if has_open_linked_pr(issue):
-            return f"Issue #{issue_number} {_LINKED_PR}."
+            return f"Issue #{issue_number} {LINKED_PR}."
     except Exception as exc:  # noqa: BLE001 - retry can recover GitHub API failures
         raise TargetRevalidationFailed(
             f"Issue #{issue_number} links could not be revalidated ({exc})."
@@ -727,12 +773,38 @@ def _source_label(failure: Failure) -> str:
 
 
 def _draft_title(task: FixTask, candidate: FixCandidate | None) -> str:
+    if task.request is not None:
+        # The agent's commit subject, which says what the change does.
+        title = prose(candidate.title, 120) if candidate is not None else ""
+        return fit_subject(title or f"Fix issue #{task.request.number}")
     failing_check = candidate.failing_check if candidate is not None else ""
     fallback = f"{_source_label(task.failure)} failure"
     return fit_subject(f"Fix {failing_check or task.failure.job_name or fallback}")
 
 
+def _change_body(task: FixTask, request: IssueRequest, candidate: FixCandidate | None) -> str:
+    """A labelled issue's draft PR: a summary fit for the squash commit, then what a reviewer can check it against."""
+    lines = []
+    if candidate is not None and candidate.summary:
+        lines += [prose(candidate.summary, 500), ""]
+    lines += [f"Fixes #{request.number}", "", "## AI generated details", ""]
+    if candidate is None:
+        lines += ["An earlier attempt prepared this branch: review its commit before merging.", ""]
+    else:
+        lines += candidate_criteria(candidate) + candidate_context(candidate, include_reasoning=True)
+    lines += [
+        "---",
+        "",
+        f"<sub>Written by the CI agent for #{request.number}, which a committer labelled for it. The bot never "
+        "merges: this PR's CI and a committer's review decide. Its commit has no DCO sign-off: whoever takes "
+        "the change over signs it off.</sub>",
+    ]
+    return "\n".join(lines)
+
+
 def _draft_body(task: FixTask, candidate: FixCandidate | None) -> str:
+    if task.request is not None:
+        return _change_body(task, task.request, candidate)
     failure = task.failure
     lines = []
     if failure.issue_number:

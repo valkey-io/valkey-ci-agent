@@ -72,6 +72,24 @@ def test_the_command_runs_with_its_own_home_and_git_allowed(monkeypatch):
     assert "secret" not in invocation.argv
 
 
+def test_a_command_kept_off_the_network_gets_a_namespace_with_only_loopback(monkeypatch):
+    monkeypatch.setattr(isolation.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    monkeypatch.setattr(isolation.shutil, "which", lambda name: f"/usr/sbin/{name}")
+
+    offline = isolation.as_user("v", {}, ["make"], home="/h", network=False)
+
+    # The namespace is made as root, before the switch to the account that cannot make one.
+    assert offline.argv[:8] == (
+        "/usr/sbin/unshare", "--net", "--", "/usr/sbin/sh", "-c", 'ip link set lo up && exec "$@"', "ci-fix-offline",
+        "/usr/sbin/runuser",
+    )
+    assert "/usr/sbin/unshare" not in isolation.as_user("v", {}, ["make"], home="/h").argv
+    monkeypatch.setattr(isolation.sys, "platform", "darwin")
+    with pytest.raises(RuntimeError, match="can only be kept off the network on Linux"):
+        isolation.as_user("v", {}, ["make"], home="/h", network=False)
+
+
 def test_root_switches_account_without_sudo_and_macos_through_sudo(monkeypatch):
     """A job's container runs as root and has no sudo; macOS has no runuser."""
     monkeypatch.setattr(isolation.os, "geteuid", lambda: 0)

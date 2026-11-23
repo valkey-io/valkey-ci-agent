@@ -36,6 +36,7 @@ from scripts.common.proc import (
     is_ancestor,
     run_git,
 )
+from scripts.common.text_utils import defused
 
 PrePushCheck = Callable[[], str]
 
@@ -474,8 +475,9 @@ def _is_stale_lease(exc: subprocess.CalledProcessError) -> bool:
 
 def commit_message(candidate: FixCandidate) -> str:
     """Return a concise bot-authored commit message for an authored patch."""
-    subject = fit_subject(candidate.title or f"Fix {candidate.failing_check or 'CI failure'}")
-    paragraphs = [candidate.root_cause.strip(), candidate.reasoning.strip()]
+    # The agent wrote these: "fixes #N" in a commit message closes that issue when it merges.
+    subject = fit_subject(defused(candidate.title or f"Fix {candidate.failing_check or 'CI failure'}"))
+    paragraphs = [defused(candidate.root_cause.strip()), defused(candidate.reasoning.strip())]
     body = "\n\n".join(
         textwrap.fill(
             paragraph,

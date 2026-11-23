@@ -27,6 +27,11 @@ These repository variables adjust its behaviour:
 | `CI_FIX_ISSUES_AUTO_DISPATCH` | Set to `false` to stop the CI fix bot from starting on detector issues by itself. |
 | `CI_FIX_ISSUES_MAX_RUNS` | How many detector issue fixes can run at once. Defaults to 2. |
 | `CI_FIX_ISSUES_PUBLISH` | How a detector issue's fix is shared: `comment` (the default) or `draft-pr`. |
+| `AGENT_FIX_DISPATCH` | Set to `true` to have the bot pick up issues labelled `needs-agent-fix`. |
+| `AGENT_FIX_MAX_RUNS` | How many labelled issues are worked on at once. Defaults to 2. |
+| `AGENT_FIX_PUBLISH` | How a labelled issue's change is shared: `comment` (the default) or `draft-pr`. |
+| `AGENT_FIX_PUSH_REPO` | The bot's own fork of Valkey, `owner/name`, to push a labelled issue's branch to. Unset, it is pushed to `valkey-io/valkey`. |
+| `AGENT_FIX_REVIEWED_THROUGH` | A pull request number: the bot's pull requests for labelled issues up to it no longer count towards its pause. |
 
 ### The model
 
@@ -78,6 +83,7 @@ securing releases, including the tag ruleset.
 | Backport Eligibility | every day at 00:30 | [Backports](backport.md#suggesting-backports) |
 | CI Fix Comment Poll | every hour | [Fixing CI failures](ci-fix.md#asking-for-a-fix) |
 | CI Fix Issue Dispatch | every hour at :23, once switched on | [Fixing CI failures](ci-fix.md#fixing-detector-issues) |
+| CI Fix Labelled Dispatch | every hour at :41, once switched on | [Making the change an issue asks for](labelled-issues.md) |
 | Test Failure Detector | every day at 23:00 | [Test Failure Detector](test-failure-detector.md) |
 | Monitor Valkey Fuzzer Runs | every four hours at :41 | [Fuzzer monitor](fuzzer-monitor.md) |
 | Watch Release PR Reviews | one per release PR, started by the cut; holds a runner for 55 minutes checking every five minutes, with the next hour's run queued, until the PR closes or is three days old | [Release notes](release-notes.md#applying-review-comments) |

@@ -14,6 +14,12 @@ inputs:
     description: Install the Claude Code CLI used by AI-backed agent jobs.
     required: false
     default: "false"
+  install-clang-format:
+    description: >-
+      Install the clang-format release Valkey's CI checks formatting with,
+      for the jobs that format a change before it is published.
+    required: false
+    default: "false"
   path:
     description: Where the agent repository is checked out.
     required: false
@@ -79,3 +85,11 @@ runs:
       if: ${{ inputs['install-claude'] == 'true' }}
       shell: bash
       run: npm install -g @anthropic-ai/claude-code@2.1.321
+
+    # Without it the change is published unformatted and the pull request's
+    # own formatting check says so: not a reason to fail the job.
+    - name: Install clang-format
+      if: ${{ inputs['install-clang-format'] == 'true' }}
+      continue-on-error: true
+      shell: bash
+      run: python -m pip install clang-format==18.1.8

@@ -218,3 +218,68 @@ def test_a_sweep_pr_is_told_in_a_line_and_the_ci_sweep_pr_is_told_why() -> None:
     )
     assert "unverified" not in explained.split("<details>")[0]
     assert "The fixture embeds an obsolete payload." in explained.split("<details>")[1]
+
+
+def _change(kind: ResultKind, *, candidate: FixCandidate | None = None, **request: object) -> FixResult:
+    from scripts.ci_fix.models import IssueRequest
+
+    task = replace(
+        _task(TargetKind.DRAFT_PR),
+        failure=replace(_task().failure, base_branch="unstable"),
+        request=IssueRequest(number=7, title="value is wrong", body="It says before.", **request),
+    )
+    return FixResult(
+        kind=kind, summary="The issue does not say what the reply is", task=task, candidate=candidate,
+        commit_sha="c" * 40, pr_number=44, pr_url="https://example/pr/44",
+    )
+
+
+def test_what_the_agent_wrote_cannot_mention_link_or_close_anything() -> None:
+    candidate = _candidate(root_cause="Fixes #99, see https://evil.example and ask @someone.")
+
+    body = render_result(_change(ResultKind.SUGGESTED, candidate=candidate))
+
+    assert "Fixes #\u200b99, see https:\u200b//evil.example and ask @\u200bsomeone." in body
+
+
+def test_the_agents_questions_and_criteria_cannot_mention_anyone_either() -> None:
+    candidate = _candidate(
+        action=CandidateAction.REFUSE, patch="", questions=("Should @someone decide?",),
+        criteria=("It replies as https://evil.example says.",),
+    )
+
+    body = render_result(_change(ResultKind.REFUSED, candidate=candidate))
+
+    assert "- Should @\u200bsomeone decide?" in body
+    assert "- It replies as https:\u200b//evil.example says." in body
+
+
+def test_a_labelled_issues_change_is_posted_with_its_criteria_checks_and_patch() -> None:
+    candidate = _candidate(criteria=("It replies with an error for a missing key.",), verification="Before any change, it failed 3 of 3 runs.")
+
+    body = render_result(_change(ResultKind.SUGGESTED, candidate=candidate))
+
+    assert body.startswith("A change for this issue, prepared and checked on `unstable` at ")
+    assert "Nothing was pushed and no PR was opened: a committer applies it, or not." in body
+    assert "**Acceptance criteria, as read from the issue**\n\n- It replies with an error for a missing key." in body
+    assert "- Before any change, it failed 3 of 3 runs." in body and "```diff" in body
+
+
+def test_a_refusal_lists_the_open_questions_and_keeps_the_failing_test() -> None:
+    candidate = _candidate(
+        action=CandidateAction.REFUSE, patch="", questions=("What does it reply for a missing key?",),
+        test_patch="+++ b/tests/unit/x.tcl\n+test {x} {}\n",
+    )
+
+    body = render_result(_change(ResultKind.REFUSED, candidate=candidate))
+
+    assert body.startswith("No change was prepared. The issue does not say what the reply is.")
+    assert "A committer has to answer these first:\n\n- What does it reply for a missing key?" in body
+    assert "<details><summary>The test that shows the issue</summary>" in body and "+test {x} {}" in body
+
+
+def test_an_opened_draft_pr_is_linked_from_its_issue() -> None:
+    body = render_result(_change(ResultKind.OPENED, candidate=_candidate(verification="It passed 40 loop(s).")))
+
+    assert body.startswith("Opened draft PR [#44](https://example/pr/44) for this issue.")
+    assert "<details><summary>What the bot checked</summary>" in body and "- It passed 40 loops." in body

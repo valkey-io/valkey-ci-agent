@@ -135,6 +135,21 @@ class TestRun:
     timed_out: bool = False
     # How long the command took: one loop's time sizes the looped run.
     seconds: float = 0.0
+    # The command failed and its output shows a server crashing (``shows_crash``).
+    crashed: bool = False
+
+
+# A server that crashed: its crash report, a failed assertion or panic, or
+# AddressSanitizer stopping it; and a C unit test, which runs the server's
+# code in its own process, killed by a signal.
+_CRASH_RE = re.compile(
+    r"BUG REPORT START|crashed by signal|killed by signal|ASSERTION FAILED|Guru Meditation|ERROR: AddressSanitizer"
+)
+
+
+def shows_crash(output: str) -> bool:
+    """Whether ``output`` shows the server's code crashing, not a test's assertion failing."""
+    return bool(_CRASH_RE.search(output))
 
 
 def failure_report(output: str) -> str:
@@ -226,12 +241,7 @@ def plan_for(
     notes: list[str] = []
     default = job is None
     if job is None:
-        accurate = " --accurate" if scheduled else ""
-        job = JobCommands(
-            build="make",
-            runtest=f"./runtest --dump-logs{accurate}",
-            moduleapi=f"./runtest-moduleapi --dump-logs{accurate}",
-        )
+        job = default_commands(scheduled=scheduled)
     moduleapi = bool(job.moduleapi) and _in_moduleapi(tests[0].file)
     tests = tuple(test for test in tests if _in_moduleapi(test.file) == moduleapi)
     base = job.moduleapi if moduleapi else job.runtest
@@ -262,6 +272,16 @@ def plan_for(
                      fallback=(_isolated_plan(repo_dir, tests, base, options, job.build, notes)
                                or _whole_file_plan(repo_dir, tests, base, options, job.build, notes))
                      if "--only" in selection else None)
+
+
+def default_commands(*, scheduled: bool) -> JobCommands:
+    """Plain ``make`` and ``runtest``, which stand in for a job that cannot host the fix."""
+    accurate = " --accurate" if scheduled else ""
+    return JobCommands(
+        build="make",
+        runtest=f"./runtest --dump-logs{accurate}",
+        moduleapi=f"./runtest-moduleapi --dump-logs{accurate}",
+    )
 
 
 def _one_line_build(build: str) -> str:
@@ -478,6 +498,27 @@ def _whole_file_plan(
         attributed=True,
         notes=(*notes, "The test could not run alone, so its whole file runs once, without loops."),
         tests=tests,
+    )
+
+
+def to_the_end(plan: VerifyPlan, repo_dir: str) -> VerifyPlan:
+    """``plan`` with its tests run to the end, not stopping at the first that fails.
+
+    With runtest's ``--durable`` where the branch has it. A test for
+    behaviour that is not there yet often fails by an error a command
+    replies, not by an assertion, and runtest then ends the whole run with
+    an exception whose stack names no test. With ``--durable`` it reports
+    that test as failed and goes on to the next.
+    """
+    durable = " --durable" if _runtest_supports(repo_dir, "--durable") else ""
+
+    def to_end(command: str) -> str:
+        # A runtest command passes --loops; a unit test's stops at nothing and takes neither option.
+        return command.replace(" --fastfail", "").replace(" --loops ", f"{durable} --loops ", 1)
+
+    return replace(
+        plan, test=to_end(plan.test), shown=to_end(plan.shown),
+        fallback=to_the_end(plan.fallback, repo_dir) if plan.fallback is not None else None,
     )
 
 

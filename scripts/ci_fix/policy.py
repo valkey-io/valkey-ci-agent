@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
 from scripts.ci_fix.models import CandidateAction, FixPolicy, FixTask, TargetKind
 from scripts.common.identity import APP_LOGIN
 
-WRITABLE_BRANCH_PREFIXES = ("backport/", "agent/backport/", "agent/ci-fix/")
+# Where a labelled issue's change is pushed (scripts/ci_fix/labelled.py).
+CHANGE_BRANCH_PREFIX = "agent/fix/"
+WRITABLE_BRANCH_PREFIXES = ("backport/", "agent/backport/", "agent/ci-fix/", CHANGE_BRANCH_PREFIX)
+# The bot's own fork of the target repository, ``owner/name``, for those
+# branches: a pull request from it runs CI with an outside contributor's
+# permissions. Unset, they are pushed to the target repository.
+PUSH_REPO_ENV = "AGENT_FIX_PUSH_REPO"
 BACKPORT_BRANCH_PREFIXES = ("backport/", "agent/backport/")
 CiFixAgentProfile = Literal["ci_fix_edit", "ci_fix_suggest"]
 
@@ -92,6 +99,11 @@ def is_writable_branch(branch: str) -> bool:
 
 def is_backport_branch(branch: str) -> bool:
     return branch.startswith(BACKPORT_BRANCH_PREFIXES)
+
+
+def push_repo() -> str:
+    """The bot's own fork (``PUSH_REPO_ENV``), or ""."""
+    return os.environ.get(PUSH_REPO_ENV, "").strip()
 
 
 def allows_ci_changes(task: FixTask) -> bool:

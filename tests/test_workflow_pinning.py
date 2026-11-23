@@ -301,6 +301,22 @@ def test_the_fix_runs_start_only_from_their_front_doors():
         assert set(workflow["on"]) == triggers, filename
 
 
+def test_labelled_issues_are_picked_up_only_while_the_switch_is_on():
+    workflow = yaml.load(Path(".github/workflows/ci-fix-labelled-dispatch.yml").read_text(encoding="utf-8"),
+                         Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["dispatch"]
+    # Off unless the variable says true, unlike the detector's queue, which is on unless it says false.
+    assert "(github.event_name == 'workflow_dispatch' || vars.AGENT_FIX_DISPATCH == 'true')" in job["if"]
+    assert workflow["on"]["schedule"] == [{"cron": "41 * * * *"}]
+    steps = {step.get("name"): step for step in job["steps"]}
+    assert steps["Dispatch"]["env"]["MAX_RUNS"] == "${{ inputs.max_runs || vars.AGENT_FIX_MAX_RUNS || '2' }}"
+    assert steps["Dispatch"]["env"]["DRY_RUN"] == "${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}"
+    token = steps["Generate target repository token"]["with"]
+    assert {k: v for k, v in token.items() if k.startswith("permission-")} == {
+        "permission-issues": "read", "permission-pull-requests": "read", "permission-metadata": "read",
+    }
+
+
 def test_the_issue_dispatcher_schedule_runs_until_switched_off_and_never_writes_valkey():
     workflow = yaml.load(Path(".github/workflows/ci-fix-issue-dispatch.yml").read_text(encoding="utf-8"),
                          Loader=yaml.BaseLoader)
@@ -347,7 +363,7 @@ def test_every_fix_front_door_runs_the_shared_fix():
 
     doors = set()
     for filename, job_id in (("ci-fix.yml", "ci-fix"), ("backport-ci-followup.yml", "follow-up"),
-                             ("ci-fix-issues.yml", "fix")):
+                             ("ci-fix-issues.yml", "fix"), ("ci-fix-labelled.yml", "fix")):
         job = yaml.safe_load((Path(".github/workflows") / filename).read_text(encoding="utf-8"))["jobs"][job_id]
         assert job["uses"] == f"./{_RUN.as_posix()}", filename
         # actions: read lets the plan job read earlier plans, which record
@@ -381,24 +397,39 @@ def test_only_the_plan_and_publish_jobs_hold_a_github_token():
             assert jobs[job_id]["permissions"] == {"contents": "read"}
             continue
         plan = job_id == "plan"
-        assert [token["id"] for token in tokens] == (["target-token"] if plan else ["target-token", "ci-token"])
+        assert [token["id"] for token in tokens] == (
+            ["target-token"] if plan else ["target-token", "push-token", "ci-token"]
+        )
         permissions = {k: v for k, v in tokens[0]["with"].items() if k.startswith("permission-")}
-        # The plan only reads and answers (a comment, a reaction); publish pushes and opens PRs.
+        # The plan only reads and answers (a comment, a reaction, a label taken off); publish pushes and opens
+        # PRs. A labelled issue's plan opens the pull request an earlier attempt pushed a branch for. Its branch
+        # goes to the bot's fork when it has one, and its publish then cannot write the target's code.
         assert permissions == {
             "permission-actions": "read", "permission-issues": "write", "permission-metadata": "read",
-            "permission-contents": "read" if plan else "write",
-            "permission-pull-requests": "read" if plan else "write",
+            "permission-contents": "read" if plan else (
+                "${{ inputs.front_door == 'label' && vars.AGENT_FIX_PUSH_REPO != '' && 'read' || 'write' }}"
+            ),
+            "permission-pull-requests": "${{ inputs.front_door == 'label' && 'write' || 'read' }}" if plan else "write",
             # The PR command's gate checks team membership.
             **({"permission-members": "read"} if plan else {}),
         }, job_id
         if not plan:
-            # Publish mints exactly one of its two tokens: workflows:write only
+            # Publish mints exactly one of its two target tokens: workflows:write only
             # for a push that may change .github/ (policy.allows_ci_changes).
-            plain, ci = tokens
+            plain, fork, ci = tokens
             assert plain["if"] == "needs.plan.outputs.ci_changes != 'true'"
             assert ci["if"] == "needs.plan.outputs.ci_changes == 'true'"
             ci_permissions = {k: v for k, v in ci["with"].items() if k.startswith("permission-")}
-            assert ci_permissions == {**permissions, "permission-workflows": "write"}
+            assert ci_permissions == {**permissions, "permission-contents": "write", "permission-workflows": "write"}
+            # The fork's token pushes a branch there and nothing else, and only where a fork is named.
+            assert fork["if"] == "steps.fork.outputs.owner != ''"
+            # workflows: write only so that a fork behind the target takes the target's own workflow files.
+            assert {k: v for k, v in fork["with"].items() if k.startswith("permission-")} == {
+                "permission-contents": "write", "permission-workflows": "write", "permission-metadata": "read",
+            }
+            assert (fork["with"]["owner"], fork["with"]["repositories"]) == (
+                "${{ steps.fork.outputs.owner }}", "${{ steps.fork.outputs.name }}",
+            )
             assert {k: v for k, v in ci["with"].items() if not k.startswith("permission-")} == {
                 k: v for k, v in plain["with"].items() if not k.startswith("permission-")
             }
@@ -408,10 +439,14 @@ def test_only_the_plan_and_publish_jobs_hold_a_github_token():
             assert publish_step["env"]["TARGET_TOKEN"] == (
                 "${{ steps.ci-token.outputs.token || steps.target-token.outputs.token }}"
             )
+            assert publish_step["env"]["AGENT_FIX_PUBLISH"] == "${{ vars.AGENT_FIX_PUBLISH }}"
+            # Publishing checks the pause again, so it reads what lifts it as the dispatcher does.
+            assert publish_step["env"]["AGENT_FIX_REVIEWED_THROUGH"] == "${{ vars.AGENT_FIX_REVIEWED_THROUGH }}"
+            assert publish_step["env"]["PUSH_TOKEN"] == "${{ steps.push-token.outputs.token }}"
         assert jobs[job_id]["permissions"] == {
             **({"actions": "read"} if job_id == "plan" else {}), "contents": "read",
         }, job_id
-    assert _RUN.read_text(encoding="utf-8").count("actions/create-github-app-token@") == 4
+    assert _RUN.read_text(encoding="utf-8").count("actions/create-github-app-token@") == 5
     assert "create-github-app-token@" not in _JOB.read_text(encoding="utf-8")
     assert jobs["plan"]["outputs"]["ci_changes"] == "${{ steps.plan.outputs.ci_changes }}"
 
@@ -662,6 +697,22 @@ def test_a_container_fix_mode_installs_the_agents_tools_from_the_distribution():
         for step in job.get("steps") or []:
             if step.get("name") == "CI fix: set up the agent":
                 assert (step["with"].get("system-packages") == "true") == bool(job.get("container")), job_id
+
+
+def test_the_jobs_that_make_a_change_install_the_formatter_valkeys_ci_checks_with():
+    """Its release is pinned in one place, and a failed install does not fail the fix."""
+    action = yaml.safe_load(Path(".github/actions/setup-agent/action.yml").read_text(encoding="utf-8"))
+    [install] = [step for step in action["runs"]["steps"] if step.get("name") == "Install clang-format"]
+
+    assert action["inputs"]["install-clang-format"]["default"] == "false"
+    assert install["if"] == "${{ inputs['install-clang-format'] == 'true' }}"
+    assert install["run"] == "python -m pip install clang-format==18.1.8" and install["continue-on-error"] is True
+    job_text = _JOB.read_text(encoding="utf-8")
+    assert "clang-format==" not in job_text and "clang-format==" not in _RUN.read_text(encoding="utf-8")
+    # A labelled issue's change is made in a job on the runner or on the bot's own, never in a container.
+    for job_id, job in yaml.safe_load(job_text)["jobs"].items():
+        [setup] = [step for step in job["steps"] if step.get("name") == "CI fix: set up the agent"]
+        assert (setup["with"].get("install-clang-format") == "true") == (not job.get("container")), job_id
 
 
 def test_enterprise_linux_container_setup_retries_and_upgrades_python(tmp_path):

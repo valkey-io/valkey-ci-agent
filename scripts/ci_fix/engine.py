@@ -23,15 +23,26 @@ already merged upstream comes first: a port, or a patch that adapts one
 test or the test harness is written on the branch, and reported as one the
 default branch does not have; product source changes there only by a commit
 merged upstream.
+
+An issue a committer labelled has no failed job (:func:`prepare_change`). Its
+evidence is made first: the agent writes a test, and code has to see it fail
+on the unchanged code, every run, on its own assertion. That test is then
+frozen, its failing run is the log of step 2, and step 3 checks more: the
+test passing looped and under AddressSanitizer, every changed test file in
+full, and a reviewer who looks for a case the change still gets wrong and
+writes it as a test that code runs.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -39,15 +50,20 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Protocol, TypeVar
 
+from scripts.ai.runtime import SESSION_SUFFIX
 from scripts.ci_fix.agent import (
     API_ERROR_PAUSE_S,
     AgentTimeout,
     ModelUnavailable,
+    Review,
+    find_counterexample,
     review_candidate,
     run_fix_agent,
+    write_failing_test,
 )
 from scripts.ci_fix.models import (
     CandidateAction,
@@ -57,6 +73,7 @@ from scripts.ci_fix.models import (
     FixPolicy,
     FixTarget,
     FixTask,
+    IssueRequest,
     TargetKind,
     UpstreamRun,
 )
@@ -79,14 +96,20 @@ from scripts.ci_fix.verification import (
     TestRun,
     VerifyPlan,
     build_plan,
+    default_commands,
     failure_report,
     plan_for,
+    shows_crash,
+    shows_failure_of,
+    to_the_end,
     upstream_plan,
 )
 from scripts.common.git_clone import is_full_sha, shallow_clone_at_sha
 from scripts.common.isolation import as_user, handed_to, isolated_user, kill_all
 from scripts.common.logging_utils import log_group
 from scripts.common.proc import (
+    BOT_EMAIL,
+    BOT_NAME,
     PROCESS_BASICS,
     EmptyPatch,
     build_approved_patch,
@@ -349,6 +372,738 @@ def _unverifiable_refusal(context: FixContext, plan: VerifyPlan | None) -> FixCa
     )
 
 
+# A labelled issue's evidence is a test written first. It has to fail this
+# many runs in a row on the unchanged code, and the agent gets this many
+# attempts at writing one.
+EVIDENCE_RUNS = 3
+EVIDENCE_ATTEMPTS = 5
+# What establishing the evidence may use of the budget, and one session of it.
+_EVIDENCE_BUDGET_S = 90 * 60
+_MAX_EVIDENCE_SESSION_S = 30 * 60
+# The most lines of product source a labelled issue's change may add and
+# remove: what a reviewer reads in one sitting. Tests are not counted.
+MAX_PRODUCT_LINES = 300
+# A change has to pass its test this many loops, or every loop the test can run.
+CHANGE_MIN_LOOPS = 10
+# What formatting a change, or regenerating a file from it, may take.
+_TIDY_TIMEOUT_S = 5 * 60
+
+
+class UnexpectedCrash(Exception):
+    """A server crashed on unchanged code, in a run for an issue that reports no crash.
+
+    It may be a vulnerability, which is reported in private: the attempt
+    ends, and nothing about it is published or logged.
+    """
+
+
+@dataclass(frozen=True)
+class _Evidence:
+    """The tests that code saw fail before any change was made."""
+
+    tests: tuple[FailedTest, ...]
+    # The plan that reached them, which the change is then checked with.
+    plan: VerifyPlan
+    # The tests as a patch on the base commit, their files, and one failing run's output.
+    patch: str
+    paths: tuple[str, ...]
+    output: str
+    # What code saw, for the report.
+    check: str
+    # The session's own reading of the issue: a feature or a bug, and its acceptance criteria.
+    written: FixCandidate
+
+
+def prepare_change(
+    task: FixTask,
+    agent_func: AgentFunc = run_fix_agent,
+    review_func: ReviewFunc | None = None,
+    test_func: TestFunc | None = None,
+    *,
+    evidence_func: AgentFunc = write_failing_test,
+    repo_dir: str = "",
+    job: JobCommands | None = None,
+) -> FixCandidate:
+    """The change the labelled issue ``task.request`` asks for, or why there is none.
+
+    No job failed, so the evidence comes first: the agent writes a test, for
+    a feature from acceptance criteria it reads in the issue, and code has to
+    see it fail ``EVIDENCE_RUNS`` runs in a row on the unchanged code
+    (:func:`_establish_evidence`). The change is then made and checked like a
+    CI fix, in the same loop, with that test frozen and its failing run as
+    the log, and has to pass more (:func:`_change_checks`,
+    :func:`_counterexample_review`). The candidate's patch is the test and
+    the change together, on the base commit.
+
+    A server that crashes on the unchanged code, where the issue reports no
+    crash, ends the attempt with nothing said about it (:class:`UnexpectedCrash`).
+    """
+    with checkout(task, repo_dir) as (repo_dir, base), _ending_at_a_crash():
+        deadline = time.monotonic() + PREPARE_BUDGET_S
+        run_test, stopping_at_crash = _runners(task, test_func)
+        guide = _change_guide(task, repo_dir)
+        evidence = _establish_evidence(
+            task, repo_dir, base, guide,
+            evidence_func=evidence_func, run_test=stopping_at_crash, deadline=deadline, job=job,
+        )
+        if isinstance(evidence, FixCandidate):
+            return evidence
+        made = _make_change(
+            task, repo_dir, guide, evidence, agent_func=agent_func, review_func=review_func,
+            run_test=run_test, stopping_at_crash=stopping_at_crash, deadline=deadline, job=job,
+        )
+        if made.action is not CandidateAction.PATCH:
+            return made
+        # What is published is the test and the change that makes it pass, as one patch on the base commit.
+        paths = tuple(sorted({*evidence.paths, *made.changed_paths}))
+        untracked = git_paths(repo_dir, "ls-files", "--others", "--exclude-standard", "-z", "--", *paths)
+        if untracked:
+            run_git(repo_dir, "add", "--intent-to-add", "--", *untracked)
+        patch = git_output(
+            repo_dir, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--binary", base, "--", *paths,
+        )
+        return replace(made, patch=patch, changed_paths=paths)
+
+
+def _request(task: FixTask) -> IssueRequest:
+    if task.request is None:
+        raise ValueError("a change is prepared for a labelled issue")
+    return task.request
+
+
+def _change_guide(task: FixTask, repo_dir: str) -> str:
+    """The bot's guide for a change, ending with the repository's own guidelines."""
+    guide = guide_for(task.failure.repo_full_name)
+    return guide + repository_guidelines(repo_dir) if guide else ""
+
+
+def _make_change(
+    task: FixTask,
+    repo_dir: str,
+    guide: str,
+    evidence: _Evidence,
+    *,
+    agent_func: AgentFunc,
+    review_func: ReviewFunc | None,
+    run_test: TestFunc,
+    stopping_at_crash: TestFunc,
+    deadline: float,
+    job: JobCommands | None,
+) -> FixCandidate:
+    """The change that makes ``evidence``'s tests pass, checked and reviewed, on the checkout's HEAD.
+
+    HEAD holds the tests already (the evidence is a commit of the checkout's
+    own), so that every round's patch is the change alone.
+    """
+    _ignore_generated_copies(repo_dir)
+    head = git_output(repo_dir, "rev-parse", "HEAD").strip()
+    sanitized = _with_sanitizer(job)
+    plan = evidence.plan
+    criteria = "".join(f"- {criterion}\n" for criterion in evidence.written.criteria)
+    context = FixContext(
+        guide=guide,
+        evidence_check=evidence.check,
+        evidence_detail="\n\n".join(part for part in (
+            evidence.check,
+            f"The acceptance criteria the test was written from:\n\n{criteria}" if criteria else "",
+            f"The test, which is in the working tree:\n\n```diff\n{evidence.patch}\n```\n",
+        ) if part),
+        frozen_patch=evidence.patch,
+        frozen_tests=evidence.tests,
+        verification=(
+            f"Code checks your change with `{plan.command(plan.loops)}`: the build must pass and the test must "
+            f"pass, once and then looped, at least {min(CHANGE_MIN_LOOPS, plan.loops)} times. It then runs "
+            "every test file the change touches in full, and the test once in a build with AddressSanitizer."
+        ),
+        verified_by_code=True,
+    )
+
+    def checks(candidate: FixCandidate, found: list[str]) -> str:
+        return _change_checks(
+            candidate, repo_dir, evidence, found, run_test=run_test, deadline=deadline, job=job, sanitized=sanitized,
+        )
+
+    made = _fix_loop(
+        task, repo_dir, head, evidence.output, context, plan,
+        agent_func=_tidied(agent_func, run_test),
+        review=review_func or _counterexample_review(task, stopping_at_crash, deadline, sanitized),
+        run_test=run_test, deadline=deadline, job=job, min_loops=CHANGE_MIN_LOOPS, also=checks,
+    )
+    return replace(
+        made, feature=evidence.written.feature, criteria=evidence.written.criteria, test_patch=evidence.patch,
+    )
+
+
+def _runners(task: FixTask, test_func: TestFunc | None) -> tuple[TestFunc, TestFunc]:
+    """How a labelled issue's commands run, both off the network: (run a check of the change, run and stop at a crash).
+
+    The second is for any run whose crash cannot be pinned on the bot's
+    change: the test's first runs, on unchanged code, and a reviewer's test
+    for a case nobody has tried. A server that crashes there, where the
+    issue reports no crash, may be a vulnerability, and the attempt ends
+    before anything about the run is logged. A crash in the change's own
+    checks is that change failing them, and goes back to its author.
+    """
+    request = _request(task)
+    run = test_func or partial(run_test_command, offline=True, quiet=True)
+
+    def checking(repo_dir: str, command: str, timeout: int) -> TestRun:
+        result = run(repo_dir, command, timeout)
+        _log_run(command, result)
+        return result
+
+    def stopping_at_crash(repo_dir: str, command: str, timeout: int) -> TestRun:
+        result = run(repo_dir, command, timeout)
+        if result.crashed and not request.crash_report:
+            raise UnexpectedCrash
+        _log_run(command, result)
+        return result
+
+    return checking, stopping_at_crash
+
+
+def _log_run(command: str, result: TestRun) -> None:
+    """Log a quiet command once its caller knows it may be shown."""
+    logger.info("Ran `%s`", command)
+    if not result.passed and not result.timed_out:
+        _log_failed_output(result.output)
+
+
+def _log_failed_output(output: str) -> None:
+    # The only record of why a command failed, once the run is over.
+    with log_group("Failed test command output"):
+        logger.info("%s", output)
+
+
+@contextmanager
+def _ending_at_a_crash() -> Iterator[None]:
+    """End the attempt at an :class:`UnexpectedCrash`, as one that stopped early, with nothing kept of it.
+
+    The sessions kept with the run's evidence records go
+    (``AgentProfile.keeps_session``): one of them wrote the test that
+    crashes the server. What is left is a failed attempt like any other.
+    """
+    try:
+        yield
+    except UnexpectedCrash:
+        directory = os.environ.get("CI_AGENT_EVIDENCE_DIR", "")
+        for session in Path(directory).glob(f"*{SESSION_SUFFIX}") if directory else ():
+            session.unlink(missing_ok=True)
+        raise RuntimeError("the run stopped before it had a result") from None
+
+
+_T = TypeVar("_T")
+
+
+def _retried(
+    session: Callable[[str, int], _T], repo_dir: str, feedback: str, timeout: Callable[[], int], label: str,
+) -> _T:
+    """Run ``session`` with ``feedback``; when it ends on a model API error, once more.
+
+    The session judged nothing, and may have died mid-edit: the second one
+    runs on the tree as the working commit has it.
+    """
+    try:
+        return session(feedback, timeout())
+    except ModelUnavailable as exc:
+        logger.warning("%s: %s; running the session once more", label, exc)
+        restore(repo_dir)
+        time.sleep(API_ERROR_PAUSE_S)
+        return session(feedback.replace(_KEPT_TREE, _RESET_TREE), timeout())
+
+
+_COMMITTED = "The agent created a commit. CI-fix agents may edit files but may not commit or push."
+
+
+def _establish_evidence(
+    task: FixTask,
+    repo_dir: str,
+    base: str,
+    guide: str,
+    *,
+    evidence_func: AgentFunc,
+    run_test: TestFunc,
+    deadline: float,
+    job: JobCommands | None,
+) -> _Evidence | FixCandidate:
+    """The test that shows the issue, committed in the checkout, or the refusal there is none.
+
+    A refusal is the agent's own (a feature whose requirements the issue
+    does not settle, an issue that is not a bug), or code's after
+    ``EVIDENCE_ATTEMPTS`` tests that did not qualify.
+    """
+    request = _request(task)
+    context = FixContext(guide=guide)
+    until = min(deadline, time.monotonic() + _EVIDENCE_BUDGET_S)
+    feedback, last = "", "no test was written"
+    for attempt in range(1, EVIDENCE_ATTEMPTS + 1):
+        # Running out of time says nothing about the issue: it is a failed attempt, which is retried.
+        if until - time.monotonic() < _MIN_ROUND_S:
+            raise RuntimeError(f"Ran out of time after {attempt - 1} attempt(s) at the test. Last: {last}")
+        try:
+            written = _retried(
+                lambda feedback, timeout: evidence_func(
+                    task, repo_dir, "", feedback=feedback, context=context, timeout=timeout,
+                ),
+                repo_dir, feedback,
+                lambda: max(60, min(int(until - time.monotonic()) // 2, _MAX_EVIDENCE_SESSION_S)),
+                f"Evidence attempt {attempt}",
+            )
+        except AgentTimeout:
+            return _refusal(
+                "The agent investigated for its whole session without writing a test that shows the issue. "
+                "No change was made."
+            )
+        if git_output(repo_dir, "rev-parse", "HEAD").strip() != base:
+            return _refusal(_COMMITTED)
+        if written.action is CandidateAction.REFUSE:
+            return replace(written, patch="", changed_paths=(), port_commit="", agent_refused=True)
+        evidence, problem = _evidence_of(
+            request, repo_dir, base, written, run_test=run_test, deadline=deadline, job=job,
+        )
+        if evidence is not None:
+            return evidence
+        last = problem.splitlines()[0]
+        tree = _KEPT_TREE if worktree_changed_paths(repo_dir, strict=True) else _RESET_TREE
+        feedback = f"{problem}\n\n{tree}"
+        logger.info("Evidence attempt %d: %s", attempt, last)
+    return _refusal(
+        f"No test that fails on the unchanged code was written in {EVIDENCE_ATTEMPTS} attempts, so no change was "
+        f"made. Last: {last}"
+    )
+
+
+def _evidence_of(
+    request: IssueRequest,
+    repo_dir: str,
+    base: str,
+    written: FixCandidate,
+    *,
+    run_test: TestFunc,
+    deadline: float,
+    job: JobCommands | None,
+) -> tuple[_Evidence | None, str]:
+    """The test in the working tree as evidence, committed: (the evidence, ""), or (None, what is wrong with it).
+
+    Only test files may have changed, and the test has to fail every run,
+    on its own assertion: a build that breaks, a command that is missing or
+    a server that does not start shows nothing about the issue. A crash
+    report's test may fail by the server crashing.
+    """
+    paths = worktree_changed_paths(repo_dir, strict=True)
+    product = [path for path in paths if not is_test_path(path)]
+    if product:
+        return None, (
+            "This step writes the test alone, and you changed " + ", ".join(f"`{path}`" for path in product)
+            + ": undo that. The change comes after code has seen the test fail."
+        )
+    # Formatted now, as the change will be: the change may not rewrite these lines later.
+    _tidy(repo_dir, run_test)
+    try:
+        patch = build_approved_patch(repo_dir, paths, strict=True)
+    except EmptyPatch:
+        return None, "You wrote no test: no file changed."
+    rejection = change_rejection(repo_dir, paths, patch)
+    if rejection:
+        return None, rejection
+    # The tests the patch adds, as code reads them; else the ones the agent says it changed.
+    added = added_tests(patch, limit=None)
+    if len(added) > _MAX_TESTS:
+        return None, (
+            f"You wrote {len(added)} tests, and code runs at most {_MAX_TESTS}, each of which has to fail: "
+            "write fewer, each checking more."
+        )
+    tests = locate_unit_tests(repo_dir, added or tuple(
+        test for test in written.failing_tests if test.name and test.file in paths
+    )[:_MAX_TESTS])
+    plan = plan_for(repo_dir, tests, scheduled=False, job=job) if tests else None
+    if plan is None:
+        return None, (
+            "No command here can run the test you wrote. Write a Tcl test with a literal name under `tests/unit/` "
+            "or `tests/integration/`, or a C unit test under `src/unit/`, and name it in `failing_tests`."
+        )
+    built = _run(run_test, repo_dir, plan.build, deadline)
+    if not built.passed:
+        return None, f"With your test, `{plan.build}` does not build.\n\nIts output:\n{built.output}"
+    # To the end, not to the first failure: every test has to be seen failing.
+    plan, runs = _runs_before(to_the_end(plan, repo_dir), request, repo_dir, run_test, deadline)
+    problem = _not_failing(plan, runs, request)
+    if problem:
+        return None, problem
+    if tree_patch(repo_dir) != patch:
+        return None, _TREE_CHANGED
+    run_git(repo_dir, "add", "--", *paths)
+    run_git(
+        repo_dir, "-c", f"user.name={BOT_NAME}", "-c", f"user.email={BOT_EMAIL}", "-c", "commit.gpgsign=false",
+        "commit", "--quiet", "--no-verify", "-m", "Add the test that shows the issue",
+    )
+    crashed = " with the server crashing, as the issue reports" if any(run.crashed for run in runs) else ""
+    command = plan.quoted(1)
+    return _Evidence(
+        tests=tests, plan=plan, patch=patch, paths=paths, output=runs[0].output, written=written,
+        check=f"Before any change, on `{base[:12]}`, `{command}` failed {EVIDENCE_RUNS} of {EVIDENCE_RUNS} runs{crashed}.",
+    ), ""
+
+
+def _not_failing(plan: VerifyPlan, runs: list[TestRun], request: IssueRequest) -> str:
+    """The agent's feedback for runs that are not evidence, or "" when every test failed every run.
+
+    ``runs`` is :func:`_runs_before`'s: one run when it did not show the
+    tests failing.
+    """
+    command, first = plan.quoted(1), runs[0]
+    if first.passed and plan.ran(first):
+        return (
+            f"Your test passes on the unchanged code (`{command}`), so it does not show the issue.\n\n"
+            f"Its output:\n{first.output}"
+        )
+    if first.passed:
+        return (
+            f"`{command}` passed without running your test: its name has to be one the command can select.\n\n"
+            f"Its output:\n{first.output}"
+        )
+    if not _shows_failure(plan, first, request):
+        return (
+            f"`{command}` failed, but not on your test's own assertion. A build that breaks, a missing command, "
+            f"or a server that does not start is not the issue.\n\nIts output:\n{first.output}"
+        )
+    failed = sum(_shows_failure(plan, run, request) for run in runs)
+    if failed < EVIDENCE_RUNS:
+        return (
+            f"Your test failed {failed} of {EVIDENCE_RUNS} runs of `{command}` on the unchanged code. It has to "
+            "fail every run: make it deterministic, by waiting for the state it depends on."
+        )
+    passing = [
+        test for test in plan.tests
+        if not all(shows_failure_of(run.report, (test,), attributed=True) or run.crashed for run in runs)
+    ]
+    if passing:
+        return (
+            "Every test you write has to fail on the unchanged code, and "
+            + ", ".join(f"`{test.name}`" for test in passing) + f" did not, in every run of `{command}`. "
+            f"A test that passes already shows nothing about the issue: drop it.\n\nIts output:\n{first.output}"
+        )
+    return ""
+
+
+def _runs_before(
+    plan: VerifyPlan, request: IssueRequest, repo_dir: str, run_test: TestFunc, deadline: float,
+) -> tuple[VerifyPlan, list[TestRun]]:
+    """Run ``plan``'s tests on code that should fail them: the plan that reached them, and its runs.
+
+    A plan that cannot run a test alone is followed by its fallbacks, as a
+    fix's verification is. One run when it does not show the tests failing,
+    else ``EVIDENCE_RUNS``.
+    """
+    while True:
+        first = _run(run_test, repo_dir, plan.command(1), deadline)
+        if _shows_failure(plan, first, request) or (first.passed and plan.ran(first)) or plan.fallback is None:
+            break
+        plan = plan.fallback
+    if not _shows_failure(plan, first, request):
+        return plan, [first]
+    return plan, [first, *(_run(run_test, repo_dir, plan.command(1), deadline) for _ in range(EVIDENCE_RUNS - 1))]
+
+
+def _shows_failure(plan: VerifyPlan, run: TestRun, request: IssueRequest) -> bool:
+    """Whether ``run`` failed on the planned tests themselves or, for a crash report, by the server crashing."""
+    return not run.passed and (plan.failed(run) or (request.crash_report and run.crashed))
+
+
+def _change_checks(
+    candidate: FixCandidate,
+    repo_dir: str,
+    evidence: _Evidence,
+    checks: list[str],
+    *,
+    run_test: TestFunc,
+    deadline: float,
+    job: JobCommands | None,
+    sanitized: JobCommands,
+) -> str:
+    """What a labelled issue's change has to pass besides its own test; "" when it does, else feedback.
+
+    Every Tcl test file it touches, in full: a change that fixes one test can
+    break its neighbours. Then the test once in a build with
+    AddressSanitizer, last, because the build stays as it leaves it.
+    """
+    files = tuple(dict.fromkeys(
+        path for path in (*evidence.paths, *candidate.changed_paths)
+        if path.endswith(".tcl") and Path(repo_dir, path).is_file()
+    ))
+    whole = plan_for(repo_dir, tuple(FailedTest("", path) for path in files), scheduled=False, job=job)
+    if whole is not None:
+        command = whole.command(1)
+        result = _run(run_test, repo_dir, command, deadline)
+        if not result.passed:
+            return (
+                f"Every test file the change touches has to pass in full, and `{command}` does not.\n\n"
+                f"Its output:\n{result.output}"
+            )
+        checks.append(f"With the fix, `{command}` passed.")
+    under = plan_for(repo_dir, evidence.tests, scheduled=False, job=sanitized)
+    if under is None:
+        raise RuntimeError("the tests the change was checked with cannot be planned in a sanitizer build")
+    failed = _verify_with_plan(replace(under, single_run=True), repo_dir, run_test, deadline, checks)
+    return f"In a build with AddressSanitizer: {failed}" if failed else ""
+
+
+_MAKE_RE = re.compile(r"^(\s*make)(?=\s|$)", re.MULTILINE)
+
+
+def _with_sanitizer(job: JobCommands | None) -> JobCommands:
+    """``job``'s commands, built with AddressSanitizer; plain ones where no job hosts the change."""
+    if job is None:
+        job = replace(default_commands(scheduled=False), unittest="make test-unit")
+    return replace(
+        job, build=_MAKE_RE.sub(r"\1 SANITIZER=address", job.build),
+        unittest=f"{job.unittest} SANITIZER=address" if job.unittest else "",
+    )
+
+
+def _tidied(agent_func: AgentFunc, run_test: TestFunc) -> AgentFunc:
+    """``agent_func``, with what it changed formatted and its generated files regenerated."""
+
+    def author(task: FixTask, repo_dir: str, job_log: str, **options: object) -> FixCandidate:
+        candidate = agent_func(task, repo_dir, job_log, **options)
+        if candidate.action is CandidateAction.PATCH:
+            _tidy(repo_dir, run_test)
+        return candidate
+
+    return author
+
+
+def _tidy(repo_dir: str, run_test: TestFunc) -> None:
+    """Format the lines the agent changed in C sources and regenerate the command table, as Valkey's CI checks both.
+
+    Code does it: the agent has no shell, and neither is a judgement. Only
+    the changed lines are formatted: the rest of a file already passes the
+    repository's check, and another release of the formatter would rewrite
+    lines the change has nothing to do with.
+    """
+    paths = worktree_changed_paths(repo_dir, strict=True)
+    sources = [
+        path for path in paths
+        if path.startswith("src/") and path.endswith((".c", ".h", ".cpp", ".hpp")) and Path(repo_dir, path).is_file()
+    ]
+    commands = []
+    # By its path: switching accounts may replace PATH, and with it the release that was installed.
+    formatter = shutil.which("clang-format")
+    if sources and formatter:
+        changed = changed_lines(tree_patch(repo_dir))
+        for path in sources:
+            lines = " ".join(f"--lines={first}:{last}" for first, last in _ranges(changed.get(path, set())))
+            if lines:
+                commands.append(f"{shlex.quote(formatter)} -i {lines} -- {shlex.quote(path)}")
+    elif sources:
+        logger.warning("clang-format is not installed: the change is not formatted")
+    if any(fnmatch.fnmatch(path, "src/commands/*.json") for path in paths):
+        commands.append("python3 utils/generate-command-code.py")
+    for command in commands:
+        if not run_test(repo_dir, command, _TIDY_TIMEOUT_S).passed:
+            logger.warning("`%s` failed: the pull request's own CI checks what it would have done", command)
+
+
+def _ranges(lines: set[int]) -> list[tuple[int, int]]:
+    """``lines`` as runs of consecutive line numbers: (first, last) of each."""
+    ranges: list[tuple[int, int]] = []
+    for line in sorted(line for line in lines if line > 0):
+        if ranges and line == ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], line)
+        else:
+            ranges.append((line, line))
+    return ranges
+
+
+def _counterexample_review(
+    task: FixTask,
+    run_test: TestFunc,
+    deadline: float,
+    job: JobCommands,
+    reviewer: Callable[..., Review] = find_counterexample,
+) -> ReviewFunc:
+    """A review that looks for a case the change still gets wrong, and proves it with a test.
+
+    The reviewer may write that case as a test, which code runs with the
+    change (in ``job``'s build, the one the checks left). A test that fails
+    stays in the tree and sends the change back with its output. One that
+    passes showed nothing wrong and is dropped, as are edits that are not a
+    test. Without a test, the reviewer's own verdict stands.
+    """
+    request = _request(task)
+
+    def review(
+        candidate: FixCandidate, repo_dir: str, job_log: str, *, context: FixContext, timeout: int,
+    ) -> tuple[bool, str]:
+        checked = tree_patch(repo_dir)
+        before = _digests(repo_dir)
+        context = replace(context, past_changes=_recent_changes(repo_dir, candidate.changed_paths))
+        try:
+            found = reviewer(task, candidate, repo_dir, job_log, context=context, timeout=timeout)
+        except ModelUnavailable as exc:
+            # The review changes nothing but its own test, and the change it judges has passed its checks.
+            logger.warning("The review: %s; running it once more", exc)
+            _reset_to(repo_dir, checked)
+            time.sleep(API_ERROR_PAUSE_S)
+            found = reviewer(task, candidate, repo_dir, job_log, context=context, timeout=timeout)
+        after = _digests(repo_dir)
+        wrote = sorted(path for path in {*before, *after} if before.get(path) != after.get(path))
+        if not wrote:
+            return found.verdict == "approve", found.reasoning
+        tests = tuple(test for test in locate_unit_tests(repo_dir, found.tests) if test.name and test.file in wrote)
+        plan = None
+        if tests and all(is_test_path(path) for path in wrote):
+            plan = plan_for(repo_dir, tests, scheduled=False, job=job)
+        note = " The reviewer's edits were not a test that code could run, and were dropped."
+        if plan is not None:
+            plan = to_the_end(replace(plan, single_run=True), repo_dir)
+            result = _run(run_test, repo_dir, plan.command(1), deadline)
+            if _shows_failure(plan, result, request):
+                return False, (
+                    f"A reviewer wrote a test for a case the change gets wrong, and it fails: {found.reasoning}\n\n"
+                    "The test is in the working tree, in " + ", ".join(f"`{path}`" for path in wrote) + ". Make the "
+                    "change handle that case. If the test itself expects the wrong behaviour, correct the test "
+                    f"and say why in `validation`.\n\nIts output:\n{result.output}"
+                )
+            note = " The reviewer's test did not fail on its own assertion, and was dropped."
+            if result.passed and plan.ran(result):
+                note = " The reviewer wrote a test for a case it expected the change to get wrong, and it passed."
+        _reset_to(repo_dir, checked)
+        logger.info("Counterexample review:%s", note)
+        # A case the reviewer was sure of, shown to hold, is no objection left.
+        approved = found.verdict == "approve" or (found.verdict == "counterexample" and note.endswith("it passed."))
+        return approved, found.reasoning + note
+
+    return review
+
+
+def _reset_to(repo_dir: str, patch: str) -> None:
+    """Put the working tree back to the working commit with ``patch`` applied: the change, without a reviewer's edits."""
+    restore(repo_dir)
+    if patch:
+        run_git(repo_dir, "apply", "--whitespace=nowarn", "-", input=patch)
+
+
+def _digests(repo_dir: str) -> dict[str, str]:
+    """Every changed file of the working tree, by content."""
+    return {path: _digest(Path(repo_dir, path)) for path in worktree_changed_paths(repo_dir, strict=True)}
+
+
+def _recent_changes(repo_dir: str, paths: tuple[str, ...]) -> str:
+    """The last merged commits to the product files in ``paths``, with their diffs; "" when they cannot be read."""
+    product = [path for path in paths if not is_test_path(path)]
+    if not product:
+        return ""
+    try:
+        log = git_output(
+            repo_dir, "log", "-3", "--no-merges", "--no-ext-diff", "--no-textconv", "--format=## %h %s%n%n%b",
+            "--patch", "HEAD", "--", *product,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if len(log) > _TEST_OUTPUT_CHARS:
+        log = log[:_TEST_OUTPUT_CHARS] + "\n[... truncated ...]"
+    return f"# The last commits to the files this change touches\n\n{log}" if log.strip() else ""
+
+
+# A Tcl test that sleeps for a fixed time, which reviewers send back: the one
+# rule of theirs code checks. The next comment that keeps coming back is a
+# second check next to it.
+_FIXED_SLEEP_RE = re.compile(r"^\s*after\s+\d+\s*;?\s*$")
+_MAX_SLEEPS_SHOWN = 10
+
+
+def _changes(patch: str) -> list[tuple[str, str, str]]:
+    """Each line ``patch`` adds or removes: its file, ``+`` or ``-``, and the line."""
+    changes: list[tuple[str, str, str]] = []
+    path = ""
+    for line in patch.splitlines():
+        if line.startswith(("+++ b/", "--- a/")):
+            path = line[6:]
+        elif path and line[:1] in ("+", "-") and not line.startswith(("+++ ", "--- ")):
+            changes.append((path, line[0], line[1:]))
+    return changes
+
+
+def change_rejection(
+    repo_dir: str,
+    changed_paths: tuple[str, ...],
+    patch: str,
+    frozen_patch: str = "",
+    frozen_tests: tuple[FailedTest, ...] = (),
+) -> str:
+    """Why a labelled issue's change cannot be published as it is, or "".
+
+    What a committer would send back before reading the change: CI
+    configuration or vendored code, a new command (the project's own
+    decision), the test that code saw fail rewritten, more product source
+    than one sitting reviews, and a test that sleeps for a fixed time. The
+    test is rewritten by removing a line that ``frozen_patch`` added, or by
+    any change inside a test of ``frozen_tests``: a line added there can
+    make it pass without the issue being fixed. The rest of its file is the
+    change's to edit, as an older test of the behaviour may have to be.
+    """
+
+    def named(paths: list[str]) -> str:
+        return ", ".join(f"`{path}`" for path in paths)
+
+    ci = [path for path in changed_paths if path.startswith(".github/")]
+    if ci:
+        return f"The change touches CI configuration ({named(ci)}), which a labelled issue's change never does."
+    vendored = [path for path in changed_paths if path.startswith("deps/")]
+    if vendored:
+        return (
+            f"The change touches vendored code ({named(vendored)}), which changes only by an update from the "
+            "project it comes from. Say which project needs the fix instead."
+        )
+    commands = [
+        path for path in changed_paths
+        if fnmatch.fnmatch(path, "src/commands/*.json") and not _in_head(repo_dir, path)
+    ]
+    if commands:
+        return (
+            f"The change adds a command ({named(commands)}). A new command is the project's to decide: refuse, "
+            "and say what the issue needs."
+        )
+    lines = _changes(patch)
+    # A lone brace or blank is in every test: only a line that says something identifies the frozen one.
+    frozen = {(path, line.strip()) for path, sign, line in _changes(frozen_patch) if sign == "+" and len(line.strip()) > 3}
+    rewritten = sorted(
+        {path for path, sign, line in lines if sign == "-" and (path, line.strip()) in frozen}
+        | {test.file for test in frozen_tests if _changes_test(repo_dir, changed_lines(patch), test)}
+    )
+    if rewritten:
+        return (
+            f"The change rewrites the test that code saw fail before it, in {named(rewritten)}. You may add tests "
+            "to that file, and change its other tests. That test stays as it is."
+        )
+    product = sum(1 for path, _sign, _line in lines if not is_test_path(path))
+    if product > MAX_PRODUCT_LINES:
+        return (
+            f"The change adds and removes {product} lines of product source, and more than {MAX_PRODUCT_LINES} is "
+            "more than a reviewer reads in one sitting. Make the smallest change that makes the test pass, or "
+            "refuse and say what a person should do."
+        )
+    sleeps = [
+        f"- `{path}`: `{line.strip()}`" for path, sign, line in lines
+        if sign == "+" and fnmatch.fnmatch(path, "tests/*.tcl") and _FIXED_SLEEP_RE.match(line)
+    ]
+    if sleeps:
+        return (
+            "The change sleeps for a fixed time in a test. Wait for the condition instead, with "
+            "`wait_for_condition` or a `wait_for_*` helper:\n" + "\n".join(sleeps[:_MAX_SLEEPS_SHOWN])
+        )
+    return ""
+
+
+def _in_head(repo_dir: str, path: str) -> bool:
+    try:
+        git_output(repo_dir, "cat-file", "-e", f"HEAD:{path}")
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
 @contextmanager
 def checkout(task: FixTask, repo_dir: str = "") -> Iterator[tuple[str, str]]:
     """The checkout at the commit the candidate is prepared on: (path, HEAD).
@@ -529,7 +1284,7 @@ def _establish(
     fixes = found or ()
     if fixes:
         logger.info("Existing-fix candidates: %s", "; ".join(f"{f.sha[:12]} {f.subject}" for f in fixes))
-    guide = guide_for(task.failure.repo_full_name)
+    guide = guide_for(task.failure.repo_full_name, failed_job=True)
     if guide:
         guide += repository_guidelines(repo_dir)
     named_paths = tuple(dict.fromkeys([*(test.file for test in tests if test.file), *paths]))
@@ -639,12 +1394,25 @@ def repository_guidelines(repo_dir: str) -> str:
     )
 
 
-def guide_for(repo_full_name: str) -> str:
-    path = _GUIDES_DIR / f"{repo_full_name.replace('/', '__')}.md"
+def guide_for(repo_full_name: str, *, failed_job: bool = False) -> str:
+    """The bot's guide for making a change to ``repo_full_name``, or "" when it has none.
+
+    With ``failed_job``, it starts with how to tell what a failed CI job
+    is (a test bug, a harness bug, a product bug) and to look for the fix in
+    the test first. That is for a job that failed, not for a change made
+    from a test written for it, which is right by construction.
+    """
+    name = repo_full_name.replace("/", "__")
     try:
-        return path.read_text(encoding="utf-8")
+        guide = (_GUIDES_DIR / f"{name}.md").read_text(encoding="utf-8")
     except OSError:
         return ""
+    if not failed_job:
+        return guide
+    try:
+        return (_GUIDES_DIR / f"{name}.failed-job.md").read_text(encoding="utf-8") + "\n" + guide
+    except OSError:
+        return guide
 
 
 def _fix_loop(
@@ -661,6 +1429,7 @@ def _fix_loop(
     deadline: float,
     job: JobCommands | None = None,
     min_loops: int = 1,
+    also: Callable[[FixCandidate, list[str]], str] | None = None,
 ) -> FixCandidate:
     established = _established_checks(context)
     feedback = ""
@@ -674,25 +1443,16 @@ def _fix_loop(
         # What comes after the agent: verification and review, or review
         # alone. In a short budget, at most half of what is left.
         reserve = min(_VERIFY_RESERVE_S if run_test is not None else _REVIEW_RESERVE_S, remaining // 2)
-        agent_timeout = remaining - reserve
-        agent_timeout = min(agent_timeout, _MAX_AGENT_ROUND_S)
         try:
-            try:
-                outcome = agent_round(
+            outcome = _retried(
+                lambda feedback, timeout: agent_round(
                     task, repo_dir, original_head, job_log, context, feedback,
-                    attempt=attempt, timeout=max(60, agent_timeout), agent_func=agent_func,
-                )
-            except ModelUnavailable as exc:
-                # The session judged nothing, and may have died mid-edit: run it
-                # once more, on the tree as the working commit has it.
-                logger.warning("CI-fix round %d: %s; running the session once more", attempt, exc)
-                restore(repo_dir)
-                time.sleep(API_ERROR_PAUSE_S)
-                agent_timeout = min(int(deadline - time.monotonic()) - reserve, _MAX_AGENT_ROUND_S)
-                outcome = agent_round(
-                    task, repo_dir, original_head, job_log, context, feedback.replace(_KEPT_TREE, _RESET_TREE),
-                    attempt=attempt, timeout=max(60, agent_timeout), agent_func=agent_func,
-                )
+                    attempt=attempt, timeout=timeout, agent_func=agent_func,
+                ),
+                repo_dir, feedback,
+                lambda: max(60, min(int(deadline - time.monotonic()) - reserve, _MAX_AGENT_ROUND_S)),
+                f"CI-fix round {attempt}",
+            )
         except AgentTimeout:
             # A session that used its whole budget investigating found no
             # evidence-backed fix; a fresh one repeats the same reading.
@@ -749,6 +1509,8 @@ def _fix_loop(
                 failed = _verify(reviewed, repo_dir, round_plan, run_test, deadline, checks, min_loops=min_loops)
                 if not failed:
                     failed = _verify_added_tests(task, reviewed, repo_dir, run_test, deadline, checks, job)
+                if not failed and also is not None:
+                    failed = also(reviewed, checks)
             if not failed:
                 # The reviewer sees what the checks showed, not only the plan.
                 approved, reasoning = review(
@@ -830,6 +1592,7 @@ def agent_round(
         declared = set(candidate.changed_paths)
         candidate = _checked_candidate(
             task, repo_dir, original_head, candidate, upstream_first=context.upstream_first,
+            frozen_patch=context.frozen_patch, frozen_tests=context.frozen_tests,
         )
     except _Rejected as exc:
         tree = _KEPT_TREE if worktree_changed_paths(repo_dir, strict=True) else _RESET_TREE
@@ -951,6 +1714,8 @@ def _inside_checkout(repo_dir: str, path: Path) -> bool:
 
 def _established_checks(context: FixContext) -> list[str]:
     checks = []
+    if context.evidence_check:
+        checks.append(context.evidence_check)
     if context.prior_fixes:
         checks.append("Existing fixes found: " + "; ".join(context.prior_fixes.splitlines()))
     elif context.prior_fixes_searched:
@@ -1003,10 +1768,13 @@ def other_issues_touched(
 # A Tcl test the patch adds: ``test "name"`` or ``test {name}`` on an added line. A name built
 # from variables is not one ``--only`` can find, and is left out.
 _ADDED_TEST_RE = re.compile(r'^\+\s*test\s+(?:"([^"$\[]+)"|\{([^}$\[]+)\})')
+# A C unit test the patch adds: ``TEST(Suite, Name)`` or ``TEST_F``. A parameterized one runs
+# under names its instantiation builds, and is left out.
+_ADDED_UNIT_TEST_RE = re.compile(r"^\+\s*TEST(?:_F)?\(\s*(\w+)\s*,\s*(\w+)\s*\)")
 
 
-def added_tests(patch: str) -> tuple[FailedTest, ...]:
-    """The Tcl tests ``patch`` adds under ``tests/``, by name and file."""
+def added_tests(patch: str, *, limit: int | None = _MAX_TESTS) -> tuple[FailedTest, ...]:
+    """The tests ``patch`` adds, by name and file: Tcl tests under ``tests/``, C unit tests under ``src/unit/``."""
     tests: list[FailedTest] = []
     path = ""
     for line in patch.splitlines():
@@ -1016,7 +1784,11 @@ def added_tests(patch: str) -> tuple[FailedTest, ...]:
             match = _ADDED_TEST_RE.match(line)
             if match:
                 tests.append(FailedTest(match.group(1) or match.group(2), path))
-    return tuple(dict.fromkeys(tests))[:_MAX_TESTS]
+        elif path.startswith("src/unit/") and path.endswith(".cpp"):
+            match = _ADDED_UNIT_TEST_RE.match(line)
+            if match:
+                tests.append(FailedTest(f"{match.group(1)}.{match.group(2)}", path))
+    return tuple(dict.fromkeys(tests))[:limit]
 
 
 def _verify_added_tests(
@@ -1072,8 +1844,16 @@ def changed_lines(patch: str) -> dict[str, set[int]]:
 
 
 _HUNK_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-# A Tcl test's start: ``test {name} {`` or ``test "name" {``.
-_TEST_START_RE = re.compile(r"^\s*test\s+[{\"]")
+# A test's start: Tcl's ``test {name} {`` or ``test "name" {``, and a C unit test's ``TEST_F(Suite, Name)``.
+_TEST_START_RE = re.compile(r"^\s*(?:test\s+[{\"]|TEST(?:_[FP])?\s*\()")
+
+
+def _starts_test(text: str, name: str) -> bool:
+    """Whether the source line ``text`` is where the test ``name`` starts."""
+    if f"{{{name}}}" in text or f'"{name}"' in text:
+        return True
+    suite, _, case = name.partition(".")
+    return bool(case) and re.search(rf"\(\s*{re.escape(suite)}\s*,\s*{re.escape(case)}\s*\)", text) is not None
 
 
 def _changes_test(repo_dir: str, changed: dict[str, set[int]], test: FailedTest) -> bool:
@@ -1093,8 +1873,7 @@ def _changes_test(repo_dir: str, changed: dict[str, set[int]], test: FailedTest)
     except OSError:
         return True
     starts = [number for number, text in enumerate(source, 1) if _TEST_START_RE.match(text)]
-    named = [number for number in starts
-             if f"{{{test.name}}}" in source[number - 1] or f'"{test.name}"' in source[number - 1]]
+    named = [number for number in starts if _starts_test(source[number - 1], test.name)]
     if not named:
         return True
     for start in named:
@@ -1283,7 +2062,7 @@ def _timeout(deadline: float) -> int:
 
 def _checked_candidate(
     task: FixTask, repo_dir: str, original_head: str, candidate: FixCandidate, *,
-    upstream_first: bool = False,
+    upstream_first: bool = False, frozen_patch: str = "", frozen_tests: tuple[FailedTest, ...] = (),
 ) -> FixCandidate:
     """``candidate`` with its patch built from the checkout, or a refusal.
 
@@ -1300,9 +2079,7 @@ def _checked_candidate(
     """
     current_head = git_output(repo_dir, "rev-parse", "HEAD").strip()
     if current_head != original_head:
-        return _refusal(
-            "The agent created a commit. CI-fix agents may edit files but may not commit or push."
-        )
+        return _refusal(_COMMITTED)
 
     changed_paths = worktree_changed_paths(repo_dir, strict=True)
     if candidate.action is CandidateAction.REFUSE:
@@ -1313,10 +2090,15 @@ def _checked_candidate(
             open_fix=candidate.open_fix if candidate.open_fix in shown else 0, agent_refused=True,
         )
     if not candidate.failing_check:
-        # The job is what failed, whatever else the agent left out.
-        candidate = replace(candidate, failing_check=task.failure.job_name)
+        # The job is what failed, whatever else the agent left out; for a labelled issue, the issue is.
+        candidate = replace(
+            candidate,
+            failing_check=task.failure.job_name if task.request is None else f"issue #{task.request.number}",
+        )
 
     capabilities = target_capabilities(task.target.kind)
+    if task.request is not None and candidate.action is CandidateAction.PORT:
+        raise _Rejected("A labelled issue's change is written here: choose `patch` or `refuse`.")
     if not capabilities.allows(candidate.action):
         raise _Rejected(
             f"The {candidate.action.value} action is not supported for "
@@ -1341,6 +2123,10 @@ def _checked_candidate(
     product = tuple(path for path in changed_paths if not is_test_path(path))
     if upstream_first and task.policy is FixPolicy.BACKPORT and product and not adapts:
         raise _Rejected(_PRODUCT_NEEDS_UPSTREAM.format(paths=", ".join(f"`{path}`" for path in product)))
+    if task.request is not None:
+        out_of_scope = change_rejection(repo_dir, changed_paths, patch, frozen_patch, frozen_tests)
+        if out_of_scope:
+            raise _Rejected(out_of_scope)
     patch_limit = capabilities.patch_limit
     if len(patch) > patch_limit:
         raise _Rejected(
@@ -1407,8 +2193,14 @@ def changed_text(diff: str, sign: str) -> set[str]:
     }
 
 
-def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S) -> TestRun:
-    """Run ``command`` in ``repo_dir`` as the isolated account."""
+def run_test_command(
+    repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S, *, offline: bool = False, quiet: bool = False,
+) -> TestRun:
+    """Run ``command`` in ``repo_dir`` as the isolated account.
+
+    ``offline`` keeps it off the network, and ``quiet`` keeps a failing
+    command's output out of the log: the caller decides whether it may be shown.
+    """
     env = filter_env(PROCESS_BASICS)
     argv = ["bash", "-c", command]
     user = isolated_user()
@@ -1416,7 +2208,7 @@ def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S)
     try:
         if user:
             with handed_to(user, Path(repo_dir)) as home:
-                invocation = as_user(user, env, argv, home=home, cwd=repo_dir)
+                invocation = as_user(user, env, argv, home=home, cwd=repo_dir, network=not offline)
                 result = _run_in_own_group(
                     list(invocation.argv),
                     None,
@@ -1431,17 +2223,16 @@ def run_test_command(repo_dir: str, command: str, timeout: int = TEST_TIMEOUT_S)
         return TestRun(passed=False, output=f"timed out after {timeout}s", timed_out=True)
     seconds = time.monotonic() - started
     output = strip_ansi((result.stdout + result.stderr).decode("utf-8", errors="replace"))
-    logger.info("Test command exited %d after %.0fs: %s", result.returncode, seconds, command)
+    logger.info("Test command exited %d after %.0fs%s", result.returncode, seconds, "" if quiet else f": {command}")
     excerpt = _excerpt(output)
-    if result.returncode != 0:
-        # The only record of why a command failed, once the run is over.
-        with log_group("Failed test command output"):
-            logger.info("%s", excerpt)
+    if result.returncode != 0 and not quiet:
+        _log_failed_output(excerpt)
     return TestRun(
         passed=result.returncode == 0,
         output=excerpt,
         report=failure_report(output),
         seconds=seconds,
+        crashed=result.returncode != 0 and shows_crash(output),
     )
 
 

@@ -5,13 +5,14 @@ from __future__ import annotations
 import re
 
 from scripts.ci_fix.models import (
+    CandidateAction,
     Failure,
     FailureType,
     FixCandidate,
     FixResult,
     ResultKind,
 )
-from scripts.common.text_utils import compact_text
+from scripts.common.text_utils import compact_text, defused, undefused
 
 _MAX_OTHER_JOBS = 10
 # A command longer than this goes on its own lines, below the check it backs.
@@ -20,6 +21,8 @@ _INLINE_COMMAND_CHARS = 80
 
 def render_result(result: FixResult) -> str:
     """Return the maintainer-facing report for one fix attempt."""
+    if result.task.request is not None:
+        return render_change(result)
     failure = result.task.failure
     job = _job(failure)
 
@@ -110,6 +113,51 @@ def render_ci_sweep_fix(result: FixResult) -> str:
     return "\n".join(body)
 
 
+def render_change(result: FixResult) -> str:
+    """The report of a labelled issue's change, for its issue."""
+    task, candidate = result.task, result.candidate
+    if result.kind is ResultKind.OPENED:
+        link = f"[#{result.pr_number}]({result.pr_url})" if result.pr_url else f"#{result.pr_number}"
+        body = [f"Opened draft PR {link} for this issue. Its CI and a committer's review decide whether it merges."]
+        checks = check_items(candidate.verification) if candidate is not None else []
+        if checks:
+            # The draft PR shows them too; here they are for whoever looks at the issue.
+            body += ["", "<details><summary>What the bot checked</summary>", "", *checks, "", "</details>"]
+        return "\n".join(body)
+    if result.kind is ResultKind.SUGGESTED:
+        body = [
+            f"A change for this issue, prepared and checked on `{task.failure.base_branch}` at "
+            f"`{task.target.expected_sha[:12]}`. "
+            "Nothing was pushed and no PR was opened: a committer applies it, or not.",
+            "",
+        ]
+        if candidate is not None:
+            body += candidate_criteria(candidate) + candidate_context(candidate, include_reasoning=True)
+        body += candidate_patch(candidate)
+        return "\n".join(body).rstrip()
+    if candidate is None or candidate.action is not CandidateAction.REFUSE:
+        # A change was prepared and not published: the summary says why.
+        return sentence(result.summary)
+    body = [f"No change was prepared. {sentence(result.summary)}", ""]
+    if candidate.questions:
+        body += ["A committer has to answer these first:", "", *(f"- {prose(q, 500)}" for q in candidate.questions), ""]
+    body += candidate_criteria(candidate) + candidate_context(candidate, include_reasoning=False)
+    if candidate.test_patch:
+        # What the next person starts from: the test fails on the unchanged code.
+        body += [
+            "<details><summary>The test that shows the issue</summary>", "",
+            _fenced(candidate.test_patch, lang="diff"), "", "</details>",
+        ]
+    return "\n".join(body).rstrip()
+
+
+def candidate_criteria(candidate: FixCandidate) -> list[str]:
+    """The acceptance criteria a feature's tests were written from, for a reviewer to hold against the issue."""
+    if not candidate.criteria:
+        return []
+    return ["**Acceptance criteria, as read from the issue**", "", *(f"- {prose(item, 500)}" for item in candidate.criteria), ""]
+
+
 def _job(failure: Failure) -> str:
     """The failed job as a comment names it, with its run."""
     job = f"`{prose(failure.job_name, 300)}`" if failure.job_name else "the failed job"
@@ -193,7 +241,8 @@ def _check_item(line: str) -> list[str]:
         text = re.sub(r"\s*(?:\bwith|:)\s*$", "", before) + after
     # The command follows the sentence it backs; any later sentence, the block.
     first, _, rest = text.partition(". ")
-    block = _fenced(command.group(1), lang="sh", indent="  ").splitlines()
+    # In its own fence the command acts on nothing, and is the one a person pastes: as code ran it.
+    block = _fenced(undefused(command.group(1)), lang="sh", indent="  ").splitlines()
     item = [f"- {first.rstrip().rstrip('.:')}:", "", *block]
     if rest.strip():
         item += ["", f"  {rest.strip()}"]
@@ -213,10 +262,11 @@ def prose(text: str, limit: int) -> str:
 
     An aside set off by two dashes takes commas; a single dash, which joins
     a clause to what explains it, takes a colon. The agent wrote the text:
-    an HTML comment in it must not read as one of the bot's own markers.
+    an HTML comment in it must not read as one of the bot's own markers, and
+    nothing in it may act on GitHub (``defused``).
     """
     text = _DASH_PAIR_RE.sub(r", \1, ", compact_text(text, limit))
-    return _DASH_RE.sub(": ", text).replace("<!--", "<!- -")
+    return defused(_DASH_RE.sub(": ", text).replace("<!--", "<!- -"))
 
 
 def _plural(text: str) -> str:

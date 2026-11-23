@@ -104,6 +104,7 @@ jobs:
         with:
           path: .ci-fix-agent
           install-claude: 'true'
+          install-clang-format: 'true'
       - name: 'CI fix: stage the isolated checkout'
         shell: bash
         run: bash .ci-fix-agent/scripts/ci_fix/job.sh stage
@@ -264,7 +265,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends \
-            build-essential pkg-config libssl-dev tcl8.6 tclx tcl-tls valgrind
+            build-essential pkg-config libssl-dev libgtest-dev libgmock-dev tcl8.6 tclx tcl-tls valgrind
       # The CI-fix steps every fix job ends with.
       - name: 'CI fix: check out the agent'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -278,6 +279,7 @@ jobs:
         with:
           path: .ci-fix-agent
           install-claude: 'true'
+          install-clang-format: 'true'
       - name: 'CI fix: stage the isolated checkout'
         shell: bash
         run: bash .ci-fix-agent/scripts/ci_fix/job.sh stage

@@ -488,3 +488,27 @@ def test_a_report_quotes_the_isolated_run_without_the_script_that_writes_its_fil
     assert "--single integration/replication.ci-fix-isolated" in quoted and "--loops 40" in quoted
     # A plan that needs no script is quoted as it runs.
     assert plan.quoted(40) == plan.command(40)
+
+
+def test_evidence_runs_to_the_end_and_reports_an_error_reply_as_the_test_failing(checkout):
+    """A test for behaviour that is not there fails by a command's error reply: with --durable that is an [err]."""
+    from scripts.ci_fix.verification import to_the_end
+
+    tests = (FailedTest("NEWCMD replies OK", "tests/integration/replication.tcl"),)
+    plan = plan_for(checkout, tests, scheduled=False)
+    assert "--fastfail" in plan.test and plan.fallback is not None
+
+    without = to_the_end(plan, checkout)
+    assert "--fastfail" not in without.test and "--durable" not in without.test
+
+    helper = Path(checkout) / "tests" / "test_helper.tcl"
+    helper.write_text(helper.read_text() + "} elseif {$opt eq {--durable}} {\n", encoding="utf-8")
+    durable = to_the_end(plan, checkout)
+
+    assert " --durable --loops" in durable.test and "--fastfail" not in durable.test
+    # Its fallback too, which runs the whole file.
+    assert " --durable --loops 1" in durable.fallback.test
+    assert durable.tests == plan.tests and durable.loops == plan.loops
+    # A unit test's command takes neither option.
+    unit = VerifyPlan(build="make", test="./src/unit/valkey-unit-gtests --gtest_repeat=1")
+    assert to_the_end(unit, checkout) == unit

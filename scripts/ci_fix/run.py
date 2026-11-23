@@ -2,13 +2,17 @@
 
 Every front door runs its fix the same way, through ``ci-fix-run.yml``:
 a Test Failure Detector issue (:mod:`scripts.ci_fix.issues`), a maintainer's
-command on a pull request (:mod:`scripts.ci_fix.main`), and a bot-owned pull
-request's red head (:mod:`scripts.backport.ci_followup`).
+command on a pull request (:mod:`scripts.ci_fix.main`), a bot-owned pull
+request's red head (:mod:`scripts.backport.ci_followup`), and an issue a
+committer labelled for a change (:mod:`scripts.ci_fix.labelled`).
 
 1. ``plan``: the front door validates its request and binds one exact failed
    job (a :class:`FixPlan`); this module resolves that job from the workflow
-   that ran it, if it can host the fix (:mod:`scripts.ci_fix.ci_job`).
-2. ``fix``: :func:`scripts.ci_fix.engine.prepare_fix`, inside that job after
+   that ran it, if it can host the fix (:mod:`scripts.ci_fix.ci_job`). A
+   labelled issue has no failed job: its change is made in the target
+   repository's pull request job, resolved the same way.
+2. ``fix``: :func:`scripts.ci_fix.engine.prepare_fix`, or for a labelled
+   issue :func:`scripts.ci_fix.engine.prepare_change`, inside that job after
    its own setup and build (``scripts/ci_fix/job.sh``), or on the bot's own
    runner. It holds no GitHub token.
 3. ``publish``: the candidate is published as its target says. A published
@@ -41,10 +45,16 @@ from typing import Any, Callable
 from github import Auth, Github, GithubException
 
 from scripts.backport import ci_followup
-from scripts.ci_fix import issues, upstream
+from scripts.ci_fix import issues, labelled, upstream
 from scripts.ci_fix import main as pr_command
 from scripts.ci_fix.ci_job import JobSpec, Unsupported, resolve, setup_script, workflow_source
-from scripts.ci_fix.engine import failed_tests, prepare_fix, prepare_upstream, upstream_task
+from scripts.ci_fix.engine import (
+    failed_tests,
+    prepare_change,
+    prepare_fix,
+    prepare_upstream,
+    upstream_task,
+)
 from scripts.ci_fix.models import (
     CandidateAction,
     FixCandidate,
@@ -57,7 +67,7 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.policy import allows_ci_changes
+from scripts.ci_fix.policy import CHANGE_BRANCH_PREFIX, allows_ci_changes, push_repo
 from scripts.ci_fix.publish import publish_candidate
 from scripts.ci_fix.state import decode, load, save
 from scripts.common.git_auth import GitAuth
@@ -88,6 +98,7 @@ _FRONT_DOORS: dict[FrontDoor, tuple[Planner, Reporter]] = {
     FrontDoor.ISSUE: (issues.plan_request, issues.report_result),
     FrontDoor.PR: (pr_command.plan_request, pr_command.report_result),
     FrontDoor.FOLLOW_UP: (ci_followup.plan_request, ci_followup.report_result),
+    FrontDoor.LABEL: (labelled.plan_request, labelled.report_result),
 }
 
 
@@ -137,7 +148,10 @@ def plan(
 def _plan_job(gh: Any, artifact_client: Any, planned: FixPlan, out: Path) -> dict[str, str]:
     """Save ``planned`` with its job log, and how its fix runs: in the failed job, or not."""
     failure = planned.task.failure
-    job_log = str(artifact_client.download_job_log(failure.repo_full_name, failure.job_id) or "")
+    # A labelled issue has no failed job: its evidence is made in the fix job.
+    job_log = "" if planned.task.request is not None else str(
+        artifact_client.download_job_log(failure.repo_full_name, failure.job_id) or ""
+    )
     fix_plan = replace(planned, job_log=job_log)
     if fix_plan.task.target.upstream_branch:
         # Read from the log, as the engine reads them: the fix job has no GitHub token.
@@ -167,7 +181,8 @@ def _job_outputs(gh: Any, task: FixTask, out: Path) -> dict[str, str]:
         "runs_on": spec.runs_on,
         "container": spec.container,
         "timeout_minutes": str(spec.timeout_minutes),
-        "use_repo": task.target.repo_full_name,
+        # The repository the change is for, not the fork its branch may be pushed to.
+        "use_repo": task.target.base_repo_full_name or task.target.repo_full_name,
         "use_git_ref": checked_out(task),
         "extra_repository": checkout.repository if checkout else "",
         "extra_ref": checkout.ref if checkout else "",
@@ -245,11 +260,17 @@ def job_for(gh: Any, task: FixTask) -> JobSpec | None:
     scheduled run tested. A run of every release branch is the exception: its
     jobs are the default branch's, which a release branch's own workflow may
     not have (``Failure.workflow_sha``). A suggestion is never run, so it
-    needs no job.
+    needs no job. Nor does the head of a pull request the bot opened for a
+    labelled issue: a job's setup and build run as the workflow user, and
+    that tree holds a change nobody has reviewed yet, made from an issue
+    anyone can write. It is built on the bot's runner, by the isolated
+    account alone.
     """
     failure = task.failure
     workflow = failure.source.value if failure.source else failure.workflow
     if task.target.kind is TargetKind.SUGGEST or not workflow:
+        return None
+    if task.target.kind is TargetKind.UPDATE_PR and task.target.branch.startswith(CHANGE_BRANCH_PREFIX):
         return None
     if failure.scheduled or not failure.pr_number:
         ref = f"refs/heads/{failure.base_branch}"
@@ -279,6 +300,8 @@ def fix(plan_dir: Path, out: Path, *, repo_dir: str = "") -> FixOutcome:
             release = load(plan_dir / RELEASE_FILE, FixCandidate)
             sha = (plan_dir / SHA_FILE).read_text(encoding="utf-8").strip()
             candidate = prepare_upstream(fix_plan.task, fix_plan.job_log, release, sha=sha, repo_dir=repo_dir, job=job)
+        elif fix_plan.task.request is not None:
+            candidate = prepare_change(fix_plan.task, repo_dir=repo_dir, job=job)
         else:
             candidate = prepare_fix(fix_plan.task, fix_plan.job_log, repo_dir=repo_dir, job=job)
         outcome = FixOutcome(candidate=candidate, started=True)
@@ -323,15 +346,31 @@ def publish_and_report(
         )
     else:
         try:
-            # Only an issue's fix reads the variable: a bad value cannot stop a PR's.
-            mode = (issue_publication() if fix_plan.task.target.kind is TargetKind.DRAFT_PR
-                    else IssuePublication.DRAFT_PR)
-            result = publish_candidate(gh, fix_plan.task, outcome.candidate, git_env=git_env, issue_publication=mode)
+            result = _published(gh, fix_plan, outcome.candidate, git_env=git_env)
         except Exception as exc:  # noqa: BLE001 - every request gets a reported result
             logger.exception("CI-fix publication failed")
             result = FixResult(kind=ResultKind.FAILED, summary=f"The CI-fix attempt failed: {exc}",
                                task=fix_plan.task, candidate=outcome.candidate)
     return reporter(gh, fix_plan, result)
+
+
+def _published(gh: Any, fix_plan: FixPlan, candidate: FixCandidate, *, git_env: dict[str, str]) -> FixResult:
+    """Publish ``candidate`` as its target says, after what only its front door can recheck."""
+    task, request = fix_plan.task, fix_plan.task.request
+    bot_login = f"{APP_LOGIN}[bot]"
+    # Only an issue's fix reads the variable: a bad value cannot stop a PR's.
+    mode = IssuePublication.DRAFT_PR
+    if task.target.kind is TargetKind.DRAFT_PR and request is None:
+        mode = issue_publication()
+    elif task.target.kind is TargetKind.DRAFT_PR and request is not None and not request.replay:
+        mode = labelled.publication()
+        if mode is IssuePublication.DRAFT_PR and candidate.action is not CandidateAction.REFUSE:
+            # As many are open as may be, since this one was dispatched: its change is posted on the issue.
+            held = labelled.hold_reason(gh.get_repo(task.failure.repo_full_name), bot_login)
+            if held:
+                logger.info("No pull request is opened: %s", held)
+                mode = IssuePublication.COMMENT
+    return publish_candidate(gh, task, candidate, git_env=git_env, issue_publication=mode)
 
 
 def load_prior_plans(
@@ -373,14 +412,7 @@ def load_prior_plans(
 
 def issue_publication() -> IssuePublication:
     """How a detector issue's fix is published, from the environment; a comment unless told otherwise."""
-    value = os.environ.get(ISSUE_PUBLICATION_ENV, "").strip().lower()
-    if not value:
-        return IssuePublication.COMMENT
-    try:
-        return IssuePublication(value)
-    except ValueError:
-        choices = ", ".join(mode.value for mode in IssuePublication)
-        raise ValueError(f"{ISSUE_PUBLICATION_ENV} must be one of {choices}, not {value!r}") from None
+    return IssuePublication.from_env(ISSUE_PUBLICATION_ENV)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -464,7 +496,11 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.get("GITHUB_SERVER_URL", "https://github.com"),
         os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GITHUB_RUN_ID", ""),
     )
-    with GitAuth(token, prefix="ci-fix-git-askpass-") as auth:
+    # A labelled issue's branch may live in the bot's own fork, which has a token of its own.
+    push_token = os.environ.get("PUSH_TOKEN", "")
+    if push_token and load(args.plan / PLAN_FILE, FixPlan).task.target.repo_full_name != push_repo():
+        push_token = ""
+    with GitAuth(push_token or token, prefix="ci-fix-git-askpass-") as auth:
         result = publish_and_report(
             gh, args.plan, args.outcome, git_env=auth.env(), run_url=run_url,
         )

@@ -28,6 +28,7 @@ from scripts.ci_fix.models import (
     FixTask,
     FrontDoor,
     IssuePublication,
+    IssueRequest,
     ResultKind,
     TargetKind,
 )
@@ -692,3 +693,122 @@ def test_the_run_page_says_whether_a_fix_was_published(tmp_path, monkeypatch):
     text = summary.read_text(encoding="utf-8")
     assert "**refused** (no fix published)" in text and "No safe fix." in text
     assert "**suggested** (a fix was published)" in text
+
+
+# --- a labelled issue: no failed job, a change made from a test written first -------
+
+def _label_plan(**target) -> FixPlan:
+    """A labelled issue's plan: on unstable's tip, hosted by Valkey's pull request job."""
+    task = FixTask(
+        Failure(repo_full_name="valkey-io/valkey", run_id=0, head_sha=_HEAD, job_id=0, job_name="test-ubuntu-latest",
+                base_branch="unstable", issue_number=7, workflow="ci"),
+        FixTarget(**{"kind": TargetKind.DRAFT_PR, "repo_full_name": "valkey-io/valkey", "branch": "agent/fix/issue-7-5",
+                     "expected_sha": _HEAD, **target}),
+        FixPolicy.GENERAL,
+        request=IssueRequest(number=7, title="value is wrong", body="It says before."),
+    )
+    return FixPlan(front_door=FrontDoor.LABEL, task=task, attempt=1)
+
+
+def test_a_labelled_issue_has_no_log_and_is_hosted_by_the_pull_request_job(monkeypatch, workflows, tmp_path):
+    planned = _label_plan()
+    monkeypatch.setitem(run._FRONT_DOORS, FrontDoor.LABEL, (lambda *_a, **_k: planned, MagicMock()))
+    artifacts = SimpleNamespace(download_job_log=lambda *_a: pytest.fail("no job failed"))
+
+    outputs = run.plan(MagicMock(), artifacts, FrontDoor.LABEL, {}, bot_login=_BOT, out=tmp_path)
+
+    assert (outputs["mode"], outputs["job"], outputs["use_git_ref"]) == ("job", "test-ubuntu-latest", _HEAD)
+    assert outputs["use_repo"] == "valkey-io/valkey"
+    # The branch's own workflow, at the commit the change is made on.
+    assert workflows == [("valkey-io/valkey", "ci", _HEAD)]
+    assert load(tmp_path / run.PLAN_FILE, FixPlan) == planned
+
+
+def test_the_change_is_made_on_the_targets_code_whichever_fork_its_branch_goes_to(monkeypatch, workflows, tmp_path):
+    planned = _label_plan(repo_full_name="valkeyrie/valkey", base_repo_full_name="valkey-io/valkey")
+    monkeypatch.setitem(run._FRONT_DOORS, FrontDoor.LABEL, (lambda *_a, **_k: planned, MagicMock()))
+
+    outputs = run.plan(MagicMock(), SimpleNamespace(), FrontDoor.LABEL, {}, bot_login=_BOT, out=tmp_path)
+
+    assert outputs["use_repo"] == "valkey-io/valkey"
+
+
+def test_the_head_of_the_bots_own_change_pr_is_never_built_by_a_jobs_setup(workflows):
+    """A job's setup and build run as the workflow user; that head is a change nobody has reviewed."""
+    head = replace(_label_plan(kind=TargetKind.UPDATE_PR).task, request=None)
+
+    assert run.job_for(MagicMock(), head) is None
+    # The issue's own change is made on the base branch's tip, which is trusted.
+    assert run.job_for(MagicMock(), _label_plan().task).name == "test-ubuntu-latest"
+
+
+def test_a_labelled_issues_change_is_prepared_from_a_test_not_a_log(monkeypatch, tmp_path):
+    save(tmp_path / run.PLAN_FILE, _label_plan())
+    seen = {}
+
+    def prepare_change(task, *, repo_dir, job):
+        seen.update(task=task, repo_dir=repo_dir, job=job)
+        return _CANDIDATE
+
+    monkeypatch.setattr(run, "prepare_change", prepare_change)
+    monkeypatch.setattr(run, "prepare_fix", lambda *_a, **_k: pytest.fail("no job failed"))
+
+    outcome = run.fix(tmp_path, tmp_path / "out", repo_dir="/checkout")
+
+    assert outcome == FixOutcome(candidate=_CANDIDATE, started=True)
+    assert seen == {"task": _label_plan().task, "repo_dir": "/checkout", "job": None}
+
+
+@pytest.mark.parametrize(("value", "mode"), [("", IssuePublication.COMMENT), ("draft-pr", IssuePublication.DRAFT_PR)])
+def test_how_a_labelled_issues_change_is_published_is_its_own_variables_choice(monkeypatch, tmp_path, value, mode):
+    save(tmp_path / run.PLAN_FILE, _label_plan())
+    save(tmp_path / run.OUTCOME_FILE, FixOutcome(candidate=_CANDIDATE))
+    monkeypatch.setenv("AGENT_FIX_PUBLISH", value)
+    # The detector's variable is for the detector's issues.
+    monkeypatch.setenv(run.ISSUE_PUBLICATION_ENV, "draft-pr" if not value else "comment")
+    monkeypatch.setitem(run._FRONT_DOORS, FrontDoor.LABEL, (MagicMock(), lambda _gh, _plan, result: result))
+    seen = {}
+
+    def publish(_gh, task, candidate, *, git_env, issue_publication):
+        seen["mode"] = issue_publication
+        return FixResult(kind=ResultKind.SUGGESTED, summary="s", task=task)
+
+    monkeypatch.setattr(run, "publish_candidate", publish)
+    monkeypatch.setattr(run.labelled, "hold_reason", lambda _repo, _bot: "")
+
+    _publish(tmp_path, tmp_path)
+
+    assert seen["mode"] is mode
+    # As many pull requests are open as may be, since the run was dispatched: the change is posted instead.
+    monkeypatch.setattr(run.labelled, "hold_reason", lambda _repo, _bot: "5 are open")
+    _publish(tmp_path, tmp_path)
+    assert seen["mode"] is IssuePublication.COMMENT
+
+
+@pytest.mark.parametrize(("pushed_to", "token"), [("valkeyrie/valkey", "fork-token"), ("valkey-io/valkey", "token")])
+def test_a_push_to_the_bots_fork_uses_the_forks_token(monkeypatch, tmp_path, pushed_to, token):
+    save(tmp_path / run.PLAN_FILE, _label_plan(repo_full_name=pushed_to))
+    used = []
+
+    class AuthContext:
+        def __init__(self, token, **_kwargs):
+            used.append(token)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def env(self):
+            return {}
+
+    monkeypatch.setenv("TARGET_TOKEN", "token")
+    monkeypatch.setenv("PUSH_TOKEN", "fork-token")
+    monkeypatch.setenv("AGENT_FIX_PUSH_REPO", "valkeyrie/valkey")
+    monkeypatch.setattr(run, "Github", lambda **_kwargs: MagicMock())
+    monkeypatch.setattr(run, "GitAuth", AuthContext)
+    monkeypatch.setattr(run, "publish_and_report", lambda *_args, **_kwargs: {"action": "opened"})
+
+    assert run.main(["publish", "--plan", str(tmp_path), "--outcome", str(tmp_path)]) == 0
+    assert used == [token]

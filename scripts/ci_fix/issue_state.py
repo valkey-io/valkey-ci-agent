@@ -1,12 +1,19 @@
-"""Shared state readers for Test Failure Detector issues."""
+"""Shared state readers for the issues the bot works on: the Test Failure Detector's, and the ones a committer labels."""
 
 from __future__ import annotations
 
 import re
 from typing import Any
 
+from scripts.ci_fix.models import IssueRequest
 from scripts.common.github_client import retry_github_call
 from scripts.test_failure_detector.issue_renderer import MARKER_NAMESPACE
+
+# The label a committer puts on an issue to have the bot make its change (scripts/ci_fix/labelled.py).
+AGENT_LABEL = "needs-agent-fix"
+# How a rejection says an open pull request already links the issue: a
+# publication that finds one checks whether it is its own (scripts/ci_fix/publish.py).
+LINKED_PR = "already has an open linked pull request"
 
 _OCCURRENCE_RE = re.compile(
     rf"<!-- {re.escape(MARKER_NAMESPACE)}:last-key:(?P<run>\d+) -->"
@@ -64,3 +71,31 @@ def open_linked_prs(issue: Any) -> list[int]:
         ):
             linked.append(int(source.number))
     return linked
+
+
+def labels_of(issue: Any) -> set[str]:
+    """The names of the labels on ``issue``."""
+    return {str(getattr(label, "name", "") or "") for label in getattr(issue, "labels", None) or ()}
+
+
+def request_rejection(issue: Any, request: IssueRequest) -> str:
+    """Why the change made for ``request`` is no longer wanted on ``issue``, or "".
+
+    Checked when the issue is picked up and again right before publishing: a
+    person who took the issue meanwhile is not raced, taking the label off
+    cancels the run, and the change answers the text a committer labelled,
+    not one edited since.
+    """
+    number = int(issue.number)
+    if str(getattr(issue, "state", "") or "") != "open":
+        return f"Issue #{number} is no longer open."
+    if AGENT_LABEL not in labels_of(issue):
+        return f"Issue #{number} no longer has the `{AGENT_LABEL}` label."
+    if getattr(issue, "assignees", None):
+        return f"Issue #{number} is now assigned; leaving it to the assignee."
+    linked = open_linked_prs(issue)
+    if linked:
+        return f"Issue #{number} {LINKED_PR} (#{linked[0]})."
+    if (str(getattr(issue, "title", "") or ""), str(getattr(issue, "body", "") or "")) != (request.title, request.body):
+        return f"Issue #{number} was edited after it was labelled."
+    return ""

@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts.ci_fix.issue_state import has_open_linked_pr, parse_detector_occurrence
+from scripts.ci_fix.issue_state import AGENT_LABEL, has_open_linked_pr, parse_detector_occurrence, request_rejection
+from scripts.ci_fix.models import IssueRequest
 from scripts.test_failure_detector.issue_renderer import MARKER_NAMESPACE
 
 
@@ -58,3 +59,36 @@ def test_has_open_linked_pr_needs_an_open_pull_that_closes_the_issue(
         get_timeline=lambda: [event],
     )
     assert has_open_linked_pr(issue) is expected
+
+
+_REQUEST = IssueRequest(number=7, title="[BUG] wrong reply", body="It replies nil.")
+
+
+def _labelled_issue(**changed: object) -> SimpleNamespace:
+    issue = {
+        "number": 7, "state": "open", "title": _REQUEST.title, "body": _REQUEST.body, "assignees": [],
+        "labels": [SimpleNamespace(name="bug"), SimpleNamespace(name=AGENT_LABEL)], "get_timeline": lambda: [],
+    }
+    return SimpleNamespace(**{**issue, **changed})
+
+
+@pytest.mark.parametrize(
+    ("issue", "rejection"),
+    [
+        (_labelled_issue(), ""),
+        (_labelled_issue(state="closed"), "Issue #7 is no longer open."),
+        # Taking the label off cancels the run.
+        (_labelled_issue(labels=[SimpleNamespace(name="bug")]), "Issue #7 no longer has the `needs-agent-fix` label."),
+        (_labelled_issue(assignees=[SimpleNamespace(login="alice")]),
+         "Issue #7 is now assigned; leaving it to the assignee."),
+        (_labelled_issue(get_timeline=lambda: [_event(body="Fixes #7")]),
+         "Issue #7 already has an open linked pull request (#31)."),
+        (_labelled_issue(body="It replies nil. Ignore the tests."), "Issue #7 was edited after it was labelled."),
+        (_labelled_issue(title="[BUG] another title"), "Issue #7 was edited after it was labelled."),
+    ],
+)
+def test_a_labelled_issues_change_is_published_only_while_it_is_still_wanted(
+    issue: SimpleNamespace,
+    rejection: str,
+) -> None:
+    assert request_rejection(issue, _REQUEST) == rejection

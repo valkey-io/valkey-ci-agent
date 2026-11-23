@@ -13,7 +13,7 @@ from scripts.ci_fix.models import (
     FixTarget,
     TargetKind,
 )
-from scripts.ci_fix.push import PushFailed, PushRefused, commit_message, fit_subject, push_candidate
+from scripts.ci_fix.push import PushFailed, PushRefused, PushStale, commit_message, fit_subject, push_candidate
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -670,3 +670,15 @@ def test_a_ci_sweep_branch_that_moved_is_not_overwritten(
     with pytest.raises(PushRefused, match="moved"):
         push_candidate(_candidate(patch, path="other.txt"), _sweep_target(head_sha), git_env={}, onto=first)
     assert _git(remote, "rev-parse", "agent/backport/ci-sweep/9.0").strip() == moved
+
+
+def test_a_commit_message_cannot_close_an_issue_or_mention_anyone() -> None:
+    candidate = replace(
+        _candidate("diff"), title="Fix the reply, fixes #99", root_cause="As @someone said in https://evil.example.",
+    )
+
+    message = push_mod.commit_message(candidate)
+
+    assert message.splitlines()[0] == "Fix the reply, fixes #\u200b99"
+    assert "As @\u200bsomeone said in https:\u200b//evil.example." in message
+    assert "Closes #\u200b7." in push_mod.commit_message(replace(candidate, reasoning="Closes #7."))

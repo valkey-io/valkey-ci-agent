@@ -20,6 +20,9 @@ from scripts.common.isolation import isolated_user
 
 logger = logging.getLogger(__name__)
 
+# What a kept session's file is named after its evidence record (AgentProfile.keeps_session).
+SESSION_SUFFIX = ".stream.jsonl"
+
 AgentProfileName = Literal[
     "conflict_resolve_edit_only",
     "test_adaptation_edit_only",
@@ -260,7 +263,7 @@ def _write_evidence(
         )
         path.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
         if profile.keeps_session:
-            path.with_suffix(".stream.jsonl").write_text(result.stdout, encoding="utf-8")
+            path.with_suffix(SESSION_SUFFIX).write_text(result.stdout, encoding="utf-8")
     except OSError as exc:
         logger.warning(
             "Could not write agent evidence for profile %s to %s: %s",
