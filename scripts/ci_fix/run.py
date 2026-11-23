@@ -3,8 +3,9 @@
 Every front door runs its fix the same way, through ``ci-fix-run.yml``:
 a Test Failure Detector issue (:mod:`scripts.ci_fix.issues`), a maintainer's
 command on a pull request (:mod:`scripts.ci_fix.main`), a bot-owned pull
-request's red head (:mod:`scripts.backport.ci_followup`), and an issue a
-committer labelled for a change (:mod:`scripts.ci_fix.labelled`).
+request's red head (:mod:`scripts.backport.ci_followup`), an issue a
+committer labelled for a change (:mod:`scripts.ci_fix.labelled`), and the
+pull request the bot opened for one (:mod:`scripts.ci_fix.upkeep`).
 
 1. ``plan``: the front door validates its request and binds one exact failed
    job (a :class:`FixPlan`); this module resolves that job from the workflow
@@ -45,13 +46,14 @@ from typing import Any, Callable
 from github import Auth, Github, GithubException
 
 from scripts.backport import ci_followup
-from scripts.ci_fix import issues, labelled, upstream
+from scripts.ci_fix import issues, labelled, upkeep, upstream
 from scripts.ci_fix import main as pr_command
 from scripts.ci_fix.ci_job import JobSpec, Unsupported, resolve, setup_script, workflow_source
 from scripts.ci_fix.engine import (
     failed_tests,
     prepare_change,
     prepare_fix,
+    prepare_review,
     prepare_upstream,
     upstream_task,
 )
@@ -99,7 +101,10 @@ _FRONT_DOORS: dict[FrontDoor, tuple[Planner, Reporter]] = {
     FrontDoor.PR: (pr_command.plan_request, pr_command.report_result),
     FrontDoor.FOLLOW_UP: (ci_followup.plan_request, ci_followup.report_result),
     FrontDoor.LABEL: (labelled.plan_request, labelled.report_result),
+    FrontDoor.UPKEEP: (upkeep.plan_request, upkeep.report_result),
 }
+# The front doors that count their failed attempts from earlier runs' plans.
+_COUNTS_ATTEMPTS = (FrontDoor.FOLLOW_UP, FrontDoor.UPKEEP)
 
 
 def plan(
@@ -122,7 +127,7 @@ def plan(
     """
     planner, reporter = _FRONT_DOORS[front_door]
     planner_options: dict[str, Any] = {"bot_login": bot_login}
-    if front_door is FrontDoor.FOLLOW_UP:
+    if front_door in _COUNTS_ATTEMPTS:
         planner_options["prior_plans"] = prior_plans
     planned = planner(gh, artifact_client, request, **planner_options)
     if not isinstance(planned, FixPlan):
@@ -270,7 +275,10 @@ def job_for(gh: Any, task: FixTask) -> JobSpec | None:
     workflow = failure.source.value if failure.source else failure.workflow
     if task.target.kind is TargetKind.SUGGEST or not workflow:
         return None
-    if task.target.kind is TargetKind.UPDATE_PR and task.target.branch.startswith(CHANGE_BRANCH_PREFIX):
+    if (
+        task.target.kind is TargetKind.UPDATE_PR and task.target.branch.startswith(CHANGE_BRANCH_PREFIX)
+        and not task.target.replaces
+    ):
         return None
     if failure.scheduled or not failure.pr_number:
         ref = f"refs/heads/{failure.base_branch}"
@@ -301,7 +309,8 @@ def fix(plan_dir: Path, out: Path, *, repo_dir: str = "") -> FixOutcome:
             sha = (plan_dir / SHA_FILE).read_text(encoding="utf-8").strip()
             candidate = prepare_upstream(fix_plan.task, fix_plan.job_log, release, sha=sha, repo_dir=repo_dir, job=job)
         elif fix_plan.task.request is not None:
-            candidate = prepare_change(fix_plan.task, repo_dir=repo_dir, job=job)
+            prepare = prepare_review if fix_plan.task.request.review else prepare_change
+            candidate = prepare(fix_plan.task, repo_dir=repo_dir, job=job)
         else:
             candidate = prepare_fix(fix_plan.task, fix_plan.job_log, repo_dir=repo_dir, job=job)
         outcome = FixOutcome(candidate=candidate, started=True)
@@ -370,6 +379,10 @@ def _published(gh: Any, fix_plan: FixPlan, candidate: FixCandidate, *, git_env: 
             if held:
                 logger.info("No pull request is opened: %s", held)
                 mode = IssuePublication.COMMENT
+    if fix_plan.front_door is FrontDoor.UPKEEP and candidate.action is not CandidateAction.REFUSE:
+        taken = upkeep.taken_over_since(gh, fix_plan, bot_login)
+        if taken:
+            return FixResult(kind=ResultKind.REFUSED, summary=taken, task=task)
     return publish_candidate(gh, task, candidate, git_env=git_env, issue_publication=mode)
 
 
@@ -469,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
         agent_token = os.environ.get("AGENT_TOKEN", "")
         agent_repo = os.environ.get("GITHUB_REPOSITORY", "")
         if (
-            FrontDoor(args.front_door) is FrontDoor.FOLLOW_UP
+            FrontDoor(args.front_door) in _COUNTS_ATTEMPTS
             and args.key
             and agent_token
             and agent_repo

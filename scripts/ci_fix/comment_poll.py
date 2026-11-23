@@ -293,6 +293,7 @@ def dispatch_ci_fix(
             "run_url": run_url,
             "hint": command.hint,
             "commenter": commenter,
+            "command": command.verb,
         }
         if comment_id:
             inputs["comment_id"] = str(comment_id)

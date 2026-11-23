@@ -179,3 +179,123 @@ def test_reaction_uses_minus_one_for_refusal() -> None:
         "/repos/o/r/issues/comments/7/reactions",
         input={"content": "-1"},
     )
+
+
+# --- `address`: a committer's review comments on the bot's own pull request --------------
+
+_ADDRESS = {**_REQUEST, "command": "address", "hint": "keep it small"}
+
+
+def _review_thread(*comments, path="src/a.c", line=12, resolved=False, outdated=False):
+    return SimpleNamespace(
+        path=path, line=line, resolved=resolved, outdated=outdated,
+        comments=[SimpleNamespace(author_login=login, body=body) for login, body in comments],
+    )
+
+
+def _change_pull(*, ref="agent/fix/issue-7-500", author=_BOT, state="open", reviews=()):
+    return SimpleNamespace(
+        number=42, state=state, user=SimpleNamespace(login=author),
+        head=SimpleNamespace(ref=ref, sha=_SHA, repo=SimpleNamespace(full_name="valkey-io/valkey")),
+        get_reviews=lambda: [SimpleNamespace(user=SimpleNamespace(login=login), body=body) for login, body in reviews],
+    )
+
+
+@pytest.fixture
+def review(wired, monkeypatch):
+    """The `address` plan with GitHub faked: who is a committer, the review threads, and the task of the change."""
+    monkeypatch.delenv("AGENT_FIX_PUSH_REPO", raising=False)
+    # The bot can push too: what it wrote is left out because it is the bot's.
+    monkeypatch.setattr(
+        main_mod.labelled, "has_write_access", lambda _repo, login: login in ("alice", "committer", "valkeyrie-ops"),
+    )
+    monkeypatch.setattr(main_mod, "GitHubGraphQLClient", lambda token: token)
+    asked: list[tuple[str, ...]] = []
+
+    def change_task(_repo, _pull, _bot, *, review):
+        asked.append(review)
+        return wired.task
+
+    monkeypatch.setattr(main_mod.upkeep, "pull_request_task", change_task)
+
+    def plan(pull, threads=(), request=_ADDRESS):
+        monkeypatch.setattr(main_mod, "list_review_threads", lambda _gql, _repo, _number: tuple(threads))
+        gh = MagicMock()
+        gh.get_repo.return_value = SimpleNamespace(full_name="valkey-io/valkey", get_pull=lambda _number: pull)
+        return main_mod.plan_request(gh, None, request, bot_login=_BOT)
+
+    wired.task, wired.asked, wired.plan = _task(), asked, plan
+    return wired
+
+
+def test_a_committers_review_comments_are_planned_as_one_change(review) -> None:
+    pull = _change_pull(reviews=[("committer", "Please  rename\nthe helper."), ("stranger", "LGTM"), ("committer", "")])
+    threads = [
+        _review_thread(("committer", "Use the existing helper."), ("stranger", "or delete it"), ("valkeyrie-ops", "ok")),
+        _review_thread(("committer", "already done"), resolved=True),
+        _review_thread(("committer", "on an older diff"), outdated=True),
+        _review_thread(("committer", "The whole file."), path="tests/unit/a.tcl", line=None),
+    ]
+
+    plan = review.plan(pull, threads)
+
+    assert isinstance(plan, FixPlan) and plan.front_door is FrontDoor.PR and plan.comment_id == 7
+    assert plan.task.failure.hint == "keep it small" and plan.task.target == _task().target
+    # Committers' words only, from unresolved threads on the current diff, then the command's own hint.
+    assert review.asked == [(
+        "committer: Please rename the helper.",
+        "committer on `src/a.c` line 12: Use the existing helper.",
+        "committer on `tests/unit/a.tcl`: The whole file.",
+        "alice: keep it small",
+    )]
+    assert review.posted == [] and review.reacted == []
+
+
+def test_only_a_committer_may_have_review_comments_addressed(review) -> None:
+    result = review.plan(_change_pull(), request={**_ADDRESS, "commenter": "mallory"})
+
+    assert result["action"] == ResultKind.REFUSED.value and review.asked == []
+    assert "`address` is a committer's command, and mallory does not have write access" in review.posted[0][2]
+    assert review.reacted == [(7, ResultKind.REFUSED)]
+
+
+@pytest.mark.parametrize("pull", [
+    _change_pull(ref="agent/backport/sweep/9.0"),
+    _change_pull(author="mallory"),
+    _change_pull(state="closed"),
+])
+def test_review_comments_are_addressed_only_on_the_bots_own_change(review, pull) -> None:
+    result = review.plan(pull, [_review_thread(("committer", "Use the helper."))])
+
+    assert result["action"] == ResultKind.REFUSED.value and review.asked == []
+    assert "an open pull request the bot opened for a labelled issue" in review.posted[0][2]
+
+
+def test_there_has_to_be_a_committers_comment_to_address(review) -> None:
+    threads = [_review_thread(("stranger", "why?")), _review_thread(("committer", "done"), resolved=True)]
+
+    result = review.plan(_change_pull(reviews=[("stranger", "nit")]), threads, request={**_ADDRESS, "hint": ""})
+
+    assert result["action"] == ResultKind.REFUSED.value and review.asked == []
+    assert "There is no unresolved review comment from a committer to apply." in review.posted[0][2]
+
+
+def test_review_comments_are_not_addressed_for_an_issue_nobody_vouches_for(review) -> None:
+    review.task = None
+
+    result = review.plan(_change_pull())
+
+    assert result["action"] == ResultKind.REFUSED.value
+    assert "No change was pushed: Its issue is closed, or was edited since it was labelled." in review.posted[0][2]
+
+
+def test_a_review_that_cannot_be_read_stays_in_the_workflow(review, monkeypatch) -> None:
+    def unreadable(_repo, _login):
+        raise RuntimeError("GitHub is down")
+
+    monkeypatch.setattr(main_mod.labelled, "has_write_access", unreadable)
+
+    result = review.plan(_change_pull())
+
+    assert result["action"] == ResultKind.FAILED.value
+    assert review.posted == [] and review.reacted == [(7, ResultKind.FAILED)]

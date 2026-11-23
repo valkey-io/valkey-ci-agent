@@ -999,3 +999,49 @@ def test_a_labelled_issues_draft_pr_leads_with_its_summary_and_closes_the_issue(
     assert body.startswith("GET now replies with an error. Fixes #\u200b1.\n\nFixes #9\n\n## AI generated details\n")
     assert "- It replies with an error." in body and "- Before any change, it failed 3 of 3 runs." in body
     assert "Its commit has no DCO sign-off" in body
+
+
+def test_a_change_made_again_is_checked_against_the_head_it_replaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = _task(TargetKind.UPDATE_PR)
+    task = replace(
+        task, request=IssueRequest(number=9, title="t", body="b", pr_number=7),
+        target=replace(task.target, branch="agent/fix/issue-9-5", expected_sha=_NEW, replaces=_HEAD),
+    )
+    pr = _pr()
+    pr.head.ref = "agent/fix/issue-9-5"
+    gh, _repo = _gh(pr=pr)
+    checks = []
+
+    def push(candidate, target, *, git_env, pre_push_check, allow_ci_changes):
+        checks.append(pre_push_check())
+        return "d" * 40
+
+    monkeypatch.setattr(publish_mod, "push_candidate", push)
+
+    result = publish_candidate(gh, task, _candidate(), git_env={})
+
+    assert checks == [""]
+    assert (result.kind, result.summary) == (ResultKind.PUSHED, "Made the change again on 9.0.")
+    pr.head.sha = "e" * 40
+    publish_candidate(gh, task, _candidate(), git_env={})
+    assert "the PR head moved from " + _HEAD[:12] in checks[1]
+
+
+def test_the_bots_own_fork_is_a_head_it_may_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = _task(TargetKind.UPDATE_PR)
+    task = replace(task, target=replace(task.target, repo_full_name="valkeyrie/valkey", branch="agent/fix/issue-9-5"))
+    pr = _pr(head_repo="valkeyrie/valkey")
+    pr.head.ref = "agent/fix/issue-9-5"
+    gh, _repo = _gh(pr=pr)
+
+    def push(*_args, pre_push_check, **_kwargs):
+        reason = pre_push_check()
+        if reason:
+            raise PushRefused(f"Refusing to push: {reason}")
+        return _NEW
+
+    monkeypatch.setattr(publish_mod, "push_candidate", push)
+
+    assert "not owned by the CI agent" in publish_candidate(gh, task, _candidate(), git_env={}).summary
+    monkeypatch.setenv("AGENT_FIX_PUSH_REPO", "valkeyrie/valkey")
+    assert publish_candidate(gh, task, _candidate(), git_env={}).kind is ResultKind.PUSHED

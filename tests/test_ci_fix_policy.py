@@ -62,11 +62,14 @@ def test_only_a_bot_owned_backport_branch_takes_a_ci_change(
     assert allows_ci_changes(task) is allowed
 
 
-def test_a_labelled_issues_branch_is_writable_and_may_go_to_the_bots_fork(monkeypatch):
+def test_a_labelled_issues_branch_is_writable_and_the_bots_fork_is_its_own(monkeypatch):
     from scripts.ci_fix import policy
 
     assert policy.is_writable_branch("agent/fix/issue-7-1")
     monkeypatch.delenv(policy.PUSH_REPO_ENV, raising=False)
-    assert policy.push_repo() == ""
+    assert policy.is_own_repo("valkey-io/valkey", "valkey-io/valkey")
+    assert not policy.is_own_repo("someone/valkey", "valkey-io/valkey") and not policy.is_own_repo("", "valkey-io/valkey")
     monkeypatch.setenv(policy.PUSH_REPO_ENV, " valkeyrie/valkey ")
     assert policy.push_repo() == "valkeyrie/valkey"
+    assert policy.is_own_repo("valkeyrie/valkey", "valkey-io/valkey")
+    assert not policy.is_own_repo("someone/valkey", "valkey-io/valkey")

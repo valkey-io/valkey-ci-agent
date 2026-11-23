@@ -30,7 +30,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import islice
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 
 from github.GithubException import GithubException
 
@@ -146,17 +146,31 @@ def has_write_access(repo: Any, login: str) -> bool:
     return str(permission) in _WRITE_ACCESS
 
 
+def committer_check(repo: Any) -> Callable[[str], bool]:
+    """Whether a login is a person who can push to ``repo``, read from GitHub once per login."""
+    known: dict[str, bool] = {}
+
+    def is_committer(login: str) -> bool:
+        if login not in known:
+            known[login] = bool(login) and not login.endswith("[bot]") and has_write_access(repo, login)
+        return known[login]
+
+    return is_committer
+
+
+def bot_markers(comments: Iterable[Any], bot_login: str, marker: re.Pattern[str]) -> Iterator[re.Match[str]]:
+    """Every ``marker`` in the comments the bot itself wrote: anyone can write one in theirs."""
+    for comment in comments:
+        if str(getattr(getattr(comment, "user", None), "login", "") or "") == bot_login:
+            yield from marker.finditer(str(getattr(comment, "body", "") or ""))
+
+
 def answered(issue: Any, label_event: int, bot_login: str) -> bool:
     """Whether the bot has reported on this labelling of ``issue``: a change, a refusal, or its last failure."""
     comments = retry_github_call(
         lambda: list(issue.get_comments()), retries=2, description=f"read issue #{issue.number} comments",
     )
-    return any(
-        int(match.group("label")) == label_event
-        for comment in comments
-        if str(getattr(getattr(comment, "user", None), "login", "") or "") == bot_login
-        for match in _MARKER_RE.finditer(str(getattr(comment, "body", "") or ""))
-    )
+    return any(int(match.group("label")) == label_event for match in bot_markers(comments, bot_login, _MARKER_RE))
 
 
 def is_crash_report(title: str) -> bool:
@@ -251,6 +265,12 @@ def is_change_pull(pull: Any, bot_login: str) -> bool:
         str(getattr(getattr(pull, "user", None), "login", "") or "") == bot_login
         and _BRANCH_RE.match(str(getattr(getattr(pull, "head", None), "ref", "") or "")) is not None
     )
+
+
+def issue_of(pull: Any) -> tuple[int, int]:
+    """The issue and the labelling the bot's pull request ``pull`` answers, from its branch; (0, 0) for any other."""
+    match = _BRANCH_RE.match(str(getattr(getattr(pull, "head", None), "ref", "") or ""))
+    return (int(match.group("issue")), int(match.group("label"))) if match else (0, 0)
 
 
 def plan_request(
@@ -402,7 +422,7 @@ def change_task(repo_full_name: str, branch: str, sha: str, request: IssueReques
         failure=Failure(
             repo_full_name=repo_full_name, run_id=0, head_sha=sha, job_id=0, job_name=_HOST_JOB, base_branch=branch,
             description=f"Issue #{request.number}: {compact_text(request.title, 300)}",
-            issue_number=request.number, workflow=_HOST_WORKFLOW,
+            issue_number=request.number, pr_number=request.pr_number, workflow=_HOST_WORKFLOW,
         ),
         target=target,
         policy=FixPolicy.GENERAL,
@@ -420,15 +440,11 @@ def committer_comments(repo: Any, issue: Any, bot_login: str) -> tuple[str, ...]
         lambda: list(islice(issue.get_comments(), _SCANNED_COMMENTS)), retries=2,
         description=f"read issue #{issue.number} comments",
     )
-    committers: dict[str, bool] = {}
+    is_committer = committer_check(repo)
     said = []
     for comment in comments:
         login = str(getattr(getattr(comment, "user", None), "login", "") or "")
-        if not login or login == bot_login or login.endswith("[bot]"):
-            continue
-        if login not in committers:
-            committers[login] = has_write_access(repo, login)
-        if committers[login]:
+        if login != bot_login and is_committer(login):
             said.append(f"{login}: {compact_text(str(getattr(comment, 'body', '') or ''), _MAX_COMMENT_CHARS)}")
     return tuple(said[-_MAX_COMMENTS:])
 

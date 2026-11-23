@@ -563,6 +563,24 @@ def test_the_change_is_made_from_the_failing_test_and_never_ported(tmp_path, mon
     assert candidate.action is CandidateAction.PATCH
 
 
+def test_a_change_to_the_bots_own_pull_request_is_shown_its_diff_and_the_review(tmp_path, monkeypatch) -> None:
+    seen = _capture(monkeypatch, {"action": "patch", "summary": "Renamed it."})
+
+    agent_mod.run_fix_agent(
+        _issue_task(pr_number=44, earlier="+++ b/src/t_string.c\n+x\n", review=("alice on `src/t_string.c`: rename it",)),
+        str(tmp_path), "",
+    )
+    assert "apply the review comments in" in seen["prompt"] and "#44" in seen["prompt"]
+    # No test was run before this session: the pull request's own are its check.
+    assert "The pull request's own tests are the check of your change." in seen["prompt"]
+    assert "failing run" not in seen["prompt"] and "failing-run.log" not in seen["files"]
+    assert seen["files"]["review-comments.md"] == "- alice on `src/t_string.c`: rename it\n"
+    assert seen["files"]["pull-request.diff"] == "+++ b/src/t_string.c\n+x\n"
+
+    agent_mod.run_fix_agent(_issue_task(pr_number=44, earlier="+++ b/src/t_string.c\n+x\n"), str(tmp_path), "")
+    assert "it now conflicts with the branch. Make the same change on this commit" in seen["prompt"]
+
+
 def test_the_review_looks_for_a_case_the_change_gets_wrong(tmp_path, monkeypatch) -> None:
     seen = _capture(monkeypatch, {
         "verdict": "counterexample", "reasoning": "It is still nil after a restart.",

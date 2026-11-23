@@ -363,7 +363,8 @@ def test_every_fix_front_door_runs_the_shared_fix():
 
     doors = set()
     for filename, job_id in (("ci-fix.yml", "ci-fix"), ("backport-ci-followup.yml", "follow-up"),
-                             ("ci-fix-issues.yml", "fix"), ("ci-fix-labelled.yml", "fix")):
+                             ("ci-fix-issues.yml", "fix"), ("ci-fix-labelled.yml", "fix"),
+                             ("ci-fix-labelled-dispatch.yml", "upkeep")):
         job = yaml.safe_load((Path(".github/workflows") / filename).read_text(encoding="utf-8"))["jobs"][job_id]
         assert job["uses"] == f"./{_RUN.as_posix()}", filename
         # actions: read lets the plan job read earlier plans, which record
@@ -402,14 +403,17 @@ def test_only_the_plan_and_publish_jobs_hold_a_github_token():
         )
         permissions = {k: v for k, v in tokens[0]["with"].items() if k.startswith("permission-")}
         # The plan only reads and answers (a comment, a reaction, a label taken off); publish pushes and opens
-        # PRs. A labelled issue's plan opens the pull request an earlier attempt pushed a branch for. Its branch
-        # goes to the bot's fork when it has one, and its publish then cannot write the target's code.
+        # PRs. Looking after the bot's own pull requests marks one ready for review from the plan. A labelled
+        # issue's branch goes to the bot's fork when it has one, and its publish then cannot write the target's code.
         assert permissions == {
             "permission-actions": "read", "permission-issues": "write", "permission-metadata": "read",
             "permission-contents": "read" if plan else (
-                "${{ inputs.front_door == 'label' && vars.AGENT_FIX_PUSH_REPO != '' && 'read' || 'write' }}"
+                "${{ (inputs.front_door == 'label' || inputs.front_door == 'upkeep') "
+                "&& vars.AGENT_FIX_PUSH_REPO != '' && 'read' || 'write' }}"
             ),
-            "permission-pull-requests": "${{ inputs.front_door == 'label' && 'write' || 'read' }}" if plan else "write",
+            "permission-pull-requests": (
+                "${{ (inputs.front_door == 'upkeep' || inputs.front_door == 'label') && 'write' || 'read' }}"
+            ) if plan else "write",
             # The PR command's gate checks team membership.
             **({"permission-members": "read"} if plan else {}),
         }, job_id

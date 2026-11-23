@@ -404,7 +404,8 @@ class _Evidence:
     tests: tuple[FailedTest, ...]
     # The plan that reached them, which the change is then checked with.
     plan: VerifyPlan
-    # The tests as a patch on the base commit, their files, and one failing run's output.
+    # The tests as a patch on the base commit, their files, and one failing
+    # run's output; empty for a pull request's own tests, which are its head's.
     patch: str
     paths: tuple[str, ...]
     output: str
@@ -465,6 +466,46 @@ def prepare_change(
         return replace(made, patch=patch, changed_paths=paths)
 
 
+def prepare_review(
+    task: FixTask,
+    agent_func: AgentFunc = run_fix_agent,
+    review_func: ReviewFunc | None = None,
+    test_func: TestFunc | None = None,
+    *,
+    repo_dir: str = "",
+    job: JobCommands | None = None,
+) -> FixCandidate:
+    """A committer's review comments (``task.request.review``) applied to the bot's own pull request.
+
+    The checkout is the pull request's head. The tests it adds are the
+    evidence: the change is checked with them as any labelled issue's is,
+    and because a review may change a test, they also have to fail again
+    with the product change taken out (:func:`_fails_without`). The
+    candidate's patch is this round's change alone, on that head.
+    """
+    request = _request(task)
+    with checkout(task, repo_dir) as (repo_dir, _head), _ending_at_a_crash():
+        deadline = time.monotonic() + PREPARE_BUDGET_S
+        run_test, stopping_at_crash = _runners(task, test_func)
+        tests = locate_unit_tests(repo_dir, added_tests(request.earlier))
+        plan = plan_for(repo_dir, tests, scheduled=False, job=job) if tests else None
+        if plan is None:
+            return _refusal(
+                "This pull request adds no test that code can run, so a change to it could not be checked. "
+                "No change was made."
+            )
+        evidence = _Evidence(
+            tests=tests, plan=plan, patch="", paths=(), output="", check="",
+            written=FixCandidate(action=CandidateAction.PATCH),
+        )
+        return _make_change(
+            task, repo_dir, _change_guide(task, repo_dir), evidence,
+            agent_func=agent_func, review_func=review_func, run_test=run_test, stopping_at_crash=stopping_at_crash,
+            deadline=deadline, job=job,
+            first_check=lambda checks: _fails_without(request, repo_dir, plan, stopping_at_crash, deadline, checks),
+        )
+
+
 def _request(task: FixTask) -> IssueRequest:
     if task.request is None:
         raise ValueError("a change is prepared for a labelled issue")
@@ -489,27 +530,32 @@ def _make_change(
     stopping_at_crash: TestFunc,
     deadline: float,
     job: JobCommands | None,
+    first_check: Callable[[list[str]], str] | None = None,
 ) -> FixCandidate:
     """The change that makes ``evidence``'s tests pass, checked and reviewed, on the checkout's HEAD.
 
     HEAD holds the tests already (the evidence is a commit of the checkout's
-    own), so that every round's patch is the change alone.
+    own, or the pull request's head), so that every round's patch is the
+    change alone. ``first_check`` runs before the other checks of a round's
+    change, and like them returns feedback, or "" after noting what it saw.
     """
     _ignore_generated_copies(repo_dir)
     head = git_output(repo_dir, "rev-parse", "HEAD").strip()
     sanitized = _with_sanitizer(job)
     plan = evidence.plan
     criteria = "".join(f"- {criterion}\n" for criterion in evidence.written.criteria)
+    reviewing = bool(_request(task).review)
     context = FixContext(
         guide=guide,
         evidence_check=evidence.check,
-        evidence_detail="\n\n".join(part for part in (
+        evidence_detail="" if reviewing else "\n\n".join(part for part in (
             evidence.check,
             f"The acceptance criteria the test was written from:\n\n{criteria}" if criteria else "",
             f"The test, which is in the working tree:\n\n```diff\n{evidence.patch}\n```\n",
         ) if part),
         frozen_patch=evidence.patch,
-        frozen_tests=evidence.tests,
+        # A review may ask for the test itself to change.
+        frozen_tests=() if reviewing else evidence.tests,
         verification=(
             f"Code checks your change with `{plan.command(plan.loops)}`: the build must pass and the test must "
             f"pass, once and then looped, at least {min(CHANGE_MIN_LOOPS, plan.loops)} times. It then runs "
@@ -519,7 +565,8 @@ def _make_change(
     )
 
     def checks(candidate: FixCandidate, found: list[str]) -> str:
-        return _change_checks(
+        failed = first_check(found) if first_check is not None else ""
+        return failed or _change_checks(
             candidate, repo_dir, evidence, found, run_test=run_test, deadline=deadline, job=job, sanitized=sanitized,
         )
 
@@ -808,6 +855,42 @@ def _runs_before(
 def _shows_failure(plan: VerifyPlan, run: TestRun, request: IssueRequest) -> bool:
     """Whether ``run`` failed on the planned tests themselves or, for a crash report, by the server crashing."""
     return not run.passed and (plan.failed(run) or (request.crash_report and run.crashed))
+
+
+def _fails_without(
+    request: IssueRequest, repo_dir: str, plan: VerifyPlan, run_test: TestFunc, deadline: float, checks: list[str],
+) -> str:
+    """Whether the pull request's tests still fail once its product change is taken out; feedback when not.
+
+    A review may ask for the test to change, and a test is evidence only
+    while it fails without the change it comes with. The product change, from
+    the default branch to the working tree, is taken out for the runs and put
+    back after them.
+    """
+    default_ref = default_branch_ref(repo_dir)
+    if not default_ref:
+        raise RuntimeError("the checkout has no default branch to take the pull request's change from")
+    base = git_output(repo_dir, "merge-base", default_ref, "HEAD").strip()
+    paths = tuple(
+        path for path in git_paths(repo_dir, "diff", "--no-renames", "--name-only", "-z", base)
+        if not is_test_path(path)
+    )
+    if not paths:
+        return ""
+    product = git_output(repo_dir, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--binary", base, "--", *paths)
+    run_git(repo_dir, "apply", "-R", "--whitespace=nowarn", "-", input=product)
+    try:
+        plan, runs = _runs_before(plan, request, repo_dir, run_test, deadline)
+    finally:
+        run_git(repo_dir, "apply", "--whitespace=nowarn", "-", input=product)
+    failed = sum(_shows_failure(plan, run, request) for run in runs)
+    if failed < EVIDENCE_RUNS:
+        return (
+            f"Without the product change, the pull request's tests failed {failed} of {EVIDENCE_RUNS} runs of "
+            f"`{plan.quoted(1)}`. A test has to fail every run without the change it comes with."
+        )
+    checks.append(f"Without the product change, `{plan.quoted(1)}` failed {EVIDENCE_RUNS} of {EVIDENCE_RUNS} runs.")
+    return ""
 
 
 def _change_checks(

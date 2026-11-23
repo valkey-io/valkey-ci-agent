@@ -187,6 +187,10 @@ class FixTarget:
     # there too, and when it applies there it is a pull request into it, not
     # a CI-sweep fix (:mod:`scripts.ci_fix.upstream`).
     upstream_branch: str = ""
+    # Set when the bot's pull request for a labelled issue conflicts with its
+    # base branch: the head of ``branch``, which the push replaces with the
+    # change made again on ``expected_sha``, the base branch's tip.
+    replaces: str = ""
 
 
 @dataclass(frozen=True)
@@ -227,6 +231,13 @@ class IssueRequest:
     # A crash report: the server crashing is the failure its test shows.
     # Anywhere else a crash stops the run, and nothing is published about it.
     crash_report: bool = False
+    # The bot's pull request for the issue, when the run changes it: its
+    # number, and its diff, which is the change to make again (a merge
+    # conflict) or to revise (``review``).
+    pr_number: int = 0
+    earlier: str = ""
+    # A committer's review comments to apply to that pull request.
+    review: tuple[str, ...] = ()
     # A replay of a closed issue on the commit before its fix: nothing is published.
     replay: bool = False
 
@@ -444,6 +455,7 @@ class FrontDoor(str, Enum):
     PR = "pr"  # a maintainer's command on a PR (scripts/ci_fix/main.py)
     FOLLOW_UP = "follow-up"  # a bot-owned PR's red head (scripts/backport/ci_followup.py)
     LABEL = "label"  # an issue a committer labelled for a change (scripts/ci_fix/labelled.py)
+    UPKEEP = "upkeep"  # the bot's own PR for a labelled issue (scripts/ci_fix/upkeep.py)
 
 
 @dataclass(frozen=True)

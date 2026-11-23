@@ -149,9 +149,7 @@ directory. A committer asked for it by labelling the issue.
 - Repository: {repo}
 - Working commit: {working_sha} on `{base_branch}`
 
-Code has already seen a test fail that shows the issue. The output of one
-failing run is at:
-{log_path}
+{evidence}
 
 Policy:
 Make the smallest coherent change to the source that makes the test pass,
@@ -511,16 +509,26 @@ def _write_change(
     task: FixTask, request: IssueRequest, repo_dir: str, job_log: str, feedback: str, timeout: int | None,
     context: FixContext,
 ) -> FixCandidate:
-    """One session that makes a labelled issue's change, with the failing run of its test as ``job_log``."""
+    """One session that makes a labelled issue's change, with the failing run of its test as ``job_log``.
+
+    A review of the bot's pull request has no failing run: its tests pass on its head.
+    """
     with _log_dir(repo_dir, "ci-fix-issue-") as log_dir:
-        log_path = Path(log_dir) / "failing-run.log"
-        log_path.write_text(job_log, encoding="utf-8")
+        if request.review:
+            evidence = "The pull request's own tests are the check of your change."
+        else:
+            log_path = Path(log_dir) / "failing-run.log"
+            log_path.write_text(job_log, encoding="utf-8")
+            evidence = (
+                "Code has already seen a test fail that shows the issue. The output of one\n"
+                f"failing run is at:\n{log_path}"
+            )
         prompt = _CHANGE_PROMPT.format(
             issue=_issue_prompt(request, Path(log_dir)),
             repo=task.failure.repo_full_name,
             working_sha=task.target.expected_sha or task.failure.head_sha,
             base_branch=task.failure.base_branch or "(unknown)",
-            log_path=log_path,
+            evidence=evidence,
             target=target_capabilities(task.target.kind).publication_guidance,
             # Written here: nothing upstream has the change to port.
             context=_context_prompt(context, Path(log_dir), False),
@@ -564,7 +572,29 @@ def _issue_prompt(request: IssueRequest | None, directory: Path) -> str:
         + (f"\n# What committers said on the issue\n\n{said}" if said else ""),
         encoding="utf-8",
     )
-    return f"Issue #{request.number} is at:\n{issue}\n\n{_UNTRUSTED_ISSUE}\n"
+    lines = [f"Issue #{request.number} is at:\n{issue}\n", _UNTRUSTED_ISSUE, ""]
+    earlier = directory / "pull-request.diff"
+    if request.earlier:
+        earlier.write_text(request.earlier, encoding="utf-8")
+    if request.review:
+        review = directory / "review-comments.md"
+        review.write_text("".join(f"- {comment}\n" for comment in request.review), encoding="utf-8")
+        lines += [
+            f"The bot's pull request for the issue, #{request.pr_number}, is the working tree, and its diff is in "
+            f"{earlier}. A committer reviewed it: apply the review comments in {review}, and change nothing "
+            "they do not ask for. A comment you cannot apply correctly is one to say so about in `validation`. "
+            "Code checks the change with the pull request's tests, by their names: keep those names, and say in "
+            "`validation` if a comment asks for one to be renamed.",
+            "",
+        ]
+    elif request.earlier:
+        lines += [
+            f"The bot's pull request for the issue, #{request.pr_number}, made the change in {earlier} on an "
+            "older commit, and it now conflicts with the branch. Make the same change on this commit: the same "
+            "test and the same fix, written for the code as it is now.",
+            "",
+        ]
+    return "\n".join(lines)
 
 
 def write_failing_test(

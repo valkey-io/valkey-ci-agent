@@ -283,3 +283,15 @@ def test_an_opened_draft_pr_is_linked_from_its_issue() -> None:
 
     assert body.startswith("Opened draft PR [#44](https://example/pr/44) for this issue.")
     assert "<details><summary>What the bot checked</summary>" in body and "- It passed 40 loops." in body
+
+
+def test_a_push_to_the_bots_own_pull_request_says_why() -> None:
+    rebased = render_result(_change(ResultKind.PUSHED, candidate=_candidate(), pr_number=44))
+    reviewed = render_result(_change(ResultKind.PUSHED, candidate=_candidate(), pr_number=44, review=("alice: rename it",)))
+    refused = render_result(_change(
+        ResultKind.REFUSED, candidate=FixCandidate(action=CandidateAction.REFUSE), pr_number=44,
+    ))
+
+    assert rebased.startswith("This pull request conflicted with `unstable`, so the change was made again on")
+    assert reviewed.startswith(f"Pushed {'c' * 40}, which applies the review comments.")
+    assert refused.startswith("No change was pushed.")

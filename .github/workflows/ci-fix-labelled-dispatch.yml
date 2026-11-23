@@ -4,6 +4,9 @@ name: CI Fix Labelled Dispatch
 # `needs-agent-fix` and waits for an answer, bugs first, keeping at most
 # max_runs of those runs active at once (scripts/ci_fix/issue_dispatch.py).
 # It only reads valkey-io/valkey; each dispatched run answers one issue.
+# Then it looks after the pull requests the bot opened for such issues, one
+# thing an hour: a merge conflict, a CI failure of its own, or marking one
+# whose CI is green ready for review (scripts/ci_fix/upkeep.py).
 #
 # The schedule runs only while the AGENT_FIX_DISPATCH repository variable is
 # "true": that is the switch that turns the label on and off. A change is
@@ -88,3 +91,27 @@ jobs:
           python -m scripts.ci_fix.issue_dispatch "${args[@]}" > dispatch.json
           cat dispatch.json
           { echo '```json'; cat dispatch.json; echo '```'; } >> "${GITHUB_STEP_SUMMARY}"
+
+  # The bot's open pull requests exist only while changes are published as
+  # draft PRs. One thing is done an hour, like the backport follow-up.
+  upkeep:
+    name: "Look after the bot's pull requests"
+    if: >-
+      github.repository == 'valkey-io/valkey-ci-agent' && github.event_name == 'schedule'
+      && vars.AGENT_FIX_DISPATCH == 'true' && vars.AGENT_FIX_PUBLISH == 'draft-pr'
+    concurrency:
+      group: ci-fix-labelled-upkeep
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/ci-fix-run.yml
+    with:
+      front_door: upkeep
+      request: '{"repo":"valkey-io/valkey"}'
+      key: upkeep-valkey
+    secrets:
+      VALKEYRIE_BOT_APP_ID: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+      VALKEYRIE_BOT_PRIVATE_KEY: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}

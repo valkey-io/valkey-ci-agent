@@ -114,8 +114,12 @@ def render_ci_sweep_fix(result: FixResult) -> str:
 
 
 def render_change(result: FixResult) -> str:
-    """The report of a labelled issue's change, for its issue."""
+    """The report of a labelled issue's change: on the issue, or on the bot's pull request for it."""
     task, candidate = result.task, result.candidate
+    request = task.request
+    if request is None:
+        raise ValueError("only a labelled issue's result is a change")
+    base = task.failure.base_branch
     if result.kind is ResultKind.OPENED:
         link = f"[#{result.pr_number}]({result.pr_url})" if result.pr_url else f"#{result.pr_number}"
         body = [f"Opened draft PR {link} for this issue. Its CI and a committer's review decide whether it merges."]
@@ -124,10 +128,20 @@ def render_change(result: FixResult) -> str:
             # The draft PR shows them too; here they are for whoever looks at the issue.
             body += ["", "<details><summary>What the bot checked</summary>", "", *checks, "", "</details>"]
         return "\n".join(body)
+    if result.kind is ResultKind.PUSHED:
+        lead = (
+            f"Pushed {result.commit_sha}, which applies the review comments." if request.review else
+            f"This pull request conflicted with `{base}`, so the change was made again on "
+            f"`{task.target.expected_sha[:12]}` and pushed as {result.commit_sha}."
+        )
+        body = [lead, ""]
+        if candidate is not None:
+            body += candidate_context(candidate, include_reasoning=True)
+        body += [_footer("This PR's own CI decides whether the change holds, and the bot never merges.")]
+        return "\n".join(body)
     if result.kind is ResultKind.SUGGESTED:
         body = [
-            f"A change for this issue, prepared and checked on `{task.failure.base_branch}` at "
-            f"`{task.target.expected_sha[:12]}`. "
+            f"A change for this issue, prepared and checked on `{base}` at `{task.target.expected_sha[:12]}`. "
             "Nothing was pushed and no PR was opened: a committer applies it, or not.",
             "",
         ]
@@ -138,7 +152,7 @@ def render_change(result: FixResult) -> str:
     if candidate is None or candidate.action is not CandidateAction.REFUSE:
         # A change was prepared and not published: the summary says why.
         return sentence(result.summary)
-    body = [f"No change was prepared. {sentence(result.summary)}", ""]
+    body = [f"No change was {'pushed' if request.pr_number else 'prepared'}. {sentence(result.summary)}", ""]
     if candidate.questions:
         body += ["A committer has to answer these first:", "", *(f"- {prose(q, 500)}" for q in candidate.questions), ""]
     body += candidate_criteria(candidate) + candidate_context(candidate, include_reasoning=False)

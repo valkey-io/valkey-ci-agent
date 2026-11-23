@@ -37,7 +37,7 @@ from scripts.ci_fix.models import (
     FixTask,
     TargetKind,
 )
-from scripts.ci_fix.policy import can_update_branch, is_backport_branch
+from scripts.ci_fix.policy import can_update_branch, is_backport_branch, is_own_repo
 from scripts.common.github_client import retry_github_call
 from scripts.common.identity import APP_LOGIN, BOT_LOGIN
 
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 _COMMAND_RE = re.compile(
     r"^\s*@(?:" + "|".join(re.escape(login) for login in (BOT_LOGIN, APP_LOGIN))
-    + r")\s+fix\b[^\S\n]*(?P<rest>[^\n]*)",
+    + r")\s+(?P<verb>fix|address)\b[^\S\n]*(?P<rest>[^\n]*)",
     re.IGNORECASE,
 )
 _RUN_PATH_RE = re.compile(
@@ -68,6 +68,9 @@ class ParsedCommand:
     hint: str
     job_id: int = 0
     run_attempt: int = 0
+    # ``fix`` a failed job, or ``address`` a committer's review comments on
+    # the pull request the bot opened for a labelled issue.
+    verb: str = "fix"
 
 
 @dataclass(frozen=True)
@@ -83,7 +86,7 @@ class GateError:
 
 
 def parse_command(body: str) -> ParsedCommand | None:
-    """Parse ``@bot fix [run-or-job-url] [hint]`` from one comment line."""
+    """Parse ``@bot fix [run-or-job-url] [hint]``, or ``@bot address [hint]``, from one comment line."""
     if not body:
         return None
     match = _COMMAND_RE.search(body)
@@ -101,9 +104,10 @@ def parse_command(body: str) -> ParsedCommand | None:
     for pattern in (_MARKDOWN_LINK_RE, _ANGLE_LINK_RE, _BARE_LINK_RE):
         rest = pattern.sub(take, rest)
     hint = " ".join(rest.split())
+    verb = match.group("verb").lower()
     if not links:
-        return ParsedCommand("", "", 0, hint)
-    if len(links) != 1:
+        return ParsedCommand("", "", 0, hint, verb=verb)
+    if len(links) != 1 or verb != "fix":
         return None
     parsed = parse_run_url(links[0])
     return replace(parsed, hint=hint) if parsed is not None else None
@@ -309,7 +313,7 @@ def build_fix_task(
             f"The run tested branch {run_branch}, not the current PR branch {head_branch}."
         )
 
-    same_repo = head_repo == pr_repo_full_name
+    same_repo = is_own_repo(head_repo, pr_repo_full_name)
     bot_owned = can_update_branch(
         same_repo=same_repo,
         branch=head_branch,

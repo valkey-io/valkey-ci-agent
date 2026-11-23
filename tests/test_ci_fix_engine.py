@@ -2732,6 +2732,96 @@ def test_three_hundred_lines_of_product_source_added_and_removed_is_the_most(tmp
     assert allowed or f"adds and removes {added + removed} lines of product source" in rejection
 
 
+def test_a_pull_requests_tests_have_to_fail_again_without_its_product_change(tmp_path, monkeypatch):
+    """A review round: the checkout is the pull request's head, and its own tests are the evidence."""
+    source, base = _source_repo(tmp_path)
+    git(source, "branch", "upstream", base)
+    (source / _TEST_FILE).parent.mkdir(parents=True)
+    (source / _TEST_FILE).write_text(f'test "{_TEST_NAME}" {{\n}}\n', encoding="utf-8")
+    (source / "value.txt").write_text("right\n", encoding="utf-8")
+    git(source, "add", "-A")
+    git(source, "commit", "-m", "the pull request")
+    head = git(source, "rev-parse", "HEAD")
+    earlier = git(source, "diff", base, head)
+    task = _issue_task(head, pr_number=9, earlier=earlier, review=("reviewer: say right, loudly",))
+    _install_clone(monkeypatch, source)
+    test = _value_test()
+
+    candidate = engine_mod.prepare_review(
+        task, agent_func=_value_agent("right, loudly"), review_func=lambda *a, **k: (True, "examined it"), test_func=test,
+    )
+
+    assert candidate.action is CandidateAction.PATCH
+    # Only this round's change, on the pull request's head.
+    assert candidate.changed_paths == ("value.txt",) and "+right, loudly" in candidate.patch
+    assert "Without the product change, `true && true` failed 3 of 3 runs." in candidate.verification
+
+
+def _reviewed_pull_request(tmp_path, monkeypatch):
+    """The review task of a pull request whose head holds a test and the product change that passes it."""
+    source, base = _source_repo(tmp_path)
+    git(source, "branch", "upstream", base)
+    (source / _TEST_FILE).parent.mkdir(parents=True)
+    (source / _TEST_FILE).write_text(f'test "{_TEST_NAME}" {{\n}}\n', encoding="utf-8")
+    (source / "value.txt").write_text("right\n", encoding="utf-8")
+    git(source, "add", "-A")
+    git(source, "commit", "-m", "the pull request")
+    head = git(source, "rev-parse", "HEAD")
+    _install_clone(monkeypatch, source)
+    return _issue_task(head, pr_number=9, earlier=git(source, "diff", base, head), review=("reviewer: rename it",))
+
+
+def test_a_review_round_that_leaves_the_test_passing_without_the_change_goes_back(tmp_path, monkeypatch):
+    task = _reviewed_pull_request(tmp_path, monkeypatch)
+    author = _value_agent("right, loudly", "right, loudly")
+
+    def agent(task, repo_dir, job_log, *, feedback="", **kwargs):
+        test_file = Path(repo_dir) / _TEST_FILE
+        if feedback:
+            git(Path(repo_dir), "checkout", "--", _TEST_FILE)
+        else:
+            test_file.write_text(test_file.read_text().replace("{\n", "{\n    skip\n"), encoding="utf-8")
+        made = author(task, repo_dir, job_log, feedback=feedback, **kwargs)
+        return replace(made, changed_paths=(_TEST_FILE, "value.txt"))
+
+    value = _value_test()
+
+    def test(repo_dir, command, timeout):
+        if command != "true" and "skip" in (Path(repo_dir) / _TEST_FILE).read_text(encoding="utf-8"):
+            return TestRun(True, "", f"[ok]: {_TEST_NAME} (1 ms)")
+        return value(repo_dir, command, timeout)
+
+    candidate = engine_mod.prepare_review(task, agent_func=agent, review_func=_approves, test_func=test)
+
+    assert candidate.action is CandidateAction.PATCH and "skip" not in candidate.patch
+    assert "Without the product change, the pull request's tests failed 0 of 3 runs" in author.feedback[1]
+
+
+def test_a_pull_request_with_no_test_code_can_run_is_not_changed_on_review(tmp_path, monkeypatch):
+    task = _reviewed_pull_request(tmp_path, monkeypatch)
+    task = replace(task, request=replace(task.request, earlier="+++ b/value.txt\n+right\n"))
+
+    candidate = engine_mod.prepare_review(
+        task, agent_func=lambda *_a, **_k: pytest.fail("no session runs"), review_func=_approves,
+        test_func=_value_test(),
+    )
+
+    assert candidate.action is CandidateAction.REFUSE
+    assert candidate.summary.startswith("This pull request adds no test that code can run")
+
+
+def test_a_checkout_that_cannot_tell_the_pull_requests_change_from_the_branch_is_an_error(tmp_path):
+    """Read as no product change, the tests would pass for evidence without having been run."""
+    source, head = _source_repo(tmp_path)
+    request = _issue_task(head, pr_number=9, review=("reviewer: rename it",)).request
+
+    with pytest.raises(RuntimeError, match="no default branch to take the pull request's change from"):
+        engine_mod._fails_without(
+            request, str(source), VerifyPlan(build="true", test="true"), lambda *_a: TestRun(True, ""),
+            time.monotonic() + 60, [],
+        )
+
+
 def test_a_command_can_be_kept_off_the_network_and_out_of_the_log(tmp_path, monkeypatch, caplog):
     seen = {}
 

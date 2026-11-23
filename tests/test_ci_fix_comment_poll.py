@@ -349,3 +349,19 @@ def test_dispatch_forwards_a_run_attempt_link_intact():
         .call_args.args[1]
     )
     assert inputs["run_url"] == f"{_RUN_URL}/attempts/3"
+
+
+def test_dispatch_says_which_command_was_given():
+    from scripts.ci_fix.comment_poll import dispatch_ci_fix
+    from scripts.ci_fix.gate import parse_command
+
+    client = MagicMock()
+    dispatch = dispatch_ci_fix(client, agent_repo="o/agent", workflow="ci-fix.yml", ref="main")
+    create_dispatch = client.get_repo.return_value.get_workflow.return_value.create_dispatch
+
+    dispatch("valkey-io/valkey", 5, parse_command("@valkeyrie-ops address only the naming"), "alice", 9)
+    inputs = create_dispatch.call_args.args[1]
+    assert (inputs["command"], inputs["hint"], inputs["run_url"]) == ("address", "only the naming", "")
+
+    dispatch("valkey-io/valkey", 5, parse_command(f"@valkeyrie-ops fix {_RUN_URL}"), "alice", 9)
+    assert create_dispatch.call_args.args[1]["command"] == "fix"

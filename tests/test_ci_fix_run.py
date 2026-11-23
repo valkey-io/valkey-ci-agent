@@ -736,9 +736,11 @@ def test_the_change_is_made_on_the_targets_code_whichever_fork_its_branch_goes_t
 def test_the_head_of_the_bots_own_change_pr_is_never_built_by_a_jobs_setup(workflows):
     """A job's setup and build run as the workflow user; that head is a change nobody has reviewed."""
     head = replace(_label_plan(kind=TargetKind.UPDATE_PR).task, request=None)
+    made_again = _label_plan(kind=TargetKind.UPDATE_PR, replaces="c" * 40).task
 
     assert run.job_for(MagicMock(), head) is None
-    # The issue's own change is made on the base branch's tip, which is trusted.
+    # The change made again is made on the base branch's tip, which is trusted.
+    assert run.job_for(MagicMock(), made_again).name == "test-ubuntu-latest"
     assert run.job_for(MagicMock(), _label_plan().task).name == "test-ubuntu-latest"
 
 
@@ -783,6 +785,43 @@ def test_how_a_labelled_issues_change_is_published_is_its_own_variables_choice(m
     monkeypatch.setattr(run.labelled, "hold_reason", lambda _repo, _bot: "5 are open")
     _publish(tmp_path, tmp_path)
     assert seen["mode"] is IssuePublication.COMMENT
+
+
+def test_a_review_round_is_prepared_on_the_pull_requests_head(monkeypatch, tmp_path):
+    plan = _label_plan(kind=TargetKind.UPDATE_PR)
+    reviewed = replace(plan, task=replace(plan.task, request=replace(plan.task.request, pr_number=9, review=("alice: rename it",))))
+    save(tmp_path / run.PLAN_FILE, reviewed)
+    monkeypatch.setattr(run, "prepare_review", lambda task, *, repo_dir, job: _CANDIDATE)
+    monkeypatch.setattr(run, "prepare_change", lambda *_a, **_k: pytest.fail("the pull request has its test"))
+
+    assert run.fix(tmp_path, tmp_path / "out").candidate == _CANDIDATE
+
+
+def test_looking_after_a_pull_request_counts_its_failed_attempts_from_earlier_plans(monkeypatch, tmp_path):
+    planner = MagicMock(return_value={"action": "skipped"})
+    monkeypatch.setitem(run._FRONT_DOORS, FrontDoor.UPKEEP, (planner, MagicMock()))
+    earlier = (replace(_pr_plan(), front_door=FrontDoor.UPKEEP),)
+
+    run.plan(
+        MagicMock(), None, FrontDoor.UPKEEP, {"repo": "valkey-io/valkey"}, bot_login="bot", out=tmp_path,
+        prior_plans=earlier,
+    )
+
+    assert planner.call_args.kwargs["prior_plans"] == earlier
+
+
+def test_a_pull_request_a_committer_took_over_during_the_run_is_not_pushed_to(monkeypatch, tmp_path):
+    plan = _pr_plan()
+    save(tmp_path / run.PLAN_FILE, replace(plan, front_door=FrontDoor.UPKEEP))
+    save(tmp_path / run.OUTCOME_FILE, FixOutcome(candidate=_CANDIDATE))
+    reported = []
+    monkeypatch.setitem(run._FRONT_DOORS, FrontDoor.UPKEEP, (MagicMock(), lambda _gh, _plan, result: reported.append(result)))
+    monkeypatch.setattr(run.upkeep, "taken_over_since", lambda _gh, _plan, _bot: "A committer has reviewed this pull request.")
+    monkeypatch.setattr(run, "publish_candidate", lambda *_a, **_k: pytest.fail("nothing is pushed"))
+
+    _publish(tmp_path, tmp_path)
+
+    assert reported[0].kind is ResultKind.REFUSED and "A committer has reviewed" in reported[0].summary
 
 
 @pytest.mark.parametrize(("pushed_to", "token"), [("valkeyrie/valkey", "fork-token"), ("valkey-io/valkey", "token")])

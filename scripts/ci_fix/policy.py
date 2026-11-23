@@ -106,6 +106,11 @@ def push_repo() -> str:
     return os.environ.get(PUSH_REPO_ENV, "").strip()
 
 
+def is_own_repo(head_repo: str, base_repo: str) -> bool:
+    """Whether a pull request's head repository is one the bot pushes to: the target, or its own fork of it."""
+    return head_repo == base_repo or bool(head_repo) and head_repo == push_repo()
+
+
 def allows_ci_changes(task: FixTask) -> bool:
     """Whether ``task``'s fix may change ``.github/``.
 

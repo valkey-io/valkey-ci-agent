@@ -672,6 +672,27 @@ def test_a_ci_sweep_branch_that_moved_is_not_overwritten(
     assert _git(remote, "rev-parse", "agent/backport/ci-sweep/9.0").strip() == moved
 
 
+def test_a_change_made_again_replaces_the_branch_it_conflicted_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The commit is made on the base branch's tip, and replaces the pull request's old head, which it leases."""
+    branch = "agent/fix/issue-7-1"
+    remote, base_sha, _port_sha = _remote(tmp_path, branch)
+    old_head = _advance(tmp_path, remote, branch, "old.txt", "the change on the old base\n")
+    patch = _patch_for(tmp_path, base_sha, remote)
+    monkeypatch.setattr(push_mod, "github_https_url", lambda _repo: str(remote))
+    target = replace(_target(base_sha, branch=branch), replaces=old_head)
+
+    pushed = push_candidate(_candidate(patch), target, git_env={})
+
+    assert _git(remote, "rev-parse", branch).strip() == pushed
+    assert _git(remote, "rev-parse", f"{pushed}^").strip() == base_sha
+    # The lease is the head it replaces: once someone has pushed to the branch, nothing is pushed.
+    _advance(tmp_path, remote, branch, "theirs.txt", "a committer's commit\n")
+    with pytest.raises(PushStale):
+        push_candidate(_candidate(patch), target, git_env={})
+    with pytest.raises(PushRefused, match="malformed SHA"):
+        push_candidate(_candidate(patch), replace(target, replaces="not-a-sha"), git_env={})
+
+
 def test_a_commit_message_cannot_close_an_issue_or_mention_anyone() -> None:
     candidate = replace(
         _candidate("diff"), title="Fix the reply, fixes #99", root_cause="As @someone said in https://evil.example.",

@@ -150,24 +150,50 @@ An attempt that fails, because the bot crashed or ran out of time, posts
 nothing and is tried once more. If that fails too, the bot says so on the
 issue and takes the label off.
 
-## After the pull request opens
+## Looking after the pull request
 
-A committer can ask for a fix to a failed job of the pull request's CI, as on
-any pull request:
+Until a committer reviews the pull request or pushes to it, the bot looks
+after it, one thing an hour:
+
+- If it conflicts with `unstable`, the change is made again on the tip of
+  `unstable`, test first, and replaces the pull request's head. That is the
+  only time the bot rebases it, because every push runs CI again. It is made
+  again rather than rebased with the conflicts resolved, so that what is
+  pushed has been seen to fail and pass on the code it will merge into.
+- If a job of its CI failed and `unstable`'s own CI does not fail the same
+  job, the bot fixes that failure the way it fixes a backport PR's. A failure
+  `unstable` has without the change is not this pull request's to fix, and
+  Claude is told to refuse one that the change did not cause.
+- When its CI is green, the draft is marked ready for review.
+
+Right before it pushes, the bot checks again that no committer has reviewed
+the pull request or pushed to it since the run started.
+
+These runs are on the bot's own runner with a plain `make`, not in the
+replayed CI job: the pull request's head is a change nobody has reviewed, and
+a replayed job's setup runs with the runner's privileges.
+
+Once a committer has reviewed it or pushed to it, the bot leaves the pull
+request alone and acts only when asked:
 
 ```text
 @valkeyrie-ops fix
 ```
 
-That fix is prepared on the bot's own runner with a plain `make`, not in the
-replayed CI job: the pull request's head is a change nobody has reviewed, and
-a replayed job's setup runs with the runner's privileges. When the branch is
-in `valkey-io/valkey` the fix is pushed to it. When it is in the bot's fork
-the fix is posted as a suggestion.
+fixes a failed CI job, as on any pull request the bot owns, and
 
-The bot does not yet look after the pull request by itself. It does not
-rebase it, fix its CI unasked, mark it ready for review, or apply review
-comments.
+```text
+@valkeyrie-ops address
+```
+
+applies the review comments. The bot collects what committers wrote in the
+unresolved review threads and in their reviews, plus anything you add after
+`address`, and Claude applies them in one commit. Every check runs again, and
+because a review may change the test, the pull request's tests also have to
+fail again with the product change taken out. `address` is a committer's
+command: the bot checks that whoever wrote it has write access. The tests are
+run by their names, so a comment that asks for a test to be renamed is one
+Claude reports instead of applying.
 
 ## Keeping the bot contained
 
@@ -190,9 +216,9 @@ credentials. On top of that:
 - Nothing is published that looks like a credential: an AWS key, a GitHub
   token, a private key.
 - The head of the bot's own pull request is a change nobody has reviewed yet.
-  When the bot is asked to fix its CI, it is built only by the separate
-  account on the bot's own runner, never by a replayed CI job's setup, which
-  runs with the runner's privileges.
+  When the bot works on it again, it is built only by the separate account on
+  the bot's own runner, never by a replayed CI job's setup, which runs with
+  the runner's privileges.
 
 The bot keeps no database. The label is the queue. A run is named after its
 issue and the labelling it answers, the bot's comment on the issue records
@@ -215,10 +241,11 @@ next is turned on.
    set `AGENT_FIX_DISPATCH` to `true`.
 3. **Pull requests.** Set `AGENT_FIX_PUBLISH` to `draft-pr`, and
    `AGENT_FIX_PUSH_REPO` if the pull requests should come from a fork.
-4. **Review loop.** Not built yet.
+4. **Review loop.** `@valkeyrie-ops address` works on the bot's pull requests
+   as soon as they exist.
 
 Setting `AGENT_FIX_DISPATCH` to anything else stops the bot from picking up
-labels.
+labels and from looking after its pull requests.
 
 ## Running it by hand
 
@@ -245,7 +272,7 @@ gh workflow run ci-fix-labelled-dispatch.yml --repo valkey-io/valkey-ci-agent --
 
 | Variable | Default | What it does |
 |---|---|---|
-| `AGENT_FIX_DISPATCH` | unset | Set to `true` to pick up labelled issues every hour. |
+| `AGENT_FIX_DISPATCH` | unset | Set to `true` to pick up labelled issues every hour and look after the bot's pull requests. |
 | `AGENT_FIX_MAX_RUNS` | `2` | How many labelled issues are worked on at once. |
 | `AGENT_FIX_PUBLISH` | `comment` | `comment` posts the change on the issue; `draft-pr` opens a draft PR. |
 | `AGENT_FIX_PUSH_REPO` | unset | The bot's own fork, `owner/name`, to push branches to. Unset, they are pushed to `valkey-io/valkey`. |
@@ -259,7 +286,9 @@ conventions, and another repository would need its own.
 
 `scripts/ci_fix/labelled.py` is the front door: it checks the labelling, plans
 the change and reports the result on the issue. `issue_dispatch.py` starts
-the runs, for this queue and for the detector's.
+the runs, for this queue and for the detector's. `upkeep.py` looks after the
+bot's pull requests, and plans the change made again on a conflict. The
+`address` command is parsed in `gate.py` and planned in `main.py`.
 
 The change itself is made by `prepare_change` in `engine.py`: the test first
 (`_establish_evidence`), then the same loop a CI fix goes through, with the

@@ -65,7 +65,9 @@ def push_candidate(
     """Commit ``candidate`` on ``target.expected_sha`` and push it.
 
     ``UPDATE_PR`` requires the remote branch to still point at
-    ``expected_sha``. ``DRAFT_PR`` creates a new branch and requires that the
+    ``expected_sha``, or at ``target.replaces`` when the commit replaces the
+    branch (the change made again on its base branch's tip, on a merge
+    conflict). ``DRAFT_PR`` creates a new branch and requires that the
     remote ref not exist. With ``target.fix_branch``, a patch goes to that
     branch instead: on top of its fixes, rebuilt on ``expected_sha``, when it
     is at ``onto``, or as its first commit when ``onto`` is empty, and
@@ -199,6 +201,8 @@ def _validate_target(target: FixTarget) -> None:
         )
     if not is_full_sha(target.expected_sha):
         raise PushRefused(f"Refusing to push from malformed SHA {target.expected_sha!r}.")
+    if target.replaces and not is_full_sha(target.replaces):
+        raise PushRefused(f"Refusing to replace malformed SHA {target.replaces!r}.")
     for branch in filter(None, (target.branch, target.fix_branch)):
         if not is_writable_branch(branch):
             raise PushRefused(
@@ -298,7 +302,7 @@ def _push(
         "origin",
         github_https_url(target.repo_full_name),
     )
-    branch, expected_remote = target.branch, ("" if create else target.expected_sha)
+    branch, expected_remote = target.branch, ("" if create else target.replaces or target.expected_sha)
     if target.fix_branch:
         # The fix stays off the branch it was made on: it goes on top of the
         # fixes of the pull request that collects them, rebuilt on that branch.

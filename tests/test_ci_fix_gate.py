@@ -131,6 +131,34 @@ def test_parse_command_rejects_non_commands(body: str) -> None:
     assert parse_command(body) is None
 
 
+@pytest.mark.parametrize(
+    ("body", "verb", "hint"),
+    [
+        ("@valkeyrie-ops address", "address", ""),
+        ("@valkeyrie-bot Address  only the naming comments\nthanks", "address", "only the naming comments"),
+        ("@valkeyrie-ops fix", "fix", ""),
+        (f"@valkeyrie-ops fix {_RUN_URL} the tcl one", "fix", "the tcl one"),
+    ],
+)
+def test_parse_command_tells_a_fix_from_review_comments_to_address(body: str, verb: str, hint: str) -> None:
+    command = parse_command(body)
+    assert command is not None
+    assert (command.verb, command.hint) == (verb, hint)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Review comments are the pull request's own: there is no run to link.
+        f"@valkeyrie-ops address {_RUN_URL}",
+        "@valkeyrie-ops address https://example.com/a",
+        "@valkeyrie-ops addressed it",
+    ],
+)
+def test_parse_command_rejects_an_address_command_with_a_link(body: str) -> None:
+    assert parse_command(body) is None
+
+
 def test_authorization_is_active_membership_or_explicit_allowlist(monkeypatch) -> None:
     assert is_authorized(_membership_gh("active"), "valkey-io", "contributors", "alice")
     assert not is_authorized(_membership_gh("pending"), "valkey-io", "contributors", "alice")
@@ -242,6 +270,18 @@ def test_contributor_or_unowned_branch_gets_suggestion(
     assert isinstance(result, FixTask)
     assert result.target.kind is TargetKind.SUGGEST
     assert result.policy is FixPolicy.GENERAL
+
+
+def test_a_branch_on_the_bots_fork_is_the_bots_own_once_the_fork_is_named(monkeypatch) -> None:
+    gh, _repo = _gh(head_repo="valkeyrie/valkey", branch="agent/fix/issue-7-500")
+
+    monkeypatch.delenv("AGENT_FIX_PUSH_REPO", raising=False)
+    assert _build(monkeypatch, gh=gh).target.kind is TargetKind.SUGGEST
+    monkeypatch.setenv("AGENT_FIX_PUSH_REPO", "valkeyrie/valkey")
+    target = _build(monkeypatch, gh=gh).target
+
+    assert target.kind is TargetKind.UPDATE_PR
+    assert (target.repo_full_name, target.base_repo_full_name) == ("valkeyrie/valkey", "valkey-io/valkey")
 
 
 def test_exact_failed_job_link_is_preserved(monkeypatch) -> None:

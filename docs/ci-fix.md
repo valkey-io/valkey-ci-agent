@@ -375,9 +375,9 @@ Each way of starting a fix has a small front door that checks the request and
 turns it into the same `FixTask`: `main.py` for PR requests,
 `comment_poll.py` for picking up comments, `issues.py` and
 `issue_dispatch.py` for detector issues, `scripts/backport/ci_followup.py`
-for backport PRs, and `labelled.py` for
-[labelled issues](labelled-issues.md). `gate.py` parses commands and checks
-that the requester is allowed. `github_runs.py` and `issue_state.py` read the state of runs and
+for backport PRs, and `labelled.py` and `upkeep.py` for
+[labelled issues](labelled-issues.md) and the PRs opened for them. `gate.py`
+parses commands and checks that the requester is allowed. `github_runs.py` and `issue_state.py` read the state of runs and
 issues.
 
 `ci_job.py` reads the workflow file and writes the script that replays a

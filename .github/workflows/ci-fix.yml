@@ -2,7 +2,9 @@ name: CI Fix Bot
 
 # A maintainer comments "@valkeyrie-ops fix [<run-or-job-url>] [hint]" on a
 # Valkey PR; the comment poller dispatches this workflow. It may also be run
-# manually while the feature is being trialled.
+# manually while the feature is being trialled. On a PR the bot opened for a
+# labelled issue, a committer's "@valkeyrie-ops address [hint]" applies the
+# review comments instead.
 #
 # The fix runs like every other (ci-fix-run.yml): planned against the PR's
 # exact failed job, prepared inside the Valkey job that failed when it
@@ -40,6 +42,14 @@ on:
         required: false
         type: string
         default: ""
+      command:
+        description: "fix a failed job, or address the review comments on the bot's own PR for a labelled issue"
+        required: false
+        type: choice
+        options:
+          - fix
+          - address
+        default: fix
 
 permissions: {}
 

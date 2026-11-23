@@ -46,7 +46,13 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.policy import allows_ci_changes, can_update_branch, is_bot_author, target_capabilities
+from scripts.ci_fix.policy import (
+    allows_ci_changes,
+    can_update_branch,
+    is_bot_author,
+    is_own_repo,
+    target_capabilities,
+)
 from scripts.ci_fix.push import (
     PushFailed,
     PushRefused,
@@ -239,6 +245,7 @@ def _publish_update(
         summary=(
             f"Ported an upstream fix for {candidate.failing_check or task.failure.job_name}."
             if candidate.action is CandidateAction.PORT
+            else f"Made the change again on {task.failure.base_branch}." if task.target.replaces
             else f"Pushed a fix for {candidate.failing_check or task.failure.job_name}."
         ),
         task=task,
@@ -673,15 +680,17 @@ def _validate_pr_target(gh: Any, task: FixTask, *, require_bot: bool) -> str:
     if str(getattr(head, "ref", "") or "") != target.branch:
         return f"PR #{task.failure.pr_number} no longer has head branch {target.branch}"
     current_sha = str(getattr(head, "sha", "") or "")
-    if current_sha != target.expected_sha:
+    # A commit that replaces the branch was made on the base branch, not on the head.
+    expected_sha = target.replaces or target.expected_sha
+    if current_sha != expected_sha:
         return (
-            f"the PR head moved from {target.expected_sha[:12]} to "
+            f"the PR head moved from {expected_sha[:12]} to "
             f"{current_sha[:12] or '(missing)'}"
         )
     if require_bot:
         author = str(getattr(getattr(pr, "user", None), "login", "") or "")
         if not can_update_branch(
-            same_repo=target.repo_full_name == task.failure.repo_full_name,
+            same_repo=is_own_repo(target.repo_full_name, task.failure.repo_full_name),
             branch=target.branch,
             author=author,
         ):

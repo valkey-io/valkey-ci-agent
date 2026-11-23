@@ -192,8 +192,10 @@ def test_a_change_is_a_comment_unless_the_variable_asks_for_a_draft_pr(monkeypat
 
 def test_the_bots_pull_requests_are_known_by_their_branch_and_author():
     assert labelled.is_change_pull(_pull(7), _BOT)
+    assert labelled.issue_of(_pull(7, ref="agent/fix/issue-7-501")) == (7, 501)
     assert not labelled.is_change_pull(_pull(7, author="mallory"), _BOT)
     assert not labelled.is_change_pull(_pull(7, ref="agent/ci-fix/issue-7-501"), _BOT)
+    assert labelled.issue_of(_pull(7, ref="agent/fix/issue-7-501-x")) == (0, 0)
 
 
 def test_no_more_pull_requests_are_opened_once_as_many_are_open_as_may_be():
