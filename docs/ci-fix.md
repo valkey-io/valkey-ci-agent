@@ -113,7 +113,7 @@ it ran where it was merged, and the PR's own CI runs the check.
 
 **Claude diagnoses and edits.** Claude gets the job's whole log, whatever the
 history search found, the verification command, and Valkey's testing
-conventions: the bot's own guide in `scripts/ci_fix/guides/` (how to tell
+conventions: the bot's own guide in `scripts/agent_fix/guides/` (how to tell
 what a failed job is in `valkey-io__valkey.failed-job.md`, then what every
 change follows in `valkey-io__valkey.md`),
 which ends with Valkey's own guidelines (`AGENTS.md`, `DEVELOPMENT_GUIDE.md`,
@@ -220,9 +220,9 @@ Patches suggested on contributor PRs are reviewed but not run.
 ## Fixing detector issues
 
 When the Test Failure Detector files an issue, the bot can attempt a fix. You
-can start it for one issue with the **CI Fix Issues** workflow. An hourly
+can start it for one issue with the **Agent Fix CI Issues** workflow. An hourly
 dispatcher also starts it for every open detector issue that is eligible.
-Setting the repository variable `CI_FIX_ISSUES_AUTO_DISPATCH` to `false`
+Setting the repository variable `AGENT_FIX_CI_ISSUES_AUTO_DISPATCH` to `false`
 turns the dispatcher off.
 
 An issue is eligible when it is open, unassigned and no open PR says it
@@ -231,7 +231,7 @@ mentions the issue doesn't count),
 and when the bot hasn't already posted a fix, declined, or failed twice for
 the failure it currently records. A newer failure makes the issue
 eligible again. At most two of these fixes run at once, which
-`CI_FIX_ISSUES_MAX_RUNS` can change. Right before starting, the bot checks
+`AGENT_FIX_CI_ISSUES_MAX_RUNS` can change. Right before starting, the bot checks
 again that it hasn't already reported on that failure, so a dispatch that is
 retried can never post a second patch.
 
@@ -246,8 +246,8 @@ can apply the patch or ignore it, and the issue isn't tried again until the
 test fails again. If the test fails again while a fix is being prepared, the
 fix is still posted, and it covers that newer failure too.
 
-If `CI_FIX_ISSUES_PUBLISH` is set to `draft-pr`, the bot instead pushes a
-branch named `agent/ci-fix/issue-<issue>-<run>` and opens a draft PR that says
+If `AGENT_FIX_CI_ISSUES_PUBLISH` is set to `draft-pr`, the bot instead pushes a
+branch named `agent/fix/ci-issue-<issue>-<run>` and opens a draft PR that says
 `Fixes #<issue>`. One test file often has several open issues, so if the patch
 touches the test of another open detector issue, the bot runs that test as
 well and mentions the issue in the PR, without closing it.
@@ -281,7 +281,7 @@ reach the model, and that is it. Separate jobs before and after it hold
 short-lived tokens for reading the failure and for publishing the result.
 
 Claude, and every build and test command the bot runs, run as a separate
-system account, which `scripts/ci_fix/job.sh` creates with a random name for
+system account, which `scripts/agent_fix/job.sh` creates with a random name for
 each fix job. That account cannot read the workflow's environment. Claude is
 started with only the AWS credentials it needs for the model, and build and
 test commands get no credentials at all. Valkey's build and test dependencies
@@ -301,18 +301,18 @@ have the final say. The bot's comment lists everything it checked, including the
 search and the verification.
 
 Each Claude session's full event stream is saved in the fix run's
-`ci-fix-result` artifact, next to the outcome, so what the agent read and
+`agent-fix-result` artifact, next to the outcome, so what the agent read and
 concluded can be looked at after the job's log is gone.
 
 ## Running it by hand
 
-To ask for a fix on a PR, dispatch **CI Fix Bot**. You are checked the same
+To ask for a fix on a PR, dispatch **Agent Fix Bot**. You are checked the same
 way a commenter would be, so you need to be a member of
 `valkey-io/contributors`, and `repo` must be `valkey-io/valkey`. Leave
 `run_url` empty to let the bot choose the failure.
 
 ```bash
-gh workflow run ci-fix.yml --repo valkey-io/valkey-ci-agent \
+gh workflow run agent-fix.yml --repo valkey-io/valkey-ci-agent \
   --field repo=valkey-io/valkey --field pr=1234 \
   --field run_url=https://github.com/valkey-io/valkey/actions/runs/123456789/job/987654321
 ```
@@ -320,21 +320,21 @@ gh workflow run ci-fix.yml --repo valkey-io/valkey-ci-agent \
 To pick up fix comments now instead of waiting for the next check:
 
 ```bash
-gh workflow run ci-fix-comment-poll.yml --repo valkey-io/valkey-ci-agent \
+gh workflow run agent-fix-comment-poll.yml --repo valkey-io/valkey-ci-agent \
   --field lookback_minutes=180
 ```
 
 To try to fix one detector issue:
 
 ```bash
-gh workflow run ci-fix-issues.yml --repo valkey-io/valkey-ci-agent --field issue=1234
+gh workflow run agent-fix-ci-issues.yml --repo valkey-io/valkey-ci-agent --field issue=1234
 ```
 
 To see which issues the dispatcher would start fixes for, without starting
 any:
 
 ```bash
-gh workflow run ci-fix-issue-dispatch.yml --repo valkey-io/valkey-ci-agent --field dry_run=true
+gh workflow run agent-fix-ci-issue-dispatch.yml --repo valkey-io/valkey-ci-agent --field dry_run=true
 ```
 
 ## Configuration
@@ -344,12 +344,20 @@ behaviour can be adjusted with these repository variables:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CI_FIX_ISSUES_AUTO_DISPATCH` | unset | Set to `false` to stop the hourly dispatcher from starting fixes for detector issues. |
-| `CI_FIX_ISSUES_MAX_RUNS` | `2` | How many detector issue fixes can run at once. |
-| `CI_FIX_ISSUES_PUBLISH` | `comment` | `comment` posts the patch on the issue; `draft-pr` opens a draft PR. |
+| `AGENT_FIX_CI_ISSUES_AUTO_DISPATCH` | unset | Set to `false` to stop the hourly dispatcher from starting fixes for detector issues. |
+| `AGENT_FIX_CI_ISSUES_MAX_RUNS` | `2` | How many detector issue fixes can run at once. |
+| `AGENT_FIX_CI_ISSUES_PUBLISH` | `comment` | `comment` posts the patch on the issue; `draft-pr` opens a draft PR. |
 | `CI_AGENT_CLAUDE_MODEL` | unset | Use a different model, for example `opus`. |
 
-`CI_FIX_AGENT_USER` names the separate account; `scripts/ci_fix/job.sh`
+The first three were `CI_FIX_ISSUES_AUTO_DISPATCH`, `CI_FIX_ISSUES_MAX_RUNS` and
+`CI_FIX_ISSUES_PUBLISH` before the bot's code was renamed from `ci_fix` to
+`agent_fix`. A value under the earlier name is still read when the new one is
+unset.
+
+Fix branches were under `agent/ci-fix/` then. A pull request opened from one
+is still the bot's to update, and one for a test still answers for that test.
+
+`AGENT_FIX_USER` names the separate account; `scripts/agent_fix/job.sh`
 creates the account and sets it. Which jobs the bot ignores, and whether it
 follows up on backport PRs, is set per repository in [`repos.yml`](registry.md).
 
@@ -360,10 +368,10 @@ another repository would need its own tokens and triggers.
 
 ## Where the code lives
 
-Every fix runs as the same three jobs in `ci-fix-run.yml`, driven by
-`scripts/ci_fix/run.py`: a plan job that pins down the failure and works out
+Every fix runs as the same three jobs in `agent-fix-run.yml`, driven by
+`scripts/agent_fix/run.py`: a plan job that pins down the failure and works out
 how to recreate the job, a fix job, and a publish job. The fix job comes from
-`ci-fix-job.yml`, and is called `fix-in-job` when it recreates the failed job,
+`agent-fix-job.yml`, and is called `fix-in-job` when it recreates the failed job,
 `fix-in-container` when that job ran in a container, and `fix-local` when it
 falls back to the bot's own runner. A sweep PR's fix for a test unstable has
 too gets two more jobs before publish: `plan-upstream` finds unstable's own

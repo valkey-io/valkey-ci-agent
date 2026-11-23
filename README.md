@@ -84,8 +84,7 @@ do want something:
 ## Why it is safe to leave running
 
 The agent only ever writes to its own branches: `backport/...`,
-`agent/backport/...`, `agent/ci-fix/...`, `agent/fix/...` and
-`agent/release-cut/...`. It opens
+`agent/backport/...`, `agent/fix/...` and `agent/release-cut/...`. It opens
 pull requests from those branches and leaves the merge to a maintainer. It
 never pushes to a release branch and never rewrites a backport branch that has
 already been published.
@@ -113,7 +112,7 @@ covers the design in more depth.
 ```text
 scripts/
   backport/               Backports, backport suggestions, CI follow-up
-  ci_fix/                 The CI fix bot, and changes for labelled issues
+  agent_fix/                 The CI fix bot, and changes for labelled issues
   test_failure_detector/  Daily CI failures to issues
   fuzzer/                 Fuzzer run triage
   release_notes/          Release notes and review comments on release PRs

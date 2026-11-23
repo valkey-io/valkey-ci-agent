@@ -171,7 +171,7 @@ _GIT_SAFE_ENV = PROCESS_BASICS
 def git_safe_env() -> dict[str, str]:
     """The scrubbed git environment, also ignoring user and system config.
 
-    For the CI fix's ``strict`` reads of a checkout an agent edited: a global
+    For the fix engine's ``strict`` reads of a checkout an agent edited: a global
     ``~/.gitconfig`` is writable by the same user that runs untrusted tests and
     edit agents, so it must not be able to add hooks or commands.
     """

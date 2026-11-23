@@ -1,5 +1,5 @@
 # An excerpt of valkey-io/valkey's .github/workflows/daily.yml at 0704408: the
-# jobs the job resolver's tests read (tests/test_ci_fix_ci_job.py), as they
+# jobs the job resolver's tests read (tests/test_agent_fix_ci_job.py), as they
 # are there. The workflow's own header is kept whole: the jobs' expressions
 # read its inputs and env.
 name: Daily

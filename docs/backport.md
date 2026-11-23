@@ -128,7 +128,7 @@ with its setup and build, or the bot's runner when that job cannot host a fix
 applies and passes, or else the agent's own version of it for unstable's code,
 which is checked and reviewed like any other fix. It has to pass at least 10
 loops of the failing test on unstable (under valgrind, all 4 that are planned),
-and is opened as a PR into unstable from `agent/ci-fix/upstream/<test>`. The sweep PR is told to backport it once
+and is opened as a PR into unstable from `agent/fix/upstream/<test>`. The sweep PR is told to backport it once
 it merges, and the job is left alone until then. When the agent finds that
 unstable needs no fix, because its code differs, the fix is the release
 branch's own and goes to the CI-sweep PR, which says why. When no fix for
