@@ -47,6 +47,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Verbatim CI log captures; trailing whitespace is part of the fixture data.
+"tests/test_ci_health_log_parser_realworld.py" = ["W291"]
 "tests/*" = [
     "F401",  # test fixtures often reuse imports
     "F811",  # test fixtures often rebind names
