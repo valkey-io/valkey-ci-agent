@@ -77,9 +77,9 @@ def test_fuzzer_profile_is_readonly() -> None:
     assert "Read" in profile.allowed_tools
 
 
-def test_ci_fix_profiles_match_their_publication_targets() -> None:
-    edit = agent_runtime.AGENT_PROFILES["ci_fix_edit"]
-    suggest = agent_runtime.AGENT_PROFILES["ci_fix_suggest"]
+def test_agent_fix_profiles_match_their_publication_targets() -> None:
+    edit = agent_runtime.AGENT_PROFILES["agent_fix_edit"]
+    suggest = agent_runtime.AGENT_PROFILES["agent_fix_suggest"]
 
     assert edit.writes_allowed is True
     assert edit.confined is True
@@ -109,7 +109,7 @@ def test_a_caller_cannot_extend_an_agent_profiles_timeout(monkeypatch) -> None:
     assert captured["timeout"] == agent_runtime.AGENT_PROFILES["release_notes_review_edit_only"].timeout
 
     # A profile with no timeout of its own runs to the caller's deadline, uncapped.
-    agent_runtime.run_agent("ci_fix_edit", "fix it", timeout=9999)
+    agent_runtime.run_agent("agent_fix_edit", "fix it", timeout=9999)
     assert captured["timeout"] == 9999
     assert captured["max_turns"] is None
     assert captured["effort"] == "xhigh"
@@ -142,11 +142,11 @@ def test_run_agent_warns_when_evidence_cannot_be_written(tmp_path, monkeypatch, 
     assert result.profile == "conflict_resolve_edit_only"
 
 
-def test_only_a_ci_fix_session_is_kept_with_its_evidence(tmp_path, monkeypatch) -> None:
+def test_only_a_agent_fix_session_is_kept_with_its_evidence(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(agent_runtime, "run_claude_code", lambda *_args, **_kwargs: ("the event stream", "", 0))
     monkeypatch.setattr(agent_runtime, "isolated_user", lambda: "")
 
-    agent_runtime.run_agent("ci_fix_review", "review", cwd=str(tmp_path), evidence_dir=tmp_path / "fix")
+    agent_runtime.run_agent("agent_fix_review", "review", cwd=str(tmp_path), evidence_dir=tmp_path / "fix")
     agent_runtime.run_agent("conflict_resolve_edit_only", "resolve", cwd=str(tmp_path), evidence_dir=tmp_path / "other")
 
     kept = list((tmp_path / "fix").glob("*.stream.jsonl"))

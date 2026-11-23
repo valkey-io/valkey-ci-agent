@@ -1,0 +1,405 @@
+name: Agent Fix Run
+
+# One fix, whichever front door asked for it: a Test Failure Detector issue
+# (agent-fix-ci-issues.yml), a maintainer's command on a PR (agent-fix.yml), a
+# bot-owned PR's red head (backport-ci-followup.yml), an issue a committer
+# labelled for a change (agent-fix-labelled.yml), or the PR the bot opened for
+# one (agent-fix-labelled-dispatch.yml).
+#
+#   plan -> fix -> [plan-upstream -> fix-upstream] -> publish
+#
+# plan binds the request to one exact failed job, and resolves that job from
+# its workflow file at the commit the fix is prepared on
+# (scripts/agent_fix/run.py, scripts/agent_fix/ci_job.py). The fix is prepared
+# inside that very job (agent-fix-job.yml): on its runner, in its container if
+# it has one, after its own checkouts, setup and build (the plan's setup.sh).
+# Then, instead of its tests, the agent fixes the failure and code verifies
+# the fix with the job's own build and test commands (scripts/agent_fix/job.sh).
+# A job that cannot host the fix is replaced by the same steps on the bot's
+# own runner. A backport sweep's fix of the bot's own, for a test the default
+# branch has too, is then made for the default branch, in that branch's own
+# job of the same name, or on the bot's runner when that job cannot host it
+# (plan-upstream, fix-upstream). The fix jobs hold no
+# GitHub token; the plan jobs and publish do the GitHub work, each with its
+# own App token.
+on:
+  workflow_call:
+    inputs:
+      front_door:
+        description: "issue, pr, follow-up, label or upkeep (scripts/agent_fix/models.py FrontDoor)"
+        required: true
+        type: string
+      request:
+        description: "The front door's request, as JSON"
+        required: true
+        type: string
+      key:
+        description: "Names this fix's artifacts apart from the other fixes in the run"
+        required: true
+        type: string
+      target_owner:
+        type: string
+        default: valkey-io
+      target_repo:
+        type: string
+        default: valkey
+    secrets:
+      VALKEYRIE_BOT_APP_ID:
+        required: true
+      VALKEYRIE_BOT_PRIVATE_KEY:
+        required: true
+      AWS_ROLE_ARN:
+        required: true
+
+permissions: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  plan:
+    name: "Plan the fix (${{ inputs.key }})"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      job: ${{ steps.plan.outputs.job }}
+      runs_on: ${{ steps.plan.outputs.runs_on }}
+      container: ${{ steps.plan.outputs.container }}
+      timeout_minutes: ${{ steps.plan.outputs.timeout_minutes }}
+      use_repo: ${{ steps.plan.outputs.use_repo }}
+      use_git_ref: ${{ steps.plan.outputs.use_git_ref }}
+      extra_repository: ${{ steps.plan.outputs.extra_repository }}
+      extra_ref: ${{ steps.plan.outputs.extra_ref }}
+      extra_path: ${{ steps.plan.outputs.extra_path }}
+      ci_changes: ${{ steps.plan.outputs.ci_changes }}
+      upstream: ${{ steps.plan.outputs.upstream }}
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+
+      - name: Generate target repository token
+        id: target-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: ${{ inputs.target_owner }}
+          repositories: ${{ inputs.target_repo }}
+          # The plan reads the PR, the run, its log and the workflow file,
+          # and reads target PR/issue state. It writes only comments and
+          # reactions: a refusal, the reaction to a maintainer's command, or
+          # a publication recovered from an earlier attempt; and for a
+          # labelled issue, the label it takes off a request it turns down.
+          # Looking after the bot's own pull requests marks one ready for
+          # review, and a labelled issue's plan opens the pull request an
+          # earlier attempt pushed a branch for: both need
+          # pull-requests: write.
+          permission-members: read
+          permission-actions: read
+          permission-contents: read
+          permission-pull-requests: ${{ (inputs.front_door == 'upkeep' || inputs.front_door == 'label') && 'write' || 'read' }}
+          permission-issues: write
+          permission-metadata: read
+
+      - name: Validate the request and plan its fix
+        id: plan
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.target-token.outputs.token }}
+          AGENT_TOKEN: ${{ github.token }}
+          FRONT_DOOR: ${{ inputs.front_door }}
+          REQUEST: ${{ inputs.request }}
+          KEY: ${{ inputs.key }}
+          # A labelled issue's change: a patch commented on the issue (the
+          # default) or 'draft-pr', and the bot's own fork its branch is
+          # pushed to, if it has one (scripts/agent_fix/labelled.py).
+          AGENT_FIX_PUBLISH: ${{ vars.AGENT_FIX_PUBLISH }}
+          AGENT_FIX_PUSH_REPO: ${{ vars.AGENT_FIX_PUSH_REPO }}
+        run: |
+          python -m scripts.agent_fix.run plan --front-door "${FRONT_DOOR}" \
+            --request "${REQUEST}" --out agent-fix-plan --key "${KEY}"
+
+      - name: Upload the plan
+        if: always() && hashFiles('agent-fix-plan/plan.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-fix-plan-${{ inputs.key }}
+          path: agent-fix-plan/
+          retention-days: 30
+          # A re-run of this run replaces it: an artifact name is unique per run.
+          overwrite: true
+
+  fix:
+    name: "Fix"
+    needs: plan
+    if: needs.plan.outputs.mode == 'job' || needs.plan.outputs.mode == 'local'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/agent-fix-job.yml
+    with:
+      plan: agent-fix-plan-${{ inputs.key }}
+      result: agent-fix-result-${{ inputs.key }}
+      mode: ${{ needs.plan.outputs.mode }}
+      job: ${{ needs.plan.outputs.job }}
+      runs_on: ${{ needs.plan.outputs.runs_on }}
+      container: ${{ needs.plan.outputs.container }}
+      timeout_minutes: ${{ needs.plan.outputs.timeout_minutes }}
+      use_repo: ${{ needs.plan.outputs.use_repo }}
+      use_git_ref: ${{ needs.plan.outputs.use_git_ref }}
+      extra_repository: ${{ needs.plan.outputs.extra_repository }}
+      extra_ref: ${{ needs.plan.outputs.extra_ref }}
+      extra_path: ${{ needs.plan.outputs.extra_path }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # A sweep's fix of the bot's own, for a test the default branch has too, is
+  # made for the default branch in that branch's own job of the same name:
+  # its setup installs and builds what the branch needs. Otherwise this
+  # passes the fix's outcome on to publish as it is.
+  plan-upstream:
+    name: "Plan the fix for the default branch (${{ inputs.key }})"
+    needs: [plan, fix]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.upstream == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      job: ${{ steps.plan.outputs.job }}
+      runs_on: ${{ steps.plan.outputs.runs_on }}
+      container: ${{ steps.plan.outputs.container }}
+      timeout_minutes: ${{ steps.plan.outputs.timeout_minutes }}
+      use_repo: ${{ steps.plan.outputs.use_repo }}
+      use_git_ref: ${{ steps.plan.outputs.use_git_ref }}
+      extra_repository: ${{ steps.plan.outputs.extra_repository }}
+      extra_ref: ${{ steps.plan.outputs.extra_ref }}
+      extra_path: ${{ steps.plan.outputs.extra_path }}
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+
+      - name: Generate target repository token
+        id: target-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: ${{ inputs.target_owner }}
+          repositories: ${{ inputs.target_repo }}
+          # The default branch's tip, the failing test's file there, and its workflow file.
+          permission-contents: read
+          permission-metadata: read
+
+      - name: Download the plan
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: agent-fix-plan-${{ inputs.key }}
+          path: agent-fix-plan
+
+      - name: Download the fix
+        # A fix job that crashed uploaded nothing; publish reports that.
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: agent-fix-result-${{ inputs.key }}
+          path: agent-fix-result
+
+      - name: Plan the fix for the default branch
+        id: plan
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.target-token.outputs.token }}
+        run: |
+          python -m scripts.agent_fix.run plan-upstream --plan agent-fix-plan --outcome agent-fix-result \
+            --out agent-fix-upstream-plan --result agent-fix-upstream-result
+
+      - name: Upload the plan
+        if: hashFiles('agent-fix-upstream-plan/release.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-fix-upstream-plan-${{ inputs.key }}
+          path: agent-fix-upstream-plan/
+          retention-days: 30
+          overwrite: true
+
+      - name: Upload the outcome for publish
+        if: always() && hashFiles('agent-fix-upstream-result/outcome.json') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-fix-upstream-result-${{ inputs.key }}
+          path: agent-fix-upstream-result/
+          retention-days: 30
+          overwrite: true
+
+  fix-upstream:
+    name: "Fix on the default branch"
+    needs: plan-upstream
+    if: needs.plan-upstream.outputs.mode == 'job' || needs.plan-upstream.outputs.mode == 'local'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/agent-fix-job.yml
+    with:
+      plan: agent-fix-upstream-plan-${{ inputs.key }}
+      result: agent-fix-upstream-result-${{ inputs.key }}
+      mode: ${{ needs.plan-upstream.outputs.mode }}
+      job: ${{ needs.plan-upstream.outputs.job }}
+      runs_on: ${{ needs.plan-upstream.outputs.runs_on }}
+      container: ${{ needs.plan-upstream.outputs.container }}
+      timeout_minutes: ${{ needs.plan-upstream.outputs.timeout_minutes }}
+      use_repo: ${{ needs.plan-upstream.outputs.use_repo }}
+      use_git_ref: ${{ needs.plan-upstream.outputs.use_git_ref }}
+      extra_repository: ${{ needs.plan-upstream.outputs.extra_repository }}
+      extra_ref: ${{ needs.plan-upstream.outputs.extra_ref }}
+      extra_path: ${{ needs.plan-upstream.outputs.extra_path }}
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  publish:
+    name: "Publish the fix (${{ inputs.key }})"
+    needs: [plan, fix, plan-upstream, fix-upstream]
+    if: always() && needs.plan.result == 'success' && (needs.plan.outputs.mode == 'job' || needs.plan.outputs.mode == 'local')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+
+      - name: Download the plan
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: agent-fix-plan-${{ inputs.key }}
+          path: agent-fix-plan
+
+      - name: Download the fix
+        # A fix job that crashed uploaded nothing; publish reports that. A
+        # sweep's fix is the one plan-upstream passed on, or the default
+        # branch's job made.
+        continue-on-error: true
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: ${{ needs.plan.outputs.upstream == 'true' && format('agent-fix-upstream-result-{0}', inputs.key) || format('agent-fix-result-{0}', inputs.key) }}
+          path: agent-fix-result
+
+      - name: Generate target repository token
+        id: target-token
+        if: needs.plan.outputs.ci_changes != 'true'
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: ${{ inputs.target_owner }}
+          repositories: ${{ inputs.target_repo }}
+          permission-actions: read
+          # A labelled issue's branch, and the pull request opened from it,
+          # live in the bot's fork when it has one: publishing its change, or
+          # looking after that pull request, then needs no write access to
+          # the target's code.
+          permission-contents: ${{ (inputs.front_door == 'label' || inputs.front_door == 'upkeep') && vars.AGENT_FIX_PUSH_REPO != '' && 'read' || 'write' }}
+          permission-pull-requests: write
+          permission-issues: write
+          permission-metadata: read
+
+      # The bot's own fork, for the branch of a labelled issue's change. A
+      # pull request from it runs CI with an outside contributor's permissions.
+      - name: Name the bot's fork
+        id: fork
+        if: vars.AGENT_FIX_PUSH_REPO != '' && (inputs.front_door == 'label' || inputs.front_door == 'upkeep' || inputs.front_door == 'pr')
+        shell: bash
+        env:
+          PUSH_REPO: ${{ vars.AGENT_FIX_PUSH_REPO }}
+        run: |
+          echo "owner=${PUSH_REPO%%/*}" >> "${GITHUB_OUTPUT}"
+          echo "name=${PUSH_REPO#*/}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate the fork's token
+        id: push-token
+        if: steps.fork.outputs.owner != ''
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: ${{ steps.fork.outputs.owner }}
+          repositories: ${{ steps.fork.outputs.name }}
+          permission-contents: write
+          # The branch is built on the target's tip, which the fork may be
+          # behind: GitHub refuses a push that brings workflow files the
+          # fork lacks without this. The change itself never touches one
+          # (scripts/agent_fix/push.py).
+          permission-workflows: write
+          permission-metadata: read
+
+      # A bot-owned backport branch may take a CI change, often an upstream
+      # one the release branch lacks (scripts/agent_fix/policy.py
+      # allows_ci_changes): only its token can push under .github/workflows.
+      - name: Generate target repository token with workflows
+        id: ci-token
+        if: needs.plan.outputs.ci_changes == 'true'
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: ${{ inputs.target_owner }}
+          repositories: ${{ inputs.target_repo }}
+          permission-actions: read
+          permission-contents: write
+          permission-workflows: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-metadata: read
+
+      - name: Publish the fix and report it
+        id: publish
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.ci-token.outputs.token || steps.target-token.outputs.token }}
+          # A detector issue's fix: a patch commented on the issue (the
+          # default), or 'draft-pr' (scripts/agent_fix/models.py IssuePublication).
+          AGENT_FIX_CI_ISSUES_PUBLISH: ${{ vars.AGENT_FIX_CI_ISSUES_PUBLISH || vars.CI_FIX_ISSUES_PUBLISH }}
+          # The same for a labelled issue's change, and where its branch goes.
+          AGENT_FIX_PUBLISH: ${{ vars.AGENT_FIX_PUBLISH }}
+          AGENT_FIX_PUSH_REPO: ${{ vars.AGENT_FIX_PUSH_REPO }}
+          # Publishing checks the cap on open pull requests again, and the pause this lifts.
+          AGENT_FIX_REVIEWED_THROUGH: ${{ vars.AGENT_FIX_REVIEWED_THROUGH }}
+          PUSH_TOKEN: ${{ steps.push-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python -m scripts.agent_fix.run publish --plan agent-fix-plan --outcome agent-fix-result
+
+      # The plan is the ledger of failed attempts. One whose fix job failed
+      # before the engine started is marked so, and is not counted.
+      - name: Record an attempt that never started
+        if: always() && steps.publish.outputs.never_started == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-fix-plan-${{ inputs.key }}
+          path: agent-fix-plan/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true

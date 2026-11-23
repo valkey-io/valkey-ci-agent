@@ -267,11 +267,11 @@ def test_an_isolated_cli_that_times_out_is_stopped_through_its_account(monkeypat
     monkeypatch.setattr(claude_code, "kill_all", killed.append)
 
     stdout, stderr, rc = claude_code._run_streaming(
-        ["sudo"], "prompt", cwd=None, env={}, timeout=3, run_as="ci-fix-agent",
+        ["sudo"], "prompt", cwd=None, env={}, timeout=3, run_as="agent-fix",
     )
 
     assert (stderr, rc) == ("timeout after 3s", 1)
-    assert killed == ["ci-fix-agent"]
+    assert killed == ["agent-fix"]
 
 
 def test_a_process_that_may_not_be_signalled_does_not_turn_a_timeout_into_a_crash(monkeypatch):
@@ -372,7 +372,7 @@ def test_unconfined_runs_keep_their_existing_flags(monkeypatch):
 
 
 def test_an_uncapped_run_passes_no_turn_limit(monkeypatch):
-    """A CI-fix profile has no turn cap: the CLI is given no --max-turns at all."""
+    """An agent-fix profile has no turn cap: the CLI is given no --max-turns at all."""
     captured = {}
     stream = '{"type":"result","subtype":"success","num_turns":1,"result":"done"}\n'
 

@@ -28,9 +28,9 @@ AgentProfileName = Literal[
     "test_adaptation_edit_only",
     "validation_repair_edit_only",
     "fuzzer_analysis_readonly",
-    "ci_fix_edit",
-    "ci_fix_suggest",
-    "ci_fix_review",
+    "agent_fix_edit",
+    "agent_fix_suggest",
+    "agent_fix_review",
     "release_notes_review_edit_only",
 ]
 
@@ -42,7 +42,7 @@ class AgentProfile:
     name: AgentProfileName
     allowed_tools: str
     # None: no limit of its own. The caller's deadline bounds the session
-    # (the CI-fix engine's budget), and the CLI is given no turn cap.
+    # (the agent-fix engine's budget), and the CLI is given no turn cap.
     timeout: int | None
     effort: str | None = "high"
     max_turns: int | None = 200
@@ -55,7 +55,7 @@ class AgentProfile:
     # Suggestion-only CI fixes are confined; bot-owned branches intentionally
     # use the same unconfined edit model as the backport agents.
     confined: bool = False
-    # Run as CI_FIX_AGENT_USER (see scripts/common/isolation.py): for a
+    # Run as AGENT_FIX_USER (see scripts/common/isolation.py): for a
     # profile with Bash in an untrusted checkout, which must not reach the
     # job's environment.
     isolated: bool = False
@@ -83,7 +83,7 @@ class AgentRunResult:
 
 # Over fourteen failures whose fix is known, Fable 5.2 sessions ran 25
 # seconds to 10 minutes at xhigh, about as long as at high.
-_CI_FIX_EFFORT = "xhigh"
+_AGENT_FIX_EFFORT = "xhigh"
 
 AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
     "conflict_resolve_edit_only": AgentProfile(
@@ -125,11 +125,11 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         writes_allowed=False,
         output_schema="text",
     ),
-    "ci_fix_edit": AgentProfile(
-        name="ci_fix_edit",
+    "agent_fix_edit": AgentProfile(
+        name="agent_fix_edit",
         allowed_tools="Read,Edit,MultiEdit,Write,Grep",
         timeout=None,
-        effort=_CI_FIX_EFFORT,
+        effort=_AGENT_FIX_EFFORT,
         max_turns=None,
         writes_allowed=True,
         output_schema="candidate-json",
@@ -138,11 +138,11 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         isolated=True,
         keeps_session=True,
     ),
-    "ci_fix_review": AgentProfile(
-        name="ci_fix_review",
+    "agent_fix_review": AgentProfile(
+        name="agent_fix_review",
         allowed_tools="Read,Grep",
         timeout=None,
-        effort=_CI_FIX_EFFORT,
+        effort=_AGENT_FIX_EFFORT,
         max_turns=None,
         output_schema="review-json",
         disallowed_tools="Bash,Glob,Edit,MultiEdit,Write",
@@ -152,11 +152,11 @@ AGENT_PROFILES: dict[AgentProfileName, AgentProfile] = {
         isolated=True,
         keeps_session=True,
     ),
-    "ci_fix_suggest": AgentProfile(
-        name="ci_fix_suggest",
+    "agent_fix_suggest": AgentProfile(
+        name="agent_fix_suggest",
         allowed_tools="Read,Edit,MultiEdit,Write,Grep",
         timeout=None,
-        effort=_CI_FIX_EFFORT,
+        effort=_AGENT_FIX_EFFORT,
         max_turns=None,
         writes_allowed=True,
         output_schema="candidate-json",

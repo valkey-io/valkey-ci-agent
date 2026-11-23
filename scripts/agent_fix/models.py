@@ -1,0 +1,490 @@
+"""Small domain model shared by every agent-fix front door."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+from scripts.common.valkey_ci import FILE_TIMEOUT_TEST_NAME, Source, is_unit_test_file
+
+
+class FixPolicy(str, Enum):
+    """What kind of change the agent may make."""
+
+    BACKPORT = "backport"
+    GENERAL = "general"
+
+
+class TargetKind(str, Enum):
+    """Where a prepared candidate should be published."""
+
+    UPDATE_PR = "update-pr"
+    SUGGEST = "suggest"
+    DRAFT_PR = "draft-pr"
+
+
+class IssuePublication(str, Enum):
+    """How a fix for a detector issue is published.
+
+    ``comment`` posts the patch on the issue for a maintainer to apply;
+    ``draft-pr`` pushes a branch and opens a draft PR. The
+    ``AGENT_FIX_CI_ISSUES_PUBLISH`` repository variable chooses; comment is the
+    default while the bot earns its PRs.
+    """
+
+    COMMENT = "comment"
+    DRAFT_PR = "draft-pr"
+
+    @classmethod
+    def from_env(cls, variable: str) -> "IssuePublication":
+        """The mode the environment variable ``variable`` names; a comment unless told otherwise."""
+        value = os.environ.get(variable, "").strip().lower()
+        if not value:
+            return cls.COMMENT
+        try:
+            return cls(value)
+        except ValueError:
+            choices = ", ".join(mode.value for mode in cls)
+            raise ValueError(f"{variable} must be one of {choices}, not {value!r}") from None
+
+
+class CandidateAction(str, Enum):
+    """The concrete action proposed by the fix agent."""
+
+    PATCH = "patch"
+    PORT = "port"
+    REFUSE = "refuse"
+
+
+class ResultKind(str, Enum):
+    """The externally visible result of one fix attempt."""
+
+    PUSHED = "pushed"
+    SUGGESTED = "suggested"
+    OPENED = "opened"
+    REFUSED = "refused"
+    FAILED = "failed"
+
+    @property
+    def successful(self) -> bool:
+        """Whether the attempt published a fix worth reporting to the target."""
+        return self in (
+            type(self).PUSHED,
+            type(self).SUGGESTED,
+            type(self).OPENED,
+        )
+
+
+# A failed attempt (an agent crash, the time running out) says nothing about
+# the failure. A detector issue and a bot-owned PR's follow-up try it again,
+# and give up after this many failed attempts.
+MAX_FAILED_ATTEMPTS = 2
+
+
+class FailureType(str, Enum):
+    """How the agent classified the observed failure."""
+
+    DETERMINISTIC = "deterministic"
+    FLAKY = "flaky"
+    INFRASTRUCTURE = "infrastructure"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class FailedTest:
+    """One failing test: its name and file.
+
+    A Tcl test's ``tests/...tcl`` file, or a C unit test's (``Suite.Test`` in
+    ``src/unit/test_x.cpp``; by base name alone until the checkout locates
+    it). ``name`` is "" when a test client timed out outside any test: then
+    only the file is known, and the whole file is what failed.
+    """
+
+    name: str
+    file: str
+
+    @classmethod
+    def from_report(cls, name: str, file: str) -> "FailedTest":
+        """The test a runtest report or detector issue names."""
+        return cls("" if name == FILE_TIMEOUT_TEST_NAME else name, file)
+
+    @property
+    def whole_file(self) -> bool:
+        return not self.name
+
+    @property
+    def is_unit_test(self) -> bool:
+        """A C unit test (Google Test), run by name, not through runtest."""
+        return is_unit_test_file(self.file)
+
+    @property
+    def unit(self) -> str:
+        """``unit/type/incr`` for ``tests/unit/type/incr.tcl``."""
+        return self.file.removeprefix("tests/").removesuffix(".tcl")
+
+
+@dataclass(frozen=True)
+class Failure:
+    """One exact failed job on one tested commit."""
+
+    repo_full_name: str
+    run_id: int
+    head_sha: str
+    job_id: int
+    job_name: str
+    run_attempt: int = 1
+    base_branch: str = ""
+    description: str = ""
+    hint: str = ""
+    pr_number: int = 0
+    issue_number: int = 0
+    other_failed_jobs: tuple[str, ...] = ()
+    # Tests the front door already knows failed (a detector issue records
+    # one). The engine adds the ones the job log shows.
+    failed_tests: tuple[FailedTest, ...] = ()
+    # The scheduled workflow that failed, or None for a PR's run. Scheduled
+    # runs pass ``--accurate`` to the tests.
+    source: Optional[Source] = None
+    # The failed run's workflow file, without ``.yml`` (``ci``, ``daily``).
+    workflow: str = ""
+    # The commit whose workflow file defined the failed job, when it is not
+    # the commit the fix is prepared on: a run of every release branch runs
+    # the default branch's jobs on each of them.
+    workflow_sha: str = ""
+
+    @property
+    def scheduled(self) -> bool:
+        return self.source is not None
+
+    @property
+    def run_url(self) -> str:
+        url = f"https://github.com/{self.repo_full_name}/actions/runs/{self.run_id}"
+        if self.run_attempt > 1:
+            return f"{url}/attempts/{self.run_attempt}"
+        return url
+
+
+@dataclass(frozen=True)
+class FixTarget:
+    """A bot branch, contributor PR, or new draft PR destination."""
+
+    kind: TargetKind
+    repo_full_name: str
+    base_repo_full_name: str = ""
+    branch: str = ""
+    expected_sha: str = ""
+    # Set for a backport sweep PR: its fix is prepared and run on ``branch``
+    # at ``expected_sha``, but pushed to this branch, whose pull request into
+    # ``branch`` collects the sweep's CI fixes for review apart from its
+    # backports.
+    fix_branch: str = ""
+    # With ``fix_branch``: the CI-sweep branches that had no open pull
+    # request when the fix was planned (:func:`ci_sweep.closed_branches`).
+    closed_fix_branches: tuple[str, ...] = ()
+    # With ``fix_branch``: the default branch. A fix of the bot's own is run
+    # there too, and when it applies there it is a pull request into it, not
+    # a CI-sweep fix (:mod:`scripts.agent_fix.upstream`).
+    upstream_branch: str = ""
+    # Set when the bot's pull request for a labelled issue conflicts with its
+    # base branch: the head of ``branch``, which the push replaces with the
+    # change made again on ``expected_sha``, the base branch's tip.
+    replaces: str = ""
+
+
+@dataclass(frozen=True)
+class OtherIssue:
+    """Another open detector issue whose test a patch here might also fix."""
+
+    number: int
+    test: FailedTest
+
+
+@dataclass(frozen=True)
+class OpenFix:
+    """An open pull request into the default branch that may fix the failure, as the agent is shown it."""
+
+    number: int
+    title: str
+    # Its diff to the files the failure names, or its whole diff, shortened.
+    diff: str = ""
+
+
+@dataclass(frozen=True)
+class IssueRequest:
+    """An issue a committer labelled for a change (:mod:`scripts.agent_fix.labelled`).
+
+    No CI job failed: the evidence is a test the agent writes first, which
+    code sees fail on the unchanged code.
+    """
+
+    number: int
+    # The issue as it was when it was labelled. Anyone can write an issue:
+    # the agent reads this as data.
+    title: str
+    body: str
+    # The labelling this run answers: its event on the issue.
+    label_event: int = 0
+    # What committers said on the issue, ``login: text``, oldest first.
+    comments: tuple[str, ...] = ()
+    # A crash report: the server crashing is the failure its test shows.
+    # Anywhere else a crash stops the run, and nothing is published about it.
+    crash_report: bool = False
+    # The bot's pull request for the issue, when the run changes it: its
+    # number, and its diff, which is the change to make again (a merge
+    # conflict) or to revise (``review``).
+    pr_number: int = 0
+    earlier: str = ""
+    # A committer's review comments to apply to that pull request.
+    review: tuple[str, ...] = ()
+    # A replay of a closed issue on the commit before its fix: nothing is published.
+    replay: bool = False
+
+
+@dataclass(frozen=True)
+class UpstreamRun:
+    """The fix made for the default branch too, for a pull request into it."""
+
+    # The default branch commit it was made on and run on.
+    sha: str
+    # The failing tests it ran there: one pull request a test.
+    tests: tuple[FailedTest, ...]
+    # What code established there, for the pull request.
+    verification: str
+    # The change on the default branch: the release branch's own patch when
+    # it applies there and passes, else the agent's adaptation of it.
+    patch: str = ""
+    changed_paths: tuple[str, ...] = ()
+    # Set for an adaptation: its commit subject, and why it is the change.
+    title: str = ""
+    reasoning: str = ""
+
+    @property
+    def adapted(self) -> bool:
+        return bool(self.title or self.reasoning)
+
+
+@dataclass(frozen=True)
+class FixTask:
+    """A validated failure paired with its publication destination."""
+
+    failure: Failure
+    target: FixTarget
+    policy: FixPolicy
+    # Other open detector issues whose test this patch may also fix. Each is
+    # verified on its own before the draft PR claims to fix it.
+    other_issues: tuple[OtherIssue, ...] = ()
+    # Open pull requests into ``target.upstream_branch`` that name the failing
+    # test or close its detector issue: one may already fix the failure.
+    open_fixes: tuple[OpenFix, ...] = ()
+    # Set for a labelled issue, which has no failed job: ``failure`` then
+    # names the commit the change is made on and the CI job that hosts it.
+    request: Optional[IssueRequest] = None
+
+
+@dataclass(frozen=True)
+class FixCandidate:
+    """A model-proposed patch, upstream port, or reason not to act."""
+
+    action: CandidateAction
+    summary: str = ""
+    failing_check: str = ""
+    root_cause: str = ""
+    reasoning: str = ""
+    failure_type: FailureType = FailureType.UNKNOWN
+    patch: str = ""
+    changed_paths: tuple[str, ...] = ()
+    port_commit: str = ""
+    validation: str = ""
+    # The agent's commit subject for a patch: what the change does.
+    title: str = ""
+    # The merged upstream commit a patch adapts to this branch, checked by
+    # code; set only where an upstream change comes first (FixContext.upstream_first).
+    adapts: str = ""
+    # The tests the agent read in the log as the ones that failed. Code runs
+    # them when it could name none itself: a valgrind or sanitizer report,
+    # or a test client's exception, names no test on its result line.
+    failing_tests: tuple[FailedTest, ...] = ()
+    # What code established about the candidate (local test runs and the
+    # review), for the maintainer report. Never written by the agent.
+    verification: str = ""
+    # Other detector issues whose test the patch changed, without showing
+    # that it fixes them. Never written by the agent.
+    also_touches: tuple[int, ...] = ()
+    # Never run: nothing the bot has can run the failing check, so the change
+    # was reviewed, and at most built (FixContext.reviewed_only, only_built).
+    # A patch like that is posted for a person to apply, never pushed. Never
+    # written by the agent.
+    not_run: bool = False
+    # An open pull request into the default branch (one of
+    # ``FixTask.open_fixes``) that the agent says fixes the failure, on a
+    # refusal; checked by code.
+    open_fix: int = 0
+    # A refusal the agent made, not code (for a check, review or session
+    # that failed). Never written by the agent.
+    agent_refused: bool = False
+    # The fix made for the default branch too, and passed there. Never
+    # written by the agent.
+    upstream: Optional[UpstreamRun] = None
+    # Why no fix for the default branch, whose failing test it shares, could
+    # be made. Never written by the agent.
+    upstream_refusal: str = ""
+    # For a labelled issue. Whether it asks for new behaviour, not a bug fix,
+    # and the acceptance criteria the agent read from it; on a refusal, the
+    # questions it could not answer without guessing.
+    feature: bool = False
+    criteria: tuple[str, ...] = ()
+    questions: tuple[str, ...] = ()
+    # The test that code saw fail before any change, as a patch: on a
+    # refusal, what the next person starts from. Never written by the agent.
+    test_patch: str = ""
+
+
+@dataclass(frozen=True)
+class FixContext:
+    """What code established before the agent starts, for it and the reviewer."""
+
+    # Merged changes that may already fix the failure (``prior_fixes``), and
+    # whether the failure gave the search anything to look for.
+    prior_fixes: str = ""
+    prior_fixes_detail: str = ""
+    prior_fixes_searched: bool = False
+    # The failing test file's recent commits, with the diff of the one that
+    # added the test (the edit agent has no git).
+    test_history: str = ""
+    # The default branch's commits to the failure's files that the checkout
+    # lacks, when one of those may fix it (``upstream_first``).
+    unported_changes: str = ""
+    # Every commit the default branch has and the working commit lacks, with
+    # the files it changes: the fix may be in a file the failure does not name.
+    unported_index: str = ""
+    # What the bot's pull requests into the other release branches changed in
+    # the failure's files: one failure is fixed the same way on every branch.
+    sibling_changes: str = ""
+    # The fixes already made for this sweep PR, waiting in its CI-sweep PR and
+    # not on the working commit: a failure is not fixed twice.
+    pending_fixes: str = ""
+    # Open pull requests into the default branch that may fix the failure
+    # (``FixTask.open_fixes``), with their diffs.
+    open_fixes: str = ""
+    # On the default branch: the fix made for the release branch that
+    # failed, to make the same fix here (``engine.prepare_upstream``).
+    release_fix: str = ""
+    # How code verifies a candidate, and whether it does.
+    verification: str = ""
+    verified_by_code: bool = False
+    # A change already merged upstream comes first: a port, or a patch that
+    # adapts one; a fix of the branch's own only where none fixes the failure.
+    # Set on a backport branch, and for a failure no command here can run.
+    upstream_first: bool = False
+    # Nothing here can run the failing check and no upstream change can be
+    # ported, so a fix is reviewed and published as not run.
+    reviewed_only: bool = False
+    # Nothing here can run the failing check, but an upstream change may fix
+    # it: a candidate is built and reviewed, not run.
+    only_built: bool = False
+    # The bot's guide for the repository, ending with the repository's own
+    # guidelines as its default branch has them.
+    guide: str = ""
+    # For a labelled issue: what code saw its test do before any change, for
+    # the report; that test's patch and output, for the agent; and the patch
+    # and tests a change may add to and never rewrite.
+    evidence_check: str = ""
+    evidence_detail: str = ""
+    frozen_patch: str = ""
+    frozen_tests: tuple[FailedTest, ...] = ()
+    # The last commits to the files a change touches, for its reviewer.
+    past_changes: str = ""
+
+
+@dataclass(frozen=True)
+class FixResult:
+    """The final published or reported outcome."""
+
+    kind: ResultKind
+    summary: str
+    task: FixTask
+    candidate: Optional[FixCandidate] = None
+    commit_sha: str = ""
+    pr_number: int = 0
+    pr_url: str = ""
+    # ``pr_number`` is an open pull request into the default branch that
+    # fixes the failure, one this attempt opened or one already open: the
+    # sweep backports it once it merges.
+    open_upstream: bool = False
+
+
+@dataclass(frozen=True)
+class IssueFailure:
+    """The failure occurrence recorded in a detector issue body."""
+
+    number: int
+    run_id: int
+    test_name: str = ""
+    test_file: str = ""
+    job_name: str = ""
+    fingerprint: str = ""
+
+    @property
+    def failed_tests(self) -> tuple[FailedTest, ...]:
+        if not (self.test_name and self.test_file):
+            return ()
+        return (FailedTest.from_report(self.test_name, self.test_file),)
+
+    def describe(self, job: str, source: Source) -> str:
+        if self.job_name and self.test_name:
+            return f"C unit test `{self.test_name}` (`{self.test_file}`) failed in {source.label} job `{job}`."
+        if self.job_name:
+            return f"The {source.label} job `{job}` failed without a recorded test failure."
+        if self.test_name == FILE_TIMEOUT_TEST_NAME:
+            return (
+                f"A test client running `{self.test_file}` timed out without "
+                f"reporting a test name in {source.label} job `{job}`."
+            )
+        return (
+            f"`{self.test_name}` in `{self.test_file}` failed in {source.label} job "
+            f"`{job}`."
+        )
+
+
+class FrontDoor(str, Enum):
+    """Where a fix request came from: it decides how the result is published and reported."""
+
+    ISSUE = "issue"  # a Test Failure Detector issue (scripts/agent_fix/issues.py)
+    PR = "pr"  # a maintainer's command on a PR (scripts/agent_fix/main.py)
+    FOLLOW_UP = "follow-up"  # a bot-owned PR's red head (scripts/backport/ci_followup.py)
+    LABEL = "label"  # an issue a committer labelled for a change (scripts/agent_fix/labelled.py)
+    UPKEEP = "upkeep"  # the bot's own PR for a labelled issue (scripts/agent_fix/upkeep.py)
+
+
+@dataclass(frozen=True)
+class FixPlan:
+    """One bound fix request, handed from the plan job to the fix and publish jobs."""
+
+    front_door: FrontDoor
+    task: FixTask
+    job_log: str = ""
+    # ISSUE: the occurrence the issue records; publication rechecks it.
+    issue: Optional[IssueFailure] = None
+    # PR: the command comment, which gets a success reaction after publication.
+    comment_id: int = 0
+    # FOLLOW-UP: successful-result markers and identities for silent attempts.
+    markers: tuple[str, ...] = ()
+    # Set by the publish job when the fix job failed before the engine started
+    # (a runner that could not install or build): such an attempt says nothing
+    # about the failure, so no front door counts it.
+    never_started: bool = False
+    # LABEL: which attempt at the labelling this is. Only the last one's failure is reported.
+    attempt: int = 0
+
+
+@dataclass(frozen=True)
+class FixOutcome:
+    """What the fix job hands the publish job: a candidate, or why there is none."""
+
+    candidate: Optional[FixCandidate] = None
+    error: str = ""
+    # The engine ran. An outcome written for it by the job's own steps, or
+    # none at all, is a job that failed before it could.
+    started: bool = False

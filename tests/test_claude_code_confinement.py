@@ -1,4 +1,4 @@
-"""Real-CLI check that confined CI-fix agents cannot leave their checkout.
+"""Real-CLI check that confined fix agents cannot leave their checkout.
 
 Drives the installed Claude Code CLI through ``run_claude_code`` against a
 mock Anthropic API that issues scripted tool calls, so the CLI's own permission

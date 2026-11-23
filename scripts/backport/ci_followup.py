@@ -3,7 +3,7 @@
 It follows every open bot-owned PR into one registered release branch, the
 sweep PR first. For a PR whose current head's CI has finished, it selects one
 unhandled actionable failure, plans its fix, which runs like every other
-(:mod:`scripts.ci_fix.run`), and reports the result.
+(:mod:`scripts.agent_fix.run`), and reports the result.
 
 When the sweep PR's own CI has nothing left to fix, the release branch's
 failures in the newest scheduled run of every release branch (Valkey's
@@ -12,7 +12,7 @@ the branch will be.
 
 A sweep PR's fixes are not pushed to it. A fix for a test the default branch
 shares is made there too and opened as a pull request into it, which the
-sweep backports once it merges (:mod:`scripts.ci_fix.upstream`). Any other is
+sweep backports once it merges (:mod:`scripts.agent_fix.upstream`). Any other is
 run on its head and then added to its CI-sweep PR (:mod:`scripts.backport.ci_sweep`),
 so that it is reviewed apart from the backports. A job with a fix there is not
 fixed again.
@@ -34,20 +34,16 @@ from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any
 
-from scripts.backport import ci_sweep
-from scripts.backport.registry import RepoEntry, load_registry
-from scripts.backport.sweep import _BRANCH_PREFIX
-from scripts.backport.sweep_prs import find_existing_pr
-from scripts.ci_fix import upstream
-from scripts.ci_fix.comment import render_ci_sweep_fix, render_result
-from scripts.ci_fix.github_runs import (
+from scripts.agent_fix import upstream
+from scripts.agent_fix.comment import render_ci_sweep_fix, render_result
+from scripts.agent_fix.github_runs import (
     FailedJob,
     most_actionable_failure,
     newest_runs_for_head,
     workflow_file,
     workflow_identity,
 )
-from scripts.ci_fix.models import (
+from scripts.agent_fix.models import (
     MAX_FAILED_ATTEMPTS,
     CandidateAction,
     Failure,
@@ -60,7 +56,11 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.policy import is_backport_branch, is_bot_author, is_own_repo, is_writable_branch
+from scripts.agent_fix.policy import is_backport_branch, is_bot_author, is_own_repo, is_writable_branch
+from scripts.backport import ci_sweep
+from scripts.backport.registry import RepoEntry, load_registry
+from scripts.backport.sweep import _BRANCH_PREFIX
+from scripts.backport.sweep_prs import find_existing_pr
 from scripts.common.github_client import retry_github_call
 from scripts.common.valkey_ci import Source
 from scripts.common.workflow_jobs import job_is_ignored
@@ -366,7 +366,7 @@ def plan_request(
     upstream_branch = ""
     if fix_branch:
         # A sweep's own fix that applies to the default branch is a pull
-        # request into it (scripts/ci_fix/upstream.py). While the bot has as
+        # request into it (scripts/agent_fix/upstream.py). While the bot has as
         # many of those open as it may, the sweep's failures wait.
         upstream_branch = str(retry_github_call(
             lambda: gh.get_repo(repo_entry.repo).default_branch, retries=2, description=f"get {repo_entry.repo}",

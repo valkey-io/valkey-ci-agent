@@ -230,9 +230,9 @@ state again from GitHub.
 The steps of the rollout map to switches, so each can be measured before the
 next is turned on.
 
-1. **Replay.** Run **CI Fix Labelled** by hand with `replay` set to a commit.
+1. **Replay.** Run **Agent Fix Labelled** by hand with `replay` set to a commit.
    The change is made on that commit for any issue, open or closed, and
-   nothing is written to Valkey. The result is the run's `ci-fix-result`
+   nothing is written to Valkey. The result is the run's `agent-fix-result`
    artifact. Replaying a closed bug on the commit before its fix shows what
    the bot would have done, to compare with what was merged. A replay reads
    the issue's text and none of its comments, which would say how it was
@@ -252,20 +252,20 @@ labels and from looking after its pull requests.
 To answer one labelled issue now instead of waiting for the next hour:
 
 ```bash
-gh workflow run ci-fix-labelled.yml --repo valkey-io/valkey-ci-agent --field issue=1234
+gh workflow run agent-fix-labelled.yml --repo valkey-io/valkey-ci-agent --field issue=1234
 ```
 
 To replay an issue on a commit, writing nothing to Valkey:
 
 ```bash
-gh workflow run ci-fix-labelled.yml --repo valkey-io/valkey-ci-agent \
+gh workflow run agent-fix-labelled.yml --repo valkey-io/valkey-ci-agent \
   --field issue=1234 --field replay=0123456789abcdef0123456789abcdef01234567
 ```
 
 To see which issues the dispatcher would start, without starting any:
 
 ```bash
-gh workflow run ci-fix-labelled-dispatch.yml --repo valkey-io/valkey-ci-agent --field dry_run=true
+gh workflow run agent-fix-labelled-dispatch.yml --repo valkey-io/valkey-ci-agent --field dry_run=true
 ```
 
 ## Configuration
@@ -284,7 +284,7 @@ conventions, and another repository would need its own.
 
 ## Where the code lives
 
-`scripts/ci_fix/labelled.py` is the front door: it checks the labelling, plans
+`scripts/agent_fix/labelled.py` is the front door: it checks the labelling, plans
 the change and reports the result on the issue. `issue_dispatch.py` starts
 the runs, for this queue and for the detector's. `upkeep.py` looks after the
 bot's pull requests, and plans the change made again on a conflict. The

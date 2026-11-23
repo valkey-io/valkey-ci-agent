@@ -233,17 +233,17 @@ def test_backport_branch_mutations_share_one_concurrency_group():
     ]
 
 
-def test_ci_fix_concurrency_groups_never_drop_a_queued_run():
+def test_agent_fix_concurrency_groups_never_drop_a_queued_run():
     expected_groups = {
-        "ci-fix.yml": "ci-fix-${{ inputs.repo }}-${{ inputs.pr }}",
+        "agent-fix.yml": "agent-fix-${{ inputs.repo }}-${{ inputs.pr }}",
         "backport-ci-followup.yml": (
             "backport-branch-mutation-${{ matrix.repo }}-${{ matrix.branch }}"
         ),
         # The whole run of one issue is the unit, not a job of it.
-        "ci-fix-issues.yml": "ci-fix-issue-${{ inputs.issue }}",
+        "agent-fix-ci-issues.yml": "agent-fix-issue-${{ inputs.issue }}",
     }
     for filename, job_name in (
-        ("ci-fix.yml", "ci-fix"), ("backport-ci-followup.yml", "follow-up"), ("ci-fix-issues.yml", None),
+        ("agent-fix.yml", "agent-fix"), ("backport-ci-followup.yml", "follow-up"), ("agent-fix-ci-issues.yml", None),
     ):
         workflow = yaml.load(
             (Path(".github/workflows") / filename).read_text(encoding="utf-8"),
@@ -276,7 +276,7 @@ def test_backport_sweep_exposes_scoped_req_res_validation_bypass():
 
 
 def test_the_comment_poller_dispatches_with_a_separate_token():
-    workflow = yaml.load(Path(".github/workflows/ci-fix-comment-poll.yml").read_text(encoding="utf-8"),
+    workflow = yaml.load(Path(".github/workflows/agent-fix-comment-poll.yml").read_text(encoding="utf-8"),
                          Loader=yaml.BaseLoader)
     steps = {step.get("name"): step for step in next(iter(workflow["jobs"].values()))["steps"]}
     target, dispatch = steps["Generate App token"]["with"], steps["Generate dispatch token"]["with"]
@@ -289,10 +289,10 @@ def test_the_fix_runs_start_only_from_their_front_doors():
     # The poller and the backport follow-up keep main's hourly schedules; the
     # runs they start are dispatched, and the issue dispatcher has its switch.
     for filename, triggers in (
-        ("ci-fix-comment-poll.yml", {"schedule", "workflow_dispatch"}),
+        ("agent-fix-comment-poll.yml", {"schedule", "workflow_dispatch"}),
         ("backport-ci-followup.yml", {"schedule", "workflow_dispatch"}),
-        ("ci-fix.yml", {"workflow_dispatch"}),
-        ("ci-fix-issues.yml", {"workflow_dispatch"}),
+        ("agent-fix.yml", {"workflow_dispatch"}),
+        ("agent-fix-ci-issues.yml", {"workflow_dispatch"}),
     ):
         workflow = yaml.load(
             (Path(".github/workflows") / filename).read_text(encoding="utf-8"),
@@ -302,7 +302,7 @@ def test_the_fix_runs_start_only_from_their_front_doors():
 
 
 def test_labelled_issues_are_picked_up_only_while_the_switch_is_on():
-    workflow = yaml.load(Path(".github/workflows/ci-fix-labelled-dispatch.yml").read_text(encoding="utf-8"),
+    workflow = yaml.load(Path(".github/workflows/agent-fix-labelled-dispatch.yml").read_text(encoding="utf-8"),
                          Loader=yaml.BaseLoader)
     job = workflow["jobs"]["dispatch"]
     # Off unless the variable says true, unlike the detector's queue, which is on unless it says false.
@@ -318,10 +318,10 @@ def test_labelled_issues_are_picked_up_only_while_the_switch_is_on():
 
 
 def test_the_issue_dispatcher_schedule_runs_until_switched_off_and_never_writes_valkey():
-    workflow = yaml.load(Path(".github/workflows/ci-fix-issue-dispatch.yml").read_text(encoding="utf-8"),
+    workflow = yaml.load(Path(".github/workflows/agent-fix-ci-issue-dispatch.yml").read_text(encoding="utf-8"),
                          Loader=yaml.BaseLoader)
     job = workflow["jobs"]["dispatch"]
-    assert "vars.CI_FIX_ISSUES_AUTO_DISPATCH != 'false'" in job["if"]
+    assert "(vars.AGENT_FIX_CI_ISSUES_AUTO_DISPATCH || vars.CI_FIX_ISSUES_AUTO_DISPATCH) != 'false'" in job["if"]
     assert "github.event_name == 'workflow_dispatch'" in job["if"]
     steps = {step.get("name"): step for step in job["steps"]}
     token = steps["Generate target repository token"]["with"]
@@ -331,10 +331,10 @@ def test_the_issue_dispatcher_schedule_runs_until_switched_off_and_never_writes_
     }
 
 
-def test_ci_fix_issue_runs_are_named_for_the_dispatcher():
-    from scripts.ci_fix.issue_dispatch import RUN_NAME
+def test_agent_fix_issue_runs_are_named_for_the_dispatcher():
+    from scripts.agent_fix.issue_dispatch import RUN_NAME
 
-    workflow = yaml.load(Path(".github/workflows/ci-fix-issues.yml").read_text(encoding="utf-8"),
+    workflow = yaml.load(Path(".github/workflows/agent-fix-ci-issues.yml").read_text(encoding="utf-8"),
                          Loader=yaml.BaseLoader)
     name = workflow["run-name"].replace("${{ inputs.issue }}", "123")
     with_run = name.replace("${{ inputs.run_id && format(' (run {0})', inputs.run_id) || '' }}", " (run 456)")
@@ -343,11 +343,11 @@ def test_ci_fix_issue_runs_are_named_for_the_dispatcher():
     assert RUN_NAME.match(without).group("issue", "run") == ("123", None)
 
 
-# --- ci-fix-run.yml: every fix is plan -> fix -> [plan-upstream -> fix-upstream] -> publish,
-# each fix job one of ci-fix-job.yml's fix-in-job | fix-in-container | fix-local
+# --- agent-fix-run.yml: every fix is plan -> fix -> [plan-upstream -> fix-upstream] -> publish,
+# each fix job one of agent-fix-job.yml's fix-in-job | fix-in-container | fix-local
 
-_RUN = Path(".github/workflows/ci-fix-run.yml")
-_JOB = Path(".github/workflows/ci-fix-job.yml")
+_RUN = Path(".github/workflows/agent-fix-run.yml")
+_JOB = Path(".github/workflows/agent-fix-job.yml")
 
 
 def _run_jobs():
@@ -359,12 +359,12 @@ def _fix_jobs():
 
 
 def test_every_fix_front_door_runs_the_shared_fix():
-    from scripts.ci_fix.models import FrontDoor
+    from scripts.agent_fix.models import FrontDoor
 
     doors = set()
-    for filename, job_id in (("ci-fix.yml", "ci-fix"), ("backport-ci-followup.yml", "follow-up"),
-                             ("ci-fix-issues.yml", "fix"), ("ci-fix-labelled.yml", "fix"),
-                             ("ci-fix-labelled-dispatch.yml", "upkeep")):
+    for filename, job_id in (("agent-fix.yml", "agent-fix"), ("backport-ci-followup.yml", "follow-up"),
+                             ("agent-fix-ci-issues.yml", "fix"), ("agent-fix-labelled.yml", "fix"),
+                             ("agent-fix-labelled-dispatch.yml", "upkeep")):
         job = yaml.safe_load((Path(".github/workflows") / filename).read_text(encoding="utf-8"))["jobs"][job_id]
         assert job["uses"] == f"./{_RUN.as_posix()}", filename
         # actions: read lets the plan job read earlier plans, which record
@@ -381,9 +381,9 @@ def test_every_fix_front_door_runs_the_shared_fix():
 
 def test_only_the_plan_and_publish_jobs_hold_a_github_token():
     jobs = _run_jobs()
-    for job_id, command in (("plan", "python -m scripts.ci_fix.run plan "),
-                            ("plan-upstream", "python -m scripts.ci_fix.run plan-upstream"),
-                            ("publish", "python -m scripts.ci_fix.run publish")):
+    for job_id, command in (("plan", "python -m scripts.agent_fix.run plan "),
+                            ("plan-upstream", "python -m scripts.agent_fix.run plan-upstream"),
+                            ("publish", "python -m scripts.agent_fix.run publish")):
         steps = jobs[job_id]["steps"]
         tokens = [step for step in steps if "actions/create-github-app-token@" in step.get("uses", "")]
         assert not any("configure-aws-credentials@" in step.get("uses", "") for step in steps), job_id
@@ -439,7 +439,9 @@ def test_only_the_plan_and_publish_jobs_hold_a_github_token():
             }
         if job_id == "publish":
             publish_step = next(step for step in steps if command in step.get("run", ""))
-            assert publish_step["env"]["CI_FIX_ISSUES_PUBLISH"] == "${{ vars.CI_FIX_ISSUES_PUBLISH }}"
+            assert publish_step["env"]["AGENT_FIX_CI_ISSUES_PUBLISH"] == (
+                "${{ vars.AGENT_FIX_CI_ISSUES_PUBLISH || vars.CI_FIX_ISSUES_PUBLISH }}"
+            )
             assert publish_step["env"]["TARGET_TOKEN"] == (
                 "${{ steps.ci-token.outputs.token || steps.target-token.outputs.token }}"
             )
@@ -459,7 +461,7 @@ _FIX_JOBS = ("fix-in-job", "fix-in-container", "fix-local")
 
 
 def test_the_fix_runs_in_the_failed_job_or_on_the_bots_runner():
-    from scripts.ci_fix.engine import AWS_SESSION_S
+    from scripts.agent_fix.engine import AWS_SESSION_S
 
     jobs = _fix_jobs()
     in_job, in_container, local = (jobs[job_id] for job_id in _FIX_JOBS)
@@ -467,29 +469,29 @@ def test_the_fix_runs_in_the_failed_job_or_on_the_bots_runner():
     assert "inputs.container != ''" in in_container["if"]
     assert in_container["container"] == "${{ inputs.container }}"
     # Without git in the container, job.sh makes the checkout an archive of the commit.
-    assert in_container["env"]["CI_FIX_REPOSITORY"] == "${{ inputs.use_repo }}"
-    assert in_container["env"]["CI_FIX_COMMIT"] == "${{ inputs.use_git_ref }}"
+    assert in_container["env"]["AGENT_FIX_REPOSITORY"] == "${{ inputs.use_repo }}"
+    assert in_container["env"]["AGENT_FIX_COMMIT"] == "${{ inputs.use_git_ref }}"
     for job in (in_job, in_container):
         assert job["runs-on"] == "${{ inputs.runs_on }}"
         assert job["timeout-minutes"] == "${{ fromJSON(inputs.timeout_minutes) }}"
-        assert job["env"]["CI_FIX_IN_JOB"] == "1"
+        assert job["env"]["AGENT_FIX_IN_JOB"] == "1"
         main, extra, download = job["steps"][:3]
         assert main["with"]["repository"] == "${{ inputs.use_repo }}"
         assert main["with"]["ref"] == "${{ inputs.use_git_ref }}"
         assert extra["if"] == "inputs.extra_repository != ''"
         assert extra["with"]["path"] == "${{ inputs.extra_path }}"
-        assert download["name"] == "CI fix: download the plan"
+        assert download["name"] == "Agent fix: download the plan"
         setup = next(step for step in job["steps"] if step["name"] == "Run the job's own setup and build")
         assert setup["shell"] == "bash"
-        assert setup["run"].endswith('scripts/ci_fix/job.sh" setup')
-    assert "CI_FIX_IN_JOB" not in str(local)
+        assert setup["run"].endswith('scripts/agent_fix/job.sh" setup')
+    assert "AGENT_FIX_IN_JOB" not in str(local)
     assert local["runs-on"] == "ubuntu-24.04"
     assert local["timeout-minutes"] * 60 == AWS_SESSION_S
     for job_id in _FIX_JOBS:
         assert jobs[job_id]["permissions"] == {"contents": "read", "id-token": "write"}, job_id
         steps = jobs[job_id]["steps"]
-        download = next(step for step in steps if step.get("name") == "CI fix: download the plan")
-        upload = next(step for step in steps if step.get("name") == "CI fix: upload the result")
+        download = next(step for step in steps if step.get("name") == "Agent fix: download the plan")
+        upload = next(step for step in steps if step.get("name") == "Agent fix: upload the result")
         assert download["with"]["name"] == "${{ inputs.plan }}", job_id
         assert upload["with"]["name"] == "${{ inputs.result }}", job_id
 
@@ -498,9 +500,9 @@ def test_a_sweeps_fix_for_a_test_unstable_has_is_made_in_unstables_own_job():
     jobs = _run_jobs()
     outputs = ("mode", "job", "runs_on", "container", "timeout_minutes", "use_repo", "use_git_ref",
                "extra_repository", "extra_ref", "extra_path")
-    for job_id, plan_job, artifacts in (("fix", "plan", ("ci-fix-plan", "ci-fix-result")),
+    for job_id, plan_job, artifacts in (("fix", "plan", ("agent-fix-plan", "agent-fix-result")),
                                         ("fix-upstream", "plan-upstream",
-                                         ("ci-fix-upstream-plan", "ci-fix-upstream-result"))):
+                                         ("agent-fix-upstream-plan", "agent-fix-upstream-result"))):
         job = jobs[job_id]
         assert job["uses"] == f"./{_JOB.as_posix()}" and job["needs"] == plan_job
         assert job["permissions"] == {"contents": "read", "id-token": "write"}
@@ -519,37 +521,37 @@ def test_a_sweeps_fix_for_a_test_unstable_has_is_made_in_unstables_own_job():
     # A sweep's outcome is the one plan-upstream passed on or unstable's job made, never the release branch's.
     download = next(step for step in jobs["publish"]["steps"] if step.get("name") == "Download the fix")
     assert download["with"]["name"] == (
-        "${{ needs.plan.outputs.upstream == 'true' && format('ci-fix-upstream-result-{0}', inputs.key)"
-        " || format('ci-fix-result-{0}', inputs.key) }}"
+        "${{ needs.plan.outputs.upstream == 'true' && format('agent-fix-upstream-result-{0}', inputs.key)"
+        " || format('agent-fix-result-{0}', inputs.key) }}"
     )
 
 
 def test_every_fix_job_uses_the_same_isolated_lifecycle():
-    from scripts.ci_fix.engine import AWS_SESSION_S
+    from scripts.agent_fix.engine import AWS_SESSION_S
 
     jobs = _fix_jobs()
     for job_id in _FIX_JOBS:
         steps = jobs[job_id]["steps"]
         names = [step.get("name") for step in steps]
         for name in (
-            "CI fix: check out the agent",
-            "CI fix: set up the agent",
-            "CI fix: stage the isolated checkout",
-            "CI fix: configure AWS credentials",
-            "CI fix: prepare the fix in this job",
-            "CI fix: ensure the fix has a result",
-            "CI fix: clean up the isolated checkout",
-            "CI fix: upload the result",
+            "Agent fix: check out the agent",
+            "Agent fix: set up the agent",
+            "Agent fix: stage the isolated checkout",
+            "Agent fix: configure AWS credentials",
+            "Agent fix: prepare the fix in this job",
+            "Agent fix: ensure the fix has a result",
+            "Agent fix: clean up the isolated checkout",
+            "Agent fix: upload the result",
         ):
             assert names.count(name) == 1, (job_id, name)
-        assert names.index("CI fix: stage the isolated checkout") < names.index(
-            "CI fix: configure AWS credentials"
+        assert names.index("Agent fix: stage the isolated checkout") < names.index(
+            "Agent fix: configure AWS credentials"
         )
-        assert names.index("CI fix: prepare the fix in this job") < names.index(
-            "CI fix: ensure the fix has a result"
+        assert names.index("Agent fix: prepare the fix in this job") < names.index(
+            "Agent fix: ensure the fix has a result"
         ) < names.index(
-            "CI fix: clean up the isolated checkout"
-        ) < names.index("CI fix: upload the result")
+            "Agent fix: clean up the isolated checkout"
+        ) < names.index("Agent fix: upload the result")
         upload = next(
             step for step in steps
             if "actions/upload-artifact@" in step.get("uses", "")
@@ -560,7 +562,7 @@ def test_every_fix_job_uses_the_same_isolated_lifecycle():
 
     container_setup = next(
         step for step in jobs["fix-in-container"]["steps"]
-        if step["name"] == "CI fix: set up the agent"
+        if step["name"] == "Agent fix: set up the agent"
     )
     assert container_setup["with"]["system-packages"] == "true"
 
@@ -569,43 +571,43 @@ def test_the_job_setup_and_dependencies_run_before_any_credential_and_the_agent_
     for job_id in _FIX_JOBS:
         names = [step.get("name") for step in _fix_jobs()[job_id]["steps"]]
         before = "Install Valkey build and test dependencies" if job_id == "fix-local" else "Run the job's own setup and build"
-        assert names.index(before) < names.index("CI fix: configure AWS credentials"), job_id
+        assert names.index(before) < names.index("Agent fix: configure AWS credentials"), job_id
         if job_id != "fix-local":
-            assert names.index("CI fix: stage the isolated checkout") < names.index(before)
-    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
-    assert script.index("CI_FIX_AGENT_USER=") < script.index("python -m scripts.ci_fix.run fix")
+            assert names.index("Agent fix: stage the isolated checkout") < names.index(before)
+    script = Path("scripts/agent_fix/job.sh").read_text(encoding="utf-8")
+    assert script.index("AGENT_FIX_USER=") < script.index("python -m scripts.agent_fix.run fix")
     assert "TOKEN" not in script
 
 
 def test_the_fix_uses_a_temp_checkout_without_acl_grants():
-    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    script = Path("scripts/agent_fix/job.sh").read_text(encoding="utf-8")
     packages = Path(".github/actions/setup-agent/system-packages.sh").read_text(encoding="utf-8")
     assert "setfacl" not in script
     assert "chmod +a" not in script
     assert " acl" not in packages
-    assert 'mktemp -d "${temp_root}/valkey-ci-fix.XXXXXX"' in script
+    assert 'mktemp -d "${temp_root}/valkey-agent-fix.XXXXXX"' in script
     assert "/private/tmp" in script
     assert 'cp -R "${GITHUB_WORKSPACE}/." "${repo}/"' in script
 
 
 def test_the_original_actions_checkout_is_never_handed_to_the_agent():
-    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    script = Path("scripts/agent_fix/job.sh").read_text(encoding="utf-8")
     assert 'cp -R "${GITHUB_WORKSPACE}/." "${repo}/"' in script
-    assert 'rm -rf -- "${repo}/.ci-fix-agent"' in script
+    assert 'rm -rf -- "${repo}/.agent-fix"' in script
     assert 'config --local --unset-all http.https://github.com/.extraheader' in script
     assert "chown" not in script[script.index("stage() {"):script.index("setup_job() {")]
 
 
 def _restore_agent(workspace: Path, temp: Path) -> subprocess.CompletedProcess[str]:
     """Run job.sh's own ``restore_agent`` (and ``as_root``) against ``workspace``."""
-    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    script = Path("scripts/agent_fix/job.sh").read_text(encoding="utf-8")
     functions = "".join(
         re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", script, re.MULTILINE | re.DOTALL).group(0)
         for name in ("as_root", "restore_agent")
     )
     program = (
         'set -euo pipefail\nsudo() { [[ "$1" == -n ]] && shift; "$@"; }\n' + functions
-        + f'agent={temp / "ci-fix-agent"}\nhome={workspace / ".ci-fix-agent"}\nrestore_agent\n'
+        + f'agent={temp / "agent-fix"}\nhome={workspace / ".agent-fix"}\nrestore_agent\n'
     )
     return subprocess.run(["bash", "-c", program], capture_output=True, text=True, check=False)
 
@@ -619,7 +621,7 @@ def _agent_code(root: Path) -> Path:
 
 def test_the_agents_code_is_put_back_for_the_jobs_own_cleanup():
     """Its setup is a composite action of this checkout: the post phase reads it from there."""
-    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    script = Path("scripts/agent_fix/job.sh").read_text(encoding="utf-8")
     stage = script[script.index("stage() {"):script.index("setup_job() {")]
     assert stage.index('mv -- "${home}" "${agent}"') < stage.index(
         'cp -R "${GITHUB_WORKSPACE}/." "${repo}/"'
@@ -630,8 +632,8 @@ def test_the_agents_code_is_put_back_for_the_jobs_own_cleanup():
 def test_what_the_agent_left_at_the_agents_path_is_never_what_the_cleanup_reads(tmp_path, planted):
     workspace, temp, outside = tmp_path / "workspace", tmp_path / "temp", tmp_path / "outside"
     workspace.mkdir()
-    _agent_code(temp / "ci-fix-agent")
-    home = workspace / ".ci-fix-agent"
+    _agent_code(temp / "agent-fix")
+    home = workspace / ".agent-fix"
     if planted == "directory":
         # The account owns the workspace: it can make the path a directory of
         # its own, which a plain move would move the real code into.
@@ -645,7 +647,7 @@ def test_what_the_agent_left_at_the_agents_path_is_never_what_the_cleanup_reads(
     assert result.returncode == 0, result.stderr
     assert not home.is_symlink()
     assert (home / ".github/actions/setup-agent/action.yml").read_text() == "name: the real agent setup\n"
-    assert not (home / "ci-fix-agent").exists()
+    assert not (home / "agent-fix").exists()
     if planted == "link":
         # The link went; what it pointed at was not followed.
         assert (outside / ".github/actions/setup-agent/action.yml").exists()
@@ -654,15 +656,15 @@ def test_what_the_agent_left_at_the_agents_path_is_never_what_the_cleanup_reads(
 def test_the_agents_code_is_put_back_where_nothing_was_left(tmp_path):
     workspace, temp = tmp_path / "workspace", tmp_path / "temp"
     workspace.mkdir()
-    _agent_code(temp / "ci-fix-agent")
+    _agent_code(temp / "agent-fix")
 
     assert _restore_agent(workspace, temp).returncode == 0
-    assert (workspace / ".ci-fix-agent/.github/actions/setup-agent/action.yml").is_file()
-    assert not (temp / "ci-fix-agent").exists()
+    assert (workspace / ".agent-fix/.github/actions/setup-agent/action.yml").is_file()
+    assert not (temp / "agent-fix").exists()
 
 
 def test_account_cleanup_accepts_userdel_removing_the_private_group(tmp_path):
-    script = Path("scripts/ci_fix/job.sh").read_text(encoding="utf-8")
+    script = Path("scripts/agent_fix/job.sh").read_text(encoding="utf-8")
     functions = "".join(
         re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", script, re.MULTILINE | re.DOTALL).group(0)
         for name in ("group_gid", "delete_account")
@@ -676,13 +678,13 @@ def test_account_cleanup_accepts_userdel_removing_the_private_group(tmp_path):
         "stop_account() { :; }\n"
         f'as_root() {{ printf "%s\\n" "$*" >> "{calls}"; }}\n'
         + functions
-        + "user=cifix1234567890\nuid=1001\ngid=1001\ndelete_account\n"
+        + "user=agentfix1234567890\nuid=1001\ngid=1001\ndelete_account\n"
     )
 
     result = subprocess.run(["bash", "-c", program], capture_output=True, text=True, check=False)
 
     assert result.returncode == 0, result.stderr
-    assert calls.read_text(encoding="utf-8").splitlines() == ["userdel cifix1234567890"]
+    assert calls.read_text(encoding="utf-8").splitlines() == ["userdel agentfix1234567890"]
 
 
 def test_a_container_fix_mode_installs_the_agents_tools_from_the_distribution():
@@ -699,7 +701,7 @@ def test_a_container_fix_mode_installs_the_agents_tools_from_the_distribution():
     assert "retry dnf" in packages
     for job_id, job in _run_jobs().items():
         for step in job.get("steps") or []:
-            if step.get("name") == "CI fix: set up the agent":
+            if step.get("name") == "Agent fix: set up the agent":
                 assert (step["with"].get("system-packages") == "true") == bool(job.get("container")), job_id
 
 
@@ -715,7 +717,7 @@ def test_the_jobs_that_make_a_change_install_the_formatter_valkeys_ci_checks_wit
     assert "clang-format==" not in job_text and "clang-format==" not in _RUN.read_text(encoding="utf-8")
     # A labelled issue's change is made in a job on the runner or on the bot's own, never in a container.
     for job_id, job in yaml.safe_load(job_text)["jobs"].items():
-        [setup] = [step for step in job["steps"] if step.get("name") == "CI fix: set up the agent"]
+        [setup] = [step for step in job["steps"] if step.get("name") == "Agent fix: set up the agent"]
         assert (setup["with"].get("install-clang-format") == "true") == (not job.get("container")), job_id
 
 
@@ -777,7 +779,7 @@ exit 1
     base_install = next(call for call in recorded if "install bash git python3 " in call)
     assert recorded.count(base_install) == 2
     assert any("install python3.11" in call for call in recorded)
-    assert github_path.read_text(encoding="utf-8").strip().endswith("/runner/ci-fix-python/bin")
+    assert github_path.read_text(encoding="utf-8").strip().endswith("/runner/agent-fix-python/bin")
 
 
 def test_the_isolation_tests_also_run_as_root_in_a_container():

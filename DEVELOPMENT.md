@@ -55,13 +55,13 @@ pytest --cov=scripts --cov-report=term-missing --cov-fail-under=60
 mypy scripts/
 ```
 
-Some tests only run when there is a real `ci-fix-agent` account and Claude
+Some tests only run when there is a real `agent-fix` account and Claude
 Code is installed, and skip otherwise. CI sets both up on its Python 3.11
 job, and runs the isolation tests a second time as root inside an Alpine
 container, so those tests always run there.
 
 Tests live in `tests/`, with one file per module. The tests for
-`scripts/ci_fix/engine.py`, for example, are in `tests/test_ci_fix_engine.py`.
+`scripts/agent_fix/engine.py`, for example, are in `tests/test_agent_fix_engine.py`.
 Shared git helpers are in `tests/git_helpers.py` and test data is under
 `tests/fixtures/`.
 
