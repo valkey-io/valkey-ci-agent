@@ -1,0 +1,154 @@
+name: CI Health
+
+# Every morning, once the Daily workflow has finished, record its run and
+# the failures of its failed jobs in a history store, then compute per-test
+# scorecards and regression onsets from that history. The store is carried
+# from run to run as an artifact of this workflow: each run downloads the
+# newest one, adds to it, and uploads it again. Nothing is written to any
+# repository; the scorecards and blame ranges are uploaded as JSON.
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository whose CI to read"
+        required: false
+        type: string
+        default: "valkey-io/valkey"
+      since:
+        description: "Also list runs created at or after this ISO 8601 time (empty = whatever is new)"
+        required: false
+        type: string
+        default: ""
+      days:
+        description: "Days of history in the recent window of the reports"
+        required: false
+        type: string
+        default: "30"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions: {}
+
+jobs:
+  ci-health:
+    name: "ci-health/${{ inputs.repo || 'valkey-io/valkey' }}"
+    if: github.repository == 'valkey-io/valkey-ci-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      # Two runs at once would each extend the same history and the later
+      # upload would drop the earlier one's additions.
+      group: ci-health
+      cancel-in-progress: false
+    env:
+      TARGET_REPO: ${{ inputs.repo || 'valkey-io/valkey' }}
+      SINCE: ${{ inputs.since || '' }}
+      DAYS: ${{ inputs.days || '30' }}
+      HISTORY_DIR: ci-health
+      REPORT_DIR: ci-health/report
+    permissions:
+      # actions: read lists this workflow's earlier runs and downloads the
+      # history they uploaded.
+      actions: read
+      contents: read
+    steps:
+      - name: Check out agent repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up agent dependencies
+        uses: ./.github/actions/setup-agent
+
+      - name: Generate GitHub App token
+        id: generate-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.VALKEYRIE_BOT_APP_ID }}
+          private-key: ${{ secrets.VALKEYRIE_BOT_PRIVATE_KEY }}
+          owner: valkey-io
+          repositories: valkey
+          permission-actions: read
+          permission-contents: read
+          permission-metadata: read
+
+      - name: Restore history from the newest earlier run
+        # Best effort: with no earlier history the sync starts from what
+        # GitHub still has, which is 90 days of logs.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p "${HISTORY_DIR}"
+          runs=$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow ci-health.yml \
+            --status success --limit 10 --json databaseId --jq '.[].databaseId') || runs=""
+          for id in ${runs}; do
+            if gh run download "${id}" --repo "${GITHUB_REPOSITORY}" \
+                --name ci-health-history --dir "${HISTORY_DIR}" >/dev/null 2>&1; then
+              echo "Restored history from run ${id}"
+              exit 0
+            fi
+          done
+          echo "No earlier history found; starting a new store"
+
+      - name: Sync Daily CI history
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Daily also runs on pull requests; only runs on unstable are
+          # reported on, and the weekly release-branch runs start there too.
+          args=(--db "${HISTORY_DIR}/history.sqlite" --repo "${TARGET_REPO}" --token "${TARGET_TOKEN}"
+                --verbose sync --branch unstable)
+          if [[ -n "${SINCE}" ]]; then
+            args+=(--since "${SINCE}")
+          fi
+          python -m scripts.ci_health.main "${args[@]}" > "${HISTORY_DIR}/sync-summary.json"
+          cat "${HISTORY_DIR}/sync-summary.json"
+
+      - name: Compute scorecards and blame ranges
+        shell: bash
+        env:
+          TARGET_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          common=(--db "${HISTORY_DIR}/history.sqlite" --repo "${TARGET_REPO}")
+          python -m scripts.ci_health.main "${common[@]}" \
+            scorecard --days "${DAYS}" --output "${REPORT_DIR}/scorecards.json"
+          python -m scripts.ci_health.main "${common[@]}" --token "${TARGET_TOKEN}" \
+            blame --days "${DAYS}" --output "${REPORT_DIR}/blame.json"
+          python - <<'EOF' >> "${GITHUB_STEP_SUMMARY}"
+          import json, os
+          report = os.environ["REPORT_DIR"]
+          cards = json.load(open(f"{report}/scorecards.json"))
+          blame = json.load(open(f"{report}/blame.json"))
+          print(f"**{len(cards['scorecards'])}** tests with failures on record, **{len(blame)}** regression onset(s)")
+          EOF
+
+      - name: Upload history
+        # The next run restores this; keep it as long as GitHub allows so a
+        # broken stretch of runs does not lose the history.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-health-history
+          path: ${{ env.HISTORY_DIR }}/history.sqlite
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-health-report-${{ github.run_id }}
+          path: |
+            ${{ env.REPORT_DIR }}
+            ${{ env.HISTORY_DIR }}/sync-summary.json
+          if-no-files-found: ignore
+          retention-days: 30
