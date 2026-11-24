@@ -351,9 +351,10 @@ def _branch_name(failure: IssueFailure) -> str:
 # How the bot recorded a result before the marker below: a heading, then a
 # Source line naming the run. Read, never written, so earlier attempts count.
 _LEGACY_RESULT_HEADING = "**Automatic CI fix \u2014 "
-_RESULT_MARKER = "<!-- valkey-ci-agent:agent-fix-result run={run} outcome={outcome} -->"
-# Read under the name it had before the package was renamed too: those results still count.
-_RESULT_MARKER_RE = re.compile(r"<!-- valkey-ci-agent:(?:agent|ci)-fix-result run=(?P<run>\d+) outcome=(?P<outcome>[a-z]+) -->")
+# The marker keeps the name it had before the package was renamed, so the
+# results already on issues still count.
+_RESULT_MARKER = "<!-- valkey-ci-agent:ci-fix-result run={run} outcome={outcome} -->"
+_RESULT_MARKER_RE = re.compile(r"<!-- valkey-ci-agent:ci-fix-result run=(?P<run>\d+) outcome=(?P<outcome>[a-z]+) -->")
 
 def _run_link(repo_full_name: str, failure: IssueFailure) -> str:
     """The Markdown link to the run that recorded ``failure``."""
