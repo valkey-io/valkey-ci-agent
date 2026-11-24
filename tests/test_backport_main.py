@@ -379,6 +379,7 @@ class TestRunBackportCleanCherryPick:
             push_repo=_DEFAULT_PUSH_REPO,
             backport_label="backport",
             llm_conflict_label="ai-resolved-conflicts",
+            benchmark_label="",
         )
 
     @patch(f"{_PATCH_PREFIX}.validate_branch_with_optional_repair")

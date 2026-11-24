@@ -37,7 +37,10 @@ The agent then pushes the branch and opens a pull request into the release
 branch, or updates the one that is already open. The PR description lists
 what was applied and has a "Needs attention" section explaining anything that
 was skipped or failed. When Claude resolved a conflict, the PR gets the
-`ai-resolved-conflicts` label so reviewers know to look closely. Backport
+`ai-resolved-conflicts` label so reviewers know to look closely. If the
+repository sets `benchmark_label` in [the registry](registry.md), a new PR
+also gets that label, so a label-triggered benchmark workflow runs once
+before the PR is merged. Updates to an open PR don't add it again. Backport
 commits carry a DCO sign-off.
 
 Once a maintainer merges the PR, the work is done. Within the hour, another

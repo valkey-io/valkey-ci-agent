@@ -113,6 +113,7 @@ only the PRs' own CI.
 |---|---|---|
 | `backport_label` | `backport` | The label put on backport PRs. |
 | `llm_conflict_label` | `ai-resolved-conflicts` | The label added when Claude resolved a conflict. |
+| `benchmark_label` | unset | A label added once, when a backport PR is opened, to start a benchmark run. Unset adds nothing. |
 | `max_conflicting_files` | `100` | A backport that conflicts in more files than this is skipped. |
 
 ## Adding a release branch

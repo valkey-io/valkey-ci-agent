@@ -397,6 +397,7 @@ def test_create_backport_pr_does_not_apply_llm_label_for_automatic_resolution() 
 def _make_creator_with_repo(
     backport_label: str = "backport",
     llm_conflict_label: str = "ai-resolved-conflicts",
+    benchmark_label: str = "",
 ):
     """Build a BackportPRCreator wired to mock github/repo/pr objects."""
     mock_github = MagicMock()
@@ -413,6 +414,7 @@ def _make_creator_with_repo(
         "owner/repo",
         backport_label=backport_label,
         llm_conflict_label=llm_conflict_label,
+        benchmark_label=benchmark_label,
     )
     return creator, mock_repo, mock_pr
 
@@ -917,3 +919,34 @@ def test_automatic_resolution_does_not_get_ai_disclosure() -> None:
 
     assert "### AI Adaptation" in llm_body
     assert "Human Review Required" in llm_body
+
+
+def test_create_backport_pr_applies_configured_benchmark_label() -> None:
+    creator, mock_repo, mock_pr = _make_creator_with_repo(benchmark_label="run-benchmark")
+
+    creator.create_backport_pr(
+        _basic_context(),
+        CherryPickResult(success=True, conflicting_files=[], applied_commits=["abc1234"]),
+        None,
+        branch_name="backport/123-to-8.1",
+    )
+
+    mock_pr.add_to_labels.assert_called_once_with("backport", "run-benchmark")
+
+
+def test_create_backport_pr_creates_missing_benchmark_label() -> None:
+    from github.GithubException import GithubException
+
+    creator, mock_repo, mock_pr = _make_creator_with_repo(benchmark_label="run-benchmark")
+    mock_repo.get_label.side_effect = GithubException(404, {"message": "Not Found"})
+
+    creator.create_backport_pr(
+        _basic_context(),
+        CherryPickResult(success=True, conflicting_files=[], applied_commits=["abc1234"]),
+        None,
+        branch_name="backport/123-to-8.1",
+    )
+
+    created = [c.kwargs["name"] for c in mock_repo.create_label.call_args_list]
+    assert created == ["backport", "run-benchmark"]
+    mock_pr.add_to_labels.assert_called_once_with("backport", "run-benchmark")

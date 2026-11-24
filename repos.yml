@@ -58,6 +58,9 @@ repos:
     ci_followup_release_workflow: weekly.yml
     backport_label: backport
     llm_conflict_label: ai-resolved-conflicts
+    # Uncomment once the benchmark runners can take one run per
+    # backport PR (valkey#3152).
+    # benchmark_label: run-benchmark
     max_conflicting_files: 100
     branches:
       - branch: "7.2"

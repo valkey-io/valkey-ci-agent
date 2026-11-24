@@ -138,4 +138,5 @@ class BackportConfig:
 
     backport_label: str = "backport"
     llm_conflict_label: str = "ai-resolved-conflicts"
+    benchmark_label: str = ""
     max_conflicting_files: int = 100

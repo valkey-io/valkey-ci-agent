@@ -62,5 +62,6 @@ class PreparedBranchSweep:
     result: BranchSweepResult
     backport_label: str = "backport"
     llm_conflict_label: str = "ai-resolved-conflicts"
+    benchmark_label: str = ""
     # How the open CI-sweep PR goes onto this head, if there is one.
     ci_sweep: Plan | None = None

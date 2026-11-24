@@ -70,6 +70,7 @@ def upsert_pr(
     branch_applied: list[CandidateResult] | None = None,
     backport_label: str = "backport",
     llm_conflict_label: str = "ai-resolved-conflicts",
+    benchmark_label: str = "",
 ) -> str:
     repo = retry_github_call(lambda: gh.get_repo(base_repo), retries=2, description=f"get {base_repo}")
     previous_body = getattr(existing_pr, "body", None) if existing_pr else None
@@ -129,6 +130,11 @@ def upsert_pr(
         description="create PR",
     )
     logger.info("Created PR #%d on %s", pr.number, base_repo)
+    # The benchmark label goes on only when the PR is opened: the benchmark
+    # workflow removes it after each run, so re-adding it on every update
+    # would benchmark the PR again on every sweep.
+    if benchmark_label:
+        labels.append(benchmark_label)
     _apply_labels(repo, pr, labels)
     comment_urls = _reconcile_sweep_diff_comments(pr, result, branch_applied=branch_applied)
     _relink_body_to_comments(pr, result, branch_applied, comment_urls)

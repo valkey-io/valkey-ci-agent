@@ -58,6 +58,7 @@ class RepoEntry:
     ci_followup_release_workflow: str = ""
     backport_label: str = "backport"
     llm_conflict_label: str = "ai-resolved-conflicts"
+    benchmark_label: str = ""
     max_conflicting_files: int = 100
 
     @property
@@ -227,6 +228,9 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
     llm_conflict_label = raw.get("llm_conflict_label", "ai-resolved-conflicts")
     if not isinstance(llm_conflict_label, str) or not llm_conflict_label.strip():
         raise ValueError(f"repos[{index}].llm_conflict_label must be a non-empty string")
+    benchmark_label = raw.get("benchmark_label", "")
+    if not isinstance(benchmark_label, str) or (benchmark_label and not benchmark_label.strip()):
+        raise ValueError(f"repos[{index}].benchmark_label must be a label name or unset")
     max_conflicting_files = raw.get("max_conflicting_files", 100)
     if not isinstance(max_conflicting_files, int) or max_conflicting_files < 1:
         raise ValueError(f"repos[{index}].max_conflicting_files must be a positive integer")
@@ -259,6 +263,7 @@ def _parse_repo_entry(raw: Any, index: int, seen_repos: set[str]) -> RepoEntry:
         ci_followup_release_workflow=ci_followup_release_workflow,
         backport_label=backport_label,
         llm_conflict_label=llm_conflict_label,
+        benchmark_label=benchmark_label,
         max_conflicting_files=max_conflicting_files,
         branches=tuple(branches),
     )
