@@ -151,6 +151,7 @@ def run_backport(
             push_repo=effective_push_repo,
             backport_label=config.backport_label,
             llm_conflict_label=config.llm_conflict_label,
+            benchmark_label=config.benchmark_label,
         )
         existing_url = pr_creator.check_duplicate(source_pr_number, target_branch)
         if existing_url:
@@ -691,6 +692,7 @@ def main() -> None:
         config=BackportConfig(
             backport_label=repo_entry.backport_label,
             llm_conflict_label=repo_entry.llm_conflict_label,
+            benchmark_label=repo_entry.benchmark_label,
             max_conflicting_files=repo_entry.max_conflicting_files,
         ),
         github_token=github_token,

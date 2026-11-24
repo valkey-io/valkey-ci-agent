@@ -108,12 +108,14 @@ class BackportPRCreator:
         push_repo: str | None = None,
         backport_label: str = "backport",
         llm_conflict_label: str = "ai-resolved-conflicts",
+        benchmark_label: str = "",
     ) -> None:
         self._github = github_client
         self._base_repo = base_repo
         self._push_repo = push_repo
         self._backport_label = backport_label or "backport"
         self._llm_conflict_label = llm_conflict_label or "ai-resolved-conflicts"
+        self._benchmark_label = benchmark_label
 
     def create_backport_pr(
         self,
@@ -186,6 +188,8 @@ class BackportPRCreator:
         labels = [self._backport_label]
         if any_ai_changes:
             labels.append(self._llm_conflict_label)
+        if self._benchmark_label:
+            labels.append(self._benchmark_label)
 
         for label in labels:
             self._ensure_label_exists(repo, label)

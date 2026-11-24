@@ -339,6 +339,7 @@ def prepare_backport_sweep(
         max_conflicting_files=repo_entry.max_conflicting_files,
         backport_label=repo_entry.backport_label,
         llm_conflict_label=repo_entry.llm_conflict_label,
+        benchmark_label=repo_entry.benchmark_label,
         work_root=work_root,
     )
 
@@ -364,6 +365,7 @@ def _process_branch(
     max_conflicting_files: int = 100,
     backport_label: str = "backport",
     llm_conflict_label: str = "ai-resolved-conflicts",
+    benchmark_label: str = "",
 ) -> BranchSweepResult:
     """Compatibility wrapper for existing direct callers and tests."""
     result, prepared = _prepare_branch(
@@ -386,6 +388,7 @@ def _process_branch(
         max_conflicting_files=max_conflicting_files,
         backport_label=backport_label,
         llm_conflict_label=llm_conflict_label,
+        benchmark_label=benchmark_label,
     )
     if prepared is not None:
         return publish_prepared_sweep(prepared, github_token, gh=gh)
@@ -413,6 +416,7 @@ def _prepare_branch(
     max_conflicting_files: int = 100,
     backport_label: str = "backport",
     llm_conflict_label: str = "ai-resolved-conflicts",
+    benchmark_label: str = "",
     work_root: str | None = None,
 ) -> tuple[BranchSweepResult, PreparedBranchSweep | None]:
     """Build one sweep branch locally and return it for a later publish step.
@@ -723,6 +727,7 @@ def _prepare_branch(
                 result=result,
                 backport_label=backport_label,
                 llm_conflict_label=llm_conflict_label,
+                benchmark_label=benchmark_label,
                 ci_sweep=_plan_ci_sweep(tmpdir, ci_pull, prepared_head, expected_pr_number),
             )
             preserve_repo = True
@@ -842,6 +847,7 @@ def publish_prepared_sweep(
             ),
             backport_label=prepared.backport_label,
             llm_conflict_label=prepared.llm_conflict_label,
+            benchmark_label=prepared.benchmark_label,
         )
         _apply_ci_sweep(gh, prepared, github_token)
     except Exception as exc:
@@ -1000,6 +1006,7 @@ def load_prepared_sweep(
     backport_branch: str,
     backport_label: str,
     llm_conflict_label: str,
+    benchmark_label: str = "",
 ) -> PreparedBranchSweep:
     state_path = Path(path)
     payload = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1043,6 +1050,7 @@ def load_prepared_sweep(
         result=result,
         backport_label=backport_label,
         llm_conflict_label=llm_conflict_label,
+        benchmark_label=benchmark_label,
         ci_sweep=_plan_from_dict(payload.get("ci_sweep")),
     )
 
@@ -1314,6 +1322,7 @@ def main() -> None:
             backport_branch=f"{_BRANCH_PREFIX}/{branch_entry.branch}",
             backport_label=repo_entry.backport_label,
             llm_conflict_label=repo_entry.llm_conflict_label,
+            benchmark_label=repo_entry.benchmark_label,
         )
         result = publish_prepared_sweep(loaded, github_token)
         emit_job_summary(build_summary([result]))

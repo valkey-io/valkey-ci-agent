@@ -107,6 +107,7 @@ class TestLoadRegistry:
         assert entry.ci_followup_release_workflow == ""
         assert entry.backport_label == "backport"
         assert entry.llm_conflict_label == "ai-resolved-conflicts"
+        assert entry.benchmark_label == ""
         assert entry.max_conflicting_files == 100
 
     def test_full_entry(self, tmp_path):
@@ -135,6 +136,7 @@ class TestLoadRegistry:
             test_path_patterns=["testing/*.cc", "integration/test_*.py"],
             backport_label="bp",
             llm_conflict_label="ai",
+            benchmark_label="run-benchmark",
             max_conflicting_files=50,
             branches=[
                 {"branch": "1.0", "project_number": 1},
@@ -172,6 +174,7 @@ class TestLoadRegistry:
         )
         assert entry.backport_label == "bp"
         assert entry.llm_conflict_label == "ai"
+        assert entry.benchmark_label == "run-benchmark"
         assert entry.max_conflicting_files == 50
         assert len(entry.branches) == 2
 
@@ -375,6 +378,13 @@ class TestValidation:
         data = _minimal_registry(repos=[_minimal_repo(llm_conflict_label="")])
         path = _write_registry(tmp_path, data)
         with pytest.raises(ValueError, match="llm_conflict_label must be a non-empty string"):
+            load_registry(path)
+
+    @pytest.mark.parametrize("value", [None, "  ", 1])
+    def test_benchmark_label_must_be_label_name_or_unset(self, tmp_path, value):
+        data = _minimal_registry(repos=[_minimal_repo(benchmark_label=value)])
+        path = _write_registry(tmp_path, data)
+        with pytest.raises(ValueError, match="benchmark_label must be a label name or unset"):
             load_registry(path)
 
     def test_validation_rules_not_list(self, tmp_path):

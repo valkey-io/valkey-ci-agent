@@ -1044,6 +1044,70 @@ def test_upsert_pr_labels_ai_resolved_conflicts():
     mock_pr.add_to_labels.assert_called_once_with("backport", "ai-resolved-conflicts")
 
 
+def _sweep_result_with_one_applied() -> BranchSweepResult:
+    return BranchSweepResult(
+        target_branch="8.1",
+        candidates_found=1,
+        results=[CandidateResult(12, "Fix replication", "applied", "")],
+    )
+
+
+def test_upsert_pr_labels_new_pr_for_benchmark():
+    """A newly opened sweep PR gets the configured benchmark label."""
+    from github.GithubException import GithubException
+
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    mock_repo.get_label.side_effect = GithubException(404, {"message": "Not Found"})
+    mock_pr = MagicMock()
+    mock_pr.number = 778
+    mock_pr.html_url = "https://github.com/valkey-io/valkey/pull/778"
+    mock_repo.create_pull.return_value = mock_pr
+
+    upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "8.1",
+        "agent/backport/sweep/8.1",
+        _sweep_result_with_one_applied(),
+        existing_pr=None,
+        benchmark_label="run-benchmark",
+    )
+
+    mock_pr.add_to_labels.assert_called_once_with("backport", "run-benchmark")
+    created = [c.kwargs["name"] for c in mock_repo.create_label.call_args_list]
+    assert created == ["backport", "run-benchmark"]
+
+
+def test_upsert_pr_does_not_relabel_updated_pr_for_benchmark():
+    """The benchmark workflow removes its label after a run, so an update to
+    an open sweep PR must not add it again and start another benchmark."""
+    mock_gh = MagicMock()
+    mock_repo = MagicMock()
+    mock_gh.get_repo.return_value = mock_repo
+    existing_pr = MagicMock()
+    existing_pr.number = 779
+    existing_pr.html_url = "https://github.com/valkey-io/valkey/pull/779"
+    existing_pr.draft = False
+    existing_pr.body = ""
+
+    upsert_pr(
+        mock_gh,
+        "valkey-io/valkey",
+        "valkey-io/valkey",
+        "8.1",
+        "agent/backport/sweep/8.1",
+        _sweep_result_with_one_applied(),
+        existing_pr=existing_pr,
+        benchmark_label="run-benchmark",
+    )
+
+    existing_pr.add_to_labels.assert_called_once_with("backport")
+    mock_repo.create_pull.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("outcome", "detail"),
     [
@@ -1891,6 +1955,7 @@ def test_prepared_state_binds_identity_and_uses_fresh_token(monkeypatch, tmp_pat
         "backport_branch": "agent/backport/sweep/8.1",
         "backport_label": "backport",
         "llm_conflict_label": "ai-resolved-conflicts",
+        "benchmark_label": "run-benchmark",
     }
     with pytest.raises(ValueError, match="identity"):
         backport_sweep.load_prepared_sweep(
@@ -1912,13 +1977,17 @@ def test_prepared_state_binds_identity_and_uses_fresh_token(monkeypatch, tmp_pat
         "push_backport_branch",
         lambda _repo, _branch, env, **kwargs: published.append((env, kwargs)),
     )
-    monkeypatch.setattr(backport_sweep, "upsert_pr", lambda *_a, **_k: "pr-url")
+    upserts: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        backport_sweep, "upsert_pr", lambda *_a, **k: upserts.append(k) or "pr-url"
+    )
 
     result = backport_sweep.publish_prepared_sweep(
         loaded, "fresh-publication-token", gh=MagicMock()
     )
 
     assert result.pr_url == "pr-url"
+    assert upserts[0]["benchmark_label"] == "run-benchmark"
     env, kwargs = published[0]
     assert env["GIT_PASSWORD"] == "fresh-publication-token"
     assert kwargs["prepared_head"] == "preparedsha"
