@@ -1,0 +1,392 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from scripts.agent_fix.models import FailedTest
+from scripts.agent_fix.prior_fixes import (
+    failing_test_history,
+    find_prior_fixes,
+    pending_fixes,
+    render_prior_fixes,
+    sibling_branch_changes,
+    summarize_prior_fixes,
+    unported_changes,
+    unported_index,
+)
+from tests.git_helpers import commit, git
+
+TEST_FILE = "tests/unit/replication.tcl"
+TEST = FailedTest("Replica reconnects after the primary restarts with a new run id", TEST_FILE)
+
+
+def _clone_like_the_engine(tmp_path: Path) -> tuple[Path, Path, str]:
+    """An upstream with ``unstable`` and a ``9.0`` release branch, and a clone of it.
+
+    The clone has every branch as ``origin/*`` and ``origin/HEAD`` set, like
+    the engine's blobless clone.
+    """
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    git(upstream, "init", "-q", "-b", "unstable")
+    git(upstream, "config", "user.name", "T")
+    git(upstream, "config", "user.email", "t@example.com")
+    commit(upstream, TEST_FILE, "test v1\n", "Add the replication test")
+    git(upstream, "branch", "9.0")
+    fork_point = git(upstream, "rev-parse", "HEAD")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(upstream), str(clone))
+    return upstream, clone, fork_point
+
+
+def _refresh(clone: Path, ref: str) -> None:
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", ref)
+
+
+def test_a_fix_on_the_default_branch_is_a_port_candidate_for_a_release_branch(tmp_path):
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, "src/server.c", "unrelated\n", "Speed up something")
+    fix = commit(
+        upstream, TEST_FILE, "test v2\n",
+        f"Deflake replication test (#4684)\n\nThe test `{TEST.name}` raced the restart.\n\nFixes #4672",
+    )
+    _refresh(clone, "origin/9.0")
+
+    fixes = find_prior_fixes(str(clone), (TEST,), issue_number=4672)
+
+    assert [f.sha for f in fixes] == [fix]
+    assert not fixes[0].on_target
+    assert fixes[0].reasons == (
+        f"changes `{TEST_FILE}`",
+        f"names the test `{TEST.name}`",
+        "references #4672",
+    )
+    assert "port candidate" in summarize_prior_fixes(fixes)
+    rendered = render_prior_fixes(str(clone), fixes)
+    assert "+test v2" in rendered and "NOT on the working commit" in rendered
+
+
+def test_a_long_test_name_wrapped_in_the_commit_message_still_matches(tmp_path):
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    fix = commit(
+        upstream, "src/replication.c", "fixed\n",
+        "Fix a race in replication\n\nThe test `Replica reconnects after the primary restarts\n"
+        "with a new run id` failed because ...",
+    )
+    _refresh(clone, "origin/9.0")
+
+    fixes = find_prior_fixes(str(clone), (TEST,))
+
+    # The wrapped name matches by its leading words only: weaker evidence,
+    # which the fix-word subject lifts over the bar.
+    assert [f.sha for f in fixes] == [fix]
+    assert fixes[0].reasons == ("names the start of the test, `Replica reconnects after the primary`",)
+
+
+def test_a_fix_already_cherry_picked_to_the_release_branch_is_not_a_port(tmp_path):
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    fix = commit(upstream, TEST_FILE, "test v2\n", "Deflake replication test (#4684)")
+    git(upstream, "checkout", "-q", "9.0")
+    git(upstream, "cherry-pick", "-x", fix)
+    ported = git(upstream, "rev-parse", "HEAD")
+    git(upstream, "checkout", "-q", "unstable")
+    _refresh(clone, "origin/9.0")
+
+    fixes = find_prior_fixes(str(clone), (TEST,))
+
+    assert [(f.sha, f.on_target, f.ported_as) for f in fixes] == [(fix, True, ported)]
+    assert "already ported" in summarize_prior_fixes(fixes)
+
+
+def test_a_fix_that_landed_after_the_failing_run_is_reported_as_already_there(tmp_path):
+    upstream, clone, fork_point = _clone_like_the_engine(tmp_path)
+    fix = commit(upstream, TEST_FILE, "test v2\n", "Fix flaky replication test")
+    _refresh(clone, "origin/unstable")
+
+    fixes = find_prior_fixes(str(clone), (TEST,), tested_sha=fork_point)
+
+    assert [(f.sha, f.on_target) for f in fixes] == [(fix, True)]
+    assert "already on the working commit" in summarize_prior_fixes(fixes)
+
+
+def test_an_unrelated_change_to_the_file_alone_is_not_a_candidate(tmp_path):
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, TEST_FILE, "test v2\n", "Add another replication test")
+    _refresh(clone, "origin/9.0")
+
+    assert find_prior_fixes(str(clone), (TEST,)) == ()
+
+
+def test_the_search_degrades_to_nothing_outside_a_repository(tmp_path):
+    # None: no search ran, which the report must not call "nothing found".
+    assert find_prior_fixes(str(tmp_path), (TEST,)) is None
+    assert find_prior_fixes(str(tmp_path), ()) is None
+
+
+def test_a_generic_subject_on_the_release_branch_is_not_taken_for_the_port(tmp_path):
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    git(upstream, "checkout", "-q", "9.0")
+    commit(upstream, "src/other.c", "x\n", "Fix flaky test")
+    git(upstream, "checkout", "-q", "unstable")
+    fix = commit(upstream, TEST_FILE, "test v2\n", "Fix flaky test")
+    _refresh(clone, "origin/9.0")
+
+    fixes = find_prior_fixes(str(clone), (TEST,))
+
+    assert [(f.sha, f.on_target) for f in fixes] == [(fix, False)]
+
+
+def test_a_backport_with_the_same_pr_subject_is_taken_for_the_port(tmp_path):
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    fix = commit(upstream, TEST_FILE, "test v2\n", "Deflake replication test (#4684)")
+    git(upstream, "checkout", "-q", "9.0")
+    ported = commit(upstream, TEST_FILE, "test v2 adapted\n", "Deflake replication test (#4684)")
+    git(upstream, "checkout", "-q", "unstable")
+    _refresh(clone, "origin/9.0")
+
+    fixes = find_prior_fixes(str(clone), (TEST,))
+
+    assert [(f.sha, f.ported_as) for f in fixes] == [(fix, ported)]
+
+
+def test_a_build_break_is_searched_by_the_files_its_log_names(tmp_path):
+    from scripts.agent_fix.prior_fixes import paths_in_log
+
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, "src/replication.c", "v1\n", "Add replication")
+    git(upstream, "branch", "-f", "9.0")
+    fix = commit(upstream, "src/replication.c", "v2\n", "Fix the replication build on 32-bit (#99)")
+    _refresh(clone, "origin/9.0")
+    # As Valkey's CI prints them: gcc runs inside src/, ASan prints absolute
+    # paths, valgrind prints frames; a file the checkout lacks is ignored.
+    log = (
+        "make[1]: Entering directory '/home/runner/work/valkey/valkey/src'\n"
+        "replication.c:120:5: error: implicit declaration of function 'rdbSaveRio'\n"
+        "    #0 0x55d in rdbSaveRio /home/runner/work/valkey/valkey/src/replication.c:131:9\n"
+        "==123==    by 0x4F2: syncCommand (replication.c:140)\n"
+        "missing.c:1:1: note: a file the checkout does not have\n"
+    )
+
+    paths = paths_in_log(str(clone), log)
+    fixes = find_prior_fixes(str(clone), (), paths=paths)
+
+    assert paths == ("src/replication.c",)
+    assert [f.sha for f in fixes] == [fix]
+
+
+def test_a_sibling_test_sharing_only_the_name_prefix_is_weak_evidence(tmp_path):
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(
+        upstream, "src/other.c", "x\n",
+        "Speed up replication\n\nThe test `Replica reconnects after the primary restarts twice` was slow.",
+    )
+    _refresh(clone, "origin/9.0")
+
+    # The prefix alone (2) under a subject with no fix words stays below the bar.
+    assert find_prior_fixes(str(clone), (TEST,)) == ()
+
+
+def test_a_log_path_leaving_the_checkout_is_ignored(tmp_path):
+    from scripts.agent_fix.prior_fixes import paths_in_log
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "server.c").write_text("x")
+    (tmp_path / "src" / "link.c").symlink_to("/etc/hosts")
+
+    log = "src/../../../etc/hosts.c:1:1: error\nserver.c:3:1: error\nlink.c:1:1: error\n"
+
+    assert paths_in_log(str(tmp_path), log) == ("src/server.c",)
+
+
+def test_the_history_shows_the_commit_that_added_the_failing_test(tmp_path):
+    """The edit agent cannot run git: the commit that added a new test is its best lead."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "unstable")
+    git(repo, "config", "user.name", "T")
+    git(repo, "config", "user.email", "t@example.com")
+    commit(repo, TEST_FILE, "test {Older test} {}\n", "Add an older test")
+    commit(repo, TEST_FILE, f"test {{Older test}} {{}}\ntest {{{TEST.name}}} {{}}\n", "Add the reconnect test (#5150)")
+    commit(repo, "src/other.c", "x\n", "Touch something else")
+    added = git(repo, "rev-parse", "HEAD~1")
+
+    history = failing_test_history(str(repo), (TEST,))
+
+    assert "Add an older test" in history and "Add the reconnect test (#5150)" in history
+    assert "Touch something else" not in history
+    assert f"newest commit that added or changed the test: `{added[:12]}`" in history
+    assert f"+test {{{TEST.name}}}" in history
+
+
+def test_a_test_name_built_from_a_variable_matches_up_to_it(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "unstable")
+    git(repo, "config", "user.name", "T")
+    git(repo, "config", "user.email", "t@example.com")
+    commit(repo, TEST_FILE, 'test "Corrupt buffered $mode stream retries" {}\n', "Add the stream test")
+
+    history = failing_test_history(str(repo), (FailedTest("Corrupt buffered $mode stream retries", TEST_FILE),))
+
+    assert "newest commit that added or changed the test" in history
+
+
+def test_no_history_outside_a_repository_or_the_checkout(tmp_path):
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    (tmp_path / TEST_FILE).write_text("x\n", encoding="utf-8")
+    assert failing_test_history(str(tmp_path), (TEST,)) == ""
+    assert failing_test_history(str(tmp_path), (FailedTest("x" * 20, "../escape.tcl"),)) == ""
+
+
+def test_a_typo_commit_is_not_ranked_as_a_fix(tmp_path):
+    """"Fix typos" touches many files and fixes no failure (refusals on #5075 listed two as port candidates)."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, TEST_FILE, "test v2\n", "Fix various typos around otherwise with a comma")
+    fix = commit(upstream, TEST_FILE, "test v3\n", "Fix the replication test's wait")
+    _refresh(clone, "origin/9.0")
+
+    assert [f.sha for f in find_prior_fixes(str(clone), (TEST,))] == [fix]
+
+
+def test_the_upstream_commits_a_branch_lacks_are_listed_by_file(tmp_path):
+    """Its subject says what a fix is, even when its message names no test the search can match (#5274)."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, "src/valkey-cli.c", "v1\n", "Add a hint test mode")
+    git(upstream, "branch", "-f", "9.0")
+    leak_fix = commit(upstream, "src/valkey-cli.c", "v2\n", "Free valkey-cli test hint before exiting (#5274)")
+    commit(upstream, "src/server.c", "unrelated\n", "Speed up something")
+    _refresh(clone, "origin/9.0")
+
+    listed = unported_changes(str(clone), ("src/valkey-cli.c", "src/missing.c"))
+
+    assert listed.startswith("# `src/valkey-cli.c`\n\n")
+    assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [leak_fix]
+    assert "Free valkey-cli test hint before exiting (#5274)" in listed
+    # With its diff to that file: the agent cannot run git, and a subject does not show what a commit changes.
+    assert f"## `{leak_fix[:12]}` Free valkey-cli test hint" in listed and "-v1\n+v2" in listed
+    assert "unrelated" not in listed
+    # Nothing to port on the default branch itself, or with no file named.
+    assert unported_changes(str(clone), ()) == ""
+    _refresh(clone, "origin/unstable")
+    assert unported_changes(str(clone), ("src/valkey-cli.c",)) == ""
+
+
+def test_the_other_release_branches_fixes_to_a_file_are_listed_with_their_diffs(tmp_path):
+    """One cluster test was fixed three ways on three release branches: each fix was written without the others."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    git(upstream, "branch", "9.1")
+    for release in ("9.0", "9.1"):
+        git(upstream, "branch", f"agent/backport/sweep/{release}", release)
+    git(upstream, "checkout", "-q", "agent/backport/sweep/9.1")
+    fix = commit(upstream, TEST_FILE, "test v1\nwait for the replica\n", "Fix the replication test: wait for the replica")
+    commit(upstream, "src/server.c", "a backport\n", "Backport something else (#1)")
+    loosened = commit(upstream, TEST_FILE, "test v1\nwait for the replica\nlooser\n", "Loosen the check")
+    git(upstream, "revert", "--no-edit", loosened)
+    git(upstream, "checkout", "-q", "agent/backport/sweep/9.0")
+    commit(upstream, TEST_FILE, "test v1\nits own\n", "This branch's own commit")
+    _refresh(clone, "origin/agent/backport/sweep/9.0")
+
+    listed = sibling_branch_changes(
+        str(clone), (TEST_FILE,), own_branch="agent/backport/sweep/9.0", base_branch="9.0",
+    )
+
+    assert "# Release branch `9.1` (`agent/backport/sweep/9.1`)" in listed
+    assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
+    assert f"## `{fix[:12]}` on `9.1`: Fix the replication test" in listed and "+wait for the replica" in listed
+    # Not a commit that was reverted, nor its revert; not another file's; not this branch's own.
+    assert "Loosen the check" not in listed and "Backport something else" not in listed
+    assert "This branch's own commit" not in listed
+
+    # Only a branch named after the release branch it is into has siblings.
+    assert sibling_branch_changes(str(clone), (TEST_FILE,), own_branch="agent/fix/ci-issue-9", base_branch="9.0") == ""
+    assert sibling_branch_changes(str(clone), (), own_branch="agent/backport/sweep/9.0", base_branch="9.0") == ""
+
+
+def test_every_upstream_commit_a_branch_lacks_is_indexed_with_its_files(tmp_path):
+    """The fix for a job that hung in a replication test was in server.c, which its log never named."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    commit(upstream, "src/valkey-cli.c", "v1\n", "Add a hint test mode")
+    git(upstream, "branch", "-f", "9.0")
+    older = commit(upstream, "src/server.c", "v2\n", "Use _exit() when a child is killed by SIGUSR1 (#4251)")
+    newer = commit(upstream, "tests/unit/a.tcl", "v3\n", "Deflake a test")
+    _refresh(clone, "origin/9.0")
+
+    index = unported_index(str(clone))
+
+    assert index.splitlines() == [
+        f"- `{newer}` {index.splitlines()[0].split()[2]} Deflake a test | tests/unit/a.tcl",
+        f"- `{older}` {index.splitlines()[1].split()[2]} Use _exit() when a child is killed by SIGUSR1 (#4251) | src/server.c",
+    ]
+    _refresh(clone, "origin/unstable")
+    assert unported_index(str(clone)) == ""
+
+
+
+def test_another_release_branchs_ci_sweep_fixes_are_listed_without_its_sweeps_backports(tmp_path):
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    git(upstream, "branch", "9.1")
+    git(upstream, "branch", "agent/backport/sweep/9.0", "9.0")
+    git(upstream, "checkout", "-q", "-b", "agent/backport/sweep/9.1", "9.1")
+    commit(upstream, TEST_FILE, "test v1\na backport\n", "Backport something (#1)")
+    git(upstream, "checkout", "-q", "-b", "agent/backport/ci-sweep/9.1")
+    fix = commit(
+        upstream, TEST_FILE, "test v1\na backport\nwait for the replica\n",
+        "Wait for the replica\n\nCI-Fix-Job: test-ubuntu",
+    )
+    git(upstream, "checkout", "-q", "-b", "agent/backport/ci-sweep/9.0", "9.0")
+    _refresh(clone, "origin/agent/backport/sweep/9.0")
+
+    listed = sibling_branch_changes(
+        str(clone), (TEST_FILE,), own_branch="agent/backport/ci-sweep/9.0", base_branch="9.0",
+        compared_with="agent/backport/sweep",
+    )
+
+    assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
+    assert "Backport something" not in listed
+    # One whose pull request was closed: its fix was turned down.
+    assert sibling_branch_changes(
+        str(clone), (TEST_FILE,), own_branch="agent/backport/ci-sweep/9.0", base_branch="9.0",
+        compared_with="agent/backport/sweep", skip=("agent/backport/ci-sweep/9.1",),
+    ) == ""
+
+
+def test_the_fixes_waiting_in_the_ci_sweep_pr_are_listed_with_their_diffs(tmp_path):
+    """The sweep's head lacks them until the CI-sweep PR is merged: a test failing in another job is not fixed twice."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    git(upstream, "checkout", "-q", "-b", "agent/backport/sweep/9.0", "9.0")
+    commit(upstream, "src/server.c", "a backport\n", "Backport something (#1)")
+    # The CI-sweep branch is the sweep's head with the fixes on top.
+    git(upstream, "checkout", "-q", "-b", "agent/backport/ci-sweep/9.0")
+    fix = commit(upstream, TEST_FILE, "test v1\nwait for the replica\n", "Wait for the replica\n\nCI-Fix-Job: test-a")
+    _refresh(clone, "origin/agent/backport/sweep/9.0")
+
+    listed = pending_fixes(str(clone), "agent/backport/ci-sweep/9.0")
+
+    assert listed.startswith("# `agent/backport/ci-sweep/9.0`\n\n")
+    assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
+    assert "+wait for the replica" in listed and "Backport something" not in listed
+    assert pending_fixes(str(clone), "agent/backport/ci-sweep/9.1") == ""
+
+
+def test_a_ci_sweep_branch_behind_its_sweep_shows_only_its_fixes(tmp_path):
+    """Before the next sweep rebuilds it, it still has the old sweep's commits, which the head now lacks."""
+    upstream, clone, _ = _clone_like_the_engine(tmp_path)
+    git(upstream, "checkout", "-q", "-b", "agent/backport/sweep/9.0", "9.0")
+    commit(upstream, "src/server.c", "an old backport\n", "Backport something (#1)\n\nBackport-Source-PR: 1")
+    git(upstream, "checkout", "-q", "-b", "agent/backport/ci-sweep/9.0")
+    fix = commit(upstream, TEST_FILE, "test v1\nwait\n", "Wait for the replica\n\nCI-Fix-Job: test-ubuntu")
+    # The sweep is rebuilt without that commit's old copy.
+    git(upstream, "checkout", "-q", "-B", "agent/backport/sweep/9.0", "9.0")
+    commit(upstream, "src/server.c", "a rebased backport\n", "Backport something (#1)\n\nBackport-Source-PR: 1")
+    _refresh(clone, "origin/agent/backport/sweep/9.0")
+
+    listed = pending_fixes(str(clone), "agent/backport/ci-sweep/9.0")
+
+    assert [line.split("`")[1] for line in listed.splitlines() if line.startswith("- ")] == [fix[:12]]
+    assert "Backport something" not in listed
+    # One whose pull request was closed: its fix was turned down.
+    assert sibling_branch_changes(
+        str(clone), (TEST_FILE,), own_branch="agent/backport/ci-sweep/9.0", base_branch="9.0",
+        compared_with="agent/backport/sweep", skip=("agent/backport/ci-sweep/9.1",),
+    ) == ""

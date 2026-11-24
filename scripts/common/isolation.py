@@ -2,7 +2,7 @@
 
 A process running as the workflow user can read the credentialed parent's
 ``/proc/<pid>/environ`` (the job's credentials are there), rewrite files the
-publish step later trusts, or leave a process behind. When ``CI_FIX_AGENT_USER``
+publish step later trusts, or leave a process behind. When ``AGENT_FIX_USER``
 names an unprivileged account (the workflows create one), a command runs as
 that account over a checkout handed to it for the command, with a fresh home
 and temp directory; afterwards every process it owns is killed, every file it
@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-USER_ENV = "CI_FIX_AGENT_USER"
+USER_ENV = "AGENT_FIX_USER"
 
 # Where an unprivileged account can leave files: the shared temp directories
 # (on macOS, also its own under /var/folders) and its own home.
@@ -79,7 +79,7 @@ def handed_to(user: str, root: Path, readable: tuple[Path, ...] = ()) -> Iterato
         _as_root("chmod", "-R", "--", "a+rX", str(directory))
     runner = f"{os.getuid()}:{os.getgid()}"
     account = pwd.getpwnam(user)
-    home = tempfile.mkdtemp(prefix="ci-fix-home-", dir=root.parent)
+    home = tempfile.mkdtemp(prefix="agent-fix-home-", dir=root.parent)
     git_dir = root / ".git"
     git_identity = _identity(git_dir)
     # ``-P`` does not help against a hard link: the chown would reach the
@@ -197,6 +197,7 @@ def as_user(
     *,
     home: str,
     cwd: str | os.PathLike[str] | None = None,
+    network: bool = True,
 ) -> IsolatedInvocation:
     """Describe ``argv`` running as ``user`` with a scrubbed environment.
 
@@ -204,7 +205,10 @@ def as_user(
     privileged launcher command line, where credentials would be visible to
     every process on the runner. When ``cwd`` is set, the command enters it
     after switching users: the workflow user may no longer be able to enter a
-    checkout once it belongs to the isolated account.
+    checkout once it belongs to the isolated account. Without ``network``
+    the command gets a network namespace of its own, with only a loopback
+    interface: a test written from an issue anyone can file reaches the
+    servers it starts and nothing else. Linux only.
     """
     if not argv:
         raise ValueError("an isolated invocation needs a command")
@@ -222,7 +226,7 @@ def as_user(
             _program("sh"),
             "-c",
             'cd "$1" && shift && exec "$@"',
-            "ci-fix-cwd",
+            "agent-fix-cwd",
             os.path.abspath(os.fspath(cwd)),
             *command,
         ]
@@ -232,6 +236,8 @@ def as_user(
     # sudo-rs (Ubuntu 26.04) ignores a bare -E and passes nothing; both sudos
     # keep the variables named here. Only the names reach the command line.
     preserve = f"--preserve-env={','.join(sorted(scrubbed))}"
+    if not network and sys.platform != "linux":
+        raise RuntimeError("a command can only be kept off the network on Linux")
     if sys.platform == "darwin":
         return IsolatedInvocation(
             (_program("sudo"), "-n", preserve, "-u", user, "--", *command),
@@ -240,9 +246,14 @@ def as_user(
     # runuser, not ``sudo -u``: it needs only root, which a runner's sudo
     # grants. setpriv prevents a setuid helper from restoring privileges.
     root = () if os.geteuid() == 0 else (_program("sudo"), "-n", preserve)
+    # A new network namespace's loopback interface is down until it is set up.
+    offline = () if network else (
+        _program("unshare"), "--net", "--", _program("sh"), "-c", 'ip link set lo up && exec "$@"', "agent-fix-offline",
+    )
     return IsolatedInvocation(
         (
             *root,
+            *offline,
             _program("runuser"),
             "--preserve-environment",
             "-u",

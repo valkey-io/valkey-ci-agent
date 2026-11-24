@@ -6,7 +6,7 @@
 #
 # - bash, which the steps after this one run in;
 # - git: without it in the container, the job checked Valkey out as an
-#   archive (scripts/ci_fix/job.sh makes that a repository);
+#   archive (scripts/agent_fix/job.sh makes that a repository);
 # - Python 3.11 or later, in a virtual environment put first on PATH;
 # - Node, for Claude Code;
 # - what the agent's own account needs (scripts/common/isolation.py):
@@ -54,6 +54,6 @@ fi
   echo "::error::The container does not provide Python 3.11 or later"
   exit 1
 }
-venv="${RUNNER_TEMP}/ci-fix-python"
+venv="${RUNNER_TEMP}/agent-fix-python"
 "${python}" -m venv "${venv}"
 echo "${venv}/bin" >> "${GITHUB_PATH}"

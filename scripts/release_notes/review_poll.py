@@ -19,8 +19,8 @@ from typing import Any
 
 from github import Auth, Github
 
+from scripts.agent_fix.gate import is_authorized
 from scripts.backport.sweep_graphql import GitHubGraphQLClient
-from scripts.ci_fix.gate import is_authorized
 from scripts.common.github_client import retry_github_call
 from scripts.common.logging_utils import configure_logging
 from scripts.common.polling import env_int, env_seconds, run_poll_loop

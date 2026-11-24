@@ -1,6 +1,6 @@
 """Untrusted commands run as a separate account that cannot reach the job's secrets.
 
-The tests that need a real account run where CI_FIX_TEST_AGENT_USER names one
+The tests that need a real account run where AGENT_FIX_TEST_USER names one
 this process can switch to, as root or through sudo (CI creates it); elsewhere
 they skip.
 """
@@ -17,16 +17,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.agent_fix import engine
 from scripts.ai import claude_code
-from scripts.ci_fix import engine
 from scripts.common import isolation
 
-_USER = os.environ.get("CI_FIX_TEST_AGENT_USER", "")
+_USER = os.environ.get("AGENT_FIX_TEST_USER", "")
 needs_user = pytest.mark.skipif(
     not _USER or (os.geteuid() != 0 and (
         shutil.which("sudo") is None
         or subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0)),
-    reason="CI_FIX_TEST_AGENT_USER names no account this test can switch to",
+    reason="AGENT_FIX_TEST_USER names no account this test can switch to",
 )
 
 
@@ -47,7 +47,7 @@ def test_the_command_runs_with_its_own_home_and_git_allowed(monkeypatch):
         "v",
         {"PATH": "/usr/bin", "HOME": "/home/runner", "AWS_SESSION_TOKEN": "secret"},
         ["bash", "-c", "make"],
-        home="/w/ci-fix-home-1",
+        home="/w/agent-fix-home-1",
     )
     assert invocation.argv[:9] == (
         "sudo",
@@ -63,13 +63,31 @@ def test_the_command_runs_with_its_own_home_and_git_allowed(monkeypatch):
         "--",
         "setpriv",
     )
-    assert invocation.argv[-5:] == ("env", "TMPDIR=/w/ci-fix-home-1", "bash", "-c", "make")
-    assert invocation.env["HOME"] == "/w/ci-fix-home-1"
-    assert invocation.env["TMPDIR"] == "/w/ci-fix-home-1"
+    assert invocation.argv[-5:] == ("env", "TMPDIR=/w/agent-fix-home-1", "bash", "-c", "make")
+    assert invocation.env["HOME"] == "/w/agent-fix-home-1"
+    assert invocation.env["TMPDIR"] == "/w/agent-fix-home-1"
     assert invocation.env["GIT_CONFIG_VALUE_0"] == "*"
     assert invocation.env["AWS_SESSION_TOKEN"] == "secret"
     assert "HOME=/home/runner" not in invocation.argv
     assert "secret" not in invocation.argv
+
+
+def test_a_command_kept_off_the_network_gets_a_namespace_with_only_loopback(monkeypatch):
+    monkeypatch.setattr(isolation.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(isolation.sys, "platform", "linux")
+    monkeypatch.setattr(isolation.shutil, "which", lambda name: f"/usr/sbin/{name}")
+
+    offline = isolation.as_user("v", {}, ["make"], home="/h", network=False)
+
+    # The namespace is made as root, before the switch to the account that cannot make one.
+    assert offline.argv[:8] == (
+        "/usr/sbin/unshare", "--net", "--", "/usr/sbin/sh", "-c", 'ip link set lo up && exec "$@"', "agent-fix-offline",
+        "/usr/sbin/runuser",
+    )
+    assert "/usr/sbin/unshare" not in isolation.as_user("v", {}, ["make"], home="/h").argv
+    monkeypatch.setattr(isolation.sys, "platform", "darwin")
+    with pytest.raises(RuntimeError, match="can only be kept off the network on Linux"):
+        isolation.as_user("v", {}, ["make"], home="/h", network=False)
 
 
 def test_root_switches_account_without_sudo_and_macos_through_sudo(monkeypatch):
@@ -127,7 +145,7 @@ def test_the_command_enters_its_checkout_after_switching_accounts(monkeypatch):
         "/chosen/sh",
         "-c",
         'cd "$1" && shift && exec "$@"',
-        "ci-fix-cwd",
+        "agent-fix-cwd",
         "/tmp/checkout with spaces",
         "/chosen/make",
         "test",
@@ -141,20 +159,20 @@ def test_the_scrubbed_environment_reaches_the_isolated_account(checkout):
         invocation = isolation.as_user(
             _USER,
             {
-                "CI_FIX_ENV_PROBE": "preserved",
+                "AGENT_FIX_ENV_PROBE": "preserved",
                 "GITHUB_WORKSPACE": str(checkout),
                 "RUNNER_TEMP": home,
             },
             [
                 "sh",
                 "-c",
-                'test "$CI_FIX_ENV_PROBE" = preserved'
+                'test "$AGENT_FIX_ENV_PROBE" = preserved'
                 ' && test "$HOME" = "$1"'
                 ' && test "$TMPDIR" = "$1"'
                 ' && test "$USER" = "$2"'
                 ' && test "$GITHUB_WORKSPACE" = "$3"'
                 ' && test "$RUNNER_TEMP" = "$1"',
-                "ci-fix-env",
+                "agent-fix-env",
                 home,
                 _USER,
                 str(checkout),
@@ -179,7 +197,7 @@ def test_file_cleanup_drops_roots_already_covered_by_an_ancestor(monkeypatch):
     monkeypatch.setattr(
         isolation.pwd,
         "getpwnam",
-        lambda _user: SimpleNamespace(pw_dir="/tmp/valkey-ci-fix.123/home"),
+        lambda _user: SimpleNamespace(pw_dir="/tmp/valkey-agent-fix.123/home"),
     )
     monkeypatch.setattr(isolation.Path, "is_dir", lambda _path: True)
     monkeypatch.setattr(isolation, "_as_root", lambda *argv: calls.append(argv))
@@ -239,7 +257,7 @@ def test_hard_link_cleanup_does_not_retry_other_find_errors(monkeypatch, tmp_pat
 @pytest.fixture
 def checkout():
     """A checkout under a traversable directory, as the engine makes one."""
-    work = Path(tempfile.mkdtemp(prefix="ci-fix-test-", dir="/tmp"))
+    work = Path(tempfile.mkdtemp(prefix="agent-fix-test-", dir="/tmp"))
     work.chmod(0o711)
     repo = work / "repo"
     repo.mkdir()
@@ -288,16 +306,16 @@ def test_a_test_command_cannot_read_the_parent_environment_or_change_git(checkou
     run = engine.run_test_command(
         str(checkout),
         f"n=$(tr '\\0' '\\n' < {credentialed} 2>/dev/null | grep -c ghs_secret); echo \"seen=${{n:-0}}\"; "
-        "echo \"home=$HOME tmp=$TMPDIR git=$GIT_CONFIG_VALUE_0\"; echo evil > .git/HEAD; echo left > /tmp/ci-fix-isolation-marker; echo ok > made; id -un",
+        "echo \"home=$HOME tmp=$TMPDIR git=$GIT_CONFIG_VALUE_0\"; echo evil > .git/HEAD; echo left > /tmp/agent-fix-isolation-marker; echo ok > made; id -un",
     )
     assert "seen=0" in run.output and _USER in run.output
     # What the command is given does arrive: a sudo that drops the
     # environment (sudo-rs with -E) would pass the check above too.
     given = next(line for line in run.output.splitlines() if line.startswith("home="))
     home, tmp, git = (field.split("=", 1)[1] for field in given.split())
-    assert "/ci-fix-home-" in home and tmp == home and git == "*"
+    assert "/agent-fix-home-" in home and tmp == home and git == "*"
     assert (checkout / ".git" / "HEAD").read_text() == head
-    assert not Path("/tmp/ci-fix-isolation-marker").exists()
+    assert not Path("/tmp/agent-fix-isolation-marker").exists()
     assert (checkout / "made").stat().st_uid == os.getuid()  # handed back
 
 
@@ -314,7 +332,7 @@ def test_nothing_the_command_started_outlives_it(checkout, monkeypatch):
 def test_the_claude_cli_runs_as_the_account(checkout, monkeypatch, tmp_path, credentialed):
     """The real CLI path, with a fake ``claude`` that reports who it is and what it can read."""
     checkout.chmod(0o700)
-    bin_dir = Path(tempfile.mkdtemp(prefix="ci-fix-bin-", dir="/tmp"))
+    bin_dir = Path(tempfile.mkdtemp(prefix="agent-fix-bin-", dir="/tmp"))
     bin_dir.chmod(0o755)
     fake = bin_dir / "claude"
     fake.write_text(
@@ -340,7 +358,7 @@ def test_a_replaced_git_directory_is_never_handed_back(monkeypatch):
     monkeypatch.setattr(isolation.pwd, "getpwnam", lambda user: me)
     monkeypatch.setattr(isolation, "kill_all", lambda user: None)
     monkeypatch.setattr(isolation, "_remove_files_of", lambda user: None)
-    work = Path(tempfile.mkdtemp(prefix="ci-fix-test-", dir="/tmp"))
+    work = Path(tempfile.mkdtemp(prefix="agent-fix-test-", dir="/tmp"))
     work.chmod(0o711)
     repo = work / "repo"
     repo.mkdir()
@@ -368,7 +386,7 @@ def test_a_replaced_git_directory_and_every_nested_one_are_removed(monkeypatch):
     monkeypatch.setattr(isolation.pwd, "getpwnam", lambda user: me)
     monkeypatch.setattr(isolation, "kill_all", lambda user: None)
     monkeypatch.setattr(isolation, "_remove_files_of", lambda user: None)
-    work = Path(tempfile.mkdtemp(prefix="ci-fix-test-", dir="/tmp"))
+    work = Path(tempfile.mkdtemp(prefix="agent-fix-test-", dir="/tmp"))
     work.chmod(0o711)
     repo = work / "repo"
     repo.mkdir()
@@ -403,7 +421,7 @@ def test_a_hard_link_in_the_checkout_is_refused_going_in_and_removed_coming_back
     monkeypatch.setattr(isolation.pwd, "getpwnam", lambda user: me)
     monkeypatch.setattr(isolation, "kill_all", lambda user: None)
     monkeypatch.setattr(isolation, "_remove_files_of", lambda user: None)
-    work = Path(tempfile.mkdtemp(prefix="ci-fix-test-", dir="/tmp"))
+    work = Path(tempfile.mkdtemp(prefix="agent-fix-test-", dir="/tmp"))
     work.chmod(0o711)
     repo = work / "repo"
     repo.mkdir()
@@ -432,7 +450,7 @@ def test_every_root_command_ends_its_options_before_its_first_operand(monkeypatc
     monkeypatch.setattr(isolation.pwd, "getpwnam", lambda user: me)
     monkeypatch.setattr(isolation, "kill_all", lambda user: None)
     monkeypatch.setattr(isolation, "_remove_files_of", lambda user: None)
-    work = Path(tempfile.mkdtemp(prefix="ci-fix-test-", dir="/tmp"))
+    work = Path(tempfile.mkdtemp(prefix="agent-fix-test-", dir="/tmp"))
     work.chmod(0o711)
     (work / "repo").mkdir()
     (work / "log").mkdir()
@@ -479,7 +497,7 @@ def test_root_is_reached_by_sudos_full_path(monkeypatch):
 def test_a_readable_directory_the_account_cannot_reach_fails_loudly(monkeypatch):
     """macOS's default temp directory is the runner's own: the agent would read nothing."""
     monkeypatch.setattr(isolation, "_as_root", lambda *argv: None)
-    work = Path(tempfile.mkdtemp(prefix="ci-fix-test-", dir="/tmp"))
+    work = Path(tempfile.mkdtemp(prefix="agent-fix-test-", dir="/tmp"))
     work.chmod(0o711)
     (work / "repo").mkdir()
     private = work / "private"

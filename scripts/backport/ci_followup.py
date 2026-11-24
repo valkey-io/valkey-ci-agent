@@ -3,7 +3,7 @@
 It follows every open bot-owned PR into one registered release branch, the
 sweep PR first. For a PR whose current head's CI has finished, it selects one
 unhandled actionable failure, plans its fix, which runs like every other
-(:mod:`scripts.ci_fix.run`), and reports the result.
+(:mod:`scripts.agent_fix.run`), and reports the result.
 
 When the sweep PR's own CI has nothing left to fix, the release branch's
 failures in the newest scheduled run of every release branch (Valkey's
@@ -12,7 +12,7 @@ the branch will be.
 
 A sweep PR's fixes are not pushed to it. A fix for a test the default branch
 shares is made there too and opened as a pull request into it, which the
-sweep backports once it merges (:mod:`scripts.ci_fix.upstream`). Any other is
+sweep backports once it merges (:mod:`scripts.agent_fix.upstream`). Any other is
 run on its head and then added to its CI-sweep PR (:mod:`scripts.backport.ci_sweep`),
 so that it is reviewed apart from the backports. A job with a fix there is not
 fixed again.
@@ -34,20 +34,16 @@ from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Any
 
-from scripts.backport import ci_sweep
-from scripts.backport.registry import RepoEntry, load_registry
-from scripts.backport.sweep import _BRANCH_PREFIX
-from scripts.backport.sweep_prs import find_existing_pr
-from scripts.ci_fix import upstream
-from scripts.ci_fix.comment import render_ci_sweep_fix, render_result
-from scripts.ci_fix.github_runs import (
+from scripts.agent_fix import upstream
+from scripts.agent_fix.comment import render_ci_sweep_fix, render_result
+from scripts.agent_fix.github_runs import (
     FailedJob,
     most_actionable_failure,
     newest_runs_for_head,
     workflow_file,
     workflow_identity,
 )
-from scripts.ci_fix.models import (
+from scripts.agent_fix.models import (
     MAX_FAILED_ATTEMPTS,
     CandidateAction,
     Failure,
@@ -60,7 +56,11 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
-from scripts.ci_fix.policy import is_backport_branch, is_bot_author, is_writable_branch
+from scripts.agent_fix.policy import is_backport_branch, is_bot_author, is_own_repo, is_writable_branch
+from scripts.backport import ci_sweep
+from scripts.backport.registry import RepoEntry, load_registry
+from scripts.backport.sweep import _BRANCH_PREFIX
+from scripts.backport.sweep_prs import find_existing_pr
 from scripts.common.github_client import retry_github_call
 from scripts.common.valkey_ci import Source
 from scripts.common.workflow_jobs import job_is_ignored
@@ -148,7 +148,7 @@ def find_followup_target(
         return None, "no-open-bot-pr"
     reasons: list[str] = []
     for pr in prs:
-        target, reason = _followup_for_pr(
+        target, reason = followup_for_pr(
             gh,
             pr,
             repo_entry=repo_entry,
@@ -195,7 +195,7 @@ def _bot_prs_into(
     return found
 
 
-def _followup_for_pr(
+def followup_for_pr(
     gh: Any,
     pr: Any,
     *,
@@ -203,8 +203,12 @@ def _followup_for_pr(
     target_branch: str,
     bot_login: str,
     prior_plans: tuple[FixPlan, ...] = (),
+    left_alone: frozenset[str] = frozenset(),
 ) -> tuple[FollowupTarget | None, str]:
-    """One unhandled failure on ``pr``'s exact current head, or why there is none."""
+    """One unhandled failure on ``pr``'s exact current head, or why there is none.
+
+    A job named in ``left_alone`` is not the pull request's to fix.
+    """
     head_branch = str(getattr(getattr(pr, "head", None), "ref", "") or "")
     if not is_writable_branch(head_branch):
         return None, "head-branch-not-writable"
@@ -250,7 +254,7 @@ def _followup_for_pr(
         keep=lambda run, job: bool(job.id)
         and job.id not in handled.job_ids
         and _job_key(run, job.name) not in handled.job_keys | handled.backport_keys
-        and job.name not in handled.fixed_jobs
+        and job.name not in handled.fixed_jobs | left_alone
         and not job_is_ignored(job.name, repo_entry.ci_followup_ignored_jobs),
     )
     release_run = False
@@ -362,7 +366,7 @@ def plan_request(
     upstream_branch = ""
     if fix_branch:
         # A sweep's own fix that applies to the default branch is a pull
-        # request into it (scripts/ci_fix/upstream.py). While the bot has as
+        # request into it (scripts/agent_fix/upstream.py). While the bot has as
         # many of those open as it may, the sweep's failures wait.
         upstream_branch = str(retry_github_call(
             lambda: gh.get_repo(repo_entry.repo).default_branch, retries=2, description=f"get {repo_entry.repo}",
@@ -422,7 +426,7 @@ def plan_request(
     )
     return FixPlan(
         front_door=FrontDoor.FOLLOW_UP, task=task,
-        markers=tuple(_markers(failure, target.run, (selected_job,))),
+        markers=tuple(markers(failure, target.run, (selected_job,))),
     )
 
 
@@ -533,7 +537,7 @@ def _validate_bot_pr(
     target_branch: str,
     bot_login: str,
 ) -> str:
-    """Return ``""`` only for an open, bot-owned PR into the target branch from this repository."""
+    """Return ``""`` only for an open, bot-owned PR into the target branch from this repository or the bot's fork."""
     if str(getattr(pr, "state", "open") or "") != "open":
         return "pr-not-open"
     if str(getattr(pr.base, "ref", "") or "") != target_branch:
@@ -541,7 +545,7 @@ def _validate_bot_pr(
     head_repo = str(
         getattr(getattr(pr.head, "repo", None), "full_name", "") or ""
     )
-    if head_repo != repo_full_name:
+    if not is_own_repo(head_repo, repo_full_name):
         return "head-repository-mismatch"
     if not re.fullmatch(
         r"[0-9a-f]{40}",
@@ -625,7 +629,7 @@ def _handled_failures(
                 job_keys.add(key)
     for plan in prior_plans:
         if (
-            plan.front_door is not FrontDoor.FOLLOW_UP
+            plan.front_door not in (FrontDoor.FOLLOW_UP, FrontDoor.UPKEEP)
             or plan.task.failure.pr_number != int(pr.number)
             or plan.task.failure.head_sha != head_sha
         ):
@@ -668,7 +672,7 @@ def _job_key(run: Any, job_name: str) -> str:
     ).hexdigest()
 
 
-def _markers(
+def markers(
     failure: Failure,
     run: Any,
     jobs: tuple[FailedJob, ...],

@@ -10,15 +10,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from scripts.backport import ci_followup
-from scripts.backport.ci_followup import (
-    FollowupTarget,
-    find_followup_target,
-)
-from scripts.backport.registry import BranchEntry, RepoEntry
-from scripts.ci_fix import github_runs
-from scripts.ci_fix.github_runs import FailedJob
-from scripts.ci_fix.models import (
+from scripts.agent_fix import github_runs
+from scripts.agent_fix.github_runs import FailedJob
+from scripts.agent_fix.models import (
     CandidateAction,
     FixCandidate,
     FixPolicy,
@@ -27,6 +21,12 @@ from scripts.ci_fix.models import (
     ResultKind,
     TargetKind,
 )
+from scripts.backport import ci_followup
+from scripts.backport.ci_followup import (
+    FollowupTarget,
+    find_followup_target,
+)
+from scripts.backport.registry import BranchEntry, RepoEntry
 
 _HEAD = "a" * 40
 _BOT = "valkeyrie-ops[bot]"
@@ -804,7 +804,7 @@ def test_a_weekly_fix_is_reported_as_the_release_branchs_failure(monkeypatch) ->
 
 # --- a pushed fix or a draft PR also has CI nobody else watches --------------------
 
-def _fix_pr(branch="agent/ci-fix/issue-9-100-1", *, author=_BOT, base="9.0", head_sha="d" * 40):
+def _fix_pr(branch="agent/fix/ci-issue-9-100-1", *, author=_BOT, base="9.0", head_sha="d" * 40):
     pr = _pr(author=author, head_sha=head_sha)
     pr.number = 4300
     pr.head.ref = branch

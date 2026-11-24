@@ -137,7 +137,7 @@ def test_list_named_artifacts_includes_the_workflow_run():
     artifacts = [
         SimpleNamespace(
             id=7,
-            name="ci-fix-plan-x",
+            name="agent-fix-plan-x",
             size_in_bytes=123,
             expired=False,
             workflow_run=SimpleNamespace(id=99),
@@ -150,13 +150,13 @@ def test_list_named_artifacts_includes_the_workflow_run():
 
     listed = ArtifactClient(mock_gh, token="t").list_named_artifacts(
         "o/r",
-        "ci-fix-plan-x",
+        "agent-fix-plan-x",
     )
 
     assert listed == [
-        WorkflowArtifact(7, "ci-fix-plan-x", 123, False, run_id=99)
+        WorkflowArtifact(7, "agent-fix-plan-x", 123, False, run_id=99)
     ]
-    mock_repo.get_artifacts.assert_called_once_with(name="ci-fix-plan-x")
+    mock_repo.get_artifacts.assert_called_once_with(name="agent-fix-plan-x")
 
 
 def _zip_with_unsupported_member(*, include_good: bool):

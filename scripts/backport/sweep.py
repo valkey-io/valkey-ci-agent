@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
 from github import Auth, Github
 from github.GithubException import GithubException
 
+from scripts.agent_fix.agent import fix_still_needed
 from scripts.backport import ci_sweep
 from scripts.backport.candidate_apply import apply_candidate
 from scripts.backport.git_commands import head_sha
@@ -58,7 +59,6 @@ from scripts.backport.sweep_validation import (
     run_test_commands,
     validate_branch_with_optional_repair,
 )
-from scripts.ci_fix.agent import fix_still_needed
 from scripts.common.git_auth import GitAuth, github_https_url
 from scripts.common.job_summary import emit_job_summary
 from scripts.common.logging_utils import (
