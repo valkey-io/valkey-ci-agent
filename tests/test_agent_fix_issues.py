@@ -652,7 +652,7 @@ def test_a_fix_published_as_a_comment_is_the_patch_on_the_issue_and_closes_the_o
     assert "**The fix:** Wait for the replica." in comment.body
     assert "- With the fix, the test passed 40 loops" in comment.body
     assert "```diff\n--- a/tests/x.tcl" in comment.body
-    assert comment.body.rstrip().endswith("<!-- valkey-ci-agent:agent-fix-result run=100 outcome=suggested -->")
+    assert comment.body.rstrip().endswith("<!-- valkey-ci-agent:ci-fix-result run=100 outcome=suggested -->")
     assert (result["action"], result["pr"]) == ("suggested", 0)
     # A fix nothing could run says so before anything else.
     not_run = replace(candidate, not_run=True, verification="No command here can run the failing check.")
@@ -667,14 +667,10 @@ def test_a_fix_published_as_a_comment_is_the_patch_on_the_issue_and_closes_the_o
     again = issue.comments.pop()
     assert "the test has failed again since, in [run 101]" in again.body
     assert again.body.rstrip().endswith(
-        "<!-- valkey-ci-agent:agent-fix-result run=100 outcome=suggested -->\n"
-        "<!-- valkey-ci-agent:agent-fix-result run=101 outcome=suggested -->")
+        "<!-- valkey-ci-agent:ci-fix-result run=100 outcome=suggested -->\n"
+        "<!-- valkey-ci-agent:ci-fix-result run=101 outcome=suggested -->")
     again.user = SimpleNamespace(login=_BOT)
     issue.get_comments = lambda: [again]
-    assert issues_mod.fix_reported(issue, replace(failure, run_id=101), repo_full_name="o/r", bot_login=_BOT)
-    # A result recorded under the marker's name from before the rename still answers for its run.
-    earlier = SimpleNamespace(user=again.user, body=again.body.replace("agent-fix-result", "ci-fix-result"))
-    issue.get_comments = lambda: [earlier]
     assert issues_mod.fix_reported(issue, replace(failure, run_id=101), repo_full_name="o/r", bot_login=_BOT)
     # A refusal says nothing about the newer run, which is still worth an attempt.
     issues_mod._terminal_comment(issue, failure, repo_full_name="o/r", action="refused", summary="s", newer_run=101)
@@ -776,7 +772,7 @@ def test_an_occurrence_the_bot_already_reported_is_skipped_when_the_run_starts()
     issue = _issue()
     issue.comments.append(SimpleNamespace(
         user=SimpleNamespace(login=_BOT),
-        body="A tentative fix.\n\n<!-- valkey-ci-agent:agent-fix-result run=100 outcome=suggested -->",
+        body="A tentative fix.\n\n<!-- valkey-ci-agent:ci-fix-result run=100 outcome=suggested -->",
     ))
     gh, _repo, _run_ = _gh(issue)
 
