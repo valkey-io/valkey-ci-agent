@@ -1,0 +1,514 @@
+"""Find merged changes that may already fix a failing test.
+
+The first question for any CI failure is whether it is already fixed: on a
+release branch (a backport PR) the fix usually exists on the
+default branch and only needs porting; on the default branch itself it may
+have landed after the failing run. The engine's checkout holds the full
+(blobless) history of every branch, so this is a local ``git log`` search,
+not a GitHub API one.
+
+Valkey squash-merges, so a fix's commit message carries its PR title and
+description. Deflake commits name the test, its file, or the issue they fix
+(``Fixes #N``), and a backport keeps the original subject and usually adds
+``(cherry picked from commit <sha>)``. Those are the signals used here. The
+result is evidence for the fix agent, never a decision: the agent reads the
+candidates' diffs and chooses whether to port one.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from scripts.agent_fix.models import FailedTest
+from scripts.backport.ci_sweep import as_fix
+from scripts.common.git_clone import is_full_sha
+from scripts.common.proc import default_branch_ref, git_output, is_ancestor
+
+logger = logging.getLogger(__name__)
+
+MAX_CANDIDATES = 5
+# How much of each diff the agent is shown.
+_DIFF_CHARS = 40_000
+_LOG_LIMIT = "200"
+# A shorter test name matches too many unrelated commit messages.
+_MIN_NAME_CHARS = 10
+_PREFIX_CHARS = 40
+# Valkey's squash-merge subject ends with its PR number, which makes an
+# identical subject on another branch a backport of the same PR.
+_PR_SUBJECT_RE = re.compile(r"\(#\d+\)\s*$")
+# How much each kind of match says about a commit; a subject with a fix word
+# adds 1, and a candidate needs ``_MIN_SCORE``.
+_REFERENCES_ISSUE = 5
+_NAMES_TEST = 4
+_CHANGES_FILE = 2
+_NAMES_TEST_START = 2
+_MIN_SCORE = 3
+_FIX_WORDS_RE = re.compile(r"\b(?:flak\w*|deflake\w*|fix\w*|race|timing|timeout|unstable test)\b", re.IGNORECASE)
+# "Fix typos" fixes no failure: such a commit changes many files and would
+# rank as a fix for every one of them.
+_NOT_A_FIX_RE = re.compile(r"\b(?:typos?|spelling)\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class PriorFix:
+    sha: str
+    subject: str
+    date: str
+    reasons: tuple[str, ...]
+    score: int
+    # Already in the commit the candidate is prepared on: it landed after the
+    # failing run, or it was ported here (``ported_as``).
+    on_target: bool = False
+    ported_as: str = ""
+
+
+def find_prior_fixes(
+    repo_dir: str,
+    tests: tuple[FailedTest, ...],
+    *,
+    tested_sha: str = "",
+    issue_number: int = 0,
+    paths: tuple[str, ...] = (),
+) -> tuple[PriorFix, ...] | None:
+    """Best candidates, strongest first; None when no search could run.
+
+    ``paths`` are other repository files the failure names (a compile error's
+    source file), for a failure that is not a test's.
+    """
+    if not tests and not issue_number and not paths:
+        return None
+    try:
+        return _find(repo_dir, tests, tested_sha=tested_sha, issue_number=issue_number, paths=paths)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning("Searching for an existing fix failed: %s", exc)
+        return None
+
+
+def _find(
+    repo_dir: str,
+    tests: tuple[FailedTest, ...],
+    *,
+    tested_sha: str,
+    issue_number: int,
+    paths: tuple[str, ...],
+) -> tuple[PriorFix, ...] | None:
+    head = git_output(repo_dir, "rev-parse", "HEAD").strip()
+    ranges: list[tuple[str, bool]] = []
+    if is_full_sha(tested_sha) and tested_sha.lower() != head.lower() and is_ancestor(repo_dir, tested_sha, head) is True:
+        # Landed between the failing run and the commit being fixed.
+        ranges.append((f"{tested_sha}..{head}", True))
+    default_ref = default_branch_ref(repo_dir)
+    if default_ref:
+        # On the default branch but not here: what a port would bring.
+        ranges.append((f"{head}..{default_ref}", False))
+    if not ranges:
+        return None
+
+    found: dict[str, PriorFix] = {}
+    for revision_range, on_target in ranges:
+        for sha, reasons in _matches(repo_dir, revision_range, tests, issue_number, paths).items():
+            subject, date = _subject_and_date(repo_dir, sha)
+            fixes = _FIX_WORDS_RE.search(subject) and not _NOT_A_FIX_RE.search(subject)
+            score = sum(weight for weight, _text in reasons) + (1 if fixes else 0)
+            if score < _MIN_SCORE:
+                continue
+            ported_as = "" if on_target else _ported_as(repo_dir, sha, subject, head)
+            found.setdefault(sha, PriorFix(
+                sha=sha, subject=subject, date=date, reasons=tuple(sorted(text for _weight, text in reasons)),
+                score=score, on_target=on_target or bool(ported_as), ported_as=ported_as,
+            ))
+    # Strongest first; among equals, the newest.
+    ranked = sorted(found.values(), key=lambda fix: fix.date, reverse=True)
+    ranked.sort(key=lambda fix: fix.score, reverse=True)
+    return tuple(ranked[:MAX_CANDIDATES])
+
+
+def _matches(
+    repo_dir: str,
+    revision_range: str,
+    tests: tuple[FailedTest, ...],
+    issue_number: int,
+    paths: tuple[str, ...],
+) -> dict[str, set[tuple[int, str]]]:
+    """Each matching commit's ``(weight, reason)`` pairs."""
+    reasons: dict[str, set[tuple[int, str]]] = {}
+
+    def add(shas: list[str], weight: int, reason: str) -> None:
+        for sha in shas:
+            reasons.setdefault(sha, set()).add((weight, reason))
+
+    files = dict.fromkeys([test.file for test in tests if test.file] + list(paths))
+    for path in files:
+        add(_log(repo_dir, revision_range, "--", path), _CHANGES_FILE, f"changes `{path}`")
+    for test in tests:
+        name = test.name.strip()
+        if len(name) < _MIN_NAME_CHARS:
+            continue
+        whole = _log(repo_dir, revision_range, "--fixed-strings", f"--grep={name}")
+        add(whole, _NAMES_TEST, f"names the test `{name}`")
+        prefix = _wrapped_prefix(name)
+        if prefix:
+            started = _log(repo_dir, revision_range, "--fixed-strings", f"--grep={prefix}")
+            add([sha for sha in started if sha not in whole], _NAMES_TEST_START,
+                f"names the start of the test, `{prefix}`")
+    if issue_number > 0:
+        add(_log(repo_dir, revision_range, "--extended-regexp", f"--grep=#{issue_number}([^0-9]|$)"),
+            _REFERENCES_ISSUE, f"references #{issue_number}")
+    return reasons
+
+
+def _wrapped_prefix(name: str) -> str:
+    """The leading words of a long test name, or "".
+
+    A commit message wraps at ~72 columns, so a long test name quoted in it
+    is often split across lines, where a whole-name grep cannot match. Many
+    tests share a long prefix, so a prefix match is weaker evidence.
+    """
+    if len(name) <= _PREFIX_CHARS:
+        return ""
+    prefix = name[:_PREFIX_CHARS].rsplit(" ", 1)[0]
+    return prefix if len(prefix) >= _MIN_NAME_CHARS * 2 else ""
+
+
+# A source file a log names with a line number, as gcc (``replication.c:120:5:
+# error``, run inside ``src/``), sanitizers (an absolute path) and valgrind
+# (``(replication.c:120)``) print it. A path starts where its run of path
+# characters does: tried from every character of a long run (a 32 KB value
+# in a failed assertion), the search is quadratic in a log given whole.
+_LOG_PATH_RE = re.compile(r"(?<![\w./-])([\w./-]*[\w-]\.(?:c|h|cc|cpp|tcl)):\d+")
+_REPO_ROOTS = ("src/", "tests/", "deps/", "modules/", "utils/")
+_MAX_LOG_PATHS = 5
+
+
+def paths_in_log(repo_dir: str, job_log: str) -> tuple[str, ...]:
+    """Files of the checkout that the log names, most-mentioned first."""
+    counts: dict[str, int] = {}
+    for match in _LOG_PATH_RE.finditer(job_log or ""):
+        path = _repo_path(repo_dir, match.group(1))
+        if path:
+            counts[path] = counts.get(path, 0) + 1
+    ranked = sorted(counts, key=lambda path: -counts[path])
+    return tuple(ranked[:_MAX_LOG_PATHS])
+
+
+def _repo_path(repo_dir: str, printed: str) -> str:
+    """The checkout path a printed source path means, or "" when it has none."""
+    candidates = []
+    for root in _REPO_ROOTS:
+        at = printed.rfind(root)
+        if at == 0 or (at > 0 and printed[at - 1] == "/"):
+            candidates.append(printed[at:])
+    if "/" not in printed:
+        # The server builds inside src/, so gcc and valgrind print bare names.
+        candidates.append(f"src/{printed}")
+    return next((path for path in candidates if _inside(repo_dir, path)), "")
+
+
+def _inside(repo_dir: str, path: str) -> bool:
+    """Whether ``path`` is a regular file of the checkout, reached without ".."."""
+    parts = Path(path).parts
+    if Path(path).is_absolute() or ".." in parts:
+        return False
+    target = Path(repo_dir, path)
+    return target.is_file() and not target.is_symlink()
+
+
+def _log(repo_dir: str, revision_range: str, *args: str) -> list[str]:
+    pathspec: tuple[str, ...] = ()
+    if "--" in args:
+        split = args.index("--")
+        args, pathspec = args[:split], args[split:]
+    output = git_output(
+        repo_dir, "log", "--no-merges", "--format=%H", f"--max-count={_LOG_LIMIT}",
+        *args, revision_range, *pathspec,
+    )
+    return [line.strip() for line in output.splitlines() if is_full_sha(line.strip())]
+
+
+def _subject_and_date(repo_dir: str, sha: str) -> tuple[str, str]:
+    subject, _, date = git_output(repo_dir, "show", "-s", "--format=%s%x00%cs", sha).strip().partition("\x00")
+    return subject, date
+
+
+def _ported_as(repo_dir: str, sha: str, subject: str, head: str) -> str:
+    """The commit on ``head`` that already carries ``sha``'s change, or "".
+
+    A ``cherry-pick -x`` trailer names the commit. Otherwise an identical
+    subject counts only when it carries a PR number: a generic subject such
+    as "Fix flaky test" is not evidence of anything.
+    """
+    searches = [("--fixed-strings", f"--grep=cherry picked from commit {sha}")]
+    if _PR_SUBJECT_RE.search(subject):
+        searches.append(("--fixed-strings", f"--grep={subject}"))
+    for args in searches:
+        output = git_output(repo_dir, "log", "--format=%H%x00%s", "--max-count=20", *args, head)
+        for line in output.splitlines():
+            commit, _, found_subject = line.partition("\x00")
+            if args[1].startswith("--grep=cherry") or found_subject == subject:
+                return commit
+    return ""
+
+
+def render_prior_fixes(repo_dir: str, fixes: tuple[PriorFix, ...]) -> str:
+    """Markdown for the agent: every candidate, and the diffs of the best ones."""
+    if not fixes:
+        return ""
+    lines = [
+        "# Merged changes that may already fix this failure",
+        "",
+        "Found by searching history for the failing test's name, its file, the",
+        "files the log names, and the issue number. They are leads, not",
+        "conclusions: read each diff and decide whether it addresses the root",
+        "cause in the job log.",
+        "",
+    ]
+    for fix in fixes:
+        if fix.ported_as:
+            where = f"already on the working commit as `{fix.ported_as[:12]}`"
+        elif fix.on_target:
+            where = "already on the working commit (landed after the failing run)"
+        else:
+            where = "on the default branch, NOT on the working commit (a port candidate)"
+        lines.append(f"- `{fix.sha}` {fix.date} {fix.subject}")
+        lines.append(f"  - {where}; {'; '.join(fix.reasons)}")
+    for fix in fixes:
+        if fix.on_target:
+            continue
+        try:
+            diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--stat", "--patch", fix.sha)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            diff = f"(could not show the commit: {exc})"
+        if len(diff) > _DIFF_CHARS:
+            diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+        lines += ["", f"## `{fix.sha[:12]}` {fix.subject}", "", "```diff", diff, "```"]
+    return "\n".join(lines) + "\n"
+
+
+# How many of the default branch's commits per file the agent is shown.
+_UNPORTED_COMMITS = 30
+
+
+def unported_changes(repo_dir: str, paths: tuple[str, ...]) -> str:
+    """Markdown: the default branch's newest commits that change ``paths`` and this checkout lacks.
+
+    For a failure only an upstream change may fix. The search above ranks
+    commits by what their message says; the fix for a failure that names no
+    test (a sanitizer report) says nothing it can match, but its subject
+    tells the agent, which cannot run git, what it is. Each commit's diff to
+    the path follows the list: a subject alone left the agent unable to tell
+    whether a commit that sounded right was the fix.
+    """
+    default_ref = default_branch_ref(repo_dir)
+    if not default_ref or not paths:
+        return ""
+    sections: list[str] = []
+    for path in dict.fromkeys(paths):
+        lines, diffs = [], []
+        try:
+            for sha in _log(repo_dir, f"HEAD..{default_ref}", f"--max-count={_UNPORTED_COMMITS}", "--", path):
+                subject, date = _subject_and_date(repo_dir, sha)
+                lines.append(f"- `{sha}` {date} {subject}")
+                diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha, "--", path)
+                if len(diff) > _DIFF_CHARS:
+                    diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+                diffs += ["", f"## `{sha[:12]}` {subject}", "", "```diff", diff.rstrip("\n"), "```"]
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.info("Could not list upstream changes to %s: %s", path, exc)
+            continue
+        if lines:
+            sections.append("\n".join([f"# `{path}`", "", *lines, *diffs]))
+    return "\n\n".join(sections) + "\n" if sections else ""
+
+
+# How many of the default branch's newest commits are indexed.
+_INDEXED_COMMITS = 5_000
+
+
+def unported_index(repo_dir: str) -> str:
+    """Markdown: the default branch's commits this checkout lacks, newest first, each with the files it changes.
+
+    A failure names the test that failed, not the file its fix is in: the
+    upstream fix for a coverage job that hung in a replication test is in
+    server.c, which the log never mentions. The agent cannot run git, so it
+    searches this for a file or a word.
+    """
+    default_ref = default_branch_ref(repo_dir)
+    if not default_ref:
+        return ""
+    try:
+        output = git_output(
+            repo_dir, "log", "--no-merges", f"--max-count={_INDEXED_COMMITS}", "--name-only",
+            "--format=%x00%H %cs %s", f"HEAD..{default_ref}",
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("Could not index the upstream commits: %s", exc)
+        return ""
+    lines = []
+    for entry in output.split("\x00")[1:]:
+        header, *files = (line for line in entry.splitlines() if line.strip())
+        sha, _, rest = header.partition(" ")
+        lines.append(f"- `{sha}` {rest} | {', '.join(files)}")
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+# How many commits per sibling branch the agent is shown.
+_SIBLING_COMMITS = 10
+_REVERTS_RE = re.compile(r"This reverts commit ([0-9a-f]{40})")
+
+
+def sibling_branch_changes(
+    repo_dir: str, paths: tuple[str, ...], *, own_branch: str, base_branch: str, compared_with: str = "",
+    skip: tuple[str, ...] = (),
+) -> str:
+    """Markdown: what the bot's pull requests into the other release branches changed in ``paths``, with diffs.
+
+    One failure shows up on several release branches, and each fix was
+    written without sight of the others. Of twenty fixes pushed to six sweep
+    PRs, one cluster test got a wait on 9.1, a packet filter on 9.0 and a new
+    debug command on 8.1, and one macOS failure was rewritten five ways. The
+    agent cannot run git, so the sibling branches' commits are given to it.
+
+    ``own_branch`` is the branch the fix is pushed to
+    (``agent/backport/sweep/8.1`` into ``8.1``); its siblings are the other
+    branches under the same prefix, each compared with the release branch it
+    is named after, or with that release's branch under ``compared_with``: a
+    CI-sweep branch with its sweep branch, so that only its fixes are shown.
+    A commit that was reverted, and its revert, are left out, and so are the
+    branches in ``skip``.
+    """
+    suffix = f"/{base_branch}"
+    if not paths or not base_branch or not own_branch.endswith(suffix):
+        return ""
+    prefix = own_branch.removesuffix(suffix)
+    try:
+        refs = git_output(
+            repo_dir, "for-each-ref", "--format=%(refname:short)", f"refs/remotes/origin/{prefix}/",
+        ).split()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("Could not list the sibling branches of %s: %s", own_branch, exc)
+        return ""
+    sections: list[str] = []
+    for ref in sorted(refs):
+        release = ref.removeprefix(f"origin/{prefix}/")
+        if release == base_branch or ref.removeprefix("origin/") in skip:
+            continue
+        revision_range = f"origin/{compared_with}/{release}..{ref}" if compared_with else f"origin/{release}..{ref}"
+        try:
+            undone = set(_REVERTS_RE.findall(git_output(repo_dir, "log", "--format=%B", revision_range)))
+            lines, diffs = [], []
+            for sha in _log(repo_dir, revision_range, f"--max-count={_SIBLING_COMMITS}", "--", *paths):
+                body = git_output(repo_dir, "show", "-s", "--format=%B", sha)
+                if sha in undone or _REVERTS_RE.search(body):
+                    continue
+                if compared_with and as_fix(sha, body) is None:
+                    # A CI-sweep branch behind its sweep has the sweep's old commits too: only its fixes count.
+                    continue
+                subject, date = _subject_and_date(repo_dir, sha)
+                lines.append(f"- `{sha[:12]}` {date} {subject}")
+                diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha, "--", *paths)
+                if len(diff) > _DIFF_CHARS:
+                    diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+                diffs += ["", f"## `{sha[:12]}` on `{release}`: {subject}", "", "```diff", diff.rstrip("\n"), "```"]
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.info("Could not read what %s changes: %s", ref, exc)
+            continue
+        if lines:
+            sections.append("\n".join([f"# Release branch `{release}` (`{ref.removeprefix('origin/')}`)", "", *lines, *diffs]))
+    return "\n\n".join(sections) + "\n" if sections else ""
+
+
+def pending_fixes(repo_dir: str, fix_branch: str) -> str:
+    """Markdown: the commits ``fix_branch`` has that the checkout lacks, with diffs.
+
+    A sweep PR's fixes wait in its CI-sweep PR, so the sweep's head, and its
+    CI, are without them until that is merged: the same test failing in
+    another job would otherwise be fixed again.
+    """
+    ref = f"origin/{fix_branch}"
+    try:
+        # Only its fixes: while it is behind the sweep it also has the sweep's old commits.
+        commits = [
+            sha for sha in _log(repo_dir, f"HEAD..{ref}")
+            if as_fix(sha, git_output(repo_dir, "show", "-s", "--format=%B", sha)) is not None
+        ][:_SIBLING_COMMITS]
+        lines, diffs = [], []
+        for sha in commits:
+            subject, date = _subject_and_date(repo_dir, sha)
+            lines.append(f"- `{sha[:12]}` {date} {subject}")
+            diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha)
+            if len(diff) > _DIFF_CHARS:
+                diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+            diffs += ["", f"## `{sha[:12]}`: {subject}", "", "```diff", diff.rstrip("\n"), "```"]
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.info("Could not read what %s adds: %s", ref, exc)
+        return ""
+    if not lines:
+        return ""
+    return "\n".join([f"# `{fix_branch}`", "", *lines, *diffs]) + "\n"
+
+
+def summarize_prior_fixes(fixes: tuple[PriorFix, ...]) -> str:
+    """One line per candidate, for the prompt and the maintainer report."""
+    lines = []
+    for fix in fixes:
+        state = (
+            f"already ported as {fix.ported_as[:12]}" if fix.ported_as
+            else "already on the working commit" if fix.on_target
+            else "port candidate"
+        )
+        lines.append(f"`{fix.sha[:12]}` {fix.subject} ({state})")
+    return "\n".join(lines)
+
+
+# How much of a failing test file's history the agent is shown.
+_HISTORY_COMMITS = 5
+
+
+def failing_test_history(repo_dir: str, tests: tuple[FailedTest, ...]) -> str:
+    """Markdown: each failing test file's recent commits, and the diff of the newest one that added or changed the test.
+
+    The commit that added a test is the best evidence for why it fails, and
+    the edit agent cannot run git. The adding commit is the newest of the
+    recent ones whose patch adds a line naming the test; a name built from a
+    variable (``$mode``) is matched up to the variable.
+    """
+    sections: list[str] = []
+    for path in dict.fromkeys(test.file for test in tests):
+        if not _inside(repo_dir, path):
+            continue
+        names = [test.name.split("$", 1)[0].strip() for test in tests if test.file == path]
+        try:
+            section = _file_history(repo_dir, path, names)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+            logger.info("Could not read the history of %s: %s", path, exc)
+            continue
+        if section:
+            sections.append(section)
+    return "\n\n".join(sections) + "\n" if sections else ""
+
+
+def _file_history(repo_dir: str, path: str, names: list[str]) -> str:
+    shas = _log(repo_dir, "HEAD", f"--max-count={_HISTORY_COMMITS}", "--", path)
+    if not shas:
+        return ""
+    names = [name for name in names if len(name) >= _MIN_NAME_CHARS]
+    lines = [f"# `{path}`", ""]
+    added = ""
+    for sha in shas:
+        subject, date = _subject_and_date(repo_dir, sha)
+        lines.append(f"- `{sha[:12]}` {date} {subject}")
+        if added or not names:
+            continue
+        patch = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--format=", sha, "--", path)
+        if any(line.startswith("+") and name in line for line in patch.splitlines() for name in names):
+            added = sha
+    if added:
+        diff = git_output(repo_dir, "show", "--no-ext-diff", "--no-textconv", "--stat", "--patch", added)
+        if len(diff) > _DIFF_CHARS:
+            diff = diff[:_DIFF_CHARS] + "\n[... diff truncated ...]"
+        lines += ["", f"## The newest commit that added or changed the test: `{added[:12]}`", "", "```diff", diff, "```"]
+    return "\n".join(lines)

@@ -306,7 +306,7 @@ def job_title_for(failure: JobFailure) -> str:
 _TITLE_CAUSE_CHARS = 100
 
 
-# The job a job-level failure issue names, read back by the CI-fix issue flow.
+# The job a job-level failure issue names, read back by the agent-fix issue flow.
 _JOB_MARKER_RE = re.compile(rf"<!-- {re.escape(MARKER_NAMESPACE)}:job:(?P<job>[^\s>]+) -->")
 
 

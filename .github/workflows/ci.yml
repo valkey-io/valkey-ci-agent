@@ -40,8 +40,8 @@ jobs:
 
       - name: Create an account for the isolation tests
         run: |
-          sudo useradd --create-home --shell /bin/bash ci-fix-agent
-          echo "CI_FIX_TEST_AGENT_USER=ci-fix-agent" >> "${GITHUB_ENV}"
+          sudo useradd --create-home --shell /bin/bash agent-fix
+          echo "AGENT_FIX_TEST_USER=agent-fix" >> "${GITHUB_ENV}"
 
       - name: Run pytest with coverage
         env:
@@ -52,7 +52,7 @@ jobs:
         run: mypy scripts/
 
   isolation-as-root:
-    # The CI-fix agent's account as a copied Valkey container job makes it:
+    # The fix agent's account as a copied Valkey container job makes it:
     # as root, without sudo, with the distribution's tools.
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -72,8 +72,8 @@ jobs:
 
       - name: Create an account for the isolation tests
         run: |
-          useradd --create-home --shell /bin/bash -K UID_MIN=2000 -K GID_MIN=2000 ci-fix-agent
-          echo "CI_FIX_TEST_AGENT_USER=ci-fix-agent" >> "${GITHUB_ENV}"
+          useradd --create-home --shell /bin/bash -K UID_MIN=2000 -K GID_MIN=2000 agent-fix
+          echo "AGENT_FIX_TEST_USER=agent-fix" >> "${GITHUB_ENV}"
 
       - name: Run the isolation tests
         run: pytest -v tests/test_isolation.py

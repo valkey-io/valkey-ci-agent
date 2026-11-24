@@ -15,7 +15,7 @@ triaging fuzzer runs, and judging whether a fix should be backported. The CVE
 scan doesn't use Claude at all.
 
 **Propose, don't merge.** Every change the agent makes goes on one of its own
-branches, `backport/...`, `agent/backport/...`, `agent/ci-fix/...` or
+branches, `backport/...`, `agent/backport/...`, `agent/fix/...` or
 `agent/release-cut/...`, and reaches the project as a pull request. That PR
 runs the repository's normal CI and needs a maintainer to merge it. The agent
 never pushes to a release branch and never rewrites a backport branch it has
@@ -40,7 +40,7 @@ that run Claude don't get a GitHub token at all.
 ```text
 scripts/
   backport/              Backports, suggestions, CI follow-up, onboarding release lines
-  ci_fix/                The CI fix bot
+  agent_fix/                The CI fix bot, and changes for labelled issues
   test_failure_detector/ Daily CI failures to issues
   fuzzer/                Fuzzer run triage
   release_notes/         Release notes and review comments on release PRs
@@ -86,7 +86,8 @@ cut and release automation are built the same way.
 | Workflow | Page | Starts in |
 |---|---|---|
 | Backports | [backport.md](backport.md) | `scripts/backport/sweep.py` |
-| Fixing CI failures | [ci-fix.md](ci-fix.md) | `scripts/ci_fix/run.py` |
+| Fixing CI failures | [ci-fix.md](ci-fix.md) | `scripts/agent_fix/run.py` |
+| Making the change an issue asks for | [labelled-issues.md](labelled-issues.md) | `scripts/agent_fix/labelled.py` |
 | Test Failure Detector | [test-failure-detector.md](test-failure-detector.md) | `scripts/test_failure_detector/main.py` |
 | Fuzzer monitor | [fuzzer-monitor.md](fuzzer-monitor.md) | `scripts/fuzzer/main.py` |
 | Release notes | [release-notes.md](release-notes.md) | `scripts/release_notes/main.py` |
@@ -111,9 +112,9 @@ hard it should think. Each task gets the narrowest set of tools that works:
 | `validation_repair_edit_only` | Read, search and edit | Repairing a backport that failed its checks |
 | `test_adaptation_edit_only` | Read, search and edit | Porting a test an older branch can't run |
 | `fuzzer_analysis_readonly` | Read and search | Triaging fuzzer runs |
-| `ci_fix_edit` | Read, search, edit, create files and run commands, as a separate account; never commit or push | Fixing CI failures on the bot's own PRs |
-| `ci_fix_review` | Read and search, as a separate account | Reviewing a proposed CI fix |
-| `ci_fix_suggest` | Read, search, edit and create files, but not run commands | Suggesting fixes on contributors' PRs |
+| `agent_fix_edit` | Read, search, edit, create files and run commands, as a separate account; never commit or push | Fixing CI failures on the bot's own PRs |
+| `agent_fix_review` | Read and search, as a separate account | Reviewing a proposed CI fix |
+| `agent_fix_suggest` | Read, search, edit and create files, but not run commands | Suggesting fixes on contributors' PRs |
 | `release_notes_review_edit_only` | Read, search and edit | Applying review comments to release notes |
 
 Some tasks need no tools at all. When Claude decides which PRs belong in the
@@ -144,7 +145,7 @@ For issues, `incidents.py` turns a failure into a stable fingerprint, and
 existing one. The detector and the fuzzer monitor both use it, each with
 their own way of writing the issue.
 
-`isolation.py` runs a command, or Claude, as the separate `ci-fix-agent`
+`isolation.py` runs a command, or Claude, as the separate `agent-fix`
 account with its own home and temporary directories, and takes the code back
 safely afterwards. `polling.py` keeps a job checking at a steady pace for
 most of an hour. `identity.py` defines the bot's accounts, and
@@ -161,7 +162,7 @@ copies don't become the usual way of working. See [the registry](registry.md).
 ## How the safety measures are tested
 
 The test suite runs on Python 3.11. CI also installs Claude Code and creates a
-real `ci-fix-agent` account, so the tests for the separate
+real `agent-fix` account, so the tests for the separate
 account and for limiting Claude's tools
 (`tests/test_isolation.py` and `tests/test_claude_code_confinement.py`) run
 for real instead of being skipped. Another job runs the isolation tests as

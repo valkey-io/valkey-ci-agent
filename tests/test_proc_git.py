@@ -218,7 +218,7 @@ def test_a_non_utf8_path_survives_discovery_patching_and_the_staged_check(tmp_pa
 
     import pytest
 
-    from scripts.ci_fix.push import _apply_patch, _staged_paths
+    from scripts.agent_fix.push import _apply_patch, _staged_paths
     from scripts.common.proc import build_approved_patch, worktree_changed_paths
 
     def git(cwd, *args):

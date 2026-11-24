@@ -15,7 +15,7 @@ def _record(path: str) -> logging.LogRecord:
 def test_records_are_tagged_by_feature_area_not_module_path():
     fmt = _TagFormatter("[%(tag)s] %(message)s")
     assert fmt.format(_record("/w/scripts/release/reconcile.py")) == "[release] hello world"
-    assert fmt.format(_record("/w/scripts/ci_fix/main.py")) == "[ci-fix] hello world"
+    assert fmt.format(_record("/w/scripts/agent_fix/main.py")) == "[agent-fix] hello world"
     # Shared helpers act for their caller, so the file is the useful tag.
     assert fmt.format(_record("/w/scripts/common/proc.py")) == "[proc] hello world"
 

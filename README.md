@@ -33,6 +33,13 @@ review it, and then pushes it or posts it as a suggested patch. It does the
 same on its own when one of its backport PRs goes red. See
 [Fixing CI failures](docs/ci-fix.md).
 
+**Making the change an issue asks for.** A committer can put the
+`needs-agent-fix` label on a Valkey issue. The bot writes a test that fails
+because of the bug, or that encodes a small feature's agreed behaviour, makes
+the change that passes it, has a second Claude session look for a case the
+change still gets wrong, and posts the result on the issue or opens a draft
+PR. See [Making the change an issue asks for](docs/labelled-issues.md).
+
 **Tracking test failures.** Every night, once Valkey's Daily CI has finished,
 the Test Failure Detector opens or updates one issue per failing test, so
 broken and flaky tests are tracked instead of forgotten. See
@@ -77,7 +84,7 @@ do want something:
 ## Why it is safe to leave running
 
 The agent only ever writes to its own branches: `backport/...`,
-`agent/backport/...`, `agent/ci-fix/...` and `agent/release-cut/...`. It opens
+`agent/backport/...`, `agent/fix/...` and `agent/release-cut/...`. It opens
 pull requests from those branches and leaves the merge to a maintainer. It
 never pushes to a release branch and never rewrites a backport branch that has
 already been published.
@@ -105,7 +112,7 @@ covers the design in more depth.
 ```text
 scripts/
   backport/               Backports, backport suggestions, CI follow-up
-  ci_fix/                 The CI fix bot
+  agent_fix/                 The CI fix bot, and changes for labelled issues
   test_failure_detector/  Daily CI failures to issues
   fuzzer/                 Fuzzer run triage
   release_notes/          Release notes and review comments on release PRs
