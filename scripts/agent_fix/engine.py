@@ -405,7 +405,8 @@ class _Evidence:
     # The plan that reached them, which the change is then checked with.
     plan: VerifyPlan
     # The tests as a patch on the base commit, their files, and one failing
-    # run's output; empty for a pull request's own tests, which are its head's.
+    # run's output; for a pull request's own tests, which are its head's,
+    # only their files.
     patch: str
     paths: tuple[str, ...]
     output: str
@@ -494,9 +495,10 @@ def prepare_review(
                 "This pull request adds no test that code can run, so a change to it could not be checked. "
                 "No change was made."
             )
+        # The pull request's test files are run in full too, as the test a labelled issue's change was made from is.
         evidence = _Evidence(
-            tests=tests, plan=plan, patch="", paths=(), output="", check="",
-            written=FixCandidate(action=CandidateAction.PATCH),
+            tests=tests, plan=plan, patch="", paths=tuple(dict.fromkeys(test.file for test in tests)), output="",
+            check="", written=FixCandidate(action=CandidateAction.PATCH),
         )
         return _make_change(
             task, repo_dir, _change_guide(task, repo_dir), evidence,

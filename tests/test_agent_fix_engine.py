@@ -2823,6 +2823,24 @@ def test_a_review_round_that_leaves_the_test_passing_without_the_change_goes_bac
     assert "Without the product change, the pull request's tests failed 0 of 3 runs" in author.feedback[1]
 
 
+def test_a_review_round_runs_the_pull_requests_test_files_in_full(tmp_path, monkeypatch):
+    # A round that changes only product code can still break a neighbour of the pull request's test.
+    task = _reviewed_pull_request(tmp_path, monkeypatch)
+    planned = []
+
+    def plan_for(_repo, tests, *, job=None, **_kwargs):  # noqa: ARG001
+        planned.append(tests)
+        return VerifyPlan(build="true", test="true", tests=tests)
+
+    monkeypatch.setattr(engine_mod, "plan_for", plan_for)
+    candidate = engine_mod.prepare_review(
+        task, agent_func=_value_agent("right, loudly"), review_func=_approves, test_func=_value_test(),
+    )
+
+    assert candidate.action is CandidateAction.PATCH and candidate.changed_paths == ("value.txt",)
+    assert (FailedTest("", _TEST_FILE),) in planned
+
+
 def test_a_pull_request_with_no_test_code_can_run_is_not_changed_on_review(tmp_path, monkeypatch):
     task = _reviewed_pull_request(tmp_path, monkeypatch)
     task = replace(task, request=replace(task.request, earlier="+++ b/value.txt\n+right\n"))
