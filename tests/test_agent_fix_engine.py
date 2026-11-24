@@ -2392,6 +2392,32 @@ def test_a_job_is_built_with_the_sanitizer_by_its_own_make_line():
     )
 
 
+def test_the_sanitizer_build_starts_without_the_plain_builds_saved_settings(tmp_path, monkeypatch):
+    # src/Makefile reads .make-settings after SANITIZER sets CFLAGS: with them, the plain build is kept.
+    def plan_for(_repo, tests, *, job=None, **_kwargs):
+        return VerifyPlan(build=job.build if job is not None else "make", test="true", tests=tests)
+
+    monkeypatch.setattr(engine_mod, "plan_for", plan_for)
+    value = _value_test()
+    saved_when_sanitized = []
+
+    def test(repo_dir, command, timeout):
+        settings = Path(repo_dir, "src", ".make-settings")
+        if "SANITIZER=address" in command:
+            saved_when_sanitized.append(settings.exists())
+        elif command.startswith("make"):
+            settings.parent.mkdir(exist_ok=True)
+            settings.write_text("CFLAGS=\nMALLOC=jemalloc\n", encoding="utf-8")
+            with Path(repo_dir, ".git", "info", "exclude").open("a", encoding="utf-8") as exclude:
+                exclude.write("/src/.make-settings\n")
+        return value(repo_dir, "true" if "&&" not in command else command, timeout)
+
+    candidate, _head = _prepare_change(tmp_path, monkeypatch, test_writer=_test_writer("assert_equal right [value]"), test=test)
+
+    assert candidate.action is CandidateAction.PATCH
+    assert saved_when_sanitized[0] is False
+
+
 def _change_repo(tmp_path):
     source, head_sha = _source_repo(tmp_path)
     (source / "src" / "commands").mkdir(parents=True)

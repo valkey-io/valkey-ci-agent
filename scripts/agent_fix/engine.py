@@ -927,6 +927,9 @@ def _change_checks(
     under = plan_for(repo_dir, evidence.tests, scheduled=False, job=sanitized)
     if under is None:
         raise RuntimeError("the tests the change was checked with cannot be planned in a sanitizer build")
+    # Valkey's src/Makefile reads its saved settings after SANITIZER sets CFLAGS and MALLOC, so a tree
+    # built without it is rebuilt as it was. Without them, make cleans and builds with the sanitizer.
+    Path(repo_dir, "src", ".make-settings").unlink(missing_ok=True)
     failed = _verify_with_plan(replace(under, single_run=True), repo_dir, run_test, deadline, checks)
     return f"In a build with AddressSanitizer: {failed}" if failed else ""
 
