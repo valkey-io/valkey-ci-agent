@@ -133,10 +133,13 @@ days), so it isn't the source. For each attempt:
    line. Other `HEAD is now at` lines, such as the libbacktrace checkout, are
    ignored. `<head>` must equal the attempt's `head_sha`.
 2. A fork controls `ci.yml`, so it can print any number. `GET /pulls/<n>`
-   must match the run's head repository, head branch and head SHA, and have
-   `valkey` as its base repository. Then `pr` and `base_ref` come from that
-   PR object. The head repository, which names the fork's owner, is only
-   compared, never stored.
+   must match the run's head repository and head branch, and have `valkey`
+   as its base repository. The PR may have moved on since the attempt, as
+   with a daily sweep it often will. So the attempt's `head_sha` must be the
+   PR's current head **or one of its commits** (`GET /pulls/<n>/commits`).
+   A commit dropped by a force-push can't be checked, and that attempt is
+   ignored. Then `pr` and `base_ref` come from that PR object. The head
+   repository, which names the fork's owner, is only compared, never stored.
 3. For a same-repo run with no such line, a single matching entry in
    `run.pull_requests` is used, with the same checks.
 4. Otherwise the PR is unknown. A lookup by fork branch isn't used, because
@@ -165,6 +168,18 @@ the merge ref moves on every push, so the job log is the only reliable
 source. A rerun replays the same merge commit. If there is no accepted line,
 the base is unknown and the attempt is ignored.
 
+The merge line is printed by the fork's own workflow, so `<base>` is checked
+too. It must be a commit on `unstable` whose committer date is no later than
+the run's `created_at`: GitHub can't have tested a base that didn't exist
+yet. Otherwise the attempt is ignored. Without this check, a fork could claim
+a base newer than the one it was tested on, so that a pre-fix failure passes
+the reset check (E1). The check still lets a fork claim an *older* base.
+That only makes its failures look pre-fix, so they are dropped, which is the
+safe direction. Verifying the merge commit itself wouldn't help: commits
+pushed to a fork can be read through `valkey`'s API, so a fork can create a
+matching one. Faked failures in general are bounded by the distinct-PR gate,
+not by this check.
+
 ### What a sighting is
 
 One record per (test, file, job). A test failing in three jobs of one
@@ -192,9 +207,14 @@ what that line and the job it points to describe.
 }
 ```
 
-`passed_in` is set when a later, really executed attempt of the same run
-passed a job with the same name. It is a flakiness signal for the analysis,
-and **doesn't add a counted attempt**.
+`passed_in` is not recorded at collection. A passing rerun often arrives in
+a later sweep than the failure, and the sweep doesn't read passing attempts.
+Instead it is **computed at analysis time**, when the referenced jobs are
+re-read anyway. For each eligible sighting, the run's later attempts are
+listed by run ID, and `passed_in` is the first one that really ran a job with
+the same name and passed it. Because the lookup is by run ID, it also finds
+reruns that came after the collection window. It is a flakiness signal for
+the analysis, and **doesn't add a counted attempt**.
 
 ### Identity: test name and file
 
@@ -271,7 +291,7 @@ Each sweep adds at most one bot comment per issue, with one line per new
 sighting:
 
 ```text
-<!-- valkey-ci-agent:pr-failure:sighting run=<id> attempt=<n> job=<id> pr=<n> base=<sha> passed_in=<n|none> -->
+<!-- valkey-ci-agent:pr-failure:sighting run=<id> attempt=<n> job=<id> pr=<n> head=<sha> base=<sha> -->
 ```
 
 Sightings are deduplicated on `(run, attempt, job)` across all comments.
@@ -291,7 +311,7 @@ recorded (see [Security](#security)).
 |---|---|---|
 | collecting | open, `state:collecting` | below the limit, or analysed and kept with some failures excluded |
 | pending | open, `state:pending` | the limit was reached; analysis is owed, and every sweep retries it |
-| ready | open, `state:ready-to-promote`, `verdict:<v>` | the analysis found a real problem; waiting for the command (phase 1) or the cap (phase 2) |
+| ready | open, `state:ready-to-promote`, `verdict:<v>` | the analysis found a real problem; waiting for the command (phase 1) or the cap (phase 2); resets are re-checked every sweep |
 | promoted | open, `state:promoted`, links the `valkey` issue | no analysis while that issue is open |
 | has-main-issue | open, `state:has-main-issue` | a Daily issue exists; collect only |
 | rejected | closed `not_planned` by the bot, with a verdict marker | the PRs' own problem; its failures no longer count |
@@ -363,7 +383,12 @@ any Claude call:
 | Gate | Default | Counts |
 |---|---|---|
 | `threshold_failures` | 3 | eligible failed attempts |
-| `min_distinct_prs` | 3 | verified PRs with an eligible failure whose diff doesn't touch the test |
+| `min_distinct_prs` | 3 | verified PRs with an eligible failure whose own change doesn't touch the test |
+
+"Its own change" is the diff that sighting's attempt really tested,
+`tested_base_sha...head_sha` (the compare API, by SHA). It isn't the PR's
+current diff: a PR can change the test in one push and revert it in the
+next, and each sighting is judged by what it ran.
 
 Excluded sightings (see [Step 2](#step-2-claude-verdict)) never count. The
 test must also have no open `valkey` issue with its marker, and must
@@ -389,9 +414,10 @@ Over 14 days of real data, these defaults give 3 candidates (#5215,
 ### Step 1: deterministic facts (no Claude)
 
 Every eligible sighting with its ID (`<run>-<attempt>-<job>`); how many
-sightings each of E1 to E3 dropped; per PR, its eligible failures,
-whether it touched the test or a file the error names, and whether it
-merged; the `passed_in` count and days spanned; whether Daily failed the test
+sightings each of E1 to E3 dropped; for each sighting, whether its own
+change (as above) touched the test or a file the error names; per PR, its
+eligible failures and whether it merged; `passed_in` for each sighting,
+computed as above, and the days spanned; whether Daily failed the test
 in the window; the reset, if any; and `unstable` commits in the window that
 touched the test or the files the error names. These are evidence for step 2,
 and none rejects a candidate on its own.
@@ -403,7 +429,7 @@ Bedrock. It uses a new profile, `pr_failure_analysis_readonly`, in
 `scripts/ai/runtime.py`, modelled on `ci_fix_review`: `Read,Grep`,
 `confined=True`, `isolated=True`, no writes. The fuzzer profile isn't
 confined, so it isn't reused. The work directory holds `unstable`, the facts
-and capped error excerpts and PR diffs, never PR code.
+and capped error excerpts and the per-sighting diffs, never PR code.
 
 ```json
 {"verdict": "unstable_regression|flaky|poorly_isolated|pr_caused|infra|unsure",
@@ -450,6 +476,13 @@ person's command, or in phase 2 the cap, decides what reaches `valkey`.
 - **Phase 2: automatic.** `ready` issues are promoted with no command, at most
   `max_promotions_per_day` (2) in 24 hours, counted from `state:promoted`
   labels. Overflow stays `ready`. The command still works, and isn't capped.
+- **Re-checked before every promotion.** A test can be fixed while its
+  issue waits as `ready`. So every sweep re-checks resets for `ready`
+  issues, and any promotion, by command or automatic, recomputes resets
+  right before it creates the issue. Automatic promotion also recomputes the
+  gates. If the test was fixed since its counted failures, or the gates no
+  longer pass, the issue goes back to collecting and the bot comments why.
+  For a command, the reply carries that reason.
 - **Creation.** Through the detector's publisher with a new
   `create_only=True`, which never updates an open issue. It uses the
   detector's renderer, title, `test-failure` label and App identity, so a
@@ -604,14 +637,18 @@ workflows, other repositories.
   forged `pull/<n>/merge` line, the libbacktrace checkout line, a PR into
   `cluster-v2` and an unknown PR (both ignored, with no other logs read), a
   failed log download, a run still in progress during the previous sweep,
-  and a failed sweep whose work the next sweep picks up.
+  and a failed sweep whose work the next sweep picks up. PR identity: a PR
+  pushed again before the sweep (accepted), a commit force-pushed away
+  (ignored), and a merge line whose base is newer than the run or not on
+  `unstable` (ignored).
 - **Tracker:** keyed comments are idempotent across overlapping sweeps;
   non-bot comments are ignored; one comment per test in a burst; stop
   and resume on 403 or 429; every state transition.
 - **Gates:** E1 to E3, including interpolated Tcl names and gtest; both
-  thresholds; no
-  re-analysis until the limit is reached again; a `pending` issue retried
-  with no new sighting.
+  thresholds; a PR that changed the test in the tested push and reverted it
+  later; no re-analysis until the limit is reached again; a `pending` issue
+  retried with no new sighting; `passed_in` found for a rerun in a later
+  sweep.
 - **Verdicts:** each row of the verdict table; exclusions that drop the
   count below the gates keep the issue collecting; exclusion IDs that aren't
   in the facts are ignored; excluded sightings never count again.
@@ -620,7 +657,8 @@ workflows, other repositories.
   promotes `ready` issues under the cap, and the command bypasses it.
 - **Resets:** a diff inside and outside the test block; a closing versus a
   referencing PR; a close with no commit; a person's close versus the bot's;
-  a pre-fix base; a fix that didn't hold.
+  a pre-fix base; a fix that didn't hold; a fix that lands while the issue
+  is `ready`, for both a command and automatic promotion.
 - **Handoff:** a promoted issue has no `last-key` and is skipped silently; a
   later detector upsert makes it dispatchable; the new markers survive an
   update and never match `_OCCURRENCE_RE` or `_last_key_re`; `create_only`
