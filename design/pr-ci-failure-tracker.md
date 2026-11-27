@@ -12,407 +12,631 @@ and we lose them.
 
 PR CI runs much more often than Daily, so it is the best evidence we have of
 how a test behaves. But most red PR CI is the PR's own fault, so we can't
-file an issue for every PR failure.
+file an issue in `valkey` for every PR failure. A premature public issue also
+draws contributors into investigating something that may not be real.
 
 ## The idea
 
-There are two stages with very different costs:
+There are two tiers and two stages:
 
-1. **Collect, cheaply and often.** Every new failure in PR CI is recorded as
-   a sighting with a reference to its job and commit. There is no Claude and
-   no judgement in this stage, only log parsing.
-2. **Analyse, rarely.** When a test has failed in enough CI runs and has
-   no issue yet, one analysis decides whether the problem belongs to
-   `unstable` rather than to the PRs. If it does, an issue is filed.
+1. **Collect, cheaply.** Every failed test in PR CI is recorded on an issue
+   in a separate **tracker repository** (`tracker_repo`), one issue per test.
+   There is no Claude here, only log parsing. The tracker issue is the state:
+   each repeat failure adds a comment, so its comments are the count. Nobody
+   watching `valkey` sees it.
+2. **Analyse, rarely.** Only when a test reaches the limit (enough failed
+   attempts from enough distinct PRs, on a test that already existed on
+   `unstable`) does one analysis look at it. Reaching the limit never labels
+   or promotes anything by itself. The analysis makes the call, with one of
+   three outcomes:
+   - **A real `unstable` problem.** The tracker issue is labelled
+     `state:ready-to-promote`.
+   - **The PRs' own problem.** The tracker issue is closed.
+   - **Partly fake.** The failures that aren't the test's fault are
+     excluded, and the issue keeps collecting until the limit is reached
+     again.
 
-Once an issue exists, the [CI fix bot's](../docs/ci-fix.md#fixing-detector-issues)
-hourly dispatcher picks it up, exactly as it does for Daily issues.
+It ships in [two phases](#phases). In phase 1, nothing reaches `valkey`
+until a maintainer comments `@valkeyrie-ops promote` on a ready tracker
+issue. In phase 2, once the phase 1 verdicts have earned trust, ready issues
+are promoted automatically, under a daily cap.
+
+Promoted issues are **report-only** in this version. The
+[CI fix bot](../docs/ci-fix.md#fixing-detector-issues) only fixes scheduled
+Daily runs (`_validate_scheduled_run` in `scripts/ci_fix/issues.py`), and it
+plans on the source run's branch, which for a PR run is the contributor's.
+So a promoted issue carries no `last-key`, and the dispatcher skips it. When
+Daily later fails the same test, the detector updates the same issue and the
+fix bot takes over as usual. [Fixing later](#fixing-later) describes how to
+make these issues fixable without the bot ever planning from a PR run.
 
 ## Pipeline
 
 ```text
-scheduled sweep
-  → completed PR CI runs updated since the cursor
-  → failed jobs of every attempt
+scheduled sweep (daily)
+  → ci.yml pull_request runs created since the last successful sweep (minus 6h)
+  → their attempts that completed since then (skip action_required)
+  → failed jobs of each attempt (skip carried-over jobs)
   → parse logs into fingerprints (the detector's parser)
-  → look for fixes merged to unstable since the last sweep → reset those fingerprints
-  → append sightings to the stats branch, prune what has expired
-  → for each fingerprint touched this sweep:
-        has an open issue?                       → nothing more
-        failed CI runs since its last reset < threshold? → nothing more
-        already analysed at this level?          → nothing more
-        otherwise                                → analyse → file issue or record verdict
+  → PR identity and tested base from the checkout log; ignore PRs not into unstable
+  → one batched comment per test on its tracker issue
+  → for each tracker issue touched this sweep, or labelled state:pending:
+        an open valkey issue carries its marker?   → link it, nothing more
+        limit not reached (again)?                  → nothing more
+        resets → recount → gates still pass?        → analyse
+        real unstable problem                       → label ready-to-promote
+                                                       (phase 2: promote, under the cap)
+        the PRs' own problem, or infra              → close as rejected
+        some failures fake, or unsure               → exclude those, keep collecting
+
+command poll (every 30 minutes)
+  → @valkeyrie-ops promote on a tracker issue, from an authorized member → promote
 ```
 
 ## Stage 1: collection
 
 ### Which runs
 
-- Repository: `valkey-io/valkey`. The repository and workflow list are
-  configured in `repos.yml`, so other repositories can be added later.
-- Workflow: the main PR CI workflow (`ci.yml`). We start with that one.
-- Event: `pull_request`, base branch `unstable`._
-- Runs that finished with a failure since the last sweep, **including
-  reruns**. A rerun keeps its run ID and bumps the attempt, so the cursor is
-  based on `updated_at` with a small overlap. Each job is deduplicated on
-  `(run_id, attempt, job_id)`.
-- Jobs matching `ci_followup_ignored_jobs` and failures in setup steps are
-  skipped, as the detector already does.
+Runs come from the workflows in `repos.yml` (`pr_failure_tracker.workflows`,
+initially `ci.yml`) with `event == pull_request`.
+
+- **The unit is an attempt, `(run_id, attempt)`.** The run object only
+  reports its latest attempt, so its conclusion is never used to pick runs. A
+  test that failed on attempt 1 and passed on the rerun is the flaky case we
+  care about most, and listing only failed runs misses it.
+- **Each sweep reads only what is new since the last successful sweep**,
+  normally the last 24 hours. The start is the start time of the last
+  successful scheduled run of this workflow, minus an hour of overlap, read
+  from the Actions API, so no cursor is stored. The first sweep reads
+  `window_days`.
+- The sweep lists runs created after the start minus 6 hours, and reads
+  their attempts that completed after the start. The 6 hours cover a run
+  that was still going during the last sweep: `ci.yml` PR runs take a median
+  of 25 minutes, and 99% finish within 2.6 hours.
+- **Caveat: late reruns are missed.** A rerun keeps its run's `created_at`,
+  and the list API only filters on creation. So a rerun of a run created
+  before that listing window is never seen. In 30 days, 12 of 37 real reruns
+  came more than a day after the run was created. The earlier attempts are
+  still recorded; only the late attempt is lost, along with the flaky signal
+  it carries. If it turns out to matter, the sweep can list 30 days of run
+  metadata (about 17 pages, no logs) and keep the runs whose `updated_at` is
+  after the start.
+- Attempts concluded `action_required` are skipped. They are fork runs
+  waiting for approval, with no jobs. In 14 days, 11 of 14 green runs with
+  `run_attempt > 1` were this, not real reruns.
+- **Anything cancelled is ignored, whatever the reason:** a manual cancel,
+  `cancel-in-progress` after a new push, or anything else. That covers a job
+  that concluded `cancelled`, and every job of an attempt that concluded
+  `cancelled`, including jobs that had already failed. This drops a few real
+  failures (4 of 40 sampled cancelled runs had one), in exchange for a
+  simple rule.
+- Otherwise, a job is read when it concluded `failure` or `timed_out`.
+- A job whose `started_at` is before its attempt's `run_started_at` was
+  carried over from an earlier attempt under a new job ID, and is skipped.
+  Otherwise deduplicating on `job_id` double-counts.
+- Jobs in `ci_followup_ignored_jobs` are skipped. A failed job with no parsed
+  test (build break, lint, a crash with no summary) is listed in the job
+  summary only. Job-level failures in PR CI are almost always the PR's own.
+- A sweep that couldn't read a log, or stopped on a rate limit, ends as
+  failed. The next sweep then starts from the same point and reads that work
+  again. The keyed tracker comments make the overlap and any re-read write
+  nothing twice. An expired log is recorded as expired, and doesn't fail the
+  sweep.
+
+### PR identity
+
+`run.pull_requests` is empty for fork PRs (138 of 155 failed runs in 14
+days), so it isn't the source. For each attempt:
+
+1. From a job log, take the first `+<merge>:refs/remotes/pull/<n>/merge`
+   fetch line and the matching `HEAD is now at <merge7> Merge <head> into <base>`
+   line. Other `HEAD is now at` lines, such as the libbacktrace checkout, are
+   ignored. `<head>` must equal the attempt's `head_sha`.
+2. A fork controls `ci.yml`, so it can print any number. `GET /pulls/<n>`
+   must match the run's head repository, head branch and head SHA, and have
+   `valkey` as its base repository. Then `pr` and `base_ref` come from that
+   PR object. The head repository, which names the fork's owner, is only
+   compared, never stored.
+3. For a same-repo run with no such line, a single matching entry in
+   `run.pull_requests` is used, with the same checks.
+4. Otherwise the PR is unknown. A lookup by fork branch isn't used, because
+   one branch can map to several PRs.
+
+### Only PRs into `unstable`
+
+`ci.yml` also runs on PRs into `8.0`, `9.x`, `cluster-v2` and `agent/**`. For
+now these are **ignored entirely**. An attempt is collected only if its
+verified PR has `base.ref == base_branch` (`unstable`) and its tested base is
+known. Anything else gets no sighting, no count and no tracker issue: a PR
+into another branch, an unknown PR, or a missing merge line. An unknown PR is
+ignored too, because its target can't be confirmed.
+
+The PR is resolved from the first failed job's log, so the other logs of an
+ignored attempt are never downloaded. In 14 days, 152 of 222 test sightings
+came from PRs into other branches, including `cluster-v2` Raft tests that
+don't exist on `unstable`. Ignoring them takes the tracker from about 63
+issues a fortnight to about 24.
+
+### Tested base
+
+`tested_base_sha` is the first parent of the merge commit in that line: the
+commit the PR was really tested on. The run's `head_sha` is the PR head, and
+the merge ref moves on every push, so the job log is the only reliable
+source. A rerun replays the same merge commit. If there is no accepted line,
+the base is unknown and the attempt is ignored.
 
 ### What a sighting is
 
-Every failed test in every failed job of every attempt becomes one record.
-A PR's own failures are recorded too: a test that breaks under many
-unrelated PRs' changes is often a badly isolated test, and that is worth
-knowing.
+One record per (test, file, job). A test failing in three jobs of one
+attempt is three sightings but one failed attempt. A sighting lives as one
+line in a tracker comment ([The tracker issue](#the-tracker-issue)); this is
+what that line and the job it points to describe.
 
 ```json
 {
-  "fingerprint": "…",
   "test": "Replica buffer don't induce eviction",
   "file": "tests/unit/maxmemory.tcl",
-  "kind": "tcl | gtest | exception | sanitizer | valgrind | …",
+  "kind": "tcl | gtest",
   "error": "first lines of the error, truncated",
-  "repo": "valkey-io/valkey",
   "pr": 1234,
-  "pr_author": "someone",
+  "pr_source": "log | run",
   "head_sha": "abc123…",
-  "base_sha": "def456…",
+  "merge_sha": "fedcba…",
   "tested_base_sha": "0123ab…",
   "run_id": 123,
   "attempt": 2,
+  "attempt_started_at": "2026-11-19T10:00:00Z",
   "job_id": 456,
   "job_name": "test-ubuntu-latest",
-  "job_url": "https://github.com/…/job/456",
-  "passed_on_rerun": false,
-  "seen_at": "2026-11-19T10:00:00Z"
+  "passed_in": {"attempt": 3, "job_id": 789}
 }
 ```
 
-`tested_base_sha` is the `unstable` commit the PR was actually tested on, which
-is the first parent of the run's merge commit. It can differ from `base_sha`
-because PR CI tests the PR merged into `unstable` as it was when the run
-started. The reset logic needs it (see [Clearing and resets](#clearing-and-resets)).
+`passed_in` is set when a later, really executed attempt of the same run
+passed a job with the same name. It is a flakiness signal for the analysis,
+and **doesn't add a counted attempt**.
 
-`passed_on_rerun` is filled in later, once a newer attempt of the same run
-has passed that job. That is strong evidence the test is flaky.
+### Identity: test name and file
 
-### Fingerprints
+A tracker issue is identified by two things only: **the test name and the
+file it's in**. Everything else (runs, attempts, jobs, PRs, errors,
+environments) changes from one sweep to the next, so it can't identify
+anything. It lives in the issue's body and comments instead.
 
-Fingerprints must be the same ones the detector uses (`incidents.py` and the
-detector's marker namespace). That way a PR sighting and a Daily issue for
-the same test match, and the "has an open issue" check is one marker lookup
-through `issue_dedup.py`.
+- **For people:** the title is the detector's, `[TEST-FAILURE] <test> in <file>`,
+  and the body starts with `Test:` and `File:` lines. A search for a test
+  name or a file path in the tracker repo finds its issue.
+- **For the bot:** the marker holds `<fp>`, the detector's existing
+  `issue_renderer.fingerprint_for`. That is a 20-hex-character hash of exactly
+  those two values (`sha256("valkey-ci-agent:test-failure|<test>|<file>")`),
+  with nothing else in it. It is hashed rather than written raw because a
+  test name can contain anything, including `-->` or another marker. A raw
+  name would break the HTML comment, or forge a marker (see
+  [Security](#security)). The bot finds the issue by matching the marker
+  exactly, never by title search, which is fuzzy and rate-limited.
 
-The detector's job-log parsing (`job_failures.py`, `valkey_ci.py`) is reused
-as is. The only Daily-specific parts are the run lookup (`download.py`) and
-the "in Daily" wording in `issue_renderer.py`. Both get a source parameter.
+Because the hash is the detector's, a PR sighting and a Daily issue for the
+same test share it. The tracker issue's marker uses its own namespace,
+`valkey-ci-agent:pr-failure:<fp>`, which the detector's and fix bot's regexes
+never match. The promoted issue uses the detector's marker, so one test gets
+one issue. Log parsing (`job_failures.py`, `valkey_ci.py`) is reused as is;
+PR CI has no `all-test-failures` artifact, so only the job-log path is used.
 
-PR CI doesn't upload the `all-test-failures` artifact that Daily does, so the
-collector works from job logs alone. That is the same path the detector
-already uses for failures the artifact misses.
+## Where state lives
 
-### Where stats live
+There is no stats branch, no cursor, no artifact, and no store of the
+tracker's own:
 
-The stats live on an orphan branch, `data/test-stats`, in this repository:
+| What | Where |
+|---|---|
+| Sightings, counts, resets, verdicts | issues in `tracker_repo`, one per test and file |
+| Where the next sweep starts | the last successful sweep run, from the Actions API |
+| Confirmed, analysed failures | the promoted issue in `valkey` |
+
+`tracker_repo` should be an issues-only repository in the org, such as
+`valkey-io/valkey-ci-tracker`, rather than a real fork of `valkey`. A fork
+has issues disabled by default, joins `valkey`'s fork network, and on a
+personal account needs the App installed there. The tracker repository holds
+no code and is never a `repos.yml` target, so no other workflow acts on it.
+
+Alternatives considered:
+
+- **A stats branch here:** rejected. An App token with `contents: write` can
+  push to any branch, so it would need a ruleset with a force-push exception,
+  plus a cursor, push retries and a monthly squash.
+- **S3:** rejected. It is an external dependency for self-hosting.
+- **Issues in `valkey`:** rejected. Unconfirmed failures would be public and
+  would draw contributors in.
+- **Stateless recompute only:** viable, but every sweep would re-read the
+  whole window, about 630 REST calls and 360 MB of logs for 21 days, and
+  maintainers would see nothing below the threshold. With the tracker, a
+  sweep reads one day: about 100 calls, and only the logs of that day's
+  failed jobs. One recompute can still rebuild the tracker.
+
+**Cost (measured 2026-11-13 to 11-26).** About 700 `ci.yml` PR runs in 14
+days, 160 of them failed, about 240 failed jobs across all attempts, about
+1 MB per test-job log. That is about 25 sightings and about 17 new failed
+jobs a day.
+
+**Burst case.** A broken `unstable` commit can fail every PR at once, around
+300 writes in one sweep, more than GitHub's 80 content writes a minute. So
+there is one comment per test per sweep, writes are throttled to about
+one a second, and a 403 or 429 stops the sweep, which the next one repeats.
+
+## The tracker issue
+
+The title is `[TEST-FAILURE] <test> in <file>`. The body has the `Test:` and
+`File:` lines and the marker `<!-- valkey-ci-agent:pr-failure:<fp> -->`.
+Each sweep adds at most one bot comment per issue, with one line per new
+sighting:
 
 ```text
-sightings.jsonl   one sighting per line, pruned to the window on every write
-verdicts.json     fingerprint → last analysis verdict, its level, and when
-resets.json       fingerprint → the fix that reset it: commit, PR, merged_at, reason
-cursor.json       the updated_at the last sweep finished at, and the last
-                  unstable commit scanned for fixes
+<!-- valkey-ci-agent:pr-failure:sighting run=<id> attempt=<n> job=<id> pr=<n> base=<sha> passed_in=<n|none> -->
 ```
 
-- There is one commit per sweep, made by code, never by Claude.
-- There is only one writer at a time: a workflow `concurrency` group with
-  `cancel-in-progress: false`. If a push is rejected anyway, the sweep
-  refetches, reapplies its records and retries once.
-- The sweep needs `contents: write` on `valkey-ci-agent`, but only for that
-  branch. This is a new kind of push target, so
-  [Where the agent pushes](../docs/architecture.md#where-the-agent-pushes) and
-  the push-safety tests get updated to allow exactly `data/test-stats`.
-- [Clearing and resets](#clearing-and-resets) keeps the files small.
+Sightings are deduplicated on `(run, attempt, job)` across all comments.
+`IssueDedupPublisher`'s `last-key` remembers only the last key, so
+interleaved runs would be double-counted with it.
+
+Only comments by the bot with a valid sighting line count, and issues are
+locked on creation. The issue is an index, not evidence: at the gate, the
+referenced jobs are re-read from GitHub.
+
+PR numbers are written as plain text in code spans, never as `#n` or a PR
+URL. Those would add "mentioned this" events to the contributor's PR, which
+is the noise this design avoids. Job URLs are fine. No author is ever
+recorded (see [Security](#security)).
+
+| State | GitHub form | Meaning |
+|---|---|---|
+| collecting | open, `state:collecting` | below the limit, or analysed and kept with some failures excluded |
+| pending | open, `state:pending` | the limit was reached; analysis is owed, and every sweep retries it |
+| ready | open, `state:ready-to-promote`, `verdict:<v>` | the analysis found a real problem; waiting for the command (phase 1) or the cap (phase 2) |
+| promoted | open, `state:promoted`, links the `valkey` issue | no analysis while that issue is open |
+| has-main-issue | open, `state:has-main-issue` | a Daily issue exists; collect only |
+| rejected | closed `not_planned` by the bot, with a verdict marker | the PRs' own problem; its failures no longer count |
+| fixed | closed `completed`, with a reset marker | the count restarts at the reset |
+| stale | closed `not_planned` by the bot | no eligible sighting in `window_days` |
+| muted | closed `not_planned` by a person | keep recording, never analyse |
+
+A new eligible sighting reopens a `fixed`, `stale` or `rejected` issue.
+Closed issues are the history, so nothing needs pruning or squashing.
 
 ## Clearing and resets
 
-The stats get cleared in two ways: on a schedule, so nothing grows forever,
-and per test, when a fix lands, so the test's count starts again.
+### Expiry
 
-### Expiry, on every write
-
-- **Sightings** older than `window_days` (default 14) are dropped.
-- **Verdicts** older than `verdict_ttl_days` (default 30) are dropped, and
-  so is a verdict with no sightings left. A test that comes back after that
-  is analysed from scratch, because the code around it has changed and an
-  old `pr_caused` shouldn't keep suppressing it.
-- **Resets** are dropped once no sighting for their fingerprint predates
-  them, since they no longer filter anything.
-
-### History, monthly
-
-A commit every hour adds up. On the first sweep of each month, the branch is
-replaced with a single commit holding the current files, and that commit is
-force-pushed. Only `data/test-stats` is ever force-pushed. It holds derived
-data that can be rebuilt, not code, so losing its history costs nothing. The
-previous month's tip is uploaded as a workflow artifact before the
-force-push, in case someone wants to look back.
+Sightings older than `window_days` (14) don't count, and a tracker issue with
+none in the window is closed as `stale`. Resets and exclusions are comments,
+so they never expire while a pre-fix base could still produce a sighting.
 
 ### Resetting a test when it is fixed
 
-When a contributor fixes a test, its old sightings are evidence about code
-that no longer exists. Leaving them counted would push a fixed test over
-the threshold on stale data, and analyse it, as soon as it fails once more.
+A failure from code that has since been fixed says nothing about the fix, so
+it must not count. Resets are worked out **only when a test would
+become a candidate**, from the `unstable` commits since the oldest eligible
+sighting's base. A fix is:
 
-**What counts as a fix.** Each sweep scans the commits that landed on
-`unstable` since the last scanned commit. A commit resets a fingerprint when
-any of these is true:
+1. **The test changed.** A commit's diff touches the `test "<name>"` block
+   (Tcl) or the `TEST(Suite, Name)` body (gtest). A refactor can trigger
+   this; that is the safe mistake, because it only delays an analysis.
+2. **A PR closed the `valkey` issue.** A PR merged into `unstable` closes it
+   through a closing reference. A PR that only *references* the issue hasn't
+   fixed it, and backports reference issues too.
+3. **The `valkey` issue was closed as completed.** The anchor is the close
+   event's commit, else the closing PR's merge commit, else `unstable` HEAD
+   at the time.
+4. **A maintainer closed the tracker issue as completed.** The anchor is
+   `unstable` HEAD at the time. This replaces v1's `workflow_dispatch` reset,
+   which couldn't be rebuilt from GitHub data.
 
-1. **It changes the test itself.** For Tcl, that means the diff touches the
-   lines of the `test "<name>"` block in the fingerprint's file. For gtest,
-   the `TEST(Suite, Name)` body. Changes elsewhere in the same file don't
-   count.
-2. **It closes the test's issue.** The commit's PR closes or references an
-   issue carrying the fingerprint's marker. This also covers fixes in source
-   files rather than the test, as long as someone linked the issue.
-3. **The issue was closed as completed.** The fix commit is taken from the
-   issue's timeline: the `closed` event's `commit_id`, or else the merge
-   commit of the PR that closed it. If neither exists, the anchor is the
-   `unstable` HEAD at the time of the close. Any fix that landed before
-   someone closed the issue is an ancestor of that commit, so it works with
-   the same ancestry check as every other reset.
-4. **A maintainer resets it by hand.** A `workflow_dispatch` input,
-   `reset=<fingerprint>|all`, with an optional commit.
+A reset is a bot comment,
+`<!-- valkey-ci-agent:pr-failure:reset anchor=<sha> reason=<1-4> source=<…> -->`.
+It closes the issue as completed. From then on
+a sighting counts only if its `tested_base_sha` contains the newest anchor
+(`git merge-base --is-ancestor` against a blobless clone of `unstable`).
 
-Rule 1 can be triggered by a refactor that isn't a fix. That is the safe
-mistake to make, because a reset only delays an analysis; it never files or
-closes anything.
-
-**What a reset does.**
-
-- It records `{commit, pr, merged_at, reason}` in `resets.json`.
-- It drops the fingerprint's verdict.
-- From then on, only sightings whose `tested_base_sha` contains the fix
-  commit count towards the threshold. The check is
-  `git merge-base --is-ancestor`, run against a treeless clone of `unstable`
-  that is kept for the whole sweep. A PR tested on an `unstable` from before
-  the fix is still running the broken test, so its failure says nothing
-  about whether the fix worked. Those sightings stay stored but don't count.
-  Every reset has a commit anchor, so there is no time-based grace period.
-
-**When the fix didn't work.** If a fingerprint crosses the threshold again
-using only post-reset sightings, the analysis is told which fix reset it.
-The issue it files (or the comment, if the old issue is reopened) says that
-the fix in commit X didn't hold, with the post-fix failures linked.
+If the post-reset sightings pass the gates again, the analysis is told which
+fix reset the test, and the promoted issue says that fix didn't hold. This
+happened in the sample window: #5515 was closed by 80bb13e, and five later
+failures from 4 PRs crossed the gates. Daily filed #5553 about 5 hours
+earlier.
 
 ## Stage 2: analysis
 
 ### When it triggers
 
-A fingerprint becomes a **candidate** when all of these hold:
+The unit is a **failed attempt**: one `(run_id, attempt)` in which the test
+failed, however many jobs it failed in. A passing attempt never counts.
 
-- No open issue carries its marker.
-- If its issue was closed, there are enough sightings from CI runs that
-  already contained the fix. Closing the issue resets the fingerprint (rule
-  3 under [Resetting a test when it is fixed](#resetting-a-test-when-it-is-fixed)),
-  so only failures whose `tested_base_sha` has the fix commit as an ancestor
-  count. The check is one `git merge-base --is-ancestor` per sighting,
-  against the clone the sweep already keeps, so it is cheap. Failures from
-  PRs that predate the fix are ignored however recent they are. A failure on
-  a PR that has the fix counts straight away; the detector's one-day grace
-  isn't used here. Such a failure means the fix didn't hold (see below).
-- Within the window, it has failed in at least `threshold_runs` CI runs
-  (default 5). A run is one `(run_id, attempt)`, so a rerun is a new run, and
-  a test failing in several jobs of the same run counts once. Only sightings
-  since the fingerprint's last reset count (see
-  [Resetting a test when it is fixed](#resetting-a-test-when-it-is-fixed)).
-  How many distinct PRs and authors those runs came from isn't part of the
-  trigger. It is handed to the analysis as evidence: many runs from one PR
-  point to `pr_caused`, and many runs across unrelated PRs point to
-  `unstable`.
-- It hasn't already been analysed at this level. A rejected candidate is
-  analysed again only when its run count reaches double what it was at the
-  last analysis (5 → 10 → 20). This stops the same candidate being
-  re-analysed on every sweep.
+A sighting is **eligible** only if:
 
-A run in which the test failed and then passed on a rerun of the same commit
-counts as two runs towards the threshold.
+- **E1:** it contains the newest reset anchor, if any.
+- **E2:** for a named test, its file at `tested_base_sha` defines it. `$var`
+  and `[...]` in Tcl names are wildcards, since 620 of 5,347 Tcl names are
+  interpolated. This drops tests the PR added and names nobody wrote.
+- **E3:** its attempt started within `window_days`.
+
+A test becomes a **candidate** when code confirms all of these, before
+any Claude call:
+
+| Gate | Default | Counts |
+|---|---|---|
+| `threshold_failures` | 3 | eligible failed attempts |
+| `min_distinct_prs` | 3 | verified PRs with an eligible failure whose diff doesn't touch the test |
+
+Excluded sightings (see [Step 2](#step-2-claude-verdict)) never count. The
+test must also have no open `valkey` issue with its marker, and must
+not already be `ready`. After an analysis that keeps the issue collecting,
+the next one waits until the **limit is reached again**: `threshold_failures`
+new eligible attempts since that analysis, with both gates still holding.
+The days spanned aren't a gate, but go into the facts. A fresh
+regression arrives as a same-day burst across PRs, which is the case to
+catch fast.
+
+| Case | Result |
+|---|---|
+| One PR fails test X in 5 attempts | 1 PR: no analysis |
+| 2 PRs fail X 4 times between them | 2 PRs: no analysis |
+| Attempt 1 fails X, attempt 2 passes | 1 failed attempt, `passed_in=2` |
+| The PR added test X | E2 fails: never counts |
+| 3 PRs, one failure each | candidate |
+
+Over 14 days of real data, these defaults give 3 candidates (#5215,
+#5515/#5553, #5232), all genuine cross-PR failures. The next test down failed
+3 times in 2 PRs, so the PR gate held it back.
 
 ### Step 1: deterministic facts (no Claude)
 
-For each PR in the candidate's sightings, the analysis gathers:
-
-- how many of the candidate's runs it accounts for, and the totals: distinct
-  PRs, distinct authors, and runs per PR
-- the diff stat, and whether the PR touched the test file or a source file
-  the error names
-- whether the PR was later merged, and whether the test kept failing on
-  other PRs afterwards
-- whether any sighting passed on a rerun
-- whether the test failed in Daily during the window (from the detector's
-  issues and runs)
-- the fix that last reset it, if any
-- the `unstable` commits merged during the window that touched the test or
-  the files the error names
-
-None of these facts rejects a candidate on its own. For example, "every PR
-touched the test file" can mean the test is fragile rather than that the PRs
-were wrong. The facts are evidence for step 2.
+Every eligible sighting with its ID (`<run>-<attempt>-<job>`); how many
+sightings each of E1 to E3 dropped; per PR, its eligible failures,
+whether it touched the test or a file the error names, and whether it
+merged; the `passed_in` count and days spanned; whether Daily failed the test
+in the window; the reset, if any; and `unstable` commits in the window that
+touched the test or the files the error names. These are evidence for step 2,
+and none rejects a candidate on its own.
 
 ### Step 2: Claude verdict
 
-This follows the fuzzer monitor's pattern. It runs under a new read-only
-profile, `pr_failure_analysis_readonly`, which can read and search, but has
-no edits, no commands, no network and no GitHub token. Its working directory
-holds:
+The analysis runs in **its own job**, with no GitHub token, only OIDC for
+Bedrock. It uses a new profile, `pr_failure_analysis_readonly`, in
+`scripts/ai/runtime.py`, modelled on `ci_fix_review`: `Read,Grep`,
+`confined=True`, `isolated=True`, no writes. The fuzzer profile isn't
+confined, so it isn't reused. The work directory holds `unstable`, the facts
+and capped error excerpts and PR diffs, never PR code.
 
-- a copy of Valkey at current `unstable` HEAD
-- the facts from step 1, as a JSON file
-- the error excerpt for each sighting (truncated), and each PR's diff,
-  capped in size
+```json
+{"verdict": "unstable_regression|flaky|poorly_isolated|pr_caused|infra|unsure",
+ "confidence": "low|medium|high",
+ "rationale": "<= 1200 chars",
+ "evidence": ["<sighting id>", "…"],
+ "exclude": [{"id": "<sighting id>", "reason": "<= 200 chars"}],
+ "suspected_commit": "<sha>|null",
+ "fix_area": "test|harness|src|deps|unknown"}
+```
 
-Claude returns one structured verdict through `ai_output.py`:
+`exclude` lists the failures that aren't the test's fault, for example one
+PR that broke the test while the others hit a real flake. It is parsed with
+`extract_json_object(strict=True)`; anything else is `unsure`. Evidence and
+exclusion IDs and commits that aren't in the facts are dropped. A separate
+publish job validates the verdict again before any write.
 
-| Verdict | Meaning | Action |
+Code first applies the exclusions as one bot comment,
+`<!-- valkey-ci-agent:pr-failure:excluded ids=<id>,… -->`, with each reason
+fenced. Then it recounts, and acts on the verdict:
+
+| Verdict | Gates after exclusions | Action |
 |---|---|---|
-| `unstable_regression` | `unstable` itself is broken, often since a specific merge | File an issue |
-| `flaky` | Fails nondeterministically regardless of the change | File an issue |
-| `poorly_isolated` | Breaks under unrelated changes: timing, ordering, shared state, overly tight assertions | File an issue |
-| `pr_caused` | The PRs that failed it really broke it, independently | Record the verdict, no issue |
-| `infra` | Runner, network or mirror problems | Record the verdict, no issue |
-| `unsure` | Not enough evidence | Record the verdict, analyse again at the next level |
+| `unstable_regression`, `flaky`, `poorly_isolated` | still pass | label `state:ready-to-promote` and `verdict:<v>`, and post the rationale (phase 2: promote, under the cap) |
+| `unstable_regression`, `flaky`, `poorly_isolated` | no longer pass | keep collecting until the limit is reached again |
+| `pr_caused`, `infra` | any | close as rejected; its sightings no longer count |
+| `unsure` | any | keep collecting; the third `unsure` labels it `needs-human-triage` |
 
-The verdict includes a short rationale and, for `unstable_regression`, the
-suspected commit if one is identifiable. Code checks the verdict against the
-schema. An unparseable answer counts as `unsure`.
+The verdict is never the only gate. The deterministic gates decide whether
+analysis happens. An exclusion can only lower a count, never raise one. A
+person's command, or in phase 2 the cap, decides what reaches `valkey`.
 
-### Step 3 (later, optional): reproduce on unstable
+## Promotion: the `valkey` issue
 
-For `unstable_regression` and `flaky`, we could rerun the test on
-`unstable` HEAD inside the recreated job, reusing the CI fix bot's job
-recreation and sandbox. A failure there confirms the verdict and goes in the
-issue. A pass doesn't refute `flaky`, so it never blocks filing. This step
-is left out of the first version because of the runner cost.
+- **Phase 1: by command only.** A member of `valkey-io/contributors`
+  comments `@valkeyrie-ops promote` on the tracker issue. Usually the issue
+  is `ready`, but the command also works on any open tracker issue, as an
+  override of the analysis. A poll every 30 minutes picks it up, the same
+  way as `@valkeyrie-ops fix`. It uses `ci_fix/gate.py`'s `parse_command`
+  pattern and `is_authorized`, which fails closed. The bot reacts to the
+  comment, and replies with the `valkey` issue or the reason it refused.
+  Because tracker issues are locked, the team needs write access to
+  `tracker_repo`.
+- **Phase 2: automatic.** `ready` issues are promoted with no command, at most
+  `max_promotions_per_day` (2) in 24 hours, counted from `state:promoted`
+  labels. Overflow stays `ready`. The command still works, and isn't capped.
+- **Creation.** Through the detector's publisher with a new
+  `create_only=True`, which never updates an open issue. It uses the
+  detector's renderer, title, `test-failure` label and App identity, so a
+  later Daily failure finds it, and `parse_issue` and `merge_environments`
+  keep working.
+- **Body.** The detector's sections, plus **"Seen in PR CI"**: failing
+  attempts, distinct PRs (counts only), passes on
+  rerun, job URLs, the fenced verdict and rationale, the fix that didn't
+  hold if any, and a link to the tracker issue.
+- **Markers.** The detector's fingerprint marker, `occurrences:1`,
+  `source:pr-ci` and `pr-key:<run>-<attempt>`, and **no `last-key`**, which
+  is reserved for the run the fix bot should fix. Without it `parse_issue`
+  returns None, and the dispatcher skips the issue without commenting.
+- **An existing `valkey` issue** is linked and left alone, and the tracker
+  issue becomes `state:has-main-issue`. The tracker never reopens a closed
+  `valkey` issue; after a reset it creates a new one that links the old.
+- **A later Daily failure** updates the issue through the detector's normal
+  upsert, which writes `last-key`, and the fix bot takes over unchanged.
 
-### The issue
+Nothing is ever posted on contributors' PRs.
 
-The issue is filed through the detector's `issue_dedup.py` publisher with
-the same marker namespace, label `test-failure`, and the detector's renderer
-with source "PR CI". It holds:
+### Fixing later
 
-- the test, file and error
-- the verdict and Claude's rationale
-- the PRs, jobs and commits it failed on, with links, plus the raw count and
-  the rerun-pass count
-- the environments (job names) it failed in
-- the suspected commit, if any
+The fix bot must never plan from a PR run, whose workflow, logs and branch
+the contributor controls. Instead, the tracker can produce a trusted run:
 
-Because the marker is shared, a later Daily failure of the same test updates
-this issue instead of opening a second one.
+1. On promotion, or on `@valkeyrie-ops reproduce` on the tracker issue, it
+   dispatches `daily.yml` on `unstable`, narrowed with `test_args` and
+   `skipjobs`, and `use_repo` and `use_git_ref` left at their defaults.
+2. If that run fails the test, the publisher records it as `last-key`.
+3. `_validate_scheduled_run` also accepts a `workflow_dispatch` run of
+   `daily.yml` on the default branch triggered by the App. That is the only
+   fix-bot change. The dispatching job needs `actions: write` on `valkey`.
 
-There are no comments on contributors' PRs in this design.
+Fixing against the latest Daily instead doesn't work when the test passed
+there, because `_failing_jobs` finds no matching job and refuses.
 
 ## Security
 
-- **PR logs and diffs are untrusted.** Any fork can put anything into a job
-  log, including text aimed at Claude. That is why the analysis profile is
-  read-only, with no network and no token, why its answer is a fixed schema
-  parsed by code, and why the issue body is rendered by code with escaping.
-  Claude's rationale is quoted, never interpreted.
-- **Issue spam.** A crafted test name could be used to open issues. Because
-  the trigger counts runs, not PRs, one fork can reach it on its own by
-  pushing or rerunning repeatedly. What stops that is the analysis, which
-  sees that every run came from one PR and returns `pr_caused`, and the
-  doubling rule, which caps how often a rejected candidate is analysed
-  again. Titles are built by code from parsed fields and truncated.
-- **Tokens.** The collector gets a one-hour App token with `actions: read`
-  on `valkey`. Filing gets `issues: write` on `valkey`. The stats push gets
-  `contents: write` on `valkey-ci-agent`, limited to `data/test-stats`.
+- **Everything in a fork PR run is untrusted, including its workflow**: job
+  names, every log line (the checkout lines too), test names, error text, PR
+  diffs and Claude's output. Only API fields are trusted, including the PR
+  object fetched in [PR identity](#pr-identity).
+- **Deterministic gates before any promotion**, independent of the verdict:
+  the failure threshold, distinct verified PRs, and the test existing at the
+  tested base. On top of those, phase 1 needs an authorized person's command,
+  and phase 2 has the daily cap. Claude can label an issue ready, close it,
+  or exclude failures, but it can never add a count or file anything by
+  itself.
+- **Forged markers.** The detector's `_build_body` puts `test_name` into the
+  body raw, and the publisher appends `last-key` after the body. A fork can
+  make its CI print a test name containing
+  `<!-- valkey-ci-agent:test-failure:last-key:N -->`.
+  `parse_detector_occurrence` takes the first match, so the fix bot would
+  dispatch on run N. A name containing another test's marker would make
+  `_find_existing` attach the wrong issue. So a test or file name with `<`,
+  `>`, a backtick, `@` or a newline, or longer than 200 characters, is never
+  promoted, not even by command. Error text and the rationale go in fences longer than any
+  backtick run inside them.
+- **No personal data.** PR author logins aren't stored anywhere: not in
+  tracker issues, `valkey` issues, the facts or the prompt. The fork owner
+  is only compared during [PR identity](#pr-identity). A PR number is a
+  public identifier, and is enough to look up the author when needed.
+- **Tokens.** Each job mints its own App token with explicit `permission-*`,
+  top-level permissions are `{}`, and no job gets `contents: write`.
+
+| Job | Repository | Permissions |
+|---|---|---|
+| collect | `valkey` | `actions: read`, `pull-requests: read` |
+| record | `tracker_repo` | `issues: write` |
+| analyze | none | Bedrock through OIDC only |
+| commands | `tracker_repo`; org team membership | `issues: write` (reactions, replies), `members: read` |
+| promote | `valkey`, `tracker_repo` | `issues: write` |
+
+The tracker never checks out, builds or runs PR code, downloads PR
+artifacts, or reruns a PR job. It runs on `schedule` and `workflow_dispatch`
+only, never `pull_request_target` or `workflow_run`. It never writes anything
+but a Daily or reproduced run to `last-key`, bumps `occurrences` on a Daily
+issue, or edits `valkey` issues it didn't create.
 
 ## Code layout
 
 ```text
 scripts/pr_failure_tracker/
-  main.py        the sweep: collect, then evaluate candidates
-  collect.py     list runs and jobs, parse logs, build sightings
-  store.py       read, append, expire, squash and push the stats branch
-  resets.py      find fixes on unstable, record resets, ancestry checks
-  candidates.py  threshold, open-issue check, verdict memory
-  analyze.py     deterministic facts and the Claude verdict
-  publish.py     file the issue through the detector's renderer
-.github/workflows/pr-failure-tracker.yml
+  main.py        the sweep: collect, record, evaluate candidates
+  collect.py     runs, attempts and jobs; log parsing; PR identity and tested base
+  tracker.py     tracker issues: markers, keyed comments, states, throttling
+  gates.py       eligibility, thresholds, exclusions, name checks, the daily cap
+  resets.py      lazy fix detection and ancestry checks
+  analyze.py     facts and the Claude verdict
+  commands.py    @valkeyrie-ops promote and reproduce on tracker issues
+  promote.py     the valkey issue, through the detector's publisher
+.github/workflows/pr-failure-tracker.yml            collect → analyze (no token) → promote
+.github/workflows/pr-failure-tracker-commands.yml   the 30-minute command poll
 docs/pr-failure-tracker.md
 tests/test_pr_failure_tracker_*.py
 ```
 
 Shared changes:
 
-- `test_failure_detector/issue_renderer.py`: a source parameter instead of
-  the hard-coded "Daily".
-- `ai/claude_code.py`: the new read-only profile.
-- `repos.yml`: a `pr_failure_tracker` block per repository with workflows,
-  window, thresholds and an `enabled` / `file_issues` switch.
+- `scripts/ai/runtime.py`: the `pr_failure_analysis_readonly` profile.
+- `test_failure_detector/issue_renderer.py`: a "Seen in PR CI" section and
+  name checks. The test-level body already says "failing in CI"; only the
+  job-level renderers say "Daily", and v2 doesn't use them.
+- `common/issue_dedup.py`: `create_only`, which returns `"skipped-exists"` if
+  an open issue matches.
+- `backport/registry.py`: parse and validate a `pr_failure_tracker` block.
+  The loader ignores unknown keys today, so a misspelled block would silently
+  do nothing.
+- `valkey_ci.Source` doesn't get a PR value, because it drives the fix bot's
+  workflow list and the backport CI follow-up.
+- Docs: a sentence in `docs/ci-fix.md` that issues from PR CI aren't fixed
+  until Daily records the failure, and the new markers in
+  `docs/test-failure-detector.md`.
 
 ## Configuration (`repos.yml`)
 
 ```yaml
 pr_failure_tracker:
-  enabled: true
-  file_issues: false        # phase 1: collect only
+  enabled: false
+  tracker_repo: valkey-io/valkey-ci-tracker   # issues only; never a repos.yml target
   workflows: [ci.yml]
   base_branch: unstable
   window_days: 14
-  verdict_ttl_days: 30
-  threshold_runs: 5
+  threshold_failures: 3
+  min_distinct_prs: 3
+  promote: command        # command (phase 1) | auto (phase 2)
+  max_promotions_per_day: 2   # phase 2 only
 ```
 
-## Rollout
+## Phases
 
-1. **Collect only.** Turn on the sweep with `file_issues: false`. It writes
-   sightings and a job summary listing the would-be candidates. We let it run
-   for a week or two, then pick the window and thresholds from real data.
-2. **Analyse in dry run.** Run the analysis on candidates and put the
-   verdicts in the job summary, without filing anything. We check the
-   verdicts by hand.
-3. **File issues.** Set `file_issues: true`.
-4. **Maybe later:** reproduction on `unstable` (step 3), more workflows, and
-   other repositories.
+**Phase 1: labels, promotion by command** (`promote: command`). Collection,
+the limit and the analysis all run as described. The analysis outcome only
+labels, closes or trims tracker issues. Nothing reaches `valkey` until a
+maintainer comments `@valkeyrie-ops promote`. During this phase,
+maintainers check the verdicts and exclusions in the tracker, and the gates
+are tuned from real data.
+
+**Phase 2: automatic promotion** (`promote: auto`), once we're happy with
+the phase 1 verdicts. `ready` issues are promoted under the daily cap, and
+the command still works.
+
+**Later:** reproduction on `unstable` ([Fixing later](#fixing-later)), more
+workflows, other repositories.
 
 ## Testing
 
-- Unit tests for each module. They use recorded run, job and log fixtures,
-  including a rerun that passes, a PR that fails the same test repeatedly,
-  and a fork PR.
-- Store tests: append, prune, reapply after a rejected push, and a corrupt
-  or missing file. A corrupt file makes the sweep fail loudly; it is never
-  overwritten.
-- Candidate tests: threshold edges, run counting (reruns, several jobs in
-  one run, a passed rerun counting twice), the open and
-  closed-issue checks (a sighting tested before the fix is ignored, one tested
-  after it counts, and the fix is found from the close commit, from the
-  closing PR, or from `unstable` HEAD at the time of the close), and
-  re-analysis levels.
-- Expiry tests: sightings past the window, verdicts past their TTL or with no
-  sightings left, resets that no longer filter anything, and the monthly
-  squash (the artifact is uploaded before the force-push, and only
-  `data/test-stats` is ever force-pushed).
-- Reset tests: a diff inside the test block (resets) and outside it (doesn't),
-  a gtest body, a linked issue, a close with no commit, the manual reset, a
-  sighting tested on a pre-fix base (doesn't count), and a fix that didn't
-  hold.
-- Analysis tests: schema validation and an unparseable answer becoming
-  `unsure`. Hostile log content ends up quoted in the prompt and escaped in
-  the issue.
-- The workflow is covered by the existing checks: pinned actions,
-  least-privilege permissions, and allowed push targets.
+- **Collection:** fixtures for a passed rerun, an `action_required` first
+  attempt, a carried-over job, a cancelled job and a failed job in a
+  cancelled run (both ignored), a fork PR with empty `pull_requests`, a
+  forged `pull/<n>/merge` line, the libbacktrace checkout line, a PR into
+  `cluster-v2` and an unknown PR (both ignored, with no other logs read), a
+  failed log download, a run still in progress during the previous sweep,
+  and a failed sweep whose work the next sweep picks up.
+- **Tracker:** keyed comments are idempotent across overlapping sweeps;
+  non-bot comments are ignored; one comment per test in a burst; stop
+  and resume on 403 or 429; every state transition.
+- **Gates:** E1 to E3, including interpolated Tcl names and gtest; both
+  thresholds; no
+  re-analysis until the limit is reached again; a `pending` issue retried
+  with no new sighting.
+- **Verdicts:** each row of the verdict table; exclusions that drop the
+  count below the gates keep the issue collecting; exclusion IDs that aren't
+  in the facts are ignored; excluded sightings never count again.
+- **Phases:** phase 1 never promotes without the command; a non-member's
+  command is refused; a command already reacted to isn't run twice; phase 2
+  promotes `ready` issues under the cap, and the command bypasses it.
+- **Resets:** a diff inside and outside the test block; a closing versus a
+  referencing PR; a close with no commit; a person's close versus the bot's;
+  a pre-fix base; a fix that didn't hold.
+- **Handoff:** a promoted issue has no `last-key` and is skipped silently; a
+  later detector upsert makes it dispatchable; the new markers survive an
+  update and never match `_OCCURRENCE_RE` or `_last_key_re`; `create_only`
+  never updates a Daily issue.
+- **Security:** a name with `<!--`, a backtick, `@` or a newline is never
+  promoted; no `#n` or PR URLs in tracker or `valkey` bodies; the analysis job
+  has no GitHub token; the workflow has no `pull_request_target` or
+  `workflow_run`.
 
 ## Open questions
 
-1. **Sweep cadence.** The proposal is hourly. Is the extra log-reading load
-   on the GitHub API acceptable? Phase 1 will show the real volume.
-2. **Is `unsure` filed after N analyses?** For example, as a
-   `needs-human-triage` issue once it reaches the third level.
-3. **Should a fingerprint the detector already tracks from Daily skip
-   collection entirely,** or keep collecting for the stats? The proposal
-   keeps collecting, because it costs nothing extra and the stats branch is
-   useful on its own.
+1. **Sweep cadence.** Daily, after the detector, is proposed. Each sweep
+   reads only what's new, so a faster sweep costs about the same in total. Is
+   a faster signal worth it?
+2. **The tracker repository.** A new `valkey-io/valkey-ci-tracker`
+   (recommended), or a fork with issues enabled? Who can see and triage it?
+3. **Fix-bot tuning** (out of scope). Oversized timeout bumps, and no test
+   alongside a `src/` fix, belong in `scripts/ci_fix/guides/valkey-io__valkey.md`
+   and are tracked separately.
